@@ -2,21 +2,20 @@ package main
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
-	"encoding/json"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
-	"strings"
-	"sync"
 	"syscall"
 	"time"
 
 	"github.com/aligorov/pionex-bot/backend/internal/accounts"
+	"github.com/aligorov/pionex-bot/backend/internal/audit"
+	"github.com/aligorov/pionex-bot/backend/internal/auth"
 	"github.com/aligorov/pionex-bot/backend/internal/autogrid"
+	"github.com/aligorov/pionex-bot/backend/internal/controlplane"
+	"github.com/aligorov/pionex-bot/backend/internal/httpapi"
+	"github.com/aligorov/pionex-bot/backend/internal/observability"
 	"github.com/aligorov/pionex-bot/backend/internal/risk"
 	"github.com/aligorov/pionex-bot/backend/internal/telegram"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -27,41 +26,6 @@ var (
 	GitCommit = "dev"
 	BuildTime = "unknown"
 )
-
-type SessionStore struct {
-	mu       sync.RWMutex
-	sessions map[string]time.Time
-}
-
-func NewSessionStore() *SessionStore {
-	return &SessionStore{
-		sessions: make(map[string]time.Time),
-	}
-}
-
-func (s *SessionStore) CreateSession() string {
-	b := make([]byte, 32)
-	_, _ = rand.Read(b)
-	token := hex.EncodeToString(b)
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.sessions[token] = time.Now().Add(24 * time.Hour)
-	return token
-}
-
-func (s *SessionStore) ValidateSession(token string) bool {
-	if token == "" {
-		return false
-	}
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	exp, exists := s.sessions[token]
-	if !exists {
-		return false
-	}
-	return time.Now().Before(exp)
-}
 
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
@@ -114,110 +78,54 @@ func main() {
 		}()
 	}
 
-	sessions := NewSessionStore()
-	mux := http.NewServeMux()
-
-	// Public Endpoints
-	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{
-			"status": "healthy",
-			"time":   time.Now().Format(time.RFC3339),
-		})
-	})
-
-	mux.HandleFunc("GET /api/version", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{
-			"version":    Version,
-			"git_commit": GitCommit,
-			"build_time": BuildTime,
-		})
-	})
-
-	// Login Handler
-	mux.HandleFunc("POST /api/auth/login", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		var creds struct {
-			Username string `json:"username"`
-			Password string `json:"password"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&creds); err != nil {
-			http.Error(w, `{"error":"invalid request"}`, http.StatusBadRequest)
-			return
-		}
-
-		adminUser := os.Getenv("ADMIN_USER")
-		if adminUser == "" {
-			adminUser = "admin"
-		}
-		adminPass := os.Getenv("ADMIN_PASS")
-		if adminPass == "" {
-			adminPass = "pionex2026"
-		}
-
-		if creds.Username != adminUser || creds.Password != adminPass {
-			w.WriteHeader(http.StatusUnauthorized)
-			json.NewEncoder(w).Encode(map[string]string{"error": "Invalid username or password"})
-			return
-		}
-
-		token := sessions.CreateSession()
-		json.NewEncoder(w).Encode(map[string]string{
-			"token": token,
-			"user":  creds.Username,
-		})
-	})
-
-	// Protected Endpoints
-	protectedHandler := func(h http.HandlerFunc) http.HandlerFunc {
-		return func(w http.ResponseWriter, r *http.Request) {
-			authHeader := r.Header.Get("Authorization")
-			token := strings.TrimPrefix(authHeader, "Bearer ")
-			if !sessions.ValidateSession(token) {
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(http.StatusUnauthorized)
-				json.NewEncoder(w).Encode(map[string]string{"error": "Unauthorized access - session token required"})
-				return
-			}
-			h(w, r)
-		}
+	// Locate frontend dist directory
+	frontendDist := "/app/frontend"
+	if _, err := os.Stat(frontendDist); err != nil {
+		frontendDist = "./frontend/dist"
 	}
 
-	mux.HandleFunc("GET /api/risk/settings", protectedHandler(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		if dbPool == nil {
-			http.Error(w, `{"error":"database unavailable"}`, http.StatusServiceUnavailable)
-			return
-		}
-		engine := risk.NewEngine(dbPool)
-		settings, err := engine.LoadSettings(r.Context())
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		json.NewEncoder(w).Encode(settings)
-	}))
+	var handler http.Handler
+	if dbPool != nil {
+		authService := auth.NewService(dbPool)
+		accountService := accounts.NewService(dbPool)
+		riskEngine := risk.NewEngine(dbPool)
+		autoService := autogrid.NewService(dbPool, riskEngine)
+		auditStore := audit.NewStore(dbPool)
+		logStore := observability.NewStore(dbPool)
 
-	// Native Go Static Frontend Server
-	frontendDist := "./frontend/dist"
-	if abs, err := filepath.Abs(frontendDist); err == nil {
-		if fi, err := os.Stat(abs); err == nil && fi.IsDir() {
-			fs := http.FileServer(http.Dir(abs))
-			mux.Handle("/", fs)
-			slog.Info("Serving frontend static assets directly from Go backend", "dir", abs)
-		}
+		controlService := controlplane.NewService(dbPool, riskEngine, auditStore, logStore, Version, GitCommit, BuildTime)
+
+		apiServer := httpapi.NewServer(
+			authService,
+			accountService,
+			autoService,
+			controlService,
+			Version,
+			GitCommit,
+			BuildTime,
+			nil,
+			frontendDist,
+			logger,
+		)
+		handler = apiServer.Handler()
+	} else {
+		mux := http.NewServeMux()
+		mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`{"status":"ok"}`))
+		})
+		handler = mux
 	}
 
 	server := &http.Server{
 		Addr:         ":8080",
-		Handler:      mux,
+		Handler:      handler,
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 10 * time.Second,
 	}
 
 	go func() {
-		slog.Info("Server listening on :8080")
+		slog.Info("Server listening on :8080", "frontend", frontendDist)
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			slog.Error("Server failed", "error", err)
 			os.Exit(1)
