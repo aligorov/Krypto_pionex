@@ -34,8 +34,10 @@ func NewLifecycleManager(db *pgxpool.Pool, pionexClient *pionex.Client) *Lifecyc
 	}
 }
 
-// CreateGridBot validates parameters, records PENDING_SUBMISSION state, and executes /api/v1/bot/futuresGrid/create.
+// CreateGridBot validates parameters, records PENDING_SUBMISSION state, and executes /api/v1/bot/orders/futuresGrid/create.
 func (lm *LifecycleManager) CreateGridBot(ctx context.Context, accountID string, params pionex.NativeFuturesGridCreateParams) (string, error) {
+	symbol := fmt.Sprintf("%s_%s_PERP", params.Base, params.Quote)
+
 	// 1. Record submission intent in PostgreSQL
 	var gridID string
 	query := `
@@ -43,8 +45,8 @@ func (lm *LifecycleManager) CreateGridBot(ctx context.Context, accountID string,
 		VALUES ($1, $2, 'PENDING_SUBMISSION', $3, $4, $5, $6, $7, $8)
 		RETURNING id
 	`
-	fingerprint := fmt.Sprintf("%s_%s_%s_%d", accountID, params.Symbol, params.LowerPrice.String(), params.GridNum)
-	err := lm.db.QueryRow(ctx, query, accountID, params.Symbol, params.LowerPrice, params.UpperPrice, params.GridNum, params.Leverage, params.QuoteInvestment, fingerprint).Scan(&gridID)
+	fingerprint := fmt.Sprintf("%s_%s_%s_%d", accountID, symbol, params.BUOrderData.LowerPrice.String(), params.BUOrderData.GridNum)
+	err := lm.db.QueryRow(ctx, query, accountID, symbol, params.BUOrderData.LowerPrice, params.BUOrderData.UpperPrice, params.BUOrderData.GridNum, params.BUOrderData.Leverage, params.BUOrderData.QuoteInvestment, fingerprint).Scan(&gridID)
 	if err != nil {
 		return "", fmt.Errorf("failed to record pending grid bot: %w", err)
 	}

@@ -20,7 +20,7 @@ echo " Build Time: $BUILD_TIME"
 echo "=========================================="
 
 echo "[1/5] Running Backend Unit Tests in Docker..."
-docker run --rm -v "$ROOT_DIR/backend":/app -w /app golang:1.22-alpine go test -v ./... || { echo "Backend tests failed!"; exit 1; }
+docker run --rm -v "$ROOT_DIR/backend":/app -w /app golang:1.25-alpine go test -v ./... || { echo "Backend tests failed!"; exit 1; }
 
 echo "[2/5] Building Docker Images (Backend & Quant Worker)..."
 cd "$ROOT_DIR"
@@ -31,7 +31,7 @@ docker compose up -d postgres backend
 sleep 5
 
 echo "[4/5] Checking Health Endpoints..."
-HEALTH_STATUS="$(curl -s http://localhost:8080/health | grep '"healthy"' || true)"
+HEALTH_STATUS="$(curl -s http://localhost:8080/health | grep '"status"' || true)"
 if [[ -z "$HEALTH_STATUS" ]]; then
     echo "Backend Health check failed!"
     docker compose logs backend

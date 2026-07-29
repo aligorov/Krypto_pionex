@@ -1,0 +1,6 @@
+.git
+.gitignore
+graphify-out
+frontend/node_modules
+frontend/dist
+**/.DS_Store

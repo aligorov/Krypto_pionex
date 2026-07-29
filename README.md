@@ -1,30 +1,71 @@
-# Standalone Pionex Trading Bot (`pionex-bot`)
+# Standalone Pionex Trading Bot
 
-Production-grade, modular monolith trading bot specifically engineered for **Pionex REST API, Futures WebSocket, Native Futures Grid Bots, and Pattern Futures Trading**.
+Pionex-only trading system with a PostgreSQL-backed control plane, authenticated React interface and MCP management server.
 
-## Key Features
+## What is implemented
 
-- **Exclusive Pionex API**: Built strictly according to official Pionex documentation (`https://www.pionex.com/docs/api-docs`).
-- **Native Futures Grid Engine**: State-machine lifecycle with strict `buOrderId` confirmation.
-- **Pattern Trading Engine**: Isolated technical pattern recognizers (BOS, CHoCH, FVG, OrderBlock) executing via ordinary Futures Orders (`/api/v1/futures/order`) with deterministic `clientOrderId`.
-- **Zero-ENV Runtime Config**: All accounts, credentials, risk limits, and kill-switches stored in PostgreSQL.
-- **Durable Risk Engine**: Automated pre-flight validation preventing over-exposure, excessive leverage, or trading during kill-switch activation.
-- **Event-Driven Backtest & OOS**: Isolated Python quant worker providing Purged K-Fold & Walk-Forward evaluation.
-- **Telegram Transactional Outbox**: Reliable notification delivery with RBAC permissions and 2FA command confirmation.
+- DB-backed users, bcrypt passwords, VIEWER/OPERATOR/ADMIN roles, session revocation and lockout.
+- HttpOnly session cookies, SameSite=Strict and CSRF validation for every web mutation.
+- User settings, runtime configuration and feature flags stored in PostgreSQL.
+- Durable risk limits and kill switch.
+- Structured application logs with secret redaction and an audit trail for web and MCP actions.
+- Streamable HTTP MCP endpoint and local stdio MCP server with scoped hashed tokens.
+- Idempotent control commands and two-phase confirmation of dangerous operations.
+- React screens for dashboard, users, settings, risk, accounts, grids, orders, logs, audit, MCP tokens and command history.
 
-## Quick Start
+Real Grid and ordinary Futures execution are disabled by default. A queued control command is not proof of execution on Pionex. Remote identifiers, partial fills, terminal states and flat-position verification remain authoritative.
 
-### 1. Launch Services via Docker Compose
+## Start
+
 ```bash
 docker compose up -d --build
 ```
 
-### 2. Run Automated Release
+Open [http://localhost:8080](http://localhost:8080).
+
+On the first start, create the administrator locally. The password is read without echo and is never passed through an environment variable:
+
 ```bash
-./dockerrelease.sh
+docker compose run --rm backend /app/pionex-admin create-user \
+  --username admin \
+  --display-name "Administrator" \
+  --role ADMIN
 ```
 
-## Documentation
+Useful checks:
 
-- [AGENTS.md](file:///Users/aleksey/Documents/Krypto_pionex/AGENTS.md): Operating rules and constraints.
-- [Initial Schema](file:///Users/aleksey/Documents/Krypto_pionex/migrations/0001_initial.sql): PostgreSQL database schema.
+```bash
+curl http://localhost:8080/health
+curl http://localhost:8080/ready
+docker compose ps
+```
+
+## MCP
+
+1. Sign in as an administrator.
+2. Open the **MCP** screen.
+3. Create a token with only the required scopes.
+4. Configure the client to use `http://localhost:8080/mcp` and the HTTP header `Authorization: Bearer <token>`.
+
+For a local stdio client, save the token to a protected file and run:
+
+```bash
+docker compose run --rm \
+  -v /absolute/path/to/token:/run/secrets/pionex-mcp-token:ro \
+  backend /app/pionex-mcp --token-file /run/secrets/pionex-mcp-token
+```
+
+See [docs/CONTROL_PLANE.md](docs/CONTROL_PLANE.md) for roles, scopes, tools and safety gates.
+
+## Runtime policy
+
+`DATABASE_URL` is the only infrastructure environment variable. Users, sessions, settings, risk policy, feature gates, MCP tokens and control state live in PostgreSQL. No default web password exists.
+
+## Verification
+
+```bash
+docker run --rm -v "$PWD/backend:/src" -w /src golang:1.25-alpine go test ./...
+npm --prefix frontend run build
+npm --prefix frontend audit --audit-level=high
+docker compose build backend
+```

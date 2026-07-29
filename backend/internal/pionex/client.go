@@ -57,9 +57,8 @@ type FuturesBalance struct {
 	Total decimal.Decimal `json:"total"`
 }
 
-// NativeFuturesGridCreateParams matches official Pionex Futures Grid creation spec.
-type NativeFuturesGridCreateParams struct {
-	Symbol          string          `json:"symbol"`
+// Nested buOrderData per official Pionex Futures Grid spec
+type BUOrderData struct {
 	GridType        string          `json:"gridType"`  // ARITHMETIC or GEOMETRIC
 	Direction       string          `json:"direction"` // LONG, SHORT, NEUTRAL
 	LowerPrice      decimal.Decimal `json:"lowerPrice"`
@@ -70,6 +69,13 @@ type NativeFuturesGridCreateParams struct {
 	ExtraMargin     decimal.Decimal `json:"extraMargin"`
 	StopLoss        decimal.Decimal `json:"stopLoss,omitempty"`
 	TakeProfit      decimal.Decimal `json:"takeProfit,omitempty"`
+}
+
+// NativeFuturesGridCreateParams matches official Pionex Futures Grid creation spec.
+type NativeFuturesGridCreateParams struct {
+	Base        string      `json:"base"`
+	Quote       string      `json:"quote"`
+	BUOrderData BUOrderData `json:"buOrderData"`
 }
 
 // NativeFuturesGridCreateResult contains the resulting remote buOrderId.

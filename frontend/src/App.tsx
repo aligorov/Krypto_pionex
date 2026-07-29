@@ -1,6 +1,8 @@
 import { useState, useEffect } from 'react';
+import PionexAccounts from './components/PionexAccounts';
+import AutoGridAutopilot from './components/AutoGridAutopilot';
 
-type Tab = 'dashboard' | 'accounts' | 'grid' | 'patterns' | 'risk' | 'ai' | 'telegram' | 'audit';
+type Tab = 'dashboard' | 'accounts' | 'autogrid' | 'patterns' | 'risk' | 'ai' | 'telegram' | 'audit';
 
 interface RiskSettings {
   KillSwitchEnabled: boolean;
@@ -124,13 +126,13 @@ export default function App() {
           </span>
         </div>
         <nav className="nav-links">
-          {(['dashboard', 'accounts', 'grid', 'patterns', 'risk', 'ai', 'telegram', 'audit'] as Tab[]).map((tab) => (
+          {(['dashboard', 'accounts', 'autogrid', 'patterns', 'risk', 'ai', 'telegram', 'audit'] as Tab[]).map((tab) => (
             <button
               key={tab}
               className={`nav-btn ${activeTab === tab ? 'active' : ''}`}
               onClick={() => setActiveTab(tab)}
             >
-              {tab.toUpperCase()}
+              {tab === 'autogrid' ? 'AUTO-GRID' : tab.toUpperCase()}
             </button>
           ))}
           <button className="nav-btn" onClick={handleLogout} style={{ color: 'var(--danger-color)', borderColor: 'var(--danger-color)' }}>
@@ -150,12 +152,9 @@ export default function App() {
           </div>
         )}
 
-        {activeTab === 'grid' && (
-          <div className="grid-card">
-            <h3>Native Futures Grid Bot Lifecycle</h3>
-            <p>Creates native grid bots via <code>/api/v1/bot/orders/futuresGrid/create</code> and verifies remote <code>buOrderId</code> before setting state to RUNNING.</p>
-          </div>
-        )}
+        {activeTab === 'accounts' && <PionexAccounts token={token} />}
+
+        {activeTab === 'autogrid' && <AutoGridAutopilot token={token} />}
 
         {activeTab === 'risk' && (
           <div className="grid-card">

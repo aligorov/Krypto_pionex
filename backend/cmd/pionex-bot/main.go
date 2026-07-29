@@ -2,212 +2,124 @@ package main
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
-	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
-	"strings"
-	"sync"
 	"syscall"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/aligorov/pionex-bot/backend/internal/audit"
+	"github.com/aligorov/pionex-bot/backend/internal/auth"
+	"github.com/aligorov/pionex-bot/backend/internal/controlplane"
+	"github.com/aligorov/pionex-bot/backend/internal/database"
+	"github.com/aligorov/pionex-bot/backend/internal/httpapi"
+	"github.com/aligorov/pionex-bot/backend/internal/mcpserver"
+	"github.com/aligorov/pionex-bot/backend/internal/observability"
 	"github.com/aligorov/pionex-bot/backend/internal/risk"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 var (
-	Version   = "1.0.0"
+	Version   = "1.1.0"
 	GitCommit = "dev"
 	BuildTime = "unknown"
 )
 
-type SessionStore struct {
-	mu       sync.RWMutex
-	sessions map[string]time.Time
-}
-
-func NewSessionStore() *SessionStore {
-	return &SessionStore{
-		sessions: make(map[string]time.Time),
-	}
-}
-
-func (s *SessionStore) CreateSession() string {
-	b := make([]byte, 32)
-	_, _ = rand.Read(b)
-	token := hex.EncodeToString(b)
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.sessions[token] = time.Now().Add(24 * time.Hour)
-	return token
-}
-
-func (s *SessionStore) ValidateSession(token string) bool {
-	if token == "" {
-		return false
-	}
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	exp, exists := s.sessions[token]
-	if !exists {
-		return false
-	}
-	return time.Now().Before(exp)
-}
+const defaultDatabaseURL = "postgres://pionex:pionex_password@localhost:5432/pionex_bot?sslmode=disable"
 
 func main() {
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	baseHandler := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})
+	bootstrapLogger := slog.New(baseHandler)
+	slog.SetDefault(bootstrapLogger)
+
+	databaseURL := os.Getenv("DATABASE_URL")
+	if databaseURL == "" {
+		databaseURL = defaultDatabaseURL
+	}
+	startupCtx, startupCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer startupCancel()
+
+	db, err := pgxpool.New(startupCtx, databaseURL)
+	if err != nil {
+		bootstrapLogger.Error("create PostgreSQL pool", "error", err)
+		os.Exit(1)
+	}
+	defer db.Close()
+	if err := db.Ping(startupCtx); err != nil {
+		bootstrapLogger.Error("PostgreSQL is unavailable", "error", err)
+		os.Exit(1)
+	}
+	if err := database.Migrate(startupCtx, db, migrationsDirectory()); err != nil {
+		bootstrapLogger.Error("database migration failed", "error", err)
+		os.Exit(1)
+	}
+
+	logStore := observability.NewStore(db)
+	dbHandler := observability.NewDBHandler(baseHandler, logStore)
+	logger := slog.New(dbHandler)
 	slog.SetDefault(logger)
 
-	slog.Info("Starting Standalone Pionex Trading Bot",
-		"version", Version,
-		"commit", GitCommit,
-		"build_time", BuildTime,
+	authService := auth.NewService(db)
+	auditStore := audit.NewStore(db)
+	riskEngine := risk.NewEngine(db)
+	controlService := controlplane.NewService(
+		db, riskEngine, auditStore, logStore, Version, GitCommit, BuildTime,
+	)
+	mcpServices := mcpserver.Services{
+		Auth: authService, Control: controlService, Version: Version,
+	}
+	api := httpapi.NewServer(
+		authService, controlService, Version, GitCommit, BuildTime,
+		mcpserver.NewHTTPHandler(mcpServices), frontendDirectory(), logger,
 	)
 
-	dbURL := os.Getenv("DATABASE_URL")
-	if dbURL == "" {
-		dbURL = "postgres://pionex:pionex_password@localhost:5432/pionex_bot?sslmode=disable"
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	dbPool, err := pgxpool.New(ctx, dbURL)
-	if err != nil {
-		slog.Warn("Could not connect to PostgreSQL pool immediately", "error", err)
-	} else {
-		defer dbPool.Close()
-		slog.Info("PostgreSQL connection pool established")
-	}
-
-	sessions := NewSessionStore()
-
-	mux := http.NewServeMux()
-
-	// Public Endpoints
-	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{
-			"status": "healthy",
-			"time":   time.Now().Format(time.RFC3339),
-		})
-	})
-
-	mux.HandleFunc("GET /api/version", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{
-			"version":    Version,
-			"git_commit": GitCommit,
-			"build_time": BuildTime,
-		})
-	})
-
-	// Login Handler
-	mux.HandleFunc("POST /api/auth/login", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		var creds struct {
-			Username string `json:"username"`
-			Password string `json:"password"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&creds); err != nil {
-			http.Error(w, `{"error":"invalid request"}`, http.StatusBadRequest)
-			return
-		}
-
-		adminUser := os.Getenv("ADMIN_USER")
-		if adminUser == "" {
-			adminUser = "admin"
-		}
-		adminPass := os.Getenv("ADMIN_PASS")
-		if adminPass == "" {
-			adminPass = "pionex2026"
-		}
-
-		if creds.Username != adminUser || creds.Password != adminPass {
-			w.WriteHeader(http.StatusUnauthorized)
-			json.NewEncoder(w).Encode(map[string]string{"error": "Invalid username or password"})
-			return
-		}
-
-		token := sessions.CreateSession()
-		json.NewEncoder(w).Encode(map[string]string{
-			"token": token,
-			"user":  creds.Username,
-		})
-	})
-
-	// Protected Endpoints
-	protectedHandler := func(h http.HandlerFunc) http.HandlerFunc {
-		return func(w http.ResponseWriter, r *http.Request) {
-			authHeader := r.Header.Get("Authorization")
-			token := strings.TrimPrefix(authHeader, "Bearer ")
-			if !sessions.ValidateSession(token) {
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(http.StatusUnauthorized)
-				json.NewEncoder(w).Encode(map[string]string{"error": "Unauthorized access - session token required"})
-				return
-			}
-			h(w, r)
-		}
-	}
-
-	mux.HandleFunc("GET /api/risk/settings", protectedHandler(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		if dbPool == nil {
-			http.Error(w, `{"error":"database unavailable"}`, http.StatusServiceUnavailable)
-			return
-		}
-		engine := risk.NewEngine(dbPool)
-		settings, err := engine.LoadSettings(r.Context())
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		json.NewEncoder(w).Encode(settings)
-	}))
-
-	// Native Go Static Frontend Server (No Nginx)
-	frontendDist := "./frontend/dist"
-	if abs, err := filepath.Abs(frontendDist); err == nil {
-		if fi, err := os.Stat(abs); err == nil && fi.IsDir() {
-			fs := http.FileServer(http.Dir(abs))
-			mux.Handle("/", fs)
-			slog.Info("Serving frontend static assets directly from Go backend", "dir", abs)
-		}
-	}
-
 	server := &http.Server{
-		Addr:         ":8080",
-		Handler:      mux,
-		ReadTimeout:  10 * time.Second,
-		WriteTimeout: 10 * time.Second,
+		Addr:              ":8080",
+		Handler:           api.Handler(),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       90 * time.Second,
+		MaxHeaderBytes:    1 << 20,
 	}
 
+	logger.Info("Standalone Pionex control plane started",
+		"component", "startup", "version", Version, "commit", GitCommit,
+		"build_time", BuildTime, "address", server.Addr,
+	)
 	go func() {
-		slog.Info("Server listening on :8080")
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			slog.Error("Server failed", "error", err)
+		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			logger.Error("HTTP server failed", "component", "http", "error", err)
 			os.Exit(1)
 		}
 	}()
 
-	stop := make(chan os.Signal, 1)
-	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
-	<-stop
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
+	<-signals
 
-	slog.Info("Shutting down gracefully...")
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
-
 	if err := server.Shutdown(shutdownCtx); err != nil {
-		slog.Error("Forced shutdown error", "error", err)
+		logger.Error("graceful shutdown failed", "component", "shutdown", "error", err)
 	}
+	logger.Info("Standalone Pionex control plane stopped",
+		"component", "shutdown", "dropped_db_logs", dbHandler.Dropped(),
+	)
+}
 
-	slog.Info("Application stopped cleanly")
+func migrationsDirectory() string {
+	if _, err := os.Stat("/app/migrations"); err == nil {
+		return "/app/migrations"
+	}
+	return "./migrations"
+}
+
+func frontendDirectory() string {
+	if _, err := os.Stat("/app/frontend/index.html"); err == nil {
+		return "/app/frontend"
+	}
+	return "./frontend/dist"
 }
