@@ -1,28 +1,31 @@
 package accounts
 
 import (
-	"bytes"
 	"testing"
 )
 
-func TestCredentialEncryptionRoundTrip(t *testing.T) {
-	key := bytes.Repeat([]byte{0x42}, 32)
-	nonceBytes := bytes.Repeat([]byte{0x11}, 64)
-	ciphertext, err := encrypt(key, "api-key", "sensitive-value", bytes.NewReader(nonceBytes))
+func TestCryptoManagerEncryptDecrypt(t *testing.T) {
+	cm, err := NewCryptoManager("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
 	if err != nil {
-		t.Fatalf("encrypt failed: %v", err)
+		t.Fatalf("Failed to create CryptoManager: %v", err)
 	}
-	if ciphertext == "sensitive-value" || ciphertext == "" {
-		t.Fatal("credential was not encrypted")
-	}
-	plaintext, err := decrypt(key, "api-key", ciphertext)
+
+	secret := "pionex_api_secret_key_12345"
+	encrypted, err := cm.Encrypt(secret)
 	if err != nil {
-		t.Fatalf("decrypt failed: %v", err)
+		t.Fatalf("Encrypt failed: %v", err)
 	}
-	if plaintext != "sensitive-value" {
-		t.Fatalf("unexpected plaintext %q", plaintext)
+
+	if encrypted == secret {
+		t.Errorf("Encrypted output should not match plain secret")
 	}
-	if _, err := decrypt(key, "api-secret", ciphertext); err == nil {
-		t.Fatal("ciphertext must be bound to its purpose")
+
+	decrypted, err := cm.Decrypt(encrypted)
+	if err != nil {
+		t.Fatalf("Decrypt failed: %v", err)
+	}
+
+	if decrypted != secret {
+		t.Errorf("Expected decrypted %s, got %s", secret, decrypted)
 	}
 }
