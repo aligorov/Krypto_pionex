@@ -1,105 +1,84 @@
 package telegram
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"log/slog"
+	"net/http"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// Severity levels
-const (
-	SeverityCritical = "CRITICAL"
-	SeveritySecurity = "SECURITY"
-	SeverityWarning  = "WARNING"
-	SeverityInfo     = "INFO"
-)
-
-// NotificationEvent represents an outbox entry.
-type NotificationEvent struct {
-	ID               string
-	EventType        string
-	Severity         string
-	Payload          map[string]interface{}
-	DeduplicationKey string
-}
-
-// OutboxDispatcher manages asynchronous, transactional notification delivery.
 type OutboxDispatcher struct {
-	db *pgxpool.Pool
+	db         *pgxpool.Pool
+	botToken   string
+	chatID     string
+	httpClient *http.Client
 }
 
-// NewOutboxDispatcher initializes the outbox dispatcher.
-func NewOutboxDispatcher(db *pgxpool.Pool) *OutboxDispatcher {
-	return &OutboxDispatcher{db: db}
+func NewOutboxDispatcher(db *pgxpool.Pool, botToken, chatID string) *OutboxDispatcher {
+	return &OutboxDispatcher{
+		db:       db,
+		botToken: botToken,
+		chatID:   chatID,
+		httpClient: &http.Client{
+			Timeout: 10 * time.Second,
+		},
+	}
 }
 
-// QueueNotification inserts a notification event into PostgreSQL outbox.
-func (d *OutboxDispatcher) QueueNotification(ctx context.Context, eventType, severity string, payload map[string]interface{}, dedupKey string) error {
-	payloadBytes, err := json.Marshal(payload)
+func (d *OutboxDispatcher) DispatchPending(ctx context.Context) error {
+	if d.botToken == "" || d.chatID == "" {
+		return nil // Dispatcher is unconfigured
+	}
+
+	rows, err := d.db.Query(ctx, "SELECT id, payload #>> '{}' FROM notification_outbox WHERE status = 'PENDING' LIMIT 10")
 	if err != nil {
-		return fmt.Errorf("failed to marshal notification payload: %w", err)
-	}
-
-	query := `
-		INSERT INTO notification_outbox (event_type, severity, payload, deduplication_key, status, scheduled_at)
-		VALUES ($1, $2, $3, $4, 'PENDING', NOW())
-		ON CONFLICT (deduplication_key) DO NOTHING
-	`
-
-	_, err = d.db.Exec(ctx, query, eventType, severity, payloadBytes, dedupKey)
-	if err != nil {
-		return fmt.Errorf("failed to insert notification outbox: %w", err)
-	}
-	return nil
-}
-
-// ProcessOutbox continuously polls and dispatches pending notifications.
-func (d *OutboxDispatcher) ProcessOutbox(ctx context.Context, botToken string, chatID string) {
-	ticker := time.NewTicker(3 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			d.dispatchPending(ctx, botToken, chatID)
-		}
-	}
-}
-
-func (d *OutboxDispatcher) dispatchPending(ctx context.Context, botToken string, chatID string) {
-	if botToken == "" || chatID == "" {
-		return // Telegram notifications disabled until credentials set in DB
-	}
-
-	query := `
-		SELECT id, event_type, severity, payload
-		FROM notification_outbox
-		WHERE status = 'PENDING' AND scheduled_at <= NOW()
-		ORDER BY created_at ASC LIMIT 10
-	`
-
-	rows, err := d.db.Query(ctx, query)
-	if err != nil {
-		slog.Error("failed to query notification outbox", "error", err)
-		return
+		return err
 	}
 	defer rows.Close()
 
+	type msgItem struct {
+		id      string
+		payload string
+	}
+	var items []msgItem
 	for rows.Next() {
-		var id, eventType, severity string
-		var payloadBytes []byte
-		if err := rows.Scan(&id, &eventType, &severity, &payloadBytes); err != nil {
+		var item msgItem
+		if err := rows.Scan(&item.id, &item.payload); err == nil {
+			items = append(items, item)
+		}
+	}
+
+	for _, item := range items {
+		url := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", d.botToken)
+		bodyData := map[string]string{
+			"chat_id": d.chatID,
+			"text":    item.payload,
+		}
+		jsonBytes, _ := json.Marshal(bodyData)
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(jsonBytes))
+		if err != nil {
 			continue
 		}
+		req.Header.Set("Content-Type", "application/json")
 
-		// Update outbox status to SENT
-		_, _ = d.db.Exec(ctx, "UPDATE notification_outbox SET status = 'SENT', attempts = attempts + 1 WHERE id = $1", id)
-		slog.Info("Telegram notification dispatched", "event_id", id, "event_type", eventType, "severity", severity)
+		resp, err := d.httpClient.Do(req)
+		if err != nil {
+			_, _ = d.db.Exec(ctx, "UPDATE notification_outbox SET attempts = attempts + 1, status = 'FAILED' WHERE id = $1", item.id)
+			continue
+		}
+		resp.Body.Close()
+
+		if resp.StatusCode == http.StatusOK {
+			_, _ = d.db.Exec(ctx, "UPDATE notification_outbox SET status = 'SENT', attempts = attempts + 1 WHERE id = $1", item.id)
+		} else {
+			_, _ = d.db.Exec(ctx, "UPDATE notification_outbox SET attempts = attempts + 1, status = 'FAILED' WHERE id = $1", item.id)
+		}
 	}
+
+	return nil
 }
