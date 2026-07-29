@@ -41,15 +41,5 @@ services:
       postgres:
         condition: service_healthy
 
-  frontend:
-    build:
-      context: .
-      dockerfile: docker/Dockerfile.frontend
-    container_name: pionex_frontend
-    ports:
-      - "3080:80"
-    depends_on:
-      - backend
-
 volumes:
   postgres_data:

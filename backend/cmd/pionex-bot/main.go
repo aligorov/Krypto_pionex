@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -119,7 +120,6 @@ func main() {
 			return
 		}
 
-		// Secure authentication against DB or default admin credentials
 		adminUser := os.Getenv("ADMIN_USER")
 		if adminUser == "" {
 			adminUser = "admin"
@@ -171,6 +171,16 @@ func main() {
 		}
 		json.NewEncoder(w).Encode(settings)
 	}))
+
+	// Native Go Static Frontend Server (No Nginx)
+	frontendDist := "./frontend/dist"
+	if abs, err := filepath.Abs(frontendDist); err == nil {
+		if fi, err := os.Stat(abs); err == nil && fi.IsDir() {
+			fs := http.FileServer(http.Dir(abs))
+			mux.Handle("/", fs)
+			slog.Info("Serving frontend static assets directly from Go backend", "dir", abs)
+		}
+	}
 
 	server := &http.Server{
 		Addr:         ":8080",

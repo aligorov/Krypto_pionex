@@ -19,18 +19,18 @@ echo " Git Commit: $COMMIT"
 echo " Build Time: $BUILD_TIME"
 echo "=========================================="
 
-echo "[1/6] Running Backend Unit Tests in Docker..."
+echo "[1/5] Running Backend Unit Tests in Docker..."
 docker run --rm -v "$ROOT_DIR/backend":/app -w /app golang:1.22-alpine go test -v ./... || { echo "Backend tests failed!"; exit 1; }
 
-echo "[2/6] Building Docker Images (Backend, Quant, Frontend)..."
+echo "[2/5] Building Docker Images (Backend & Quant Worker)..."
 cd "$ROOT_DIR"
-docker compose build backend quant-worker frontend
+docker compose build backend quant-worker
 
-echo "[3/6] Starting Temporary Container Smoke Test..."
-docker compose up -d postgres backend frontend
+echo "[3/5] Starting Temporary Container Smoke Test..."
+docker compose up -d postgres backend
 sleep 5
 
-echo "[4/6] Checking Health Endpoints..."
+echo "[4/5] Checking Health Endpoints..."
 HEALTH_STATUS="$(curl -s http://localhost:8080/health | grep '"healthy"' || true)"
 if [[ -z "$HEALTH_STATUS" ]]; then
     echo "Backend Health check failed!"
@@ -40,18 +40,9 @@ if [[ -z "$HEALTH_STATUS" ]]; then
 fi
 echo "Backend Health Check Passed!"
 
-FRONTEND_STATUS="$(curl -s -I http://localhost:3080 | grep '200 OK' || true)"
-if [[ -z "$FRONTEND_STATUS" ]]; then
-    echo "Frontend HTTP check failed!"
-    docker compose logs frontend
-    docker compose down
-    exit 1
-fi
-echo "Frontend HTTP 200 OK Passed!"
-
 docker compose down
 
-echo "[5/6] Tagging Release v$VERSION..."
+echo "[5/5] Tagging Release v$VERSION..."
 if git rev-parse -q --verify "refs/tags/v$VERSION" >/dev/null 2>&1; then
     echo "Tag v$VERSION already exists."
 else
