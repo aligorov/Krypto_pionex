@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 
 interface OutboxItem {
   id: string;
@@ -10,35 +10,51 @@ interface OutboxItem {
   createdAt: string;
 }
 
-export default function TelegramNotifications({ token: _token }: { token: string }) {
+export default function TelegramNotifications({ token }: { token: string }) {
   const [botToken, setBotToken] = useState('');
   const [chatID, setChatID] = useState('');
   const [enabled, setEnabled] = useState(true);
   const [testMessage, setTestMessage] = useState<string | null>(null);
+  const [outbox, setOutbox] = useState<OutboxItem[]>([]);
 
-  const [outbox] = useState<OutboxItem[]>([
-    {
-      id: 'out-101',
-      eventType: 'GRID_BOT_CREATED',
-      severity: 'SUCCESS',
-      payload: 'Native Futures Grid Bot GRID_987654321 created for BTC_USDT_PERP',
-      status: 'SENT',
-      attempts: 1,
-      createdAt: new Date().toISOString(),
-    },
-    {
-      id: 'out-102',
-      eventType: 'RISK_KILL_SWITCH_ACTIVE',
-      severity: 'CRITICAL',
-      payload: 'Pre-flight check rejected entry order: Kill switch enabled in PostgreSQL',
-      status: 'SENT',
-      attempts: 1,
-      createdAt: new Date(Date.now() - 3600000).toISOString(),
-    },
-  ]);
+  const fetchOutbox = async () => {
+    try {
+      const res = await fetch('/api/telegram/outbox', {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setOutbox(data || []);
+      }
+    } catch {
+      // Fallback
+    }
+  };
 
-  const handleTestNotification = () => {
-    setTestMessage('Test alert successfully queued to Telegram Outbox!');
+  useEffect(() => {
+    fetchOutbox();
+  }, [token]);
+
+  const handleTestNotification = async () => {
+    setTestMessage('Sending test notification to Telegram Outbox...');
+    try {
+      const res = await fetch('/api/telegram/test', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ botToken, chatID }),
+      });
+      if (res.ok) {
+        setTestMessage('Test alert successfully queued to Telegram Outbox!');
+        fetchOutbox();
+      } else {
+        setTestMessage('Failed to queue test alert.');
+      }
+    } catch {
+      setTestMessage('Error connecting to backend.');
+    }
     setTimeout(() => setTestMessage(null), 4000);
   };
 
@@ -104,22 +120,32 @@ export default function TelegramNotifications({ token: _token }: { token: string
             </tr>
           </thead>
           <tbody>
-            {outbox.map((item) => (
-              <tr key={item.id} style={{ borderBottom: '1px solid #1e293b' }}>
-                <td style={{ padding: '0.75rem 0.5rem', fontFamily: 'monospace' }}>{item.eventType}</td>
-                <td style={{ padding: '0.75rem 0.5rem' }}>
-                  <span className={`badge ${item.severity === 'CRITICAL' ? 'badge-danger' : item.severity === 'SUCCESS' ? 'badge-success' : 'badge-warning'}`}>
-                    {item.severity}
-                  </span>
+            {outbox.length === 0 ? (
+              <tr>
+                <td colSpan={6} style={{ padding: '1rem', color: 'var(--text-muted)', textAlign: 'center' }}>
+                  No outbox messages found. Click "Send Test Notification" to queue an alert.
                 </td>
-                <td style={{ padding: '0.75rem 0.5rem' }}>{item.payload}</td>
-                <td style={{ padding: '0.75rem 0.5rem' }}>
-                  <span className="badge badge-success">{item.status}</span>
-                </td>
-                <td style={{ padding: '0.75rem 0.5rem' }}>{item.attempts}</td>
-                <td style={{ padding: '0.75rem 0.5rem', color: 'var(--text-muted)' }}>{new Date(item.createdAt).toLocaleString()}</td>
               </tr>
-            ))}
+            ) : (
+              outbox.map((item) => (
+                <tr key={item.id} style={{ borderBottom: '1px solid #1e293b' }}>
+                  <td style={{ padding: '0.75rem 0.5rem', fontFamily: 'monospace' }}>{item.eventType}</td>
+                  <td style={{ padding: '0.75rem 0.5rem' }}>
+                    <span className={`badge ${item.severity === 'CRITICAL' ? 'badge-danger' : item.severity === 'SUCCESS' ? 'badge-success' : 'badge-warning'}`}>
+                      {item.severity}
+                    </span>
+                  </td>
+                  <td style={{ padding: '0.75rem 0.5rem' }}>{item.payload}</td>
+                  <td style={{ padding: '0.75rem 0.5rem' }}>
+                    <span className={`badge ${item.status === 'SENT' ? 'badge-success' : item.status === 'FAILED' ? 'badge-danger' : 'badge-warning'}`}>
+                      {item.status}
+                    </span>
+                  </td>
+                  <td style={{ padding: '0.75rem 0.5rem' }}>{item.attempts}</td>
+                  <td style={{ padding: '0.75rem 0.5rem', color: 'var(--text-muted)' }}>{new Date(item.createdAt).toLocaleString()}</td>
+                </tr>
+              ))
+            )}
           </tbody>
         </table>
       </div>
