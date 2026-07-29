@@ -25,8 +25,11 @@ func TestCreateFuturesGridBotOfficialContract(t *testing.T) {
 			t.Errorf("Expected base BTC quote USDT, got %s %s", req.Base, req.Quote)
 		}
 
-		if req.BUOrderData.GridNum != 10 {
-			t.Errorf("Expected gridNum 10, got %d", req.BUOrderData.GridNum)
+		if req.BUOrderData.Row != 10 {
+			t.Errorf("Expected row 10, got %d", req.BUOrderData.Row)
+		}
+		if req.BUOrderData.GridType != "arithmetic" || req.BUOrderData.Trend != "long" {
+			t.Errorf("Expected official lowercase grid_type/trend, got %s/%s", req.BUOrderData.GridType, req.BUOrderData.Trend)
 		}
 
 		resp := APIEnvelope[NativeFuturesGridCreateResult]{
@@ -49,11 +52,11 @@ func TestCreateFuturesGridBotOfficialContract(t *testing.T) {
 		Base:  "BTC",
 		Quote: "USDT",
 		BUOrderData: BUOrderData{
-			GridType:        "ARITHMETIC",
-			Direction:       "LONG",
-			LowerPrice:      decimal.NewFromInt(50000),
-			UpperPrice:      decimal.NewFromInt(60000),
-			GridNum:         10,
+			GridType:        "arithmetic",
+			Trend:           "long",
+			Bottom:          decimal.NewFromInt(50000),
+			Top:             decimal.NewFromInt(60000),
+			Row:             10,
 			Leverage:        5,
 			QuoteInvestment: decimal.NewFromInt(100),
 			ExtraMargin:     decimal.Zero,

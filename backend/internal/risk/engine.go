@@ -78,6 +78,62 @@ func (e *Engine) ValidateNewOrder(ctx context.Context, requestedLeverage int, in
 	return nil
 }
 
+// ValidateNewGrid adds durable portfolio-state checks to the static limits.
+// Only non-terminal native grids for the selected Pionex account are counted.
+func (e *Engine) ValidateNewGrid(
+	ctx context.Context,
+	accountID, symbol string,
+	requestedLeverage int,
+	investmentUSD decimal.Decimal,
+) error {
+	if err := e.ValidateNewOrder(ctx, requestedLeverage, investmentUSD); err != nil {
+		return err
+	}
+	settings, err := e.LoadSettings(ctx)
+	if err != nil {
+		return err
+	}
+	var accountExposure, symbolExposure decimal.Decimal
+	var activeBots int
+	err = e.db.QueryRow(ctx, `
+		SELECT
+			COALESCE(SUM(quote_investment), 0),
+			COALESCE(SUM(quote_investment) FILTER (WHERE symbol = $2), 0),
+			COUNT(*)
+		FROM grid_bots
+		WHERE account_id = $1
+		  AND status IN (
+			'PENDING_SUBMISSION', 'SUBMISSION_UNKNOWN', 'RUNNING',
+			'STOP_REQUESTED', 'STOPPING'
+		  )
+	`, accountID, symbol).Scan(&accountExposure, &symbolExposure, &activeBots)
+	if err != nil {
+		return fmt.Errorf("risk engine: load active grid exposure: %w", err)
+	}
+	if activeBots >= settings.MaxActiveGridBots {
+		return fmt.Errorf(
+			"risk engine: active grid limit reached: current %d, max %d",
+			activeBots, settings.MaxActiveGridBots,
+		)
+	}
+	nextAccountExposure := accountExposure.Add(investmentUSD)
+	if nextAccountExposure.GreaterThan(settings.MaxAccountExposureUSD) {
+		return fmt.Errorf(
+			"%w: current %s + requested %s, max %s",
+			ErrExposureLimitExceeded, accountExposure, investmentUSD,
+			settings.MaxAccountExposureUSD,
+		)
+	}
+	nextSymbolExposure := symbolExposure.Add(investmentUSD)
+	if nextSymbolExposure.GreaterThan(settings.MaxSymbolExposureUSD) {
+		return fmt.Errorf(
+			"risk engine: symbol exposure limit exceeded: current %s + requested %s, max %s",
+			symbolExposure, investmentUSD, settings.MaxSymbolExposureUSD,
+		)
+	}
+	return nil
+}
+
 // UpdateSettings persists the complete risk policy atomically.
 func (e *Engine) UpdateSettings(ctx context.Context, settings RiskSettings) (*RiskSettings, error) {
 	if settings.MaxLeverage < 1 || settings.MaxLeverage > 100 {

@@ -55,11 +55,15 @@ export interface RiskSettings {
 export interface Account {
   id: string;
   name: string;
+  keyFingerprint: string;
   isEnabled: boolean;
   isPaper: boolean;
   hasReadPermission: boolean;
   hasFuturesPermission: boolean;
   hasBotPermission: boolean;
+  capabilityStatus: string;
+  lastVerifiedAt: string | null;
+  lastError: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -182,12 +186,122 @@ export interface PreparedCommand {
 export type Tab =
   | 'dashboard'
   | 'accounts'
+  | 'autogrid'
   | 'grids'
-  | 'orders'
   | 'risk'
-  | 'users'
   | 'settings'
-  | 'logs'
-  | 'audit'
-  | 'mcp'
-  | 'control';
+  | 'audit';
+
+export interface LoginResponse {
+  user: User;
+  csrfToken: string;
+  expiresAt: string;
+}
+
+export interface BootstrapStatus {
+  initialized: boolean;
+  setupCommand: string;
+}
+
+export type AutoGridStatus =
+  | 'STOPPED'
+  | 'STARTING'
+  | 'RUNNING'
+  | 'PAUSED'
+  | 'EMERGENCY_STOPPED';
+
+export interface AutoGridSettings {
+  id: string;
+  accountId: string | null;
+  status: AutoGridStatus;
+  executionMode: 'PAPER' | 'REAL';
+  budgetUsdt: string;
+  maxActiveBots: number;
+  leverage: number;
+  minSharpe: string;
+  minEvPct: string;
+  stopLossMode: 'NONE' | 'ADAPTIVE_ATR';
+  smartPnlEnabled: boolean;
+  adaptiveLeverageEnabled: boolean;
+  densityGridEnabled: boolean;
+  candleInterval: string;
+  lookbackCandles: number;
+  maxSymbolsPerScan: number;
+  scanIntervalSeconds: number;
+  minVolume24h: string;
+  minVolatilityPct: string;
+  maxVolatilityPct: string;
+  maxDrawdownPct: string;
+  minProfitFactor: string;
+  feeBps: string;
+  slippageBps: string;
+  lastError: string | null;
+  lastStartedAt: string | null;
+  lastStoppedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface AutoGridScanRun {
+  id: string;
+  status: string;
+  candidatesFound: number;
+  errorMessage: string | null;
+  startedAt: string;
+  completedAt: string | null;
+}
+
+export interface AutoGridCandidate {
+  id: string;
+  symbol: string;
+  currentPrice: string;
+  volatilityPct: string;
+  volume24h: string;
+  fundingRate: string | null;
+  expectedValuePct: string;
+  sharpe: string;
+  sortino: string;
+  maxDrawdownPct: string;
+  winRatePct: string;
+  profitFactor: string;
+  turnoverProxy: string;
+  score: string;
+  decision: 'ACCEPTED' | 'REJECTED';
+  rejectionReason: string | null;
+  lowerPrice: string;
+  upperPrice: string;
+  gridNum: number;
+  recommendedLeverage: number;
+  recommendedTrend: 'long' | 'short' | 'no_trend';
+  modelAssumptions: Record<string, unknown>;
+  createdAt: string;
+}
+
+export interface AutoGridBot {
+  id: string;
+  source: 'PAPER' | 'REAL';
+  accountId: string | null;
+  buOrderId: string | null;
+  symbol: string;
+  status: string;
+  direction: string;
+  gridType: string;
+  lowerPrice: string;
+  upperPrice: string;
+  gridNum: number;
+  leverage: number;
+  quoteInvestment: string;
+  realizedPnlUsdt: string | null;
+  unrealizedPnlUsdt: string | null;
+  reconciliationState: string;
+  updatedAt: string;
+}
+
+export interface AutoGridState {
+  settings: AutoGridSettings;
+  lastScan: AutoGridScanRun | null;
+  candidates: AutoGridCandidate[];
+  activeBots: AutoGridBot[];
+  metricDefinitions: Record<string, string>;
+  featureAvailability: Record<string, string>;
+}

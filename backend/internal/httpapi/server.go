@@ -16,8 +16,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aligorov/pionex-bot/backend/internal/accounts"
 	"github.com/aligorov/pionex-bot/backend/internal/audit"
 	"github.com/aligorov/pionex-bot/backend/internal/auth"
+	"github.com/aligorov/pionex-bot/backend/internal/autogrid"
 	"github.com/aligorov/pionex-bot/backend/internal/controlplane"
 	"github.com/aligorov/pionex-bot/backend/internal/observability"
 	"github.com/aligorov/pionex-bot/backend/internal/risk"
@@ -33,6 +35,8 @@ const (
 
 type Server struct {
 	auth         *auth.Service
+	accounts     *accounts.Service
+	autogrid     *autogrid.Service
 	control      *controlplane.Service
 	version      string
 	commit       string
@@ -44,6 +48,8 @@ type Server struct {
 
 func NewServer(
 	authService *auth.Service,
+	accountService *accounts.Service,
+	autoGridService *autogrid.Service,
 	controlService *controlplane.Service,
 	version, commit, buildTime string,
 	mcpHandler http.Handler,
@@ -51,7 +57,8 @@ func NewServer(
 	logger *slog.Logger,
 ) *Server {
 	return &Server{
-		auth: authService, control: controlService,
+		auth: authService, accounts: accountService,
+		autogrid: autoGridService, control: controlService,
 		version: version, commit: commit, buildTime: buildTime,
 		mcpHandler: mcpHandler, frontendDist: frontendDist, logger: logger,
 	}
@@ -85,6 +92,13 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("PUT /api/risk/settings", s.withRole(auth.RoleAdmin, http.HandlerFunc(s.updateRiskSettings)))
 
 	mux.Handle("GET /api/accounts", s.withSession(http.HandlerFunc(s.listAccounts)))
+	mux.Handle("POST /api/accounts", s.withRole(auth.RoleAdmin, http.HandlerFunc(s.createAccount)))
+	mux.Handle("PATCH /api/accounts/{id}", s.withRole(auth.RoleAdmin, http.HandlerFunc(s.updateAccount)))
+	mux.Handle("DELETE /api/accounts/{id}", s.withRole(auth.RoleAdmin, http.HandlerFunc(s.deleteAccount)))
+	mux.Handle("POST /api/accounts/{id}/verify", s.withRole(auth.RoleAdmin, http.HandlerFunc(s.verifyAccount)))
+	mux.Handle("GET /api/autogrid", s.withSession(http.HandlerFunc(s.autoGridState)))
+	mux.Handle("PUT /api/autogrid/settings", s.withRole(auth.RoleOperator, http.HandlerFunc(s.updateAutoGridSettings)))
+	mux.Handle("POST /api/autogrid/actions/{action}", s.withRole(auth.RoleOperator, http.HandlerFunc(s.autoGridAction)))
 	mux.Handle("GET /api/grids", s.withSession(http.HandlerFunc(s.listGrids)))
 	mux.Handle("GET /api/orders", s.withSession(http.HandlerFunc(s.listOrders)))
 	mux.Handle("GET /api/logs", s.withSession(http.HandlerFunc(s.listLogs)))
@@ -395,12 +409,147 @@ func (s *Server) updateRiskSettings(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) listAccounts(w http.ResponseWriter, r *http.Request) {
-	items, err := s.control.ListAccounts(r.Context())
+	items, err := s.accounts.List(r.Context())
 	if err != nil {
 		s.fail(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, items)
+}
+
+func (s *Server) createAccount(w http.ResponseWriter, r *http.Request) {
+	var input accounts.CreateInput
+	if !decodeJSON(w, r, &input) {
+		return
+	}
+	item, err := s.accounts.Create(r.Context(), input)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	s.auditMutation(r, "pionex_account.create", "pionex_account", item.ID, map[string]any{
+		"name":                 item.Name,
+		"keyFingerprint":       item.KeyFingerprint,
+		"isPaper":              item.IsPaper,
+		"hasFuturesPermission": item.HasFuturesPermission,
+		"hasBotPermission":     item.HasBotPermission,
+	})
+	writeJSON(w, http.StatusCreated, item)
+}
+
+func (s *Server) updateAccount(w http.ResponseWriter, r *http.Request) {
+	var input accounts.UpdateInput
+	if !decodeJSON(w, r, &input) {
+		return
+	}
+	item, err := s.accounts.Update(r.Context(), r.PathValue("id"), input)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	s.auditMutation(r, "pionex_account.update", "pionex_account", item.ID, map[string]any{
+		"name":           item.Name,
+		"keyFingerprint": item.KeyFingerprint,
+		"isEnabled":      item.IsEnabled,
+	})
+	writeJSON(w, http.StatusOK, item)
+}
+
+func (s *Server) verifyAccount(w http.ResponseWriter, r *http.Request) {
+	item, err := s.accounts.Verify(r.Context(), r.PathValue("id"))
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	s.auditMutation(r, "pionex_account.verify", "pionex_account", item.ID, map[string]any{
+		"capabilityStatus": item.CapabilityStatus,
+		"keyFingerprint":   item.KeyFingerprint,
+	})
+	writeJSON(w, http.StatusOK, item)
+}
+
+func (s *Server) deleteAccount(w http.ResponseWriter, r *http.Request) {
+	accountID := r.PathValue("id")
+	if err := s.accounts.Delete(r.Context(), accountID); err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	s.auditMutation(r, "pionex_account.delete", "pionex_account", accountID, nil)
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (s *Server) autoGridState(w http.ResponseWriter, r *http.Request) {
+	state, err := s.autogrid.State(r.Context())
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, state)
+}
+
+func (s *Server) updateAutoGridSettings(w http.ResponseWriter, r *http.Request) {
+	var input autogrid.UpdateSettingsInput
+	if !decodeJSON(w, r, &input) {
+		return
+	}
+	item, err := s.autogrid.UpdateSettings(r.Context(), input)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	s.auditMutation(r, "autogrid.settings.update", "autogrid", item.ID, map[string]any{
+		"executionMode":           item.ExecutionMode,
+		"accountId":               item.AccountID,
+		"budgetUsdt":              item.BudgetUSDT,
+		"maxActiveBots":           item.MaxActiveBots,
+		"leverage":                item.Leverage,
+		"stopLossMode":            item.StopLossMode,
+		"smartPnlEnabled":         item.SmartPNLEnabled,
+		"adaptiveLeverageEnabled": item.AdaptiveLeverageEnabled,
+		"densityGridEnabled":      item.DensityGridEnabled,
+	})
+	writeJSON(w, http.StatusOK, item)
+}
+
+func (s *Server) autoGridAction(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		IdempotencyKey string `json:"idempotencyKey"`
+	}
+	if !decodeJSON(w, r, &input) {
+		return
+	}
+	action := r.PathValue("action")
+	commandType := map[string]string{
+		"start":          "autogrid.start",
+		"scan":           "autogrid.scan",
+		"stop":           "autogrid.stop",
+		"emergency-stop": "autogrid.emergency_stop",
+	}[action]
+	if commandType == "" {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown AutoGrid action"})
+		return
+	}
+	settings, err := s.autogrid.GetSettings(r.Context())
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	prepared, err := s.control.PrepareCommand(
+		r.Context(), principalFromContext(r.Context()), controlplane.PrepareCommandInput{
+			CommandType:  commandType,
+			ResourceType: "autogrid",
+			ResourceID:   settings.ID,
+			Arguments: map[string]any{
+				"real": settings.ExecutionMode == "REAL",
+			},
+			IdempotencyKey: input.IdempotencyKey,
+		},
+	)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, prepared)
 }
 
 func (s *Server) listGrids(w http.ResponseWriter, r *http.Request) {

@@ -672,8 +672,10 @@ func (s *Service) executeCommand(
 		status = "QUEUED"
 		result["executor"] = "native_grid_worker"
 		result["message"] = "durable stop request queued; remote terminal and flat-position verification are still required"
-	case "grid.create", "grid.reduce", "pattern.cancel", "position.emergency_close", "scanner.run":
-		if entryCommand(commandType) {
+	case "grid.create", "grid.reduce", "pattern.cancel", "position.emergency_close",
+		"scanner.run", "autogrid.start", "autogrid.scan",
+		"autogrid.stop", "autogrid.emergency_stop":
+		if entryCommand(commandType, arguments) {
 			allowed, reason, checkErr := s.entryAllowed(ctx, commandType)
 			if checkErr != nil {
 				executeErr = checkErr
@@ -751,11 +753,11 @@ func (s *Service) entryAllowed(ctx context.Context, commandType string) (bool, s
 		return false, "kill switch is enabled", nil
 	}
 	configKey := "real_pattern_execution_enabled"
-	if commandType == "grid.create" {
+	if commandType == "grid.create" || commandType == "autogrid.start" {
 		configKey = "real_grid_execution_enabled"
 	}
 	featureName := "real_pattern_execution"
-	if commandType == "grid.create" {
+	if commandType == "grid.create" || commandType == "autogrid.start" {
 		featureName = "real_native_grid"
 	}
 	var enabled, featureEnabled bool
@@ -816,7 +818,9 @@ func validateCommand(commandType string) error {
 	switch commandType {
 	case "kill_switch.set", "account.set_enabled", "scanner.run",
 		"grid.create", "grid.stop", "grid.reduce",
-		"pattern.cancel", "position.emergency_close":
+		"pattern.cancel", "position.emergency_close",
+		"autogrid.start", "autogrid.scan", "autogrid.stop",
+		"autogrid.emergency_stop":
 		return nil
 	default:
 		return fmt.Errorf("unsupported command type %q", commandType)
@@ -838,8 +842,11 @@ func requiredRole(commandType string, arguments map[string]any) string {
 
 func dangerousCommand(commandType string, arguments map[string]any) bool {
 	switch commandType {
-	case "scanner.run":
+	case "scanner.run", "autogrid.scan", "autogrid.stop":
 		return false
+	case "autogrid.start":
+		real, ok := boolArgument(arguments, "real")
+		return ok && real
 	case "kill_switch.set":
 		enabled, ok := boolArgument(arguments, "enabled")
 		return !ok || !enabled
@@ -857,8 +864,15 @@ func boolArgument(arguments map[string]any, key string) (bool, bool) {
 	return result, ok
 }
 
-func entryCommand(commandType string) bool {
-	return commandType == "grid.create"
+func entryCommand(commandType string, arguments map[string]any) bool {
+	if commandType == "grid.create" {
+		return true
+	}
+	if commandType == "autogrid.start" {
+		real, ok := boolArgument(arguments, "real")
+		return ok && real
+	}
+	return false
 }
 
 func executorFor(commandType string) string {
@@ -869,6 +883,8 @@ func executorFor(commandType string) string {
 		return "futures_execution_worker"
 	case "scanner.run":
 		return "market_scanner_worker"
+	case "autogrid.start", "autogrid.scan", "autogrid.stop", "autogrid.emergency_stop":
+		return "autogrid_worker"
 	default:
 		return "control_worker"
 	}

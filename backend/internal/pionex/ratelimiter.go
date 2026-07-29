@@ -9,11 +9,11 @@ import (
 
 // RateLimiter manages weighted API request limits.
 type RateLimiter struct {
-	mu           sync.Mutex
-	capacity     int
-	tokens       int
-	refillRate   int // tokens per second
-	lastRefill   time.Time
+	mu            sync.Mutex
+	capacity      int
+	tokens        int
+	refillRate    int // tokens per second
+	lastRefill    time.Time
 	cooldownUntil time.Time
 }
 

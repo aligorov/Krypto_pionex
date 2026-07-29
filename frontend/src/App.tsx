@@ -1,8 +1,12 @@
 import { useState, useEffect } from 'react';
 import PionexAccounts from './components/PionexAccounts';
 import AutoGridAutopilot from './components/AutoGridAutopilot';
+import TelegramNotifications from './components/TelegramNotifications';
+import AuditLogs from './components/AuditLogs';
+import MCPServer from './components/MCPServer';
+import SettingsView from './components/SettingsView';
 
-type Tab = 'dashboard' | 'accounts' | 'autogrid' | 'patterns' | 'risk' | 'ai' | 'telegram' | 'audit';
+type Tab = 'dashboard' | 'accounts' | 'autogrid' | 'telegram' | 'audit' | 'mcp' | 'settings';
 
 interface RiskSettings {
   KillSwitchEnabled: boolean;
@@ -126,13 +130,13 @@ export default function App() {
           </span>
         </div>
         <nav className="nav-links">
-          {(['dashboard', 'accounts', 'autogrid', 'patterns', 'risk', 'ai', 'telegram', 'audit'] as Tab[]).map((tab) => (
+          {(['dashboard', 'accounts', 'autogrid', 'telegram', 'audit', 'mcp', 'settings'] as Tab[]).map((tab) => (
             <button
               key={tab}
               className={`nav-btn ${activeTab === tab ? 'active' : ''}`}
               onClick={() => setActiveTab(tab)}
             >
-              {tab === 'autogrid' ? 'AUTO-GRID' : tab.toUpperCase()}
+              {tab === 'autogrid' ? 'AUTO-GRID' : tab === 'audit' ? 'AUDIT & LOGS' : tab.toUpperCase()}
             </button>
           ))}
           <button className="nav-btn" onClick={handleLogout} style={{ color: 'var(--danger-color)', borderColor: 'var(--danger-color)' }}>
@@ -152,25 +156,17 @@ export default function App() {
           </div>
         )}
 
-        {activeTab === 'accounts' && <PionexAccounts token={token} />}
+        {activeTab === 'accounts' && <PionexAccounts canManage={true} />}
 
-        {activeTab === 'autogrid' && <AutoGridAutopilot token={token} />}
+        {activeTab === 'autogrid' && <AutoGridAutopilot canOperate={true} />}
 
-        {activeTab === 'risk' && (
-          <div className="grid-card">
-            <h3>Durable Risk Engine</h3>
-            <p><strong>Kill Switch State:</strong> {riskSettings?.KillSwitchEnabled ? 'ON (Blocked)' : 'OFF (Allowed)'}</p>
-            <p><strong>Max Account Exposure:</strong> ${riskSettings?.MaxAccountExposureUSD} USD</p>
-            <p><strong>Max Leverage:</strong> {riskSettings?.MaxLeverage}x</p>
-          </div>
-        )}
+        {activeTab === 'telegram' && <TelegramNotifications token={token} />}
 
-        {activeTab === 'ai' && (
-          <div className="grid-card">
-            <h3>Pionex AI Boundary</h3>
-            <p>Pionex Spot AI strategies are strictly isolated and never applied to Futures Grid bots. All AI recommendations require explicit approval before execution.</p>
-          </div>
-        )}
+        {activeTab === 'audit' && <AuditLogs token={token} />}
+
+        {activeTab === 'mcp' && <MCPServer token={token} />}
+
+        {activeTab === 'settings' && <SettingsView token={token} />}
       </main>
     </div>
   );

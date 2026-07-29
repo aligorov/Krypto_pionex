@@ -10,8 +10,10 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/aligorov/pionex-bot/backend/internal/accounts"
 	"github.com/aligorov/pionex-bot/backend/internal/audit"
 	"github.com/aligorov/pionex-bot/backend/internal/auth"
+	"github.com/aligorov/pionex-bot/backend/internal/autogrid"
 	"github.com/aligorov/pionex-bot/backend/internal/controlplane"
 	"github.com/aligorov/pionex-bot/backend/internal/database"
 	"github.com/aligorov/pionex-bot/backend/internal/httpapi"
@@ -62,8 +64,10 @@ func main() {
 	slog.SetDefault(logger)
 
 	authService := auth.NewService(db)
+	accountService := accounts.NewService(db)
 	auditStore := audit.NewStore(db)
 	riskEngine := risk.NewEngine(db)
+	autoGridService := autogrid.NewService(db, riskEngine)
 	controlService := controlplane.NewService(
 		db, riskEngine, auditStore, logStore, Version, GitCommit, BuildTime,
 	)
@@ -71,9 +75,16 @@ func main() {
 		Auth: authService, Control: controlService, Version: Version,
 	}
 	api := httpapi.NewServer(
-		authService, controlService, Version, GitCommit, BuildTime,
+		authService, accountService, autoGridService, controlService,
+		Version, GitCommit, BuildTime,
 		mcpserver.NewHTTPHandler(mcpServices), frontendDirectory(), logger,
 	)
+	runtimeCtx, runtimeCancel := context.WithCancel(context.Background())
+	defer runtimeCancel()
+	autoGridWorker := autogrid.NewWorker(
+		db, autoGridService, accountService, riskEngine, logger,
+	)
+	go autoGridWorker.Run(runtimeCtx)
 
 	server := &http.Server{
 		Addr:              ":8080",
@@ -99,6 +110,7 @@ func main() {
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
 	<-signals
+	runtimeCancel()
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()

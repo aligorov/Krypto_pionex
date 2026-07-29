@@ -27,7 +27,7 @@ func NewSigner(apiKey, apiSecret string) *Signer {
 }
 
 // SignRequest computes the HMAC SHA256 signature for HTTP requests.
-// Signature format: HMAC_SHA256(path + "?" + sortedQueryString + bodyString, apiSecret)
+// Signature format: HMAC_SHA256(method + path + "?" + sortedQueryString + bodyString, apiSecret)
 func (s *Signer) SignRequest(method, path string, queryParams url.Values, body []byte, timestamp int64) (string, error) {
 	if timestamp <= 0 {
 		timestamp = time.Now().UnixMilli()
@@ -53,7 +53,7 @@ func (s *Signer) SignRequest(method, path string, queryParams url.Values, body [
 	}
 	queryString := strings.Join(queryParts, "&")
 
-	rawToSign := fmt.Sprintf("%s?%s%s", path, queryString, string(body))
+	rawToSign := fmt.Sprintf("%s%s?%s%s", strings.ToUpper(method), path, queryString, string(body))
 
 	mac := hmac.New(sha256.New, []byte(s.apiSecret))
 	_, err := mac.Write([]byte(rawToSign))
