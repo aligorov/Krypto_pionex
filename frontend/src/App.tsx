@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import { useState, useEffect } from 'react';
 
 type Tab = 'dashboard' | 'accounts' | 'grid' | 'patterns' | 'risk' | 'ai' | 'telegram' | 'audit';
 
