@@ -9,9 +9,42 @@ import SettingsView from './components/SettingsView';
 type Tab = 'dashboard' | 'autogrid' | 'accounts' | 'gridbots' | 'risk' | 'audit' | 'settings' | 'telegram' | 'mcp';
 
 export default function App() {
-  const [token, setToken] = useState<string | null>(localStorage.getItem('pionex_token') || 'demo_token');
+  const [token, setToken] = useState<string | null>(localStorage.getItem('pionex_token'));
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
+  const [loginError, setLoginError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+
   const [activeTab, setActiveTab] = useState<Tab>('autogrid');
   const [alertDismissed, setAlertDismissed] = useState(false);
+
+  const handleLogin = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setLoginError(null);
+    setLoading(true);
+
+    try {
+      const res = await fetch('/api/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username, password }),
+      });
+
+      const data = await res.json();
+      if (!res.ok) {
+        setLoginError(data.error || 'Неверный логин или пароль');
+        setLoading(false);
+        return;
+      }
+
+      localStorage.setItem('pionex_token', data.token);
+      setToken(data.token);
+    } catch {
+      setLoginError('Ошибка подключения к серверу');
+    } finally {
+      setLoading(false);
+    }
+  };
 
   const handleLogout = () => {
     localStorage.removeItem('pionex_token');
@@ -29,13 +62,45 @@ export default function App() {
               <div className="brand-subtitle">standalone / production</div>
             </div>
           </div>
-          <button
-            onClick={() => setToken('session_active')}
-            className="btn-launch"
-            style={{ width: '100%', padding: '0.75rem' }}
-          >
-            Войти в систему
-          </button>
+
+          {loginError && (
+            <div style={{ backgroundColor: '#2a1215', color: '#f87171', border: '1px solid #991b1b', padding: '0.75rem', borderRadius: '0.5rem', marginBottom: '1rem', fontSize: '0.85rem', textAlign: 'center' }}>
+              {loginError}
+            </div>
+          )}
+
+          <form onSubmit={handleLogin}>
+            <div style={{ marginBottom: '1rem' }}>
+              <label style={{ display: 'block', fontSize: '0.8rem', color: 'var(--text-muted)', marginBottom: '0.375rem' }}>Логин</label>
+              <input
+                type="text"
+                value={username}
+                onChange={(e) => setUsername(e.target.value)}
+                placeholder="admin"
+                required
+              />
+            </div>
+
+            <div style={{ marginBottom: '1.5rem' }}>
+              <label style={{ display: 'block', fontSize: '0.8rem', color: 'var(--text-muted)', marginBottom: '0.375rem' }}>Пароль</label>
+              <input
+                type="password"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                placeholder="pionex2026"
+                required
+              />
+            </div>
+
+            <button
+              type="submit"
+              disabled={loading}
+              className="btn-launch"
+              style={{ width: '100%', padding: '0.75rem' }}
+            >
+              {loading ? 'Вход...' : 'Войти в систему'}
+            </button>
+          </form>
         </div>
       </div>
     );
