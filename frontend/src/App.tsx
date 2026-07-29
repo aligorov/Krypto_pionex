@@ -6,7 +6,7 @@ import AuditLogs from './components/AuditLogs';
 import MCPServer from './components/MCPServer';
 import SettingsView from './components/SettingsView';
 
-type Tab = 'dashboard' | 'accounts' | 'autogrid' | 'telegram' | 'audit' | 'mcp' | 'settings';
+type Tab = 'dashboard' | 'accounts' | 'autogrid' | 'risk' | 'telegram' | 'audit' | 'mcp' | 'settings';
 
 interface RiskSettings {
   KillSwitchEnabled: boolean;
@@ -20,7 +20,7 @@ export default function App() {
   const [password, setPassword] = useState('');
   const [loginError, setLoginError] = useState<string | null>(null);
 
-  const [activeTab, setActiveTab] = useState<Tab>('dashboard');
+  const [activeTab, setActiveTab] = useState<Tab>('autogrid');
   const [riskSettings, setRiskSettings] = useState<RiskSettings | null>(null);
 
   useEffect(() => {
@@ -77,40 +77,42 @@ export default function App() {
 
   if (!token) {
     return (
-      <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', minHeight: '100vh', backgroundColor: 'var(--bg-color)' }}>
-        <div className="grid-card" style={{ width: '360px', padding: '2rem' }}>
-          <h2 style={{ textAlign: 'center', color: 'var(--accent-color)', marginBottom: '1.5rem' }}>Pionex Bot Login</h2>
+      <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', minHeight: '100vh', backgroundColor: 'var(--bg-dark-950)' }}>
+        <div className="grid-card" style={{ width: '380px', padding: '2rem' }}>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '0.5rem', marginBottom: '1.5rem' }}>
+            <span style={{ fontSize: '1.75rem' }}>🤖</span>
+            <h2 style={{ margin: 0, color: 'var(--primary-400)', fontSize: '1.5rem', fontWeight: 700 }}>CryptoBot</h2>
+          </div>
           {loginError && (
-            <div style={{ backgroundColor: 'rgba(239, 68, 68, 0.2)', color: 'var(--danger-color)', padding: '0.75rem', borderRadius: '0.375rem', marginBottom: '1rem', textAlign: 'center' }}>
+            <div style={{ backgroundColor: 'rgba(239, 68, 68, 0.2)', color: 'var(--danger-red)', padding: '0.75rem', borderRadius: '0.5rem', marginBottom: '1rem', textAlign: 'center', fontSize: '0.875rem' }}>
               {loginError}
             </div>
           )}
           <form onSubmit={handleLogin}>
             <div style={{ marginBottom: '1rem' }}>
-              <label style={{ display: 'block', color: 'var(--text-muted)', marginBottom: '0.5rem', fontSize: '0.875rem' }}>Username</label>
+              <label style={{ display: 'block', color: 'var(--text-dark-400)', marginBottom: '0.5rem', fontSize: '0.85rem' }}>Username</label>
               <input
                 type="text"
                 value={username}
                 onChange={(e) => setUsername(e.target.value)}
                 placeholder="admin"
                 required
-                style={{ width: '100%', padding: '0.625rem', borderRadius: '0.375rem', border: '1px solid #334155', backgroundColor: '#0f172a', color: '#fff', boxSizing: 'border-box' }}
               />
             </div>
             <div style={{ marginBottom: '1.5rem' }}>
-              <label style={{ display: 'block', color: 'var(--text-muted)', marginBottom: '0.5rem', fontSize: '0.875rem' }}>Password</label>
+              <label style={{ display: 'block', color: 'var(--text-dark-400)', marginBottom: '0.5rem', fontSize: '0.85rem' }}>Password</label>
               <input
                 type="password"
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
                 placeholder="pionex2026"
                 required
-                style={{ width: '100%', padding: '0.625rem', borderRadius: '0.375rem', border: '1px solid #334155', backgroundColor: '#0f172a', color: '#fff', boxSizing: 'border-box' }}
               />
             </div>
             <button
               type="submit"
-              style={{ width: '100%', padding: '0.75rem', borderRadius: '0.375rem', border: 'none', backgroundColor: 'var(--accent-color)', color: '#0f172a', fontWeight: 'bold', cursor: 'pointer' }}
+              className="btn-primary"
+              style={{ width: '100%', padding: '0.75rem' }}
             >
               Sign In
             </button>
@@ -120,35 +122,99 @@ export default function App() {
     );
   }
 
-  return (
-    <div>
-      <header className="app-header">
-        <div style={{ display: 'flex', alignItems: 'center', gap: '1rem' }}>
-          <h2 style={{ margin: 0, color: 'var(--accent-color)' }}>Pionex Bot Dashboard</h2>
-          <span className={`badge ${riskSettings?.KillSwitchEnabled ? 'badge-danger' : 'badge-success'}`}>
-            {riskSettings?.KillSwitchEnabled ? 'KILL SWITCH: ACTIVE' : 'SYSTEM: READY'}
-          </span>
-        </div>
-        <nav className="nav-links">
-          {(['dashboard', 'accounts', 'autogrid', 'telegram', 'audit', 'mcp', 'settings'] as Tab[]).map((tab) => (
-            <button
-              key={tab}
-              className={`nav-btn ${activeTab === tab ? 'active' : ''}`}
-              onClick={() => setActiveTab(tab)}
-            >
-              {tab === 'autogrid' ? 'AUTO-GRID' : tab === 'audit' ? 'AUDIT & LOGS' : tab.toUpperCase()}
-            </button>
-          ))}
-          <button className="nav-btn" onClick={handleLogout} style={{ color: 'var(--danger-color)', borderColor: 'var(--danger-color)' }}>
-            LOGOUT
-          </button>
-        </nav>
-      </header>
+  const sidebarItems: { id: Tab; label: string; icon: string }[] = [
+    { id: 'dashboard', label: 'Analysis', icon: '📊' },
+    { id: 'autogrid', label: 'Trade', icon: '📈' },
+    { id: 'risk', label: 'Risk', icon: '🛡️' },
+    { id: 'accounts', label: 'Portfolio', icon: '💼' },
+    { id: 'telegram', label: 'Alerts', icon: '🔔' },
+    { id: 'audit', label: 'Logs', icon: '📜' },
+    { id: 'mcp', label: 'MCP Server', icon: '⚡' },
+    { id: 'settings', label: 'Settings', icon: '⚙️' },
+  ];
 
-      <main className="main-container">
+  return (
+    <div style={{ display: 'flex', minHeight: '100vh', backgroundColor: 'var(--bg-dark-950)' }}>
+      {/* Left Sidebar Navigation */}
+      <aside style={{ width: '240px', backgroundColor: 'var(--bg-dark-900)', borderRight: '1px solid var(--border-dark-700)', display: 'flex', flexDirection: 'column', justifyContent: 'space-between', padding: '1.25rem 1rem' }}>
+        <div>
+          {/* Logo Header */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.625rem', marginBottom: '2rem', paddingLeft: '0.5rem' }}>
+            <span style={{ fontSize: '1.5rem' }}>🤖</span>
+            <h1 style={{ margin: 0, fontSize: '1.25rem', fontWeight: 700, color: 'var(--text-dark-100)' }}>CryptoBot</h1>
+          </div>
+
+          {/* Navigation Links */}
+          <nav style={{ display: 'flex', flexDirection: 'column', gap: '0.25rem' }}>
+            {sidebarItems.map((item) => (
+              <button
+                key={item.id}
+                onClick={() => setActiveTab(item.id)}
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '0.75rem',
+                  padding: '0.625rem 0.875rem',
+                  borderRadius: '0.5rem',
+                  fontSize: '0.875rem',
+                  fontWeight: 500,
+                  color: activeTab === item.id ? 'var(--primary-400)' : 'var(--text-dark-400)',
+                  backgroundColor: activeTab === item.id ? 'rgba(2, 132, 199, 0.18)' : 'transparent',
+                  border: activeTab === item.id ? '1px solid rgba(2, 132, 199, 0.4)' : '1px solid transparent',
+                  cursor: 'pointer',
+                  textAlign: 'left',
+                  transition: 'all 0.15s ease-in-out',
+                }}
+              >
+                <span>{item.icon}</span>
+                <span>{item.label}</span>
+              </button>
+            ))}
+          </nav>
+        </div>
+
+        {/* Bottom User Status */}
+        <div style={{ borderTop: '1px solid var(--border-dark-700)', paddingTop: '1rem', marginTop: '1rem' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginBottom: '0.75rem', paddingLeft: '0.5rem' }}>
+            <span style={{ width: '8px', height: '8px', borderRadius: '50%', backgroundColor: 'var(--success-green)' }}></span>
+            <span style={{ fontSize: '0.75rem', color: 'var(--text-dark-400)' }}>Connected aligorov (admin)</span>
+          </div>
+          <button
+            onClick={handleLogout}
+            style={{
+              width: '100%',
+              padding: '0.5rem',
+              borderRadius: '0.5rem',
+              border: '1px solid var(--border-dark-600)',
+              backgroundColor: 'transparent',
+              color: 'var(--danger-red)',
+              fontSize: '0.85rem',
+              fontWeight: 600,
+              cursor: 'pointer',
+            }}
+          >
+            Logout
+          </button>
+        </div>
+      </aside>
+
+      {/* Main Content Area */}
+      <main style={{ flex: 1, padding: '1.75rem 2rem', overflowY: 'auto' }}>
+        {/* Top Status Header */}
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1.5rem' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '1rem' }}>
+            <h2 style={{ margin: 0, fontSize: '1.5rem', fontWeight: 700, color: 'var(--text-dark-100)' }}>
+              Pionex Bot Control Plane
+            </h2>
+            <span className={`badge ${riskSettings?.KillSwitchEnabled ? 'badge-danger' : 'badge-success'}`}>
+              {riskSettings?.KillSwitchEnabled ? 'KILL SWITCH: ACTIVE' : 'SYSTEM: READY'}
+            </span>
+          </div>
+        </div>
+
         {activeTab === 'dashboard' && (
           <div className="grid-card">
-            <h3>System Status</h3>
+            <h3>System Overview</h3>
             <p><strong>Exclusive Provider:</strong> Pionex REST & Futures WebSocket API</p>
             <p><strong>Backend Version:</strong> 1.0.0 (Production)</p>
             <p><strong>Runtime Config:</strong> PostgreSQL (Zero-ENV Policy Active)</p>
