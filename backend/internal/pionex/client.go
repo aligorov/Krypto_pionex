@@ -15,8 +15,8 @@ import (
 )
 
 const (
-	DefaultHost      = "https://api.pionex.com"
-	RequestTimeout   = 15 * time.Second
+	DefaultHost    = "https://api.pionex.com"
+	RequestTimeout = 15 * time.Second
 )
 
 // Client represents the Pionex API REST client.
@@ -51,16 +51,16 @@ type APIEnvelope[T any] struct {
 
 // FuturesBalance represents account balance data for Futures.
 type FuturesBalance struct {
-	Coin      string          `json:"coin"`
-	Free      decimal.Decimal `json:"free"`
-	Used      decimal.Decimal `json:"used"`
-	Total     decimal.Decimal `json:"total"`
+	Coin  string          `json:"coin"`
+	Free  decimal.Decimal `json:"free"`
+	Used  decimal.Decimal `json:"used"`
+	Total decimal.Decimal `json:"total"`
 }
 
 // NativeFuturesGridCreateParams matches official Pionex Futures Grid creation spec.
 type NativeFuturesGridCreateParams struct {
 	Symbol          string          `json:"symbol"`
-	GridType        string          `json:"gridType"` // ARITHMETIC or GEOMETRIC
+	GridType        string          `json:"gridType"`  // ARITHMETIC or GEOMETRIC
 	Direction       string          `json:"direction"` // LONG, SHORT, NEUTRAL
 	LowerPrice      decimal.Decimal `json:"lowerPrice"`
 	UpperPrice      decimal.Decimal `json:"upperPrice"`
@@ -77,9 +77,9 @@ type NativeFuturesGridCreateResult struct {
 	BUOrderID string `json:"buOrderId"`
 }
 
-// CreateFuturesGridBot submits a native grid bot request to Pionex.
+// CreateFuturesGridBot submits a native grid bot request using official path /api/v1/bot/orders/futuresGrid/create.
 func (c *Client) CreateFuturesGridBot(ctx context.Context, params NativeFuturesGridCreateParams) (*NativeFuturesGridCreateResult, error) {
-	path := "/api/v1/bot/futuresGrid/create"
+	path := "/api/v1/bot/orders/futuresGrid/create"
 	bodyBytes, err := json.Marshal(params)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal grid params: %w", err)

@@ -38,9 +38,9 @@ type FuturesPosition struct {
 	LiquidationPrice decimal.Decimal `json:"liquidationPrice"`
 }
 
-// PlaceFuturesOrder places an ordinary futures order (Pattern Trading).
+// PlaceFuturesOrder places an ordinary futures order using official endpoint /uapi/v1/trade/order.
 func (c *Client) PlaceFuturesOrder(ctx context.Context, params FuturesOrderRequest) (*FuturesOrderResult, error) {
-	path := "/api/v1/futures/order"
+	path := "/uapi/v1/trade/order"
 	bodyBytes, err := json.Marshal(params)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal futures order: %w", err)
@@ -74,9 +74,9 @@ func (c *Client) PlaceFuturesOrder(ctx context.Context, params FuturesOrderReque
 	return &env.Data, nil
 }
 
-// GetFuturesPositions fetches active futures positions.
+// GetFuturesPositions fetches active futures positions using /uapi/v1/trade/position.
 func (c *Client) GetFuturesPositions(ctx context.Context) ([]FuturesPosition, error) {
-	path := "/api/v1/futures/position"
+	path := "/uapi/v1/trade/position"
 	req, err := c.newSignedRequest(ctx, http.MethodGet, path, nil, nil)
 	if err != nil {
 		return nil, err

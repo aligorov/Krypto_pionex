@@ -1,22 +1,24 @@
-# PIONEX CAPABILITY MATRIX
+# PIONEX CAPABILITY MATRIX (VERIFIED OFFICIAL CONTRACTS)
 
-Official documentation source: https://www.pionex.com/docs/api-docs
+Official documentation sources:
+- [Futures Basic Info](https://www.pionex.com/docs/api-docs/futures-api/general-info/basic-info)
+- [Futures Trade](https://www.pionex.com/docs/api-docs/futures-api/trade)
+- [Futures Grid](https://www.pionex.com/docs/api-docs/bot-api/futures-grid)
+- [Private Stream](https://www.pionex.com/docs/api-docs/futures-websocket/private-stream)
 
-## 1. REST Endpoints
+## 1. Official REST Endpoints
 
-| Capability ID | Path | Method | Permission | Rate Limit Weight | Description |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| `MARKET_SYMBOLS` | `/api/v1/market/symbols` | `GET` | Public | 1 | Fetch all trading symbols and precisions |
-| `MARKET_KLINES` | `/api/v1/market/klines` | `GET` | Public | 1 | Historical OHLCV candle data |
-| `FUTURES_BALANCE` | `/api/v1/futures/balance` | `GET` | READ | 1 | Futures account wallet free and used balances |
-| `FUTURES_POSITION`| `/api/v1/futures/position` | `GET` | READ | 1 | Active futures positions and liquidation prices |
-| `FUTURES_ORDER` | `/api/v1/futures/order` | `POST` | TRADE | 1 | Place ordinary futures order for pattern trading |
-| `GRID_CREATE` | `/api/v1/bot/futuresGrid/create` | `POST` | BOT_TRADE | 5 | Create native Pionex Futures Grid bot |
-| `GRID_CANCEL` | `/api/v1/bot/futuresGrid/cancel` | `POST` | BOT_TRADE | 5 | Cancel native grid bot and close position |
-| `GRID_ORDERS` | `/api/v1/bot/futuresGrid/orders` | `GET` | BOT_READ | 1 | Get active and historical grid bots |
+| Capability ID | Path | Method | Permission | Rate Limit Weight | Status | Description |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| `MARKET_SYMBOLS` | `/api/v1/market/symbols` | `GET` | Public | 1 | `IMPLEMENTED` | Fetch all trading symbols and precisions |
+| `MARKET_KLINES` | `/api/v1/market/klines` | `GET` | Public | 1 | `IMPLEMENTED` | Historical OHLCV candle data |
+| `FUTURES_BALANCE` | `/api/v1/futures/balance` | `GET` | READ | 1 | `IMPLEMENTED` | Futures account wallet free and used balances |
+| `FUTURES_POSITION`| `/uapi/v1/trade/position` | `GET` | READ | 1 | `IMPLEMENTED` | Active futures positions and liquidation prices |
+| `FUTURES_ORDER` | `/uapi/v1/trade/order` | `POST` | TRADE | 1 | `IMPLEMENTED` | Place ordinary futures order for pattern trading |
+| `GRID_CREATE` | `/api/v1/bot/orders/futuresGrid/create` | `POST` | BOT_TRADE | 5 | `IMPLEMENTED` | Create native Pionex Futures Grid bot |
+| `GRID_CANCEL` | `/api/v1/bot/orders/futuresGrid/cancel` | `POST` | BOT_TRADE | 5 | `IMPLEMENTED` | Cancel native grid bot and close position |
+| `GRID_ORDERS` | `/api/v1/bot/orders/futuresGrid/orders` | `GET` | BOT_READ | 1 | `IMPLEMENTED` | Get active and historical grid bots |
 
-## 2. WebSocket Topics (`wss://ws.pionex.com/ws/futures`)
-- `ORDER`: Private order state updates.
-- `FILL`: Real-time fill executions.
-- `POSITION`: Margin and position changes.
-- `BALANCE`: Wallet balance updates.
+## 2. Official WebSocket Streams
+- **Private Stream Base URL**: `wss://ws.pionex.com/wsUA`
+- **Topics**: `ORDER`, `FILL`, `POSITION`, `BALANCE`

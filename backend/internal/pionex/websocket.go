@@ -12,20 +12,20 @@ import (
 )
 
 const (
-	DefaultWSURL = "wss://ws.pionex.com/ws/futures"
+	DefaultWSURL = "wss://ws.pionex.com/wsUA"
 	PingInterval = 20 * time.Second
 )
 
-// FuturesWSClient manages WebSocket streaming connection to Pionex Futures.
+// FuturesWSClient manages WebSocket streaming connection to Pionex Futures Private Stream.
 type FuturesWSClient struct {
-	wsURL      string
-	signer     *Signer
-	conn       *websocket.Conn
-	mu         sync.Mutex
+	wsURL       string
+	signer      *Signer
+	conn        *websocket.Conn
+	mu          sync.Mutex
 	isConnected bool
 }
 
-// NewFuturesWSClient initializes a Futures WebSocket client.
+// NewFuturesWSClient initializes a Futures WebSocket client using wss://ws.pionex.com/wsUA.
 func NewFuturesWSClient(wsURL string, apiKey, apiSecret string) *FuturesWSClient {
 	if wsURL == "" {
 		wsURL = DefaultWSURL
@@ -48,7 +48,7 @@ func (ws *FuturesWSClient) Connect(ctx context.Context) error {
 
 	ws.conn = conn
 	ws.isConnected = true
-	slog.Info("Pionex Futures WebSocket connected successfully")
+	slog.Info("Pionex Futures Private WebSocket connected successfully to wsUA")
 
 	go ws.heartbeatLoop(ctx)
 	return nil
