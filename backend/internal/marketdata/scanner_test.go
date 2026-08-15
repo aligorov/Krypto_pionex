@@ -1,0 +1,115 @@
+package marketdata
+
+import (
+	"context"
+	"math"
+	"testing"
+	"time"
+
+	"github.com/aligorov/pionex-bot/backend/internal/pionex"
+	"github.com/shopspring/decimal"
+)
+
+type mockMarketClient struct {
+	symbols []pionex.SymbolInfo
+	tickers []pionex.TickerInfo
+	klines  map[string][]pionex.KlineCandle
+}
+
+func (m *mockMarketClient) GetMarketSymbols(ctx context.Context, symbolType string) ([]pionex.SymbolInfo, error) {
+	return m.symbols, nil
+}
+
+func (m *mockMarketClient) GetTickers(ctx context.Context, symbol, symbolType string) ([]pionex.TickerInfo, error) {
+	return m.tickers, nil
+}
+
+func (m *mockMarketClient) GetKlines(ctx context.Context, symbol, interval string, limit int) ([]pionex.KlineCandle, error) {
+	if candles, ok := m.klines[symbol]; ok {
+		return candles, nil
+	}
+	// Fallback generated candles
+	return synthCandles(func(i int) float64 { return 100 + 2*math.Sin(float64(i)/3) }, limit), nil
+}
+
+func TestParkinsonVolatility(t *testing.T) {
+	candles := synthCandles(func(i int) float64 { return 100 + math.Sin(float64(i)) }, 50)
+	vol := parkinsonVolatility(candles, 24)
+	if vol <= 0 {
+		t.Fatalf("expected positive parkinson volatility, got %f", vol)
+	}
+}
+
+func TestScannerMultiTierPipeline(t *testing.T) {
+	symbols := []pionex.SymbolInfo{
+		{Symbol: "BTC_USDT", BaseCurrency: "BTC", QuoteCurrency: "USDT", Type: "PERP", Status: "TRADING", Enabled: true},
+		{Symbol: "ETH_USDT", BaseCurrency: "ETH", QuoteCurrency: "USDT", Type: "PERP", Status: "TRADING", Enabled: true},
+		{Symbol: "SOL_USDT", BaseCurrency: "SOL", QuoteCurrency: "USDT", Type: "PERP", Status: "TRADING", Enabled: true},
+		{Symbol: "PUMP_USDT", BaseCurrency: "PUMP", QuoteCurrency: "USDT", Type: "PERP", Status: "TRADING", Enabled: true},
+	}
+
+	tickers := []pionex.TickerInfo{
+		{Symbol: "BTC_USDT", Open: decimal.NewFromFloat(60000), Close: decimal.NewFromFloat(60500), Amount: decimal.NewFromFloat(10000000)},
+		{Symbol: "ETH_USDT", Open: decimal.NewFromFloat(3000), Close: decimal.NewFromFloat(3010), Amount: decimal.NewFromFloat(5000000)},
+		{Symbol: "SOL_USDT", Open: decimal.NewFromFloat(150), Close: decimal.NewFromFloat(152), Amount: decimal.NewFromFloat(2000000)},
+		// Extreme pump outlier (> 50% 24h change) should be filtered out at L1
+		{Symbol: "PUMP_USDT", Open: decimal.NewFromFloat(1), Close: decimal.NewFromFloat(2.5), Amount: decimal.NewFromFloat(8000000)},
+	}
+
+	klines := map[string][]pionex.KlineCandle{
+		"BTC_USDT": synthCandles(func(i int) float64 { return 60000 + 500*math.Sin(float64(i)/3) }, 80),
+		"ETH_USDT": synthCandles(func(i int) float64 { return 3000 + 40*math.Sin(float64(i)/4) }, 80),
+		"SOL_USDT": synthCandles(func(i int) float64 { return 150 + 3*math.Sin(float64(i)/2) }, 80),
+	}
+
+	mock := &mockMarketClient{symbols: symbols, tickers: tickers, klines: klines}
+	scanner := NewScanner(mock)
+
+	config := ScanConfig{
+		Interval:            "60M",
+		LookbackCandles:     60,
+		MaxSymbols:          10,
+		MinVolume24h:        decimal.NewFromInt(100000),
+		MinVolatilityPct:    0.5,
+		MaxVolatilityPct:    30.0,
+		MinExpectedValuePct: 0.0,
+		MinSharpe:           0.1,
+		MaxDrawdownPct:      25.0,
+		MinProfitFactor:     1.0,
+		FeeBps:              5.0,
+		SlippageBps:         5.0,
+		BaseLeverage:        2,
+		AdaptiveLeverage:    true,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	candidates, err := scanner.ScanMarkets(ctx, config)
+	if err != nil {
+		t.Fatalf("ScanMarkets failed: %v", err)
+	}
+
+	if len(candidates) == 0 {
+		t.Fatal("expected candidates, got 0")
+	}
+
+	// Verify that anomalous pump symbol was excluded by L1 screener
+	for _, c := range candidates {
+		if c.Symbol == "PUMP_USDT" {
+			t.Fatal("PUMP_USDT should have been excluded by L1 fast filter")
+		}
+	}
+
+	// Verify that candidates have computed Choppiness and Parkinson metrics
+	for _, c := range candidates {
+		if c.Decision == "ACCEPTED" {
+			if c.Score <= 0 {
+				t.Fatalf("expected positive score for accepted candidate %s, got %f", c.Symbol, c.Score)
+			}
+			if c.GridNum <= 0 {
+				t.Fatalf("expected positive grid count for %s, got %d", c.Symbol, c.GridNum)
+			}
+		}
+	}
+}

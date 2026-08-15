@@ -125,19 +125,22 @@ type FuturesGridOrder struct {
 	Base        string `json:"base"`
 	Quote       string `json:"quote"`
 	Status      string `json:"status"`
+	ReasonBy    string `json:"reasonBy"`
 	BUOrderData struct {
 		Status            string          `json:"status"`
-		Top               decimal.Decimal `json:"top"`
-		Bottom            decimal.Decimal `json:"bottom"`
+		ReasonBy          string          `json:"reasonBy"`
+		Top               decimal.Decimal  `json:"top"`
+		Bottom            decimal.Decimal  `json:"bottom"`
 		Row               int             `json:"row"`
 		GridType          string          `json:"gridType"`
 		Trend             string          `json:"trend"`
 		Leverage          int             `json:"leverage"`
-		OpenPrice         decimal.Decimal `json:"openPrice"`
-		Position          decimal.Decimal `json:"position"`
-		PositionOpenPrice decimal.Decimal `json:"positionOpenPrice"`
-		ProfitWithdrawn   decimal.Decimal `json:"profitWithdrawn"`
+		OpenPrice         decimal.Decimal  `json:"openPrice"`
+		Position          decimal.Decimal  `json:"position"`
+		PositionOpenPrice decimal.Decimal  `json:"positionOpenPrice"`
+		ProfitWithdrawn   decimal.Decimal  `json:"profitWithdrawn"`
 		RiskStatus        string          `json:"riskStatus"`
+		LiquidationPrice  decimal.Decimal  `json:"liquidationPrice"`
 	} `json:"buOrderData"`
 }
 

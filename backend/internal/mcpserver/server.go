@@ -3,15 +3,19 @@ package mcpserver
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
 
+	"github.com/aligorov/pionex-bot/backend/internal/accounts"
 	"github.com/aligorov/pionex-bot/backend/internal/audit"
 	"github.com/aligorov/pionex-bot/backend/internal/auth"
+	"github.com/aligorov/pionex-bot/backend/internal/autogrid"
 	"github.com/aligorov/pionex-bot/backend/internal/controlplane"
 	"github.com/aligorov/pionex-bot/backend/internal/observability"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/shopspring/decimal"
 )
 
 type contextKey string
@@ -19,9 +23,11 @@ type contextKey string
 const principalContextKey contextKey = "mcp_principal"
 
 type Services struct {
-	Auth    *auth.Service
-	Control *controlplane.Service
-	Version string
+	Auth     *auth.Service
+	Control  *controlplane.Service
+	AutoGrid *autogrid.Service
+	Accounts *accounts.Service
+	Version  string
 }
 
 type EmptyInput struct{}
@@ -459,7 +465,391 @@ func NewServer(services Services, principal auth.Principal) *mcp.Server {
 		return nil, DataOutput{Data: map[string]bool{"ok": err == nil}}, err
 	})
 
+	registerAutoGridTools(server, services, principal, readOnly, writeHint)
+
 	return server
+}
+
+type AutoGridActionInput struct {
+	Action         string `json:"action"`
+	IdempotencyKey string `json:"idempotencyKey,omitempty"`
+}
+
+// AutoGridSettingsUpdateInput mirrors autogrid.UpdateSettingsInput with all
+// decimals as strings: MCP JSON schemas cannot express shopspring decimal
+// structs, and string parsing keeps the exchange-grade precision.
+type AutoGridSettingsUpdateInput struct {
+	AccountID               string `json:"accountId,omitempty"`
+	ExecutionMode           string `json:"executionMode"`
+	BudgetUSDT              string `json:"budgetUsdt"`
+	MaxActiveBots           int    `json:"maxActiveBots"`
+	Leverage                int    `json:"leverage"`
+	MinSharpe               string `json:"minSharpe"`
+	MinEVPct                string `json:"minEvPct"`
+	StopLossMode            string `json:"stopLossMode"`
+	SmartPNLEnabled         bool   `json:"smartPnlEnabled"`
+	AdaptiveLeverageEnabled bool   `json:"adaptiveLeverageEnabled"`
+	DensityGridEnabled      bool   `json:"densityGridEnabled"`
+	CandleInterval          string `json:"candleInterval"`
+	LookbackCandles         int    `json:"lookbackCandles"`
+	MaxSymbolsPerScan       int    `json:"maxSymbolsPerScan"`
+	ScanIntervalSeconds     int    `json:"scanIntervalSeconds"`
+	MinVolume24h            string `json:"minVolume24h"`
+	MinVolatilityPct        string `json:"minVolatilityPct"`
+	MaxVolatilityPct        string `json:"maxVolatilityPct"`
+	MaxDrawdownPct          string `json:"maxDrawdownPct"`
+	MinProfitFactor         string `json:"minProfitFactor"`
+	FeeBps                  string `json:"feeBps"`
+	SlippageBps             string `json:"slippageBps"`
+	PnLTargetUSDT           string `json:"pnlTargetUsdt"`
+	MaxLossUSDT             string `json:"maxLossUsdt"`
+	ManageIntervalSeconds   int    `json:"manageIntervalSeconds"`
+	RangeBreakBufferPct     string `json:"rangeBreakBufferPct"`
+	MaxAdjustmentsPerBot    int    `json:"maxAdjustmentsPerBot"`
+	AIKitEnabled            bool   `json:"aiKitEnabled"`
+}
+
+type AutoGridBotIDInput struct {
+	BotID string `json:"botId"`
+}
+
+type AutoGridAIKitInput struct {
+	Symbol string `json:"symbol"`
+}
+
+type AutoGridPresetApplyInput struct {
+	PresetID string `json:"presetId"`
+}
+
+type AutoGridManualDeployInput struct {
+	Symbol      string `json:"symbol"`
+	Mode        string `json:"mode,omitempty"` // PAPER, REAL or empty (= autopilot mode)
+	Direction   string `json:"direction,omitempty"`
+	Leverage    int    `json:"leverage,omitempty"`
+	Lower       string `json:"lower,omitempty"`
+	Upper       string `json:"upper,omitempty"`
+	Row         int    `json:"row,omitempty"`
+	RangeSource string `json:"rangeSource,omitempty"`
+}
+
+type AutoGridBotAdjustInput struct {
+	BotID           string `json:"botId"`
+	Mode            string `json:"mode"`
+	QuoteInvestment string `json:"quoteInvestment,omitempty"`
+	Lower           string `json:"lower,omitempty"`
+	Upper           string `json:"upper,omitempty"`
+	Row             int    `json:"row,omitempty"`
+}
+
+// registerAutoGridTools exposes the full AutoGrid management surface: state
+// with live PnL, settings, lifecycle actions through the durable command
+// queue, per-bot close/adjust and the native Pionex AI Kit advisory.
+func registerAutoGridTools(
+	server *mcp.Server,
+	services Services,
+	principal auth.Principal,
+	readOnly, writeHint *mcp.ToolAnnotations,
+) {
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "autogrid_state",
+		Description: "Full AutoGrid state: settings, last scan candidates with regime metrics, " +
+			"active bots with realized/unrealized PnL, closed bots with outcomes and the PnL summary.",
+		Annotations: readOnly,
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, _ EmptyInput) (*mcp.CallToolResult, DataOutput, error) {
+		if err := requireScope(principal, "mcp:read"); err != nil {
+			return nil, DataOutput{}, err
+		}
+		data, err := services.AutoGrid.State(ctx)
+		return nil, DataOutput{Data: data}, err
+	})
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "autogrid_settings_update",
+		Description: "Update AutoGrid execution settings (stopped autopilot only): mode, budget, " +
+			"per-bot PnL target and max loss, manage interval, scanner thresholds. All decimals are " +
+			"strings. Requires mcp:trade.",
+		Annotations: writeHint,
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, input AutoGridSettingsUpdateInput) (*mcp.CallToolResult, DataOutput, error) {
+		if err := requireWrite(ctx, services, principal, "mcp:trade"); err != nil {
+			return nil, DataOutput{}, err
+		}
+		update := autogrid.UpdateSettingsInput{
+			ExecutionMode:           input.ExecutionMode,
+			MaxActiveBots:           input.MaxActiveBots,
+			Leverage:                input.Leverage,
+			StopLossMode:            input.StopLossMode,
+			SmartPNLEnabled:         input.SmartPNLEnabled,
+			AdaptiveLeverageEnabled: input.AdaptiveLeverageEnabled,
+			DensityGridEnabled:      input.DensityGridEnabled,
+			CandleInterval:          input.CandleInterval,
+			LookbackCandles:         input.LookbackCandles,
+			MaxSymbolsPerScan:       input.MaxSymbolsPerScan,
+			ScanIntervalSeconds:     input.ScanIntervalSeconds,
+			ManageIntervalSeconds:   input.ManageIntervalSeconds,
+			MaxAdjustmentsPerBot:    input.MaxAdjustmentsPerBot,
+			AIKitEnabled:            input.AIKitEnabled,
+		}
+		if input.AccountID != "" {
+			accountID := input.AccountID
+			update.AccountID = &accountID
+		}
+		decimalFields := []struct {
+			raw  string
+			dest *decimal.Decimal
+			name string
+		}{
+			{input.BudgetUSDT, &update.BudgetUSDT, "budgetUsdt"},
+			{input.MinSharpe, &update.MinSharpe, "minSharpe"},
+			{input.MinEVPct, &update.MinEVPct, "minEvPct"},
+			{input.MinVolume24h, &update.MinVolume24h, "minVolume24h"},
+			{input.MinVolatilityPct, &update.MinVolatilityPct, "minVolatilityPct"},
+			{input.MaxVolatilityPct, &update.MaxVolatilityPct, "maxVolatilityPct"},
+			{input.MaxDrawdownPct, &update.MaxDrawdownPct, "maxDrawdownPct"},
+			{input.MinProfitFactor, &update.MinProfitFactor, "minProfitFactor"},
+			{input.FeeBps, &update.FeeBps, "feeBps"},
+			{input.SlippageBps, &update.SlippageBps, "slippageBps"},
+			{input.PnLTargetUSDT, &update.PnLTargetUSDT, "pnlTargetUsdt"},
+			{input.MaxLossUSDT, &update.MaxLossUSDT, "maxLossUsdt"},
+			{input.RangeBreakBufferPct, &update.RangeBreakBufferPct, "rangeBreakBufferPct"},
+		}
+		for _, field := range decimalFields {
+			if err := field.dest.UnmarshalText([]byte(field.raw)); err != nil {
+				return nil, DataOutput{}, fmt.Errorf("invalid %s decimal %q", field.name, field.raw)
+			}
+		}
+		data, err := services.AutoGrid.UpdateSettings(ctx, update)
+		if err == nil {
+			recordMCP(ctx, services, principal, "autogrid.settings.update", "autogrid", data.ID, map[string]any{
+				"executionMode": data.ExecutionMode, "pnlTargetUsdt": data.PnLTargetUSDT,
+				"maxLossUsdt": data.MaxLossUSDT,
+			})
+		}
+		return nil, DataOutput{Data: data}, err
+	})
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "autogrid_action",
+		Description: "Run an AutoGrid lifecycle action: start, scan, stop or emergency-stop. " +
+			"Goes through the durable command queue; dangerous actions return a one-time confirmation " +
+			"code that must be confirmed with command_confirm. Requires mcp:trade.",
+		Annotations: writeHint,
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, input AutoGridActionInput) (*mcp.CallToolResult, DataOutput, error) {
+		if err := requireWrite(ctx, services, principal, "mcp:trade"); err != nil {
+			return nil, DataOutput{}, err
+		}
+		commandType := map[string]string{
+			"start": "autogrid.start", "scan": "autogrid.scan",
+			"stop": "autogrid.stop", "emergency-stop": "autogrid.emergency_stop",
+		}[input.Action]
+		if commandType == "" {
+			return nil, DataOutput{}, fmt.Errorf(
+				"unknown action %q; expected start, scan, stop or emergency-stop", input.Action)
+		}
+		settings, err := services.AutoGrid.GetSettings(ctx)
+		if err != nil {
+			return nil, DataOutput{}, err
+		}
+		data, err := services.Control.PrepareCommand(ctx, principal, controlplane.PrepareCommandInput{
+			CommandType:  commandType,
+			ResourceType: "autogrid",
+			ResourceID:   settings.ID,
+			Arguments:    map[string]any{"real": settings.ExecutionMode == "REAL"},
+			IdempotencyKey: fmt.Sprintf("mcp-%s-%s-%d", commandType, settings.ID, time.Now().UnixNano()),
+		})
+		return nil, DataOutput{Data: data}, err
+	})
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "autogrid_bot_close",
+		Description: "Close one AutoGrid bot by id. Real bots receive a durable stop intent; the " +
+			"reconcile loop submits the native Pionex cancel and verifies the terminal state remotely. " +
+			"Requires mcp:trade.",
+		Annotations: writeHint,
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, input AutoGridBotIDInput) (*mcp.CallToolResult, DataOutput, error) {
+		if err := requireWrite(ctx, services, principal, "mcp:trade"); err != nil {
+			return nil, DataOutput{}, err
+		}
+		settings, err := services.AutoGrid.GetSettings(ctx)
+		if err != nil {
+			return nil, DataOutput{}, err
+		}
+		source, err := services.AutoGrid.RequestBotClose(
+			ctx, settings.ID, input.BotID, "MCP_MANUAL_CLOSE",
+		)
+		if err == nil {
+			recordMCP(ctx, services, principal, "autogrid.bot.close", "grid_bot", input.BotID, map[string]any{
+				"source": source,
+			})
+		}
+		return nil, DataOutput{Data: map[string]any{
+			"ok": err == nil, "source": source,
+			"message": "close requested; native cancel is submitted and verified by the reconcile loop",
+		}}, err
+	})
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "autogrid_bot_adjust",
+		Description: "Manage a running bot through the native Pionex adjustParams endpoint: " +
+			"mode=invest_in adds quoteInvestment USDT; mode=adjust_params moves the grid range " +
+			"(lower, upper, optional row). Requires mcp:trade.",
+		Annotations: writeHint,
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, input AutoGridBotAdjustInput) (*mcp.CallToolResult, DataOutput, error) {
+		if err := requireWrite(ctx, services, principal, "mcp:trade"); err != nil {
+			return nil, DataOutput{}, err
+		}
+		adjust := autogrid.AdjustBotInput{Mode: input.Mode, Row: input.Row}
+		if input.QuoteInvestment != "" {
+			if err := adjust.QuoteInvestment.UnmarshalText([]byte(input.QuoteInvestment)); err != nil {
+				return nil, DataOutput{}, errors.New("invalid quoteInvestment decimal")
+			}
+		}
+		if input.Lower != "" {
+			if err := adjust.Lower.UnmarshalText([]byte(input.Lower)); err != nil {
+				return nil, DataOutput{}, errors.New("invalid lower decimal")
+			}
+		}
+		if input.Upper != "" {
+			if err := adjust.Upper.UnmarshalText([]byte(input.Upper)); err != nil {
+				return nil, DataOutput{}, errors.New("invalid upper decimal")
+			}
+		}
+		settings, err := services.AutoGrid.GetSettings(ctx)
+		if err != nil {
+			return nil, DataOutput{}, err
+		}
+		source, err := services.AutoGrid.AdjustBot(
+			ctx, services.Accounts, settings.ID, input.BotID, adjust,
+		)
+		if err == nil {
+			recordMCP(ctx, services, principal, "autogrid.bot.adjust", "grid_bot", input.BotID, map[string]any{
+				"source": source, "mode": adjust.Mode,
+			})
+		}
+		return nil, DataOutput{Data: map[string]any{
+			"ok": err == nil, "source": source, "mode": adjust.Mode,
+		}}, err
+	})
+
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "autogrid_mode_set",
+		Description: "Switch the autopilot execution mode PAPER/REAL at any time (affects newly opened bots; running bots keep their nature). REAL requires the durable gates and a verified account. Requires mcp:trade.",
+		Annotations: writeHint,
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, input AutoGridPresetApplyInput) (*mcp.CallToolResult, DataOutput, error) {
+		if err := requireWrite(ctx, services, principal, "mcp:trade"); err != nil {
+			return nil, DataOutput{}, err
+		}
+		if input.PresetID == "" {
+			return nil, DataOutput{}, errors.New("presetId must carry the mode PAPER or REAL here")
+		}
+		settings, err := services.AutoGrid.SetExecutionMode(ctx, input.PresetID)
+		if err == nil {
+			recordMCP(ctx, services, principal, "autogrid.mode.set", "autogrid", settings.ID, map[string]any{
+				"mode": settings.ExecutionMode,
+			})
+		}
+		return nil, DataOutput{Data: settings}, err
+	})
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "autogrid_settings_ai_fill",
+		Description: "Sample the native Pionex AI Kit across the most liquid PERP pairs and derive " +
+			"autopilot setting proposals (volatility band, drawdown cap, leverage, DYNAMIC targets). " +
+			"Advisory only: apply them with autogrid_settings_update.",
+		Annotations: readOnly,
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, _ EmptyInput) (*mcp.CallToolResult, DataOutput, error) {
+		if err := requireScope(principal, "mcp:read"); err != nil {
+			return nil, DataOutput{}, err
+		}
+		data, err := services.AutoGrid.AIKitSettingsFill(ctx, services.Accounts)
+		return nil, DataOutput{Data: data}, err
+	})
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "autogrid_presets_list",
+		Description: "List the researched market-phase presets (flat range, uptrend, downtrend, " +
+			"turbulence, strict sandbox) with full parameter patches and usage guidance.",
+		Annotations: readOnly,
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, _ EmptyInput) (*mcp.CallToolResult, DataOutput, error) {
+		if err := requireScope(principal, "mcp:read"); err != nil {
+			return nil, DataOutput{}, err
+		}
+		return nil, DataOutput{Data: autogrid.MarketPhasePresets()}, nil
+	})
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "autogrid_preset_apply",
+		Description: "Apply a market-phase preset (stopped autopilot only). Execution mode, account and budget stay under manual operator control. Requires mcp:trade.",
+		Annotations: writeHint,
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, input AutoGridPresetApplyInput) (*mcp.CallToolResult, DataOutput, error) {
+		if err := requireWrite(ctx, services, principal, "mcp:trade"); err != nil {
+			return nil, DataOutput{}, err
+		}
+		settings, preset, err := services.AutoGrid.ApplyPreset(ctx, input.PresetID)
+		if err == nil {
+			recordMCP(ctx, services, principal, "autogrid.preset.apply", "autogrid", settings.ID, map[string]any{
+				"preset": preset.ID, "title": preset.Title,
+			})
+		}
+		return nil, DataOutput{Data: map[string]any{"settings": settings, "preset": preset}}, err
+	})
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "autogrid_bot_deploy",
+		Description: "Open one bot with operator-confirmed parameters. Empty fields fall back to the " +
+			"latest scanner recommendation. Use autogrid_ai_strategy first to get an AI-adapted range " +
+			"proposal (width from the Spot AI Kit, centered on the PERP price). Requires mcp:trade.",
+		Annotations: writeHint,
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, input AutoGridManualDeployInput) (*mcp.CallToolResult, DataOutput, error) {
+		if err := requireWrite(ctx, services, principal, "mcp:trade"); err != nil {
+			return nil, DataOutput{}, err
+		}
+		deploy := autogrid.ManualDeployInput{
+			Symbol: input.Symbol, Mode: input.Mode, Direction: input.Direction,
+			Leverage: input.Leverage, Row: input.Row, RangeSource: input.RangeSource,
+		}
+		if input.Lower != "" {
+			if err := deploy.Lower.UnmarshalText([]byte(input.Lower)); err != nil {
+				return nil, DataOutput{}, errors.New("invalid lower decimal")
+			}
+		}
+		if input.Upper != "" {
+			if err := deploy.Upper.UnmarshalText([]byte(input.Upper)); err != nil {
+				return nil, DataOutput{}, errors.New("invalid upper decimal")
+			}
+		}
+		bot, source, err := services.AutoGrid.DeployManualBot(ctx, services.Accounts, deploy)
+		if err == nil {
+			recordMCP(ctx, services, principal, "autogrid.bot.deploy.manual", "grid_bot", bot.ID, map[string]any{
+				"source": source, "symbol": bot.Symbol, "direction": bot.Direction,
+				"leverage": bot.Leverage, "rangeSource": input.RangeSource,
+			})
+		}
+		return nil, DataOutput{Data: map[string]any{"bot": bot, "source": source}}, err
+	})
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "autogrid_ai_strategy",
+		Description: "Fetch the native Pionex AI Kit recommendation (annualized, volatility, " +
+			"maxDrawDown, spot grid levels) for a PERP symbol like BTC_USDT_PERP. Advisory only: " +
+			"Spot AI parameters are never applied to Futures Grid bots.",
+		Annotations: readOnly,
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, input AutoGridAIKitInput) (*mcp.CallToolResult, DataOutput, error) {
+		if err := requireScope(principal, "mcp:read"); err != nil {
+			return nil, DataOutput{}, err
+		}
+		strategy, err := services.AutoGrid.AIKitStrategy(ctx, services.Accounts, input.Symbol)
+		if err != nil {
+			return nil, DataOutput{}, err
+		}
+		return nil, DataOutput{Data: map[string]any{
+			"symbol":   input.Symbol,
+			"advisory": map[string]any{
+				"boundary": "Pionex AI Kit parameters are Spot-only and are never applied to Futures Grid bots",
+			},
+			"strategy": strategy,
+		}}, nil
+	})
 }
 
 func NewHTTPHandler(services Services) http.Handler {

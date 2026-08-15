@@ -235,6 +235,17 @@ export interface AutoGridSettings {
   minProfitFactor: string;
   feeBps: string;
   slippageBps: string;
+  pnlTargetMode: 'DYNAMIC' | 'FIXED';
+  pnlTargetUsdt: string;
+  maxLossUsdt: string;
+  manageIntervalSeconds: number;
+  rangeBreakBufferPct: string;
+  maxAdjustmentsPerBot: number;
+  aiKitEnabled: boolean;
+  aiAutotuneEnabled: boolean;
+  aiAutotuneIntervalSeconds: number;
+  lastAutotuneAt: string | null;
+  lastAutotuneNotes: string | null;
   lastError: string | null;
   lastStartedAt: string | null;
   lastStoppedAt: string | null;
@@ -294,6 +305,44 @@ export interface AutoGridBot {
   realizedPnlUsdt: string | null;
   unrealizedPnlUsdt: string | null;
   reconciliationState: string;
+  adjustmentsCount: number;
+  pnlTargetUsdt: string | null;
+  maxLossUsdt: string | null;
+  updatedAt: string;
+}
+
+export interface AutoGridClosedBot {
+  id: string;
+  source: 'PAPER' | 'REAL';
+  symbol: string;
+  direction: string;
+  quoteInvestment: string;
+  realizedPnlUsdt: string | null;
+  closedReason: string | null;
+  status: string;
+  closedAt: string | null;
+}
+
+export interface AutoGridPnLSummary {
+  realizedUsdt: string;
+  unrealizedUsdt: string;
+  totalUsdt: string;
+  closedBots: number;
+  profitable: number;
+}
+
+export interface ExchangeSnapshot {
+  connected: boolean;
+  accountName?: string;
+  error?: string;
+  coins: Array<{ coin: string; free: string; frozen: string; debts: string }>;
+  usdtFree: string;
+  usdtFrozen: string;
+  usdtDebts: string;
+  spotCoins: Array<{ coin: string; free: string; frozen: string }>;
+  spotUsdtFree: string;
+  spotUsdtFrozen: string;
+  totalUsdt: string;
   updatedAt: string;
 }
 
@@ -302,6 +351,75 @@ export interface AutoGridState {
   lastScan: AutoGridScanRun | null;
   candidates: AutoGridCandidate[];
   activeBots: AutoGridBot[];
+  closedBots: AutoGridClosedBot[];
+  pnl: { paper: AutoGridPnLSummary; real: AutoGridPnLSummary };
+  exchange?: ExchangeSnapshot;
   metricDefinitions: Record<string, string>;
   featureAvailability: Record<string, string>;
+}
+
+export interface SpotGridAIStrategy {
+  annualized: string;
+  totalApr: string;
+  high: string;
+  low: string;
+  gridCount: number;
+  strategyId: string;
+  volatility: string;
+  maxDrawDown: string;
+  options: Array<{
+    period: number;
+    annualized: string;
+    high: string;
+    low: string;
+    gridCount: number;
+    volatility: string;
+    maxDrawDown: string;
+    suitabilityMin: string;
+    suitabilityMax: string;
+  }>;
+}
+
+export interface AIKitResponse {
+  symbol: string;
+  advisory: { boundary: string };
+  strategy: SpotGridAIStrategy;
+  futuresAdapted: {
+    lower: string;
+    upper: string;
+    gridCount: number;
+    note: string;
+  };
+}
+
+export interface AutoGridPreset {
+  id: string;
+  title: string;
+  phase: string;
+  description: string;
+  whenToUse: string;
+  patch: {
+    maxActiveBots?: number;
+    leverage?: number;
+    minSharpe?: string;
+    minEvPct?: string;
+    stopLossMode?: string;
+    adaptiveLeverageEnabled?: boolean;
+    densityGridEnabled?: boolean;
+    candleInterval?: string;
+    lookbackCandles?: number;
+    maxSymbolsPerScan?: number;
+    scanIntervalSeconds?: number;
+    minVolume24h?: string;
+    minVolatilityPct?: string;
+    maxVolatilityPct?: string;
+    maxDrawdownPct?: string;
+    minProfitFactor?: string;
+    pnlTargetUsdt?: string;
+    maxLossUsdt?: string;
+    manageIntervalSeconds?: number;
+    rangeBreakBufferPct?: string;
+    maxAdjustmentsPerBot?: number;
+    aiKitEnabled?: boolean;
+  };
 }

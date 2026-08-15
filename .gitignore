@@ -1,3 +1,14 @@
-graphify-out/
-frontend/node_modules/
 
+# Python artifacts
+__pycache__/
+*.pyc
+
+# Frontend build output
+frontend/dist/
+
+# Local env / logs / scratch
+.env
+*.log
+.DS_Store
+.playwright-mcp/
+graphify-out/

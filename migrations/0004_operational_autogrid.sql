@@ -1,7 +1,7 @@
 -- 0004_operational_autogrid.sql
 -- Durable Pionex credential storage, operational AutoGrid settings and paper execution.
 
-CREATE TABLE credential_keyring (
+CREATE TABLE IF NOT EXISTS credential_keyring (
     id SMALLINT PRIMARY KEY CHECK (id = 1),
     key_material BYTEA NOT NULL CHECK (octet_length(key_material) = 32),
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),

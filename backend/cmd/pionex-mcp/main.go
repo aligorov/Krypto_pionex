@@ -12,8 +12,10 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/aligorov/pionex-bot/backend/internal/accounts"
 	"github.com/aligorov/pionex-bot/backend/internal/audit"
 	"github.com/aligorov/pionex-bot/backend/internal/auth"
+	"github.com/aligorov/pionex-bot/backend/internal/autogrid"
 	"github.com/aligorov/pionex-bot/backend/internal/controlplane"
 	"github.com/aligorov/pionex-bot/backend/internal/database"
 	"github.com/aligorov/pionex-bot/backend/internal/mcpserver"
@@ -72,11 +74,16 @@ func main() {
 		exitError(errors.New("invalid MCP token"))
 	}
 	logStore := observability.NewStore(db)
+	riskEngine := risk.NewEngine(db)
 	controlService := controlplane.NewService(
-		db, risk.NewEngine(db), audit.NewStore(db), logStore, Version, "stdio", "runtime",
+		db, riskEngine, audit.NewStore(db), logStore, Version, "stdio", "runtime",
 	)
 	server := mcpserver.NewServer(mcpserver.Services{
-		Auth: authService, Control: controlService, Version: Version,
+		Auth:     authService,
+		Control:  controlService,
+		AutoGrid: autogrid.NewService(db, riskEngine),
+		Accounts: accounts.NewService(db),
+		Version:  Version,
 	}, *principal)
 	if err := server.Run(ctx, &mcp.StdioTransport{}); err != nil && !errors.Is(err, context.Canceled) {
 		exitError(err)

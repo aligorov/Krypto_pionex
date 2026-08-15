@@ -14,7 +14,9 @@ import (
 	"github.com/aligorov/pionex-bot/backend/internal/auth"
 	"github.com/aligorov/pionex-bot/backend/internal/autogrid"
 	"github.com/aligorov/pionex-bot/backend/internal/controlplane"
+	"github.com/aligorov/pionex-bot/backend/internal/database"
 	"github.com/aligorov/pionex-bot/backend/internal/httpapi"
+	"github.com/aligorov/pionex-bot/backend/internal/mcpserver"
 	"github.com/aligorov/pionex-bot/backend/internal/observability"
 	"github.com/aligorov/pionex-bot/backend/internal/risk"
 	"github.com/aligorov/pionex-bot/backend/internal/telegram"
@@ -50,6 +52,17 @@ func main() {
 		slog.Warn("Could not connect to PostgreSQL pool immediately", "error", err)
 	} else {
 		defer dbPool.Close()
+
+		// Apply pending migrations so upgrades of an existing volume never run
+		// against a stale schema (pionex-admin is no longer the only path).
+		migrationsDir := "./migrations"
+		if _, statErr := os.Stat(migrationsDir); statErr != nil {
+			migrationsDir = "/app/migrations"
+		}
+		if migrateErr := database.Migrate(ctx, dbPool, migrationsDir); migrateErr != nil {
+			slog.Error("Database migration failed", "error", migrateErr)
+			os.Exit(1)
+		}
 		slog.Info("PostgreSQL connection pool established")
 
 		// Initialize services & worker
@@ -95,6 +108,16 @@ func main() {
 
 		controlService := controlplane.NewService(dbPool, riskEngine, auditStore, logStore, Version, GitCommit, BuildTime)
 
+		// The MCP streamable HTTP endpoint is mounted at /mcp and authenticated
+		// with scoped Bearer API tokens (same tokens as the stdio binary).
+		mcpHandler := mcpserver.NewHTTPHandler(mcpserver.Services{
+			Auth:     authService,
+			Control:  controlService,
+			AutoGrid: autoService,
+			Accounts: accountService,
+			Version:  Version,
+		})
+
 		apiServer := httpapi.NewServer(
 			authService,
 			accountService,
@@ -103,7 +126,7 @@ func main() {
 			Version,
 			GitCommit,
 			BuildTime,
-			nil,
+			mcpHandler,
 			frontendDist,
 			logger,
 		)

@@ -1,80 +1,168 @@
-import { useState } from 'react';
+import { FormEvent, useCallback, useEffect, useState } from 'react';
+import { api } from '../api';
+import { describeError } from './AutoGridAutopilot';
+import type { APIToken } from '../types';
 
-interface MCPTool {
-  name: string;
-  description: string;
-  requiredRole: 'VIEWER' | 'OPERATOR' | 'ADMIN';
-  enabled: boolean;
+interface Props {
+  canManage: boolean;
 }
 
-export default function MCPServer({ token: _token }: { token: string }) {
-  const [mcpEnabled] = useState(true);
+const ALL_SCOPES = ['mcp:read', 'mcp:operate', 'mcp:trade', 'mcp:admin'];
 
-  const [tools] = useState<MCPTool[]>([
-    {
-      name: 'pionex_risk_check',
-      description: 'Evaluates pre-flight risk limits against PostgreSQL risk_settings table',
-      requiredRole: 'OPERATOR',
-      enabled: true,
-    },
-    {
-      name: 'pionex_grid_create',
-      description: 'Submits a native Futures Grid Bot request to Pionex API',
-      requiredRole: 'ADMIN',
-      enabled: true,
-    },
-    {
-      name: 'pionex_account_validate',
-      description: 'Verifies Pionex API Key read/trade capabilities via test REST call',
-      requiredRole: 'ADMIN',
-      enabled: true,
-    },
-  ]);
+export default function MCPServer({ canManage }: Props) {
+  const [tokens, setTokens] = useState<APIToken[]>([]);
+  const [error, setError] = useState<string | null>(null);
+  const [name, setName] = useState('');
+  const [scopes, setScopes] = useState<string[]>(['mcp:read']);
+  const [secret, setSecret] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const load = useCallback(async () => {
+    try {
+      setTokens(await api<APIToken[]>('/api/mcp/tokens'));
+    } catch (loadError) {
+      setError(describeError(loadError));
+    }
+  }, []);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  async function create(event: FormEvent) {
+    event.preventDefault();
+    setBusy(true);
+    setError(null);
+    setSecret(null);
+    try {
+      const result = await api<{ token: APIToken; secret: string }>('/api/mcp/tokens', {
+        method: 'POST',
+        body: JSON.stringify({ name, scopes }),
+      });
+      setSecret(result.secret);
+      setName('');
+      await load();
+    } catch (createError) {
+      setError(describeError(createError));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function revoke(id: string) {
+    if (!window.confirm('Отозвать токен? Клиенты с ним немедленно потеряют доступ.')) return;
+    setBusy(true);
+    try {
+      await api(`/api/mcp/tokens/${id}`, { method: 'DELETE' });
+      await load();
+    } catch (revokeError) {
+      setError(describeError(revokeError));
+    } finally {
+      setBusy(false);
+    }
+  }
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>
-      {/* MCP Status Banner */}
-      <div className="grid-card" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-        <div>
-          <h3 style={{ margin: 0 }}>Model Context Protocol (MCP) Control Plane</h3>
-          <p style={{ margin: '0.25rem 0 0 0', color: 'var(--text-muted)', fontSize: '0.875rem' }}>
-            Serves AI agents and automated tools over stdio/SSE protocol
-          </p>
+    <div className="section-stack">
+      {error && <div className="alert danger"><span>{error}</span></div>}
+
+      <div className="panel">
+        <div className="panel-heading">
+          <div>
+            <span className="eyebrow">MCP ENDPOINT</span>
+            <h3>Streamable HTTP MCP</h3>
+          </div>
         </div>
-        <span className={`badge ${mcpEnabled ? 'badge-success' : 'badge-danger'}`}>
-          {mcpEnabled ? 'MCP SERVER: ONLINE' : 'MCP SERVER: OFFLINE'}
-        </span>
+        <p className="muted">
+          Подключите MCP-клиент к <code>/mcp</code> с заголовком{' '}
+          <code>Authorization: Bearer &lt;token&gt;</code>. Токены хранятся в PostgreSQL как SHA-256
+          хэши; полный доступ к командам — только через confirm-коды control plane.
+        </p>
       </div>
 
-      {/* Tools Registry */}
-      <div className="grid-card">
-        <h3>Registered MCP Tools</h3>
-        <table style={{ width: '100%', borderCollapse: 'collapse', marginTop: '1rem', textAlign: 'left' }}>
-          <thead>
-            <tr style={{ borderBottom: '1px solid #334155', color: 'var(--text-muted)' }}>
-              <th style={{ padding: '0.5rem' }}>Tool Name</th>
-              <th style={{ padding: '0.5rem' }}>Description</th>
-              <th style={{ padding: '0.5rem' }}>Required Role</th>
-              <th style={{ padding: '0.5rem' }}>Status</th>
-            </tr>
-          </thead>
-          <tbody>
-            {tools.map((t) => (
-              <tr key={t.name} style={{ borderBottom: '1px solid #1e293b' }}>
-                <td style={{ padding: '0.75rem 0.5rem', fontFamily: 'monospace', fontWeight: 'bold', color: 'var(--accent-color)' }}>{t.name}</td>
-                <td style={{ padding: '0.75rem 0.5rem' }}>{t.description}</td>
-                <td style={{ padding: '0.75rem 0.5rem' }}>
-                  <span className="badge badge-warning">{t.requiredRole}</span>
-                </td>
-                <td style={{ padding: '0.75rem 0.5rem' }}>
-                  <span className={`badge ${t.enabled ? 'badge-success' : 'badge-danger'}`}>
-                    {t.enabled ? 'ENABLED' : 'DISABLED'}
-                  </span>
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
+      {secret && (
+        <div className="alert success">
+          <div>
+            <strong>Токен создан — показывается один раз:</strong>
+            <pre>{secret}</pre>
+          </div>
+          <button onClick={() => setSecret(null)}>×</button>
+        </div>
+      )}
+
+      <div className="panel">
+        <div className="panel-heading">
+          <div>
+            <span className="eyebrow">TOKENS</span>
+            <h3>Токены ({tokens.length})</h3>
+          </div>
+        </div>
+
+        {canManage && (
+          <form className="inline-form" onSubmit={create} style={{ marginBottom: 18 }}>
+            <input
+              placeholder="Имя токена (напр. claude-local)"
+              value={name}
+              onChange={(event) => setName(event.target.value)}
+              required
+            />
+            <select
+              multiple
+              value={scopes}
+              onChange={(event) =>
+                setScopes(Array.from(event.target.selectedOptions).map((option) => option.value))}
+              style={{ minHeight: 39 }}
+            >
+              {ALL_SCOPES.map((scope) => (
+                <option key={scope} value={scope}>{scope}</option>
+              ))}
+            </select>
+            <button className="button primary" type="submit" disabled={busy || name.trim() === ''}>
+              Создать токен
+            </button>
+          </form>
+        )}
+
+        {tokens.length === 0 ? (
+          <div className="empty-state">Токенов нет.</div>
+        ) : (
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Имя</th>
+                  <th>Префикс</th>
+                  <th>Скоупы</th>
+                  <th>Последнее использование</th>
+                  <th>Истекает</th>
+                  <th>Создан</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody>
+                {tokens.map((token) => (
+                  <tr key={token.id}>
+                    <td><strong>{token.name}</strong></td>
+                    <td><code>{token.prefix}…</code></td>
+                    <td>
+                      {token.scopes.map((scope) => (
+                        <span key={scope} className="badge neutral" style={{ marginRight: 4 }}>{scope}</span>
+                      ))}
+                    </td>
+                    <td>{token.lastUsedAt ? new Date(token.lastUsedAt).toLocaleString() : '—'}</td>
+                    <td>{token.expiresAt ? new Date(token.expiresAt).toLocaleString() : 'никогда'}</td>
+                    <td>{new Date(token.createdAt).toLocaleString()}</td>
+                    <td>
+                      <button className="button small danger" disabled={busy} onClick={() => void revoke(token.id)}>
+                        Отозвать
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
       </div>
     </div>
   );

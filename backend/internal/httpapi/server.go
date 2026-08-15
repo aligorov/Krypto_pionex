@@ -99,6 +99,14 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /api/autogrid", s.withSession(http.HandlerFunc(s.autoGridState)))
 	mux.Handle("PUT /api/autogrid/settings", s.withRole(auth.RoleOperator, http.HandlerFunc(s.updateAutoGridSettings)))
 	mux.Handle("POST /api/autogrid/actions/{action}", s.withRole(auth.RoleOperator, http.HandlerFunc(s.autoGridAction)))
+	mux.Handle("POST /api/autogrid/bots", s.withRole(auth.RoleOperator, http.HandlerFunc(s.deployManualAutoGridBot)))
+	mux.Handle("PUT /api/autogrid/mode", s.withRole(auth.RoleOperator, http.HandlerFunc(s.setAutoGridMode)))
+	mux.Handle("POST /api/autogrid/bots/{id}/close", s.withRole(auth.RoleOperator, http.HandlerFunc(s.closeAutoGridBot)))
+	mux.Handle("POST /api/autogrid/bots/{id}/adjust", s.withRole(auth.RoleOperator, http.HandlerFunc(s.adjustAutoGridBot)))
+	mux.Handle("GET /api/autogrid/ai-strategy", s.withSession(http.HandlerFunc(s.autoGridAIStrategy)))
+	mux.Handle("GET /api/autogrid/presets", s.withSession(http.HandlerFunc(s.listAutoGridPresets)))
+	mux.Handle("GET /api/autogrid/settings/ai-fill", s.withSession(http.HandlerFunc(s.autoGridAIFill)))
+	mux.Handle("POST /api/autogrid/presets/{id}/apply", s.withRole(auth.RoleOperator, http.HandlerFunc(s.applyAutoGridPreset)))
 	mux.Handle("GET /api/grids", s.withSession(http.HandlerFunc(s.listGrids)))
 	mux.Handle("GET /api/orders", s.withSession(http.HandlerFunc(s.listOrders)))
 	mux.Handle("GET /api/logs", s.withSession(http.HandlerFunc(s.listLogs)))
@@ -484,6 +492,7 @@ func (s *Server) autoGridState(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, err)
 		return
 	}
+	state.Exchange = s.autogrid.ExchangeSnapshotWith(r.Context(), s.accounts)
 	writeJSON(w, http.StatusOK, state)
 }
 
@@ -550,6 +559,155 @@ func (s *Server) autoGridAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusAccepted, prepared)
+}
+
+func (s *Server) setAutoGridMode(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		Mode string `json:"mode"`
+	}
+	if !decodeJSON(w, r, &input) {
+		return
+	}
+	settings, err := s.autogrid.SetExecutionMode(r.Context(), input.Mode)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	s.auditMutation(r, "autogrid.mode.set", "autogrid", settings.ID, map[string]any{
+		"mode": settings.ExecutionMode,
+	})
+	writeJSON(w, http.StatusOK, settings)
+}
+
+func (s *Server) closeAutoGridBot(w http.ResponseWriter, r *http.Request) {
+	settings, err := s.autogrid.GetSettings(r.Context())
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	source, err := s.autogrid.RequestBotClose(
+		r.Context(), settings.ID, r.PathValue("id"), "MANUAL_CLOSE",
+	)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	s.auditMutation(r, "autogrid.bot.close", "grid_bot", r.PathValue("id"), map[string]any{
+		"source": source,
+	})
+	writeJSON(w, http.StatusAccepted, map[string]any{
+		"ok": true, "source": source,
+		"message": "close requested; native cancel is submitted and verified by the reconcile loop",
+	})
+}
+
+func (s *Server) autoGridAIStrategy(w http.ResponseWriter, r *http.Request) {
+	symbol := strings.TrimSpace(r.URL.Query().Get("symbol"))
+	if symbol == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "symbol query parameter is required"})
+		return
+	}
+	strategy, lower, upper, err := s.autogrid.AIKitProposal(r.Context(), s.accounts, symbol)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"symbol": symbol,
+		"advisory": map[string]any{
+			"boundary": "Pionex AI Kit parameters are Spot-only; the futures proposal adapts the AI width to the live PERP price and stays operator-confirmable",
+		},
+		"strategy":     strategy,
+		"futuresAdapted": map[string]any{
+			"lower":     lower,
+			"upper":     upper,
+			"gridCount": strategy.GridCount,
+			"note":      "width from AI Kit, centered on PERP price, clamped to +/-12.5%",
+		},
+	})
+}
+
+func (s *Server) autoGridAIFill(w http.ResponseWriter, r *http.Request) {
+	suggestion, err := s.autogrid.AIKitSettingsFill(r.Context(), s.accounts)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, suggestion)
+}
+
+func (s *Server) listAutoGridPresets(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, autogrid.MarketPhasePresets())
+}
+
+func (s *Server) applyAutoGridPreset(w http.ResponseWriter, r *http.Request) {
+	settings, preset, err := s.autogrid.ApplyPreset(r.Context(), r.PathValue("id"))
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	s.auditMutation(r, "autogrid.preset.apply", "autogrid", settings.ID, map[string]any{
+		"preset":      preset.ID,
+		"title":       preset.Title,
+		"leverage":    settings.Leverage,
+		"pnlTarget":   settings.PnLTargetUSDT,
+		"maxLoss":     settings.MaxLossUSDT,
+	})
+	writeJSON(w, http.StatusOK, map[string]any{"settings": settings, "preset": preset})
+}
+
+func (s *Server) deployManualAutoGridBot(w http.ResponseWriter, r *http.Request) {
+	var input autogrid.ManualDeployInput
+	if !decodeJSON(w, r, &input) {
+		return
+	}
+	bot, source, err := s.autogrid.DeployManualBot(r.Context(), s.accounts, input)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	s.auditMutation(r, "autogrid.bot.deploy.manual", "grid_bot", bot.ID, map[string]any{
+		"source":      source,
+		"symbol":      bot.Symbol,
+		"direction":   bot.Direction,
+		"leverage":    bot.Leverage,
+		"lower":       bot.LowerPrice,
+		"upper":       bot.UpperPrice,
+		"row":         bot.GridNum,
+		"rangeSource": input.RangeSource,
+	})
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"bot": bot, "source": source,
+		"message": "bot deployed with operator-confirmed parameters",
+	})
+}
+
+func (s *Server) adjustAutoGridBot(w http.ResponseWriter, r *http.Request) {
+	var input autogrid.AdjustBotInput
+	if !decodeJSON(w, r, &input) {
+		return
+	}
+	settings, err := s.autogrid.GetSettings(r.Context())
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	source, err := s.autogrid.AdjustBot(
+		r.Context(), s.accounts, settings.ID, r.PathValue("id"), input,
+	)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	s.auditMutation(r, "autogrid.bot.adjust", "grid_bot", r.PathValue("id"), map[string]any{
+		"source": source, "mode": input.Mode,
+		"quoteInvestment": input.QuoteInvestment,
+		"lower":           input.Lower, "upper": input.Upper, "row": input.Row,
+	})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok": true, "source": source, "mode": input.Mode,
+		"message": "native adjustParams submitted to Pionex",
+	})
 }
 
 func (s *Server) listGrids(w http.ResponseWriter, r *http.Request) {
@@ -767,9 +925,16 @@ func (s *Server) spaHandler() http.Handler {
 		clean := filepath.Clean(strings.TrimPrefix(r.URL.Path, "/"))
 		requested := filepath.Join(absolute, clean)
 		if info, statErr := os.Stat(requested); statErr == nil && !info.IsDir() {
+			// Hashed build artifacts never change: cache them hard.
+			if strings.HasPrefix(r.URL.Path, "/assets/") {
+				w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+			}
 			files.ServeHTTP(w, r)
 			return
 		}
+		// The SPA entry must always revalidate so browsers never run a
+		// stale bundle after a deploy.
+		w.Header().Set("Cache-Control", "no-cache")
 		http.ServeFile(w, r, indexPath)
 	})
 }
@@ -845,7 +1010,7 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, target any) bool {
 	decoder := json.NewDecoder(r.Body)
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(target); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON request"})
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON request: " + err.Error()})
 		return false
 	}
 	return true

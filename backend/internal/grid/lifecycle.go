@@ -35,6 +35,10 @@ type CreateInput struct {
 	AutoGridSettingsID *string
 	IdempotencyKey     string
 	Params             pionex.NativeFuturesGridCreateParams
+	// PnLTargetUSDT / MaxLossUSDT capture the deploy-time dynamic targets so
+	// the supervision loop uses the numbers the market offered at open.
+	PnLTargetUSDT *decimal.Decimal
+	MaxLossUSDT   *decimal.Decimal
 }
 
 func NewLifecycleManager(db *pgxpool.Pool, pionexClient *pionex.Client) *LifecycleManager {
@@ -64,10 +68,11 @@ func (manager *LifecycleManager) CreateGridBot(
 			account_id, autogrid_settings_id, symbol, status, direction,
 			grid_type, lower_price, upper_price, grid_num, leverage,
 			quote_investment, extra_margin, stop_loss, take_profit,
-			request_fingerprint, execution_mode, reconciliation_state
+			request_fingerprint, execution_mode, reconciliation_state,
+			pnl_target_usdt, max_loss_usdt
 		) VALUES (
 			$1, $2, $3, 'PENDING_SUBMISSION', $4, $5, $6, $7, $8, $9,
-			$10, $11, $12, $13, $14, 'REAL', 'PENDING'
+			$10, $11, $12, $13, $14, 'REAL', 'PENDING', $15, $16
 		)
 		ON CONFLICT (request_fingerprint) DO NOTHING
 		RETURNING id
