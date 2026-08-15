@@ -363,8 +363,24 @@ func scoreCandidate(
 	if !ValidateMinGridStep(gridStep*100, config.FeeBps, config.SlippageBps) {
 		reasons = append(reasons, "grid step too narrow for trading fees")
 	}
-	if regime.IsSqueeze && volatilityPct > 8.0 {
-		reasons = append(reasons, "volatility squeeze breakout hazard")
+	if regime.IsSqueeze {
+		reasons = append(reasons, "volatility squeeze: impending explosive breakout")
+	}
+	if recommendedTrend == "no_trend" && (regime.ADX > 32.0 || math.Abs(regime.EMASlopePct) > 3.0) {
+		reasons = append(reasons, fmt.Sprintf("trend too strong for neutral grid (ADX: %.1f, EMA slope: %.2f%%)", regime.ADX, regime.EMASlopePct))
+	}
+	if len(sorted) >= 3 {
+		for i := len(sorted) - 3; i < len(sorted); i++ {
+			cOpen, _ := sorted[i].Open.Float64()
+			cClose, _ := sorted[i].Close.Float64()
+			if cOpen > 0 {
+				pctChange := math.Abs(cClose-cOpen) / cOpen * 100
+				if pctChange > 4.5 {
+					reasons = append(reasons, fmt.Sprintf("recent flash candle spike (%.1f%%) - waiting for stabilization", pctChange))
+					break
+				}
+			}
+		}
 	}
 
 	decision := "ACCEPTED"

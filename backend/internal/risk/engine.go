@@ -89,6 +89,9 @@ func (e *Engine) ValidateNewGrid(
 	if err := e.ValidateNewOrder(ctx, requestedLeverage, investmentUSD); err != nil {
 		return err
 	}
+	if err := e.ValidateDailyLoss(ctx); err != nil {
+		return err
+	}
 	settings, err := e.LoadSettings(ctx)
 	if err != nil {
 		return err
@@ -183,6 +186,33 @@ func (e *Engine) SetKillSwitch(ctx context.Context, enabled bool) error {
 	}
 	if tag.RowsAffected() != 1 {
 		return errors.New("risk engine: risk settings row is missing")
+	}
+	return nil
+}
+
+// ValidateDailyLoss checks if today's cumulative realized loss across bots has breached max_daily_loss_usd.
+func (e *Engine) ValidateDailyLoss(ctx context.Context) error {
+	settings, err := e.LoadSettings(ctx)
+	if err != nil {
+		return err
+	}
+	if settings.MaxDailyLossUSD.IsZero() || settings.MaxDailyLossUSD.IsNegative() {
+		return nil
+	}
+	var dailyRealizedLoss decimal.Decimal
+	err = e.db.QueryRow(ctx, `
+		SELECT COALESCE(SUM(CASE WHEN realized_pnl_usdt < 0 THEN -realized_pnl_usdt ELSE 0 END), 0)
+		FROM (
+			SELECT realized_pnl_usdt FROM grid_bots WHERE stopped_at > NOW() - INTERVAL '24 hours' AND status = 'STOPPED'
+			UNION ALL
+			SELECT realized_pnl_usdt FROM paper_grid_bots WHERE closed_at > NOW() - INTERVAL '24 hours' AND status = 'COMPLETED'
+		) losses
+	`).Scan(&dailyRealizedLoss)
+	if err != nil {
+		return fmt.Errorf("risk engine: check daily loss: %w", err)
+	}
+	if dailyRealizedLoss.GreaterThanOrEqual(settings.MaxDailyLossUSD) {
+		return fmt.Errorf("risk engine: daily loss limit reached ($%s / max $%s) - new entries paused", dailyRealizedLoss.StringFixed(2), settings.MaxDailyLossUSD.StringFixed(2))
 	}
 	return nil
 }

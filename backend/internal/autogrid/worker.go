@@ -404,6 +404,25 @@ func (worker *Worker) deployPaper(
 	`, settings.ID).Scan(&activeCount); err != nil {
 		return fmt.Errorf("count active paper grids: %w", err)
 	}
+	// Portfolio Circuit Breaker: if >= 3 stop-losses in the last 1 hour, pause new bot deployments
+	var recentStopLossCount int
+	if err := worker.db.QueryRow(ctx, `
+		SELECT COUNT(*) FROM (
+			SELECT 1 FROM paper_grid_bots
+			WHERE settings_id = $1
+			  AND status = 'COMPLETED'
+			  AND closed_reason IN ('STOP_LOSS', 'STOP_LOSS_NATIVE')
+			  AND closed_at > NOW() - INTERVAL '1 hour'
+			UNION ALL
+			SELECT 1 FROM grid_bots
+			WHERE status = 'STOPPED'
+			  AND closed_reason IN ('STOP_LOSS', 'STOP_LOSS_NATIVE', 'loss_stop')
+			  AND stopped_at > NOW() - INTERVAL '1 hour'
+		) recent_stops
+	`, settings.ID).Scan(&recentStopLossCount); err == nil && recentStopLossCount >= 3 {
+		log.Printf("[PORTFOLIO_CIRCUIT_BREAKER] %d stop-losses occurred in the last 1h; holding new deployments", recentStopLossCount)
+		return nil
+	}
 	for _, candidate := range candidates {
 		if candidate.Decision != "ACCEPTED" {
 			continue
@@ -515,6 +534,17 @@ func (worker *Worker) deployReal(
 		  )
 	`, *settings.AccountID).Scan(&activeCount); err != nil {
 		return fmt.Errorf("count active real grids: %w", err)
+	}
+	// Portfolio Circuit Breaker: if >= 3 stop-losses in the last 1 hour, pause new bot deployments
+	var recentStopLossCountReal int
+	if err := worker.db.QueryRow(ctx, `
+		SELECT COUNT(*) FROM grid_bots
+		WHERE status = 'STOPPED'
+		  AND closed_reason IN ('STOP_LOSS', 'STOP_LOSS_NATIVE', 'loss_stop')
+		  AND stopped_at > NOW() - INTERVAL '1 hour'
+	`).Scan(&recentStopLossCountReal); err == nil && recentStopLossCountReal >= 3 {
+		log.Printf("[PORTFOLIO_CIRCUIT_BREAKER] %d real stop-losses occurred in the last 1h; holding new deployments", recentStopLossCountReal)
+		return nil
 	}
 	deployErrors := make([]string, 0)
 	for _, candidate := range candidates {
