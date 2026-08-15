@@ -91,6 +91,7 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /api/llm/settings", s.withSession(http.HandlerFunc(s.getLLMSettings)))
 	mux.Handle("PUT /api/llm/settings", s.withRole(auth.RoleAdmin, http.HandlerFunc(s.updateLLMSettings)))
 	mux.Handle("POST /api/llm/test", s.withRole(auth.RoleAdmin, http.HandlerFunc(s.testLLMConnection)))
+	mux.Handle("POST /api/llm/models", s.withSession(http.HandlerFunc(s.listLLMModels)))
 	mux.Handle("GET /api/llm/audits", s.withSession(http.HandlerFunc(s.listLLMAudits)))
 
 	mux.Handle("GET /api/dashboard", s.withSession(http.HandlerFunc(s.dashboard)))
@@ -1308,6 +1309,29 @@ func (s *Server) testLLMConnection(w http.ResponseWriter, r *http.Request) {
 		"ok":        true,
 		"response":  resp,
 		"latencyMs": latencyMs,
+	})
+}
+
+func (s *Server) listLLMModels(w http.ResponseWriter, r *http.Request) {
+	if s.llm == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "LLM service is not initialized"})
+		return
+	}
+	var input llm.Settings
+	if r.Body != nil && r.ContentLength > 0 {
+		_ = decodeJSON(w, r, &input)
+	}
+	models, err := s.llm.ListModels(r.Context(), input)
+	if err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":    false,
+			"error": err.Error(),
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":     true,
+		"models": models,
 	})
 }
 

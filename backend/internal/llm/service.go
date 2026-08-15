@@ -254,3 +254,17 @@ func newUUID() string {
 	b[8] = (b[8] & 0x3f) | 0x80 // Variant RFC 4122
 	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
+
+// ListModels queries the provider for available models using the given or stored API key.
+func (s *Service) ListModels(ctx context.Context, settings Settings) ([]string, error) {
+	if strings.TrimSpace(settings.APIKey) == "" {
+		current, err := s.GetSettings(ctx)
+		if err == nil && current.APIKey != "" {
+			settings.APIKey = current.APIKey
+		}
+	}
+	if strings.TrimSpace(settings.APIKey) == "" {
+		return nil, errors.New("API-ключ не заполнен")
+	}
+	return s.client.ListAvailableModels(ctx, settings)
+}

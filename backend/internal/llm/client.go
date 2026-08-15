@@ -346,3 +346,99 @@ func (c *Client) callOpenAICompatible(
 
 	return openAIResp.Choices[0].Message.Content, nil
 }
+
+// ListAvailableModels queries the provider's API for the list of available models.
+func (c *Client) ListAvailableModels(ctx context.Context, settings Settings) ([]string, error) {
+	switch settings.Provider {
+	case ProviderGemini:
+		baseURL := settings.BaseURL
+		if baseURL == "" {
+			baseURL = "https://generativelanguage.googleapis.com/v1beta"
+		}
+		endpoint := fmt.Sprintf("%s/models?key=%s", baseURL, settings.APIKey)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+		if err != nil {
+			return nil, err
+		}
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("gemini models network error: %w", err)
+		}
+		defer resp.Body.Close()
+		respBytes, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return nil, err
+		}
+		if resp.StatusCode >= 400 {
+			return nil, fmt.Errorf("gemini API error [%d]: %s", resp.StatusCode, string(respBytes))
+		}
+		var listResp struct {
+			Models []struct {
+				Name                       string   `json:"name"`
+				DisplayName                string   `json:"displayName"`
+				SupportedGenerationMethods []string `json:"supportedGenerationMethods"`
+			} `json:"models"`
+		}
+		if err := json.Unmarshal(respBytes, &listResp); err != nil {
+			return nil, fmt.Errorf("parse gemini models: %w", err)
+		}
+		models := make([]string, 0, len(listResp.Models))
+		for _, m := range listResp.Models {
+			canGenerate := false
+			for _, method := range m.SupportedGenerationMethods {
+				if method == "generateContent" {
+					canGenerate = true
+					break
+				}
+			}
+			if canGenerate {
+				cleanName := strings.TrimPrefix(m.Name, "models/")
+				models = append(models, cleanName)
+			}
+		}
+		return models, nil
+
+	case ProviderOpenRouter:
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://openrouter.ai/api/v1/models", nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Authorization", "Bearer "+settings.APIKey)
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("openrouter models network error: %w", err)
+		}
+		defer resp.Body.Close()
+		respBytes, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return nil, err
+		}
+		if resp.StatusCode >= 400 {
+			return nil, fmt.Errorf("openrouter API error [%d]: %s", resp.StatusCode, string(respBytes))
+		}
+		var orResp struct {
+			Data []struct {
+				ID string `json:"id"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(respBytes, &orResp); err != nil {
+			return nil, fmt.Errorf("parse openrouter models: %w", err)
+		}
+		models := make([]string, 0, len(orResp.Data))
+		for _, d := range orResp.Data {
+			models = append(models, d.ID)
+		}
+		return models, nil
+
+	case ProviderAnthropic:
+		return []string{
+			"claude-3-7-sonnet-20250219",
+			"claude-3-5-sonnet-20241022",
+			"claude-3-5-haiku-20241022",
+			"claude-3-opus-20240229",
+		}, nil
+
+	default:
+		return []string{"default"}, nil
+	}
+}

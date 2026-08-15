@@ -49,6 +49,8 @@ export function LLMSettingsModal({ onClose, onSaved }: Props) {
   const [baseUrl, setBaseUrl] = useState('');
   const [temperature, setTemperature] = useState(0.2);
   const [thinkingEnabled, setThinkingEnabled] = useState(true);
+  const [availableModels, setAvailableModels] = useState<string[]>([]);
+  const [loadingModels, setLoadingModels] = useState(false);
 
   useEffect(() => {
     loadSettings();
@@ -91,12 +93,38 @@ export function LLMSettingsModal({ onClose, onSaved }: Props) {
   function handleProviderChange(newProvider: 'gemini' | 'anthropic' | 'openrouter' | 'custom') {
     setProvider(newProvider);
     setTestResult(null);
+    setAvailableModels([]);
     const presets = MODEL_PRESETS[newProvider] || [];
     if (presets.length > 0 && !presets.includes(model)) {
       setModel(presets[0]);
     }
     if (newProvider === 'openrouter' && !baseUrl) {
       setBaseUrl('https://openrouter.ai/api/v1/chat/completions');
+    }
+  }
+
+  async function handleFetchModels() {
+    setLoadingModels(true);
+    setStatusMessage(null);
+    try {
+      const res = await api<{ ok: boolean; models?: string[]; error?: string }>('/api/llm/models', {
+        method: 'POST',
+        body: JSON.stringify({
+          provider,
+          apiKey: apiKey.trim() || settings?.apiKeyMasked,
+          baseUrl,
+        }),
+      });
+      if (res.ok && res.models && res.models.length > 0) {
+        setAvailableModels(res.models);
+        setStatusMessage({ kind: 'success', text: `Получено ${res.models.length} доступных моделей по вашему API-ключу.` });
+      } else {
+        setStatusMessage({ kind: 'danger', text: res.error || 'Не удалось получить список моделей' });
+      }
+    } catch (err) {
+      setStatusMessage({ kind: 'danger', text: describeError(err) });
+    } finally {
+      setLoadingModels(false);
     }
   }
 
@@ -273,15 +301,36 @@ export function LLMSettingsModal({ onClose, onSaved }: Props) {
               </label>
 
               <div>
-                <label style={{ marginBottom: 6, display: 'block', fontWeight: 600 }}>Модель</label>
-                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 8 }}>
-                  {(MODEL_PRESETS[provider] || []).map((p) => (
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
+                  <label style={{ fontWeight: 600, margin: 0 }}>Модель нейросети</label>
+                  <button
+                    type="button"
+                    className="button small"
+                    onClick={handleFetchModels}
+                    disabled={loadingModels}
+                    style={{ fontSize: '0.75rem', padding: '2px 8px' }}
+                  >
+                    {loadingModels ? 'Загрузка…' : '🔄 Получить список по API'}
+                  </button>
+                </div>
+                <div style={{
+                  display: 'flex',
+                  flexWrap: 'wrap',
+                  gap: 6,
+                  marginBottom: 8,
+                  maxHeight: availableModels.length > 0 ? '140px' : 'auto',
+                  overflowY: availableModels.length > 0 ? 'auto' : 'visible',
+                  padding: availableModels.length > 0 ? '6px' : '0',
+                  background: availableModels.length > 0 ? 'rgba(0, 0, 0, 0.2)' : 'transparent',
+                  borderRadius: '6px'
+                }}>
+                  {(availableModels.length > 0 ? availableModels : MODEL_PRESETS[provider] || []).map((p) => (
                     <button
                       key={p}
                       type="button"
                       className={`button small ${model === p ? 'primary' : 'secondary'}`}
                       onClick={() => setModel(p)}
-                      style={{ fontSize: '0.8rem', padding: '3px 8px' }}
+                      style={{ fontSize: '0.75rem', padding: '3px 8px' }}
                     >
                       {p}
                     </button>
