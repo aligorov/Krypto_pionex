@@ -203,7 +203,7 @@ func (e *Engine) ValidateDailyLoss(ctx context.Context) error {
 	err = e.db.QueryRow(ctx, `
 		SELECT COALESCE(SUM(CASE WHEN realized_pnl_usdt < 0 THEN -realized_pnl_usdt ELSE 0 END), 0)
 		FROM (
-			SELECT realized_pnl_usdt FROM grid_bots WHERE stopped_at > NOW() - INTERVAL '24 hours' AND status = 'STOPPED'
+			SELECT realized_pnl_usdt FROM grid_bots WHERE COALESCE(closed_at, updated_at) > NOW() - INTERVAL '24 hours' AND status = 'STOPPED'
 			UNION ALL
 			SELECT realized_pnl_usdt FROM paper_grid_bots WHERE closed_at > NOW() - INTERVAL '24 hours' AND status = 'COMPLETED'
 		) losses

@@ -429,7 +429,7 @@ func (worker *Worker) deployPaper(
 			SELECT 1 FROM grid_bots
 			WHERE status = 'STOPPED'
 			  AND closed_reason IN ('STOP_LOSS', 'STOP_LOSS_NATIVE', 'loss_stop')
-			  AND stopped_at > NOW() - INTERVAL '1 hour'
+			  AND COALESCE(closed_at, updated_at) > NOW() - INTERVAL '1 hour'
 		) recent_stops
 	`, settings.ID).Scan(&recentStopLossCount); err == nil && recentStopLossCount >= 3 {
 		worker.logger.Warn("Portfolio circuit breaker: recent stop-losses holding new deployments", "recentStopLossCount", recentStopLossCount)
@@ -557,7 +557,7 @@ func (worker *Worker) deployReal(
 		SELECT COUNT(*) FROM grid_bots
 		WHERE status = 'STOPPED'
 		  AND closed_reason IN ('STOP_LOSS', 'STOP_LOSS_NATIVE', 'loss_stop')
-		  AND stopped_at > NOW() - INTERVAL '1 hour'
+		  AND COALESCE(closed_at, updated_at) > NOW() - INTERVAL '1 hour'
 	`).Scan(&recentStopLossCountReal); err == nil && recentStopLossCountReal >= 3 {
 		worker.logger.Warn("Portfolio circuit breaker: recent real stop-losses holding new deployments", "recentStopLossCountReal", recentStopLossCountReal)
 		return nil
@@ -594,7 +594,7 @@ func (worker *Worker) deployReal(
 				WHERE account_id = $1 AND symbol = $2
 				  AND status = 'STOPPED'
 				  AND closed_reason IN ('STOP_LOSS', 'STOP_LOSS_NATIVE', 'loss_stop')
-				  AND stopped_at > NOW() - INTERVAL '2 hours'
+				  AND COALESCE(closed_at, updated_at) > NOW() - INTERVAL '2 hours'
 			)
 		`, *settings.AccountID, candidate.Symbol).Scan(&recentlyStoppedReal); err == nil && recentlyStoppedReal {
 			continue
