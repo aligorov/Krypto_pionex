@@ -117,6 +117,7 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /api/autogrid/presets", s.withSession(http.HandlerFunc(s.listAutoGridPresets)))
 	mux.Handle("GET /api/autogrid/settings/ai-fill", s.withSession(http.HandlerFunc(s.autoGridAIFill)))
 	mux.Handle("POST /api/autogrid/presets/{id}/apply", s.withRole(auth.RoleOperator, http.HandlerFunc(s.applyAutoGridPreset)))
+	mux.Handle("POST /api/autogrid/paper/clear", s.withRole(auth.RoleOperator, http.HandlerFunc(s.clearPaperHistory)))
 	mux.Handle("GET /api/grids", s.withSession(http.HandlerFunc(s.listGrids)))
 	mux.Handle("GET /api/orders", s.withSession(http.HandlerFunc(s.listOrders)))
 	mux.Handle("GET /api/logs", s.withSession(http.HandlerFunc(s.listLogs)))
@@ -754,6 +755,30 @@ func (s *Server) closeAutoGridBot(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, map[string]any{
 		"ok": true, "source": source,
 		"message": "close requested; native cancel is submitted and verified by the reconcile loop",
+	})
+}
+
+func (s *Server) clearPaperHistory(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		IncludeRunning bool `json:"includeRunning"`
+	}
+	if r.Body != nil && r.ContentLength > 0 {
+		if !decodeJSON(w, r, &input) {
+			return
+		}
+	}
+	count, err := s.autogrid.ClearPaperHistory(r.Context(), input.IncludeRunning)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	s.auditMutation(r, "autogrid.paper.clear", "paper_grid_bots", "all", map[string]any{
+		"deletedCount":   count,
+		"includeRunning": input.IncludeRunning,
+	})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"success":      true,
+		"deletedCount": count,
 	})
 }
 

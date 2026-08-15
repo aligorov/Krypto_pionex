@@ -56,6 +56,28 @@ export default function AutoGridAutopilot({ canOperate, accountsHref }: Props) {
     }
   }
 
+  const [clearingPaper, setClearingPaper] = useState(false);
+
+  async function handleClearPaper() {
+    if (!window.confirm('Сбросить историю и накопленный PnL симуляции (PAPER)? Завершенные боты будут удалены.')) {
+      return;
+    }
+    setClearingPaper(true);
+    setMessage(null);
+    try {
+      const res = await api<{ success: boolean; deletedCount: number }>('/api/autogrid/paper/clear', {
+        method: 'POST',
+        body: JSON.stringify({ includeRunning: false }),
+      });
+      setMessage({ kind: 'success', text: `История симуляции очищена (${res.deletedCount} ботов удалено).` });
+      await load();
+    } catch (clearErr) {
+      setMessage({ kind: 'danger', text: describeError(clearErr) });
+    } finally {
+      setClearingPaper(false);
+    }
+  }
+
   const load = useCallback(async () => {
     try {
       const result = await api<AutoGridState>('/api/autogrid');
@@ -211,9 +233,21 @@ export default function AutoGridAutopilot({ canOperate, accountsHref }: Props) {
           value={String(state.activeBots.length)}
         />
         <Metric
-          label="PnP СИМУЛЯЦИЯ (всего)"
+          label="PnL СИМУЛЯЦИЯ (всего)"
           value={`${pnl?.paper.totalUsdt ?? '0'} USDT`}
           tone={(Number(pnl?.paper.totalUsdt) || 0) >= 0 ? 'positive' : 'negative'}
+          action={
+            <button
+              type="button"
+              className="btn btn-secondary btn-small"
+              style={{ padding: '2px 8px', fontSize: '11px', lineHeight: '1.2' }}
+              disabled={clearingPaper}
+              onClick={handleClearPaper}
+              title="Очистить историю симуляции и обнулить PnL"
+            >
+              {clearingPaper ? '…' : 'Очистить'}
+            </button>
+          }
         />
         <Metric
           label="PnL REAL (всего)"
@@ -350,10 +384,25 @@ export default function AutoGridAutopilot({ canOperate, accountsHref }: Props) {
   );
 }
 
-function Metric({ label, value, tone, hint }: { label: string; value: string; tone?: string; hint?: string }) {
+function Metric({
+  label,
+  value,
+  tone,
+  hint,
+  action,
+}: {
+  label: React.ReactNode;
+  value: string;
+  tone?: string;
+  hint?: string;
+  action?: React.ReactNode;
+}) {
   return (
     <div className="metric-card">
-      <span>{label}</span>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+        <span>{label}</span>
+        {action}
+      </div>
       <strong className={tone}>{value}</strong>
       {hint && <small className="muted">{hint}</small>}
     </div>

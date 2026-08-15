@@ -1874,3 +1874,16 @@ func normalizePercent(value float64) float64 {
 	}
 	return 0
 }
+
+// ClearPaperHistory removes simulated paper bots history from PostgreSQL.
+func (s *Service) ClearPaperHistory(ctx context.Context, includeRunning bool) (int64, error) {
+	query := `DELETE FROM paper_grid_bots WHERE status = 'COMPLETED'`
+	if includeRunning {
+		query = `DELETE FROM paper_grid_bots`
+	}
+	tag, err := s.db.Exec(ctx, query)
+	if err != nil {
+		return 0, fmt.Errorf("clear paper history: %w", err)
+	}
+	return tag.RowsAffected(), nil
+}

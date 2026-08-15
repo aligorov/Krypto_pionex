@@ -19,6 +19,25 @@ export default function Overview({ onRefresh }: Props) {
 
   const pnl = state?.pnl;
   const exchange = state?.exchange;
+  const [clearingPaper, setClearingPaper] = useState(false);
+
+  async function handleClearPaper() {
+    if (!window.confirm('Сбросить историю и накопленный PnL симуляции (PAPER)? Завершенные боты будут удалены.')) {
+      return;
+    }
+    setClearingPaper(true);
+    try {
+      await api<{ success: boolean; deletedCount: number }>('/api/autogrid/paper/clear', {
+        method: 'POST',
+        body: JSON.stringify({ includeRunning: false }),
+      });
+      onRefresh();
+    } catch {
+      // ignore
+    } finally {
+      setClearingPaper(false);
+    }
+  }
 
   return (
     <div className="section-stack">
@@ -29,6 +48,18 @@ export default function Overview({ onRefresh }: Props) {
           label="PnL СИМУЛЯЦИЯ"
           value={`${pnl?.paper.totalUsdt ?? '0'} USDT`}
           tone={(Number(pnl?.paper.totalUsdt) || 0) >= 0 ? 'positive' : 'negative'}
+          action={
+            <button
+              type="button"
+              className="btn btn-secondary btn-small"
+              style={{ padding: '2px 8px', fontSize: '11px', lineHeight: '1.2' }}
+              disabled={clearingPaper}
+              onClick={handleClearPaper}
+              title="Очистить историю симуляции и обнулить PnL"
+            >
+              {clearingPaper ? '…' : 'Очистить'}
+            </button>
+          }
         />
         <Metric
           label="PnL REAL"
@@ -157,10 +188,25 @@ export default function Overview({ onRefresh }: Props) {
   );
 }
 
-function Metric({ label, value, tone, hint }: { label: string; value: string; tone?: string; hint?: string }) {
+function Metric({
+  label,
+  value,
+  tone,
+  hint,
+  action,
+}: {
+  label: React.ReactNode;
+  value: string;
+  tone?: string;
+  hint?: string;
+  action?: React.ReactNode;
+}) {
   return (
     <div className="metric-card">
-      <span>{label}</span>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+        <span>{label}</span>
+        {action}
+      </div>
       <strong className={tone}>{value}</strong>
       {hint && <small className="muted">{hint}</small>}
     </div>
