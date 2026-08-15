@@ -315,13 +315,22 @@ func scoreCandidate(
 
 	leverage := config.BaseLeverage
 	if config.AdaptiveLeverage {
-		volatilityCap := int(math.Floor(12 / math.Max(volatilityPct, 1)))
-		if volatilityCap < 1 {
-			volatilityCap = 1
+		minLev := 1
+		if config.BaseLeverage >= 2 {
+			minLev = 2
+		}
+		volatilityCap := int(math.Round(24.0 / math.Max(volatilityPct, 1.0)))
+		if volatilityCap < minLev {
+			volatilityCap = minLev
 		}
 		if leverage > volatilityCap {
 			leverage = volatilityCap
 		}
+		if leverage < minLev {
+			leverage = minLev
+		}
+	} else if leverage < 2 && config.BaseLeverage >= 2 {
+		leverage = 2
 	}
 
 	recommendedTrend := regime.RecommendedTrend()

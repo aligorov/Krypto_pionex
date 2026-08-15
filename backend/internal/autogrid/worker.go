@@ -435,6 +435,10 @@ func (worker *Worker) deployPaper(
 			continue
 		}
 		target, maxLoss := computeBotTargets(settings, candidate)
+		lev := candidate.RecommendedLeverage
+		if lev < 2 && settings.Leverage >= 2 {
+			lev = 2
+		}
 		tag, err = worker.db.Exec(ctx, `
 			INSERT INTO paper_grid_bots (
 				settings_id, candidate_id, symbol, status, direction, grid_type,
@@ -456,7 +460,7 @@ func (worker *Worker) deployPaper(
 		`, settings.ID, candidate.ID, candidate.Symbol,
 			databaseTrend(candidate.RecommendedTrend), gridType,
 			candidate.LowerPrice, candidate.UpperPrice, candidate.GridNum,
-			candidate.RecommendedLeverage, settings.BudgetUSDT,
+			lev, settings.BudgetUSDT,
 			candidate.CurrentPrice, settings.PnLTargetMode, target, maxLoss)
 		if err != nil {
 			return fmt.Errorf("deploy paper grid %s: %w", candidate.Symbol, err)
@@ -523,9 +527,13 @@ func (worker *Worker) deployReal(
 		if exists {
 			continue
 		}
+		realLev := candidate.RecommendedLeverage
+		if realLev < 2 && settings.Leverage >= 2 {
+			realLev = 2
+		}
 		if err := worker.risk.ValidateNewGrid(
 			ctx, *settings.AccountID, candidate.Symbol,
-			candidate.RecommendedLeverage, settings.BudgetUSDT,
+			realLev, settings.BudgetUSDT,
 		); err != nil {
 			deployErrors = append(deployErrors, fmt.Sprintf("%s: risk gate: %v", candidate.Symbol, err))
 			continue
@@ -539,7 +547,7 @@ func (worker *Worker) deployReal(
 			Top: candidate.UpperPrice, Bottom: candidate.LowerPrice,
 			Row: candidate.GridNum, GridType: mapGridType(settings.DensityGridEnabled),
 			Trend:           candidate.RecommendedTrend,
-			Leverage:        candidate.RecommendedLeverage,
+			Leverage:        realLev,
 			QuoteInvestment: settings.BudgetUSDT,
 			InvestCoin:      "USDT", InvestmentFrom: "USER",
 		}
