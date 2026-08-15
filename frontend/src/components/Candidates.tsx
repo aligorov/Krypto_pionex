@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { api } from '../api';
 import { describeError } from './AutoGridAutopilot';
 import type { AIKitResponse, AutoGridCandidate, AutoGridState } from '../types';
@@ -13,10 +13,15 @@ interface AIKitState {
   error: string | null;
 }
 
+type SortKey = 'createdAt' | 'score' | 'volatilityPct' | 'expectedValuePct' | 'symbol';
+type SortOrder = 'asc' | 'desc';
+
 export default function Candidates({ canOperate: _canOperate }: Props) {
   const [state, setState] = useState<AutoGridState | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [aiKit, setAiKit] = useState<Record<string, AIKitState>>({});
+  const [sortKey, setSortKey] = useState<SortKey>('createdAt');
+  const [sortOrder, setSortOrder] = useState<SortOrder>('desc');
 
   const load = useCallback(async () => {
     try {
@@ -47,13 +52,54 @@ export default function Candidates({ canOperate: _canOperate }: Props) {
     }
   }
 
+  function handleSort(key: SortKey) {
+    if (sortKey === key) {
+      setSortOrder((prev) => (prev === 'desc' ? 'asc' : 'desc'));
+    } else {
+      setSortKey(key);
+      setSortOrder('desc');
+    }
+  }
+
+  const sortCandidates = useCallback((candidates: AutoGridCandidate[]) => {
+    return [...candidates].sort((a, b) => {
+      let comparison = 0;
+      switch (sortKey) {
+        case 'createdAt':
+          comparison = new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime();
+          break;
+        case 'score':
+          comparison = Number(a.score) - Number(b.score);
+          break;
+        case 'volatilityPct':
+          comparison = Number(a.volatilityPct) - Number(b.volatilityPct);
+          break;
+        case 'expectedValuePct':
+          comparison = Number(a.expectedValuePct) - Number(b.expectedValuePct);
+          break;
+        case 'symbol':
+          comparison = a.symbol.localeCompare(b.symbol);
+          break;
+      }
+      return sortOrder === 'desc' ? -comparison : comparison;
+    });
+  }, [sortKey, sortOrder]);
+
+  const accepted = useMemo(() => {
+    if (!state) return [];
+    return sortCandidates(state.candidates.filter((c) => c.decision === 'ACCEPTED'));
+  }, [state, sortCandidates]);
+
+  const rejected = useMemo(() => {
+    if (!state) return [];
+    return sortCandidates(state.candidates.filter((c) => c.decision !== 'ACCEPTED'));
+  }, [state, sortCandidates]);
+
   if (!state) {
     return <div className="empty-state">{error ?? 'Загрузка кандидатов…'}</div>;
   }
 
   const scan = state.lastScan;
-  const accepted = state.candidates.filter((candidate) => candidate.decision === 'ACCEPTED');
-  const rejected = state.candidates.filter((candidate) => candidate.decision !== 'ACCEPTED');
 
   return (
     <div className="section-stack">
@@ -65,16 +111,44 @@ export default function Candidates({ canOperate: _canOperate }: Props) {
       )}
 
       <div className="panel">
-        <div className="panel-heading">
+        <div className="panel-heading" style={{ flexWrap: 'wrap', gap: '1rem' }}>
           <div>
             <span className="eyebrow">LAST SCAN</span>
-            <h3>Кандидаты последнего скана</h3>
+            <h3>Кандидаты последнего скана ({accepted.length})</h3>
           </div>
-          <span className="muted">
-            {scan
-              ? `${new Date(scan.startedAt).toLocaleString()} · ${scan.candidatesFound} пар · принято ${accepted.length}`
-              : 'Скан ещё не выполнялся'}
-          </span>
+          
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', flexWrap: 'wrap' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem', fontSize: '0.85rem' }}>
+              <span className="muted">Сортировка:</span>
+              <button
+                className={`button small ${sortKey === 'createdAt' ? 'primary' : ''}`}
+                onClick={() => handleSort('createdAt')}
+                title="Сортировать по времени сканирования"
+              >
+                Время {sortKey === 'createdAt' ? (sortOrder === 'desc' ? '↓' : '↑') : ''}
+              </button>
+              <button
+                className={`button small ${sortKey === 'score' ? 'primary' : ''}`}
+                onClick={() => handleSort('score')}
+                title="Сортировать по Score"
+              >
+                Score {sortKey === 'score' ? (sortOrder === 'desc' ? '↓' : '↑') : ''}
+              </button>
+              <button
+                className={`button small ${sortKey === 'volatilityPct' ? 'primary' : ''}`}
+                onClick={() => handleSort('volatilityPct')}
+                title="Сортировать по волатильности"
+              >
+                Волатильность {sortKey === 'volatilityPct' ? (sortOrder === 'desc' ? '↓' : '↑') : ''}
+              </button>
+            </div>
+            
+            <span className="muted">
+              {scan
+                ? `${new Date(scan.startedAt).toLocaleString()} · ${scan.candidatesFound} пар`
+                : 'Скан ещё не выполнялся'}
+            </span>
+          </div>
         </div>
 
         {accepted.length === 0 ? (
@@ -86,16 +160,27 @@ export default function Candidates({ canOperate: _canOperate }: Props) {
             <table>
               <thead>
                 <tr>
-                  <th>Символ</th>
-                  <th>Score</th>
+                  <th onClick={() => handleSort('createdAt')} style={{ cursor: 'pointer', whiteSpace: 'nowrap' }}>
+                    Время {sortKey === 'createdAt' ? (sortOrder === 'desc' ? '↓' : '↑') : ''}
+                  </th>
+                  <th onClick={() => handleSort('symbol')} style={{ cursor: 'pointer', whiteSpace: 'nowrap' }}>
+                    Символ {sortKey === 'symbol' ? (sortOrder === 'desc' ? '↓' : '↑') : ''}
+                  </th>
+                  <th onClick={() => handleSort('score')} style={{ cursor: 'pointer', whiteSpace: 'nowrap' }}>
+                    Score {sortKey === 'score' ? (sortOrder === 'desc' ? '↓' : '↑') : ''}
+                  </th>
                   <th>Режим рынка</th>
                   <th>Позиция в диапазоне</th>
-                  <th>Волатильность</th>
+                  <th onClick={() => handleSort('volatilityPct')} style={{ cursor: 'pointer', whiteSpace: 'nowrap' }}>
+                    Волатильность {sortKey === 'volatilityPct' ? (sortOrder === 'desc' ? '↓' : '↑') : ''}
+                  </th>
                   <th>ADX</th>
                   <th>Грид (диапазон)</th>
                   <th>Направление</th>
                   <th>Плечо</th>
-                  <th>EV / Sharpe</th>
+                  <th onClick={() => handleSort('expectedValuePct')} style={{ cursor: 'pointer', whiteSpace: 'nowrap' }}>
+                    EV / Sharpe {sortKey === 'expectedValuePct' ? (sortOrder === 'desc' ? '↓' : '↑') : ''}
+                  </th>
                   <th>AI Kit</th>
                 </tr>
               </thead>
@@ -126,6 +211,9 @@ export default function Candidates({ canOperate: _canOperate }: Props) {
             <table>
               <thead>
                 <tr>
+                  <th onClick={() => handleSort('createdAt')} style={{ cursor: 'pointer', whiteSpace: 'nowrap' }}>
+                    Время {sortKey === 'createdAt' ? (sortOrder === 'desc' ? '↓' : '↑') : ''}
+                  </th>
                   <th>Символ</th>
                   <th>Причина</th>
                   <th>Волатильность</th>
@@ -135,6 +223,11 @@ export default function Candidates({ canOperate: _canOperate }: Props) {
               <tbody>
                 {rejected.map((candidate) => (
                   <tr key={candidate.id}>
+                    <td>
+                      <span className="badge neutral" title={new Date(candidate.createdAt).toLocaleString()}>
+                        {formatTime(candidate.createdAt)}
+                      </span>
+                    </td>
                     <td>{candidate.symbol}</td>
                     <td><small>{candidate.rejectionReason ?? '—'}</small></td>
                     <td>{candidate.volatilityPct}%</td>
@@ -167,6 +260,11 @@ function CandidateRow({
 
   return (
     <tr>
+      <td>
+        <span className="badge neutral" title={new Date(candidate.createdAt).toLocaleString()}>
+          {formatTime(candidate.createdAt)}
+        </span>
+      </td>
       <td>
         <strong>{candidate.symbol}</strong>
         <small>{candidate.currentPrice}</small>
@@ -232,4 +330,11 @@ function formatNumber(value: unknown): string {
   const parsed = Number(value);
   if (!Number.isFinite(parsed)) return '—';
   return parsed.toFixed(1);
+}
+
+function formatTime(dateStr: string): string {
+  if (!dateStr) return '—';
+  const d = new Date(dateStr);
+  if (isNaN(d.getTime())) return '—';
+  return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
 }
