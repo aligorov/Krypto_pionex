@@ -387,12 +387,23 @@ func (s *Service) State(ctx context.Context) (*State, error) {
 	err = s.db.QueryRow(ctx, `
 		SELECT id, status, candidates_found, error_message, started_at, completed_at
 		FROM autogrid_scan_runs
-		WHERE settings_id = $1
+		WHERE settings_id = $1 AND status = 'SUCCEEDED'
 		ORDER BY started_at DESC LIMIT 1
 	`, settings.ID).Scan(
 		&scan.ID, &scan.Status, &scan.CandidatesFound, &scan.ErrorMessage,
 		&scan.StartedAt, &scan.CompletedAt,
 	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		err = s.db.QueryRow(ctx, `
+			SELECT id, status, candidates_found, error_message, started_at, completed_at
+			FROM autogrid_scan_runs
+			WHERE settings_id = $1
+			ORDER BY started_at DESC LIMIT 1
+		`, settings.ID).Scan(
+			&scan.ID, &scan.Status, &scan.CandidatesFound, &scan.ErrorMessage,
+			&scan.StartedAt, &scan.CompletedAt,
+		)
+	}
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return nil, fmt.Errorf("load AutoGrid last scan: %w", err)
 	}

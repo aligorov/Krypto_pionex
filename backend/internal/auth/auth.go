@@ -33,6 +33,7 @@ var (
 	ErrInactiveUser       = errors.New("user is disabled")
 	ErrUnauthorized       = errors.New("authentication required")
 	ErrForbidden          = errors.New("insufficient permissions")
+	ErrTwoFactorRequired  = errors.New("two-factor authentication code required")
 
 	usernamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{2,63}$`)
 )
@@ -45,10 +46,17 @@ type User struct {
 	Role               string     `json:"role"`
 	IsActive           bool       `json:"isActive"`
 	MustChangePassword bool       `json:"mustChangePassword"`
+	TwoFactorEnabled   bool       `json:"twoFactorEnabled"`
 	LockedUntil        *time.Time `json:"lockedUntil"`
 	LastLoginAt        *time.Time `json:"lastLoginAt"`
 	CreatedAt          time.Time  `json:"createdAt"`
 	UpdatedAt          time.Time  `json:"updatedAt"`
+}
+
+type TOTPSetup struct {
+	Secret        string   `json:"secret"`
+	OTPAuthURL    string   `json:"otpauthUrl"`
+	RecoveryCodes []string `json:"recoveryCodes"`
 }
 
 type UserSettings struct {
@@ -175,10 +183,11 @@ func (s *Service) CreateUser(ctx context.Context, input CreateUserInput) (*User,
 			username, display_name, email, password_hash, role, must_change_password
 		) VALUES ($1, $2, $3, $4, $5, $6)
 		RETURNING id, username, display_name, email, role, is_active,
-		          must_change_password, locked_until, last_login_at, created_at, updated_at
+		          must_change_password, COALESCE(totp_enabled, false),
+		          locked_until, last_login_at, created_at, updated_at
 	`, username, displayName, email, string(hash), role, input.MustChangePassword).Scan(
 		&user.ID, &user.Username, &user.DisplayName, &user.Email, &user.Role,
-		&user.IsActive, &user.MustChangePassword, &user.LockedUntil,
+		&user.IsActive, &user.MustChangePassword, &user.TwoFactorEnabled, &user.LockedUntil,
 		&user.LastLoginAt, &user.CreatedAt, &user.UpdatedAt,
 	)
 	if err != nil {
@@ -195,20 +204,24 @@ func (s *Service) CreateUser(ctx context.Context, input CreateUserInput) (*User,
 	return &user, nil
 }
 
-func (s *Service) Authenticate(ctx context.Context, username, password string) (*User, error) {
+func (s *Service) Authenticate(ctx context.Context, username, password, totpCode string) (*User, error) {
 	normalized := strings.ToLower(strings.TrimSpace(username))
 	var user User
 	var passwordHash string
 	var failedAttempts int
+	var totpSecret *string
+	var recoveryCodes []string
 	err := s.db.QueryRow(ctx, `
 		SELECT id, username, display_name, email, password_hash, role, is_active,
-		       must_change_password, failed_login_attempts, locked_until,
+		       must_change_password, COALESCE(totp_enabled, false), totp_secret,
+		       COALESCE(totp_recovery_codes, ARRAY[]::TEXT[]), failed_login_attempts, locked_until,
 		       last_login_at, created_at, updated_at
 		FROM app_users
 		WHERE username = $1
 	`, normalized).Scan(
 		&user.ID, &user.Username, &user.DisplayName, &user.Email, &passwordHash,
-		&user.Role, &user.IsActive, &user.MustChangePassword, &failedAttempts,
+		&user.Role, &user.IsActive, &user.MustChangePassword, &user.TwoFactorEnabled,
+		&totpSecret, &recoveryCodes, &failedAttempts,
 		&user.LockedUntil, &user.LastLoginAt, &user.CreatedAt, &user.UpdatedAt,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -240,6 +253,48 @@ func (s *Service) Authenticate(ctx context.Context, username, password string) (
 			WHERE id = $1
 		`, user.ID, failedAttempts, lockedUntil)
 		return nil, ErrInvalidCredentials
+	}
+
+	if user.TwoFactorEnabled {
+		trimmedCode := strings.TrimSpace(totpCode)
+		if trimmedCode == "" {
+			return nil, ErrTwoFactorRequired
+		}
+		valid := false
+		if totpSecret != nil && *totpSecret != "" && ValidateTOTPCode(*totpSecret, trimmedCode) {
+			valid = true
+		} else {
+			normInput := NormalizeRecoveryCode(trimmedCode)
+			remaining := make([]string, 0, len(recoveryCodes))
+			for _, rc := range recoveryCodes {
+				if !valid && NormalizeRecoveryCode(rc) == normInput {
+					valid = true
+				} else {
+					remaining = append(remaining, rc)
+				}
+			}
+			if valid {
+				_, _ = s.db.Exec(ctx, `
+					UPDATE app_users SET totp_recovery_codes = $2, updated_at = NOW()
+					WHERE id = $1
+				`, user.ID, remaining)
+			}
+		}
+
+		if !valid {
+			failedAttempts++
+			var lockedUntil *time.Time
+			if failedAttempts >= 5 {
+				locked := s.now().Add(15 * time.Minute)
+				lockedUntil = &locked
+			}
+			_, _ = s.db.Exec(ctx, `
+				UPDATE app_users
+				SET failed_login_attempts = $2, locked_until = $3, updated_at = NOW()
+				WHERE id = $1
+			`, user.ID, failedAttempts, lockedUntil)
+			return nil, ErrInvalidTOTPCode
+		}
 	}
 
 	now := s.now()
@@ -339,7 +394,8 @@ func (s *Service) RevokeSession(ctx context.Context, sessionID string) error {
 func (s *Service) ListUsers(ctx context.Context) ([]User, error) {
 	rows, err := s.db.Query(ctx, `
 		SELECT id, username, display_name, email, role, is_active,
-		       must_change_password, locked_until, last_login_at, created_at, updated_at
+		       must_change_password, COALESCE(totp_enabled, false),
+		       locked_until, last_login_at, created_at, updated_at
 		FROM app_users
 		ORDER BY username
 	`)
@@ -353,7 +409,7 @@ func (s *Service) ListUsers(ctx context.Context) ([]User, error) {
 		var user User
 		if err := rows.Scan(
 			&user.ID, &user.Username, &user.DisplayName, &user.Email, &user.Role,
-			&user.IsActive, &user.MustChangePassword, &user.LockedUntil,
+			&user.IsActive, &user.MustChangePassword, &user.TwoFactorEnabled, &user.LockedUntil,
 			&user.LastLoginAt, &user.CreatedAt, &user.UpdatedAt,
 		); err != nil {
 			return nil, fmt.Errorf("scan user: %w", err)
@@ -390,17 +446,89 @@ func (s *Service) GetUser(ctx context.Context, userID string) (*User, error) {
 	var user User
 	err := s.db.QueryRow(ctx, `
 		SELECT id, username, display_name, email, role, is_active,
-		       must_change_password, locked_until, last_login_at, created_at, updated_at
+		       must_change_password, COALESCE(totp_enabled, false),
+		       locked_until, last_login_at, created_at, updated_at
 		FROM app_users WHERE id = $1
 	`, userID).Scan(
 		&user.ID, &user.Username, &user.DisplayName, &user.Email, &user.Role,
-		&user.IsActive, &user.MustChangePassword, &user.LockedUntil,
+		&user.IsActive, &user.MustChangePassword, &user.TwoFactorEnabled, &user.LockedUntil,
 		&user.LastLoginAt, &user.CreatedAt, &user.UpdatedAt,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("get user: %w", err)
 	}
 	return &user, nil
+}
+
+func (s *Service) Setup2FA(ctx context.Context, userID string) (*TOTPSetup, error) {
+	var username string
+	err := s.db.QueryRow(ctx, "SELECT username FROM app_users WHERE id = $1 AND is_active = TRUE", userID).Scan(&username)
+	if err != nil {
+		return nil, fmt.Errorf("load user for 2FA setup: %w", err)
+	}
+	secret, err := GenerateTOTPSecret()
+	if err != nil {
+		return nil, err
+	}
+	recoveryCodes, err := GenerateRecoveryCodes()
+	if err != nil {
+		return nil, err
+	}
+	otpauthURL := FormatTOTPURL(username, secret)
+	return &TOTPSetup{
+		Secret:        secret,
+		OTPAuthURL:    otpauthURL,
+		RecoveryCodes: recoveryCodes,
+	}, nil
+}
+
+func (s *Service) Enable2FA(ctx context.Context, userID, secret, code string, recoveryCodes []string) error {
+	if !ValidateTOTPCode(secret, code) {
+		return ErrInvalidTOTPCode
+	}
+	tag, err := s.db.Exec(ctx, `
+		UPDATE app_users
+		SET totp_secret = $2,
+		    totp_enabled = TRUE,
+		    totp_recovery_codes = $3,
+		    updated_at = NOW()
+		WHERE id = $1 AND is_active = TRUE
+	`, userID, secret, recoveryCodes)
+	if err != nil {
+		return fmt.Errorf("enable 2FA: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return errors.New("user not found or inactive")
+	}
+	return nil
+}
+
+func (s *Service) Disable2FA(ctx context.Context, userID, password string) error {
+	var passwordHash string
+	err := s.db.QueryRow(ctx, `
+		SELECT password_hash FROM app_users WHERE id = $1 AND is_active = TRUE
+	`, userID).Scan(&passwordHash)
+	if err != nil {
+		return fmt.Errorf("load user for 2FA disable: %w", err)
+	}
+	if bcrypt.CompareHashAndPassword([]byte(passwordHash), []byte(password)) != nil {
+		return ErrInvalidCredentials
+	}
+	tag, err := s.db.Exec(ctx, `
+		UPDATE app_users
+		SET totp_secret = NULL,
+		    totp_enabled = FALSE,
+		    totp_recovery_codes = NULL,
+		    updated_at = NOW()
+		WHERE id = $1 AND is_active = TRUE
+	`, userID)
+	if err != nil {
+		return fmt.Errorf("disable 2FA: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return errors.New("user not found or inactive")
+	}
+	return nil
 }
 
 func (s *Service) ChangePassword(ctx context.Context, userID, password string, mustChange bool) error {

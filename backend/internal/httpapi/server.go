@@ -73,6 +73,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/auth/login", s.login)
 	mux.Handle("POST /api/auth/logout", s.withSession(http.HandlerFunc(s.logout)))
 	mux.Handle("GET /api/auth/me", s.withSession(http.HandlerFunc(s.me)))
+	mux.Handle("GET /api/auth/2fa/setup", s.withSession(http.HandlerFunc(s.setup2FA)))
+	mux.Handle("POST /api/auth/2fa/enable", s.withSession(http.HandlerFunc(s.enable2FA)))
+	mux.Handle("POST /api/auth/2fa/disable", s.withSession(http.HandlerFunc(s.disable2FA)))
 
 	mux.Handle("GET /api/dashboard", s.withSession(http.HandlerFunc(s.dashboard)))
 	mux.Handle("GET /api/users", s.withRole(auth.RoleAdmin, http.HandlerFunc(s.listUsers)))
@@ -163,12 +166,19 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 	var input struct {
 		Username string `json:"username"`
 		Password string `json:"password"`
+		Code     string `json:"code,omitempty"`
 	}
 	if !decodeJSON(w, r, &input) {
 		return
 	}
-	user, err := s.auth.Authenticate(r.Context(), input.Username, input.Password)
+	user, err := s.auth.Authenticate(r.Context(), input.Username, input.Password, input.Code)
 	if err != nil {
+		if errors.Is(err, auth.ErrTwoFactorRequired) {
+			writeJSON(w, http.StatusOK, map[string]any{
+				"requires2fa": true,
+			})
+			return
+		}
 		status := http.StatusUnauthorized
 		if errors.Is(err, auth.ErrAccountLocked) {
 			status = http.StatusLocked
@@ -335,6 +345,50 @@ func (s *Server) changeMyPassword(w http.ResponseWriter, r *http.Request) {
 	}
 	s.auditMutation(r, "user.password.change", "user", principal.UserID, nil)
 	clearAuthCookies(w, requestSecure(r))
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (s *Server) setup2FA(w http.ResponseWriter, r *http.Request) {
+	principal := principalFromContext(r.Context())
+	setup, err := s.auth.Setup2FA(r.Context(), principal.UserID)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, setup)
+}
+
+func (s *Server) enable2FA(w http.ResponseWriter, r *http.Request) {
+	principal := principalFromContext(r.Context())
+	var input struct {
+		Secret        string   `json:"secret"`
+		Code          string   `json:"code"`
+		RecoveryCodes []string `json:"recoveryCodes"`
+	}
+	if !decodeJSON(w, r, &input) {
+		return
+	}
+	if err := s.auth.Enable2FA(r.Context(), principal.UserID, input.Secret, input.Code, input.RecoveryCodes); err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	s.auditMutation(r, "user.2fa.enable", "user", principal.UserID, nil)
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (s *Server) disable2FA(w http.ResponseWriter, r *http.Request) {
+	principal := principalFromContext(r.Context())
+	var input struct {
+		Password string `json:"password"`
+	}
+	if !decodeJSON(w, r, &input) {
+		return
+	}
+	if err := s.auth.Disable2FA(r.Context(), principal.UserID, input.Password); err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	s.auditMutation(r, "user.2fa.disable", "user", principal.UserID, nil)
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 

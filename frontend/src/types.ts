@@ -8,10 +8,24 @@ export interface User {
   role: Role;
   isActive: boolean;
   mustChangePassword: boolean;
+  twoFactorEnabled: boolean;
   lockedUntil: string | null;
   lastLoginAt: string | null;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface TOTPSetupResponse {
+  secret: string;
+  otpauthUrl: string;
+  recoveryCodes: string[];
+}
+
+export interface LoginResponse {
+  user?: User;
+  csrfToken?: string;
+  expiresAt?: string;
+  requires2fa?: boolean;
 }
 
 export interface UserSettings {
@@ -191,12 +205,6 @@ export type Tab =
   | 'risk'
   | 'settings'
   | 'audit';
-
-export interface LoginResponse {
-  user: User;
-  csrfToken: string;
-  expiresAt: string;
-}
 
 export interface BootstrapStatus {
   initialized: boolean;

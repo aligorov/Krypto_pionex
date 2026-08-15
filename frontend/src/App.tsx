@@ -9,6 +9,7 @@ import Overview from './components/Overview';
 import RiskSettings from './components/RiskSettings';
 import AuditLogs from './components/AuditLogs';
 import MCPServer from './components/MCPServer';
+import SecurityModal from './components/SecurityModal';
 
 type Tab = 'overview' | 'autogrid' | 'candidates' | 'bots' | 'accounts' | 'risk' | 'audit' | 'mcp';
 
@@ -20,11 +21,16 @@ export default function App() {
   const [booting, setBooting] = useState(true);
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
+  const [totpCode, setTotpCode] = useState('');
+  const [requires2FA, setRequires2FA] = useState(false);
   const [loginError, setLoginError] = useState<string | null>(null);
+  const [loginSuccessMessage, setLoginSuccessMessage] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [overview, setOverview] = useState<Dashboard | null>(null);
 
   const [activeTab, setActiveTab] = useState<Tab>('overview');
+  const [showSecurityModal, setShowSecurityModal] = useState(false);
+  const [securityTab, setSecurityTab] = useState<'password' | '2fa'>('password');
 
   const loadOverview = useCallback(() => {
     api<Dashboard>('/api/dashboard')
@@ -36,7 +42,13 @@ export default function App() {
     let active = true;
     api<User>('/api/auth/me')
       .then((me) => {
-        if (active) setUser(me);
+        if (active) {
+          setUser(me);
+          if (me.mustChangePassword) {
+            setShowSecurityModal(true);
+            setSecurityTab('password');
+          }
+        }
       })
       .catch(() => {
         /* not signed in yet */
@@ -59,14 +71,33 @@ export default function App() {
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
     setLoginError(null);
+    setLoginSuccessMessage(null);
     setLoading(true);
     try {
       const data = await api<LoginResponse>('/api/auth/login', {
         method: 'POST',
-        body: JSON.stringify({ username, password }),
+        body: JSON.stringify({
+          username,
+          password,
+          code: totpCode.trim() || undefined,
+        }),
       });
-      setUser(data.user);
-      setPassword('');
+
+      if (data.requires2fa) {
+        setRequires2FA(true);
+        return;
+      }
+
+      if (data.user) {
+        setUser(data.user);
+        setPassword('');
+        setTotpCode('');
+        setRequires2FA(false);
+        if (data.user.mustChangePassword) {
+          setShowSecurityModal(true);
+          setSecurityTab('password');
+        }
+      }
     } catch (error) {
       setLoginError(error instanceof ApiError ? error.message : 'Ошибка подключения к серверу');
     } finally {
@@ -82,6 +113,8 @@ export default function App() {
     }
     setUser(null);
     setOverview(null);
+    setRequires2FA(false);
+    setTotpCode('');
   };
 
   if (booting) {
@@ -113,32 +146,82 @@ export default function App() {
             </div>
           </div>
 
+          {loginSuccessMessage && <div className="alert success">{loginSuccessMessage}</div>}
           {loginError && <div className="alert danger">{loginError}</div>}
 
           <form className="form-stack" onSubmit={handleLogin}>
-            <label>
-              Логин
-              <input
-                type="text"
-                value={username}
-                onChange={(e) => setUsername(e.target.value)}
-                autoComplete="username"
-                required
-              />
-            </label>
-            <label>
-              Пароль
-              <input
-                type="password"
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                autoComplete="current-password"
-                required
-              />
-            </label>
-            <button type="submit" className="button primary" disabled={loading}>
-              {loading ? 'Вход…' : 'Войти'}
-            </button>
+            {!requires2FA ? (
+              <>
+                <label>
+                  Логин
+                  <input
+                    type="text"
+                    value={username}
+                    onChange={(e) => setUsername(e.target.value)}
+                    autoComplete="username"
+                    required
+                  />
+                </label>
+                <label>
+                  Пароль
+                  <input
+                    type="password"
+                    value={password}
+                    onChange={(e) => setPassword(e.target.value)}
+                    autoComplete="current-password"
+                    required
+                  />
+                </label>
+                <button type="submit" className="button primary" disabled={loading}>
+                  {loading ? 'Вход…' : 'Войти'}
+                </button>
+              </>
+            ) : (
+              <>
+                <div className="alert info" style={{ textAlign: 'left', fontSize: '0.85rem' }}>
+                  🛡️ Для входа требуется 6-значный код из Google Authenticator или резервный код восстановления.
+                </div>
+                <label>
+                  Код аутентификации (2FA)
+                  <input
+                    type="text"
+                    maxLength={9}
+                    value={totpCode}
+                    onChange={(e) => setTotpCode(e.target.value)}
+                    placeholder="000000 или XXXX-XXXX"
+                    autoComplete="one-time-code"
+                    autoFocus
+                    required
+                    style={{
+                      fontSize: '1.3rem',
+                      textAlign: 'center',
+                      letterSpacing: '0.2em',
+                      fontWeight: 700,
+                    }}
+                  />
+                </label>
+                <div style={{ display: 'flex', gap: 8 }}>
+                  <button
+                    type="button"
+                    className="button secondary"
+                    onClick={() => {
+                      setRequires2FA(false);
+                      setTotpCode('');
+                    }}
+                  >
+                    Назад
+                  </button>
+                  <button
+                    type="submit"
+                    className="button primary"
+                    disabled={loading || !totpCode.trim()}
+                    style={{ flex: 1 }}
+                  >
+                    {loading ? 'Проверка…' : 'Подтвердить'}
+                  </button>
+                </div>
+              </>
+            )}
           </form>
         </div>
       </div>
@@ -186,9 +269,29 @@ export default function App() {
         <div className="sidebar-footer">
           <div className="identity">
             <div style={{ fontWeight: 700 }}>{user.displayName || user.username}</div>
-            <div className="muted">{user.username} · {user.role}</div>
+            <div className="muted" style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+              <span>{user.username} · {user.role}</span>
+              {user.twoFactorEnabled && (
+                <span className="badge success" title="2FA активна" style={{ fontSize: '9px', padding: '1px 5px' }}>
+                  2FA
+                </span>
+              )}
+            </div>
           </div>
-          <button className="button" onClick={handleLogout}>Выйти</button>
+          <div style={{ display: 'flex', gap: 6 }}>
+            <button
+              className="button small"
+              onClick={() => {
+                setSecurityTab('password');
+                setShowSecurityModal(true);
+              }}
+              title="Сменить пароль или настроить 2FA"
+              style={{ flex: 1 }}
+            >
+              🛡️ Защита
+            </button>
+            <button className="button small" onClick={handleLogout}>Выйти</button>
+          </div>
         </div>
       </aside>
 
@@ -226,6 +329,21 @@ export default function App() {
         {activeTab === 'audit' && <AuditLogs />}
         {activeTab === 'mcp' && <MCPServer canManage={canManage(user.role)} />}
       </main>
+
+      {(showSecurityModal || user.mustChangePassword) && (
+        <SecurityModal
+          user={user}
+          defaultTab={securityTab}
+          onClose={() => setShowSecurityModal(false)}
+          onUserUpdated={(updated) => setUser(updated)}
+          onPasswordChanged={() => {
+            setUser(null);
+            setOverview(null);
+            setShowSecurityModal(false);
+            setLoginSuccessMessage('Пароль успешно изменён! Пожалуйста, войдите с новым паролем.');
+          }}
+        />
+      )}
     </div>
   );
 }
