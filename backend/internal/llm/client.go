@@ -66,7 +66,7 @@ func (c *Client) callGemini(
 ) (string, error) {
 	model := settings.Model
 	if model == "" {
-		model = "gemini-2.0-flash"
+		model = "gemini-3.7-flash"
 	}
 	baseURL := settings.BaseURL
 	if baseURL == "" {
