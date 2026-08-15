@@ -74,18 +74,18 @@ func (s *Service) UpdateSettings(ctx context.Context, patch Settings) (*Settings
 
 	_, err = s.db.Exec(ctx, `
 		UPDATE llm_settings
-		SET enabled = $2,
-		    provider = $3,
-		    api_key = $4,
-		    model = $5,
-		    base_url = $6,
-		    temperature = $7,
-		    thinking_enabled = $8,
-		    require_approval_to_deploy = $9,
-		    audit_interval_seconds = $10,
+		SET enabled = $1,
+		    provider = $2,
+		    api_key = $3,
+		    model = $4,
+		    base_url = $5,
+		    temperature = $6,
+		    thinking_enabled = $7,
+		    require_approval_to_deploy = $8,
+		    audit_interval_seconds = $9,
 		    updated_at = NOW()
 		WHERE id = 1
-	`, patch.ID, patch.Enabled, provider, apiKey, model,
+	`, patch.Enabled, provider, apiKey, model,
 		strings.TrimSpace(patch.BaseURL), patch.Temperature, patch.ThinkingEnabled,
 		patch.RequireApprovalToDeploy, patch.AuditIntervalSeconds)
 	if err != nil {
