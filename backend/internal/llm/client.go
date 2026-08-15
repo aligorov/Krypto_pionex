@@ -126,6 +126,7 @@ func (c *Client) callGemini(
 		return "", err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-goog-api-key", strings.TrimSpace(settings.APIKey))
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -361,6 +362,7 @@ func (c *Client) ListAvailableModels(ctx context.Context, settings Settings) ([]
 		if err != nil {
 			return nil, err
 		}
+		req.Header.Set("x-goog-api-key", strings.TrimSpace(settings.APIKey))
 		resp, err := c.httpClient.Do(req)
 		if err != nil {
 			return nil, fmt.Errorf("gemini models network error: %w", err)
