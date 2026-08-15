@@ -14,7 +14,6 @@ import (
 	"github.com/aligorov/pionex-bot/backend/internal/marketdata"
 	"github.com/aligorov/pionex-bot/backend/internal/pionex"
 	"github.com/aligorov/pionex-bot/backend/internal/risk"
-	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/shopspring/decimal"
@@ -1398,10 +1397,6 @@ func (worker *Worker) enrichAndAuditCandidatesWithLLM(
 		if candidate.Decision != "ACCEPTED" || auditedCount >= 5 {
 			continue
 		}
-		candUUID, err := uuid.Parse(candidate.ID)
-		if err != nil {
-			continue
-		}
 		candles, err := worker.publicClient.GetKlines(ctx, candidate.Symbol, "15M", 30)
 		if err != nil {
 			worker.logger.Warn("Failed to fetch klines for LLM candidate audit", "symbol", candidate.Symbol, "error", err)
@@ -1459,7 +1454,7 @@ func (worker *Worker) enrichAndAuditCandidatesWithLLM(
 			}
 		}
 
-		decision, record, err := worker.llm.AuditCandidate(ctx, &candUUID, input)
+		decision, record, err := worker.llm.AuditCandidate(ctx, &candidate.ID, input)
 		if err != nil {
 			worker.logger.Warn("LLM candidate audit failed", "symbol", candidate.Symbol, "error", err)
 			continue
@@ -1479,14 +1474,14 @@ func (worker *Worker) enrichAndAuditCandidatesWithLLM(
 				    rejection_reason = $3,
 				    model_assumptions = model_assumptions || jsonb_build_object('llmAuditId', $4::TEXT, 'llmConfidence', $5::NUMERIC, 'llmReasoning', $6::TEXT)
 				WHERE id = $1 AND scan_id = $2
-			`, candidate.ID, scanID, reason, record.ID.String(), decision.Confidence, decision.ReasoningSummary)
+			`, candidate.ID, scanID, reason, record.ID, decision.Confidence, decision.ReasoningSummary)
 			worker.logger.Info("Candidate rejected by LLM intelligence", "symbol", candidate.Symbol, "reason", reason)
 		} else {
 			_, _ = worker.db.Exec(ctx, `
 				UPDATE autogrid_candidates
 				SET model_assumptions = model_assumptions || jsonb_build_object('llmAuditId', $3::TEXT, 'llmConfidence', $4::NUMERIC, 'llmReasoning', $5::TEXT, 'llmRegime', $6::TEXT)
 				WHERE id = $1 AND scan_id = $2
-			`, candidate.ID, scanID, record.ID.String(), decision.Confidence, decision.ReasoningSummary, decision.Regime)
+			`, candidate.ID, scanID, record.ID, decision.Confidence, decision.ReasoningSummary, decision.Regime)
 		}
 	}
 	return nil

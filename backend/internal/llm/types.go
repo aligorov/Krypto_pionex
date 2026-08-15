@@ -3,7 +3,6 @@ package llm
 import (
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/shopspring/decimal"
 )
 
@@ -34,8 +33,8 @@ type Settings struct {
 
 // AuditRecord represents a recorded evaluation of a symbol/candidate by the LLM.
 type AuditRecord struct {
-	ID                uuid.UUID       `json:"id"`
-	CandidateID       *uuid.UUID      `json:"candidateId,omitempty"`
+	ID                string          `json:"id"`
+	CandidateID       *string         `json:"candidateId,omitempty"`
 	Symbol            string          `json:"symbol"`
 	Provider          string          `json:"provider"`
 	Model             string          `json:"model"`

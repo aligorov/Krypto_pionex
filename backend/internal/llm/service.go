@@ -2,6 +2,7 @@ package llm
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,7 +10,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/shopspring/decimal"
 )
@@ -119,7 +119,7 @@ func (s *Service) TestConnection(ctx context.Context, settings Settings) (string
 // AuditCandidate evaluates a symbol with the configured LLM and saves the audit record to PostgreSQL.
 func (s *Service) AuditCandidate(
 	ctx context.Context,
-	candidateID *uuid.UUID,
+	candidateID *string,
 	input CandidateInput,
 ) (*AuditDecision, *AuditRecord, error) {
 	settings, err := s.GetSettings(ctx)
@@ -165,7 +165,7 @@ func (s *Service) AuditCandidate(
 	}
 
 	record := &AuditRecord{
-		ID:                uuid.New(),
+		ID:                newUUID(),
 		CandidateID:       candidateID,
 		Symbol:            input.Symbol,
 		Provider:          settings.Provider,
@@ -245,4 +245,12 @@ func maskKey(key string) string {
 		return "••••••••"
 	}
 	return k[:4] + "••••••••" + k[len(k)-4:]
+}
+
+func newUUID() string {
+	b := make([]byte, 16)
+	_, _ = rand.Read(b)
+	b[6] = (b[6] & 0x0f) | 0x40 // Version 4
+	b[8] = (b[8] & 0x3f) | 0x80 // Variant RFC 4122
+	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
