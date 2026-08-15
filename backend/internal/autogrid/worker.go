@@ -377,7 +377,10 @@ func percentReading(value any) float64 {
 }
 
 // isEntryTimingFavorable validates that the current price is positioned
-// favorably within the channel structure before launching a directional grid.
+// favorably within the channel structure before launching a grid:
+// - NEUTRAL: must be within the core median channel (35% to 65%) to avoid boundary traps.
+// - LONG: must be in the lower pullback accumulation zone (15% to 45%).
+// - SHORT: must be in the upper relief rebound zone (55% to 85%).
 func isEntryTimingFavorable(candidate Candidate) bool {
 	rangePos := 50.0
 	if val, ok := candidate.ModelAssumptions["rangePositionPct"].(float64); ok {
@@ -391,11 +394,14 @@ func isEntryTimingFavorable(candidate Candidate) bool {
 
 	switch candidate.RecommendedTrend {
 	case "long":
-		return rangePos <= 70.0
+		// Buy the dip: enter only when price pulled back to lower channel support (15%-45%)
+		return rangePos >= 15.0 && rangePos <= 45.0
 	case "short":
-		return rangePos >= 30.0
+		// Sell the rip: enter only when price bounced into upper channel resistance (55%-85%)
+		return rangePos >= 55.0 && rangePos <= 85.0
 	default:
-		return true
+		// Neutral range: enter in the channel core (35%-65%) to maintain symmetric headroom
+		return rangePos >= 35.0 && rangePos <= 65.0
 	}
 }
 
@@ -624,9 +630,15 @@ func (worker *Worker) deployReal(
 			InvestCoin:      "USDT", InvestmentFrom: "USER",
 		}
 		if settings.StopLossMode == "ADAPTIVE_ATR" {
-			stop := candidate.LowerPrice.Mul(decimal.NewFromFloat(0.98))
+			bufferPct := settings.RangeBreakBufferPct
+			if bufferPct.LessThanOrEqual(decimal.Zero) {
+				bufferPct = decimal.NewFromFloat(2.0)
+			}
+			bufferMultiplier := decimal.NewFromInt(1).Sub(bufferPct.Div(decimal.NewFromInt(100)))
+			stop := candidate.LowerPrice.Mul(bufferMultiplier)
 			if candidate.RecommendedTrend == "short" {
-				stop = candidate.UpperPrice.Mul(decimal.NewFromFloat(1.02))
+				shortMultiplier := decimal.NewFromInt(1).Add(bufferPct.Div(decimal.NewFromInt(100)))
+				stop = candidate.UpperPrice.Mul(shortMultiplier)
 			}
 			data.LossStopType = "price"
 			data.LossStop = &stop
