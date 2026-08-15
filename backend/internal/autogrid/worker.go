@@ -394,14 +394,14 @@ func isEntryTimingFavorable(candidate Candidate) bool {
 
 	switch candidate.RecommendedTrend {
 	case "long":
-		// Buy the dip: enter only when price pulled back to lower channel support (15%-45%)
-		return rangePos >= 15.0 && rangePos <= 45.0
+		// Accumulation / Dip buying: enter from lower bounce (10%) up to channel median (65%)
+		return rangePos >= 10.0 && rangePos <= 65.0
 	case "short":
-		// Sell the rip: enter only when price bounced into upper channel resistance (55%-85%)
-		return rangePos >= 55.0 && rangePos <= 85.0
+		// Distribution / Rip selling: enter from channel median (35%) up to upper resistance (90%)
+		return rangePos >= 35.0 && rangePos <= 90.0
 	default:
-		// Neutral range: enter in the channel core (35%-65%) to maintain symmetric headroom
-		return rangePos >= 35.0 && rangePos <= 65.0
+		// Neutral range: trade healthy channel (20% to 80%), avoiding extreme 20% boundary traps
+		return rangePos >= 20.0 && rangePos <= 80.0
 	}
 }
 
