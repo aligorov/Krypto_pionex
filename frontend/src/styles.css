@@ -472,3 +472,31 @@ input:disabled, select:disabled { opacity: .65; }
   color: var(--text);
   letter-spacing: 0.05em;
 }
+
+/* IP Security & Whitelist styles */
+.ip-security-content {
+  display: grid;
+  gap: 16px;
+}
+
+.security-sub-section {
+  display: grid;
+  gap: 8px;
+}
+
+.empty-state-box {
+  padding: 20px;
+  text-align: center;
+  background: var(--surface-soft);
+  border: 1px dashed var(--border);
+  border-radius: 8px;
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+.whitelist-add-form {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}

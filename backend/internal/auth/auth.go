@@ -124,15 +124,21 @@ type APIToken struct {
 }
 
 type Service struct {
-	db  *pgxpool.Pool
-	now func() time.Time
+	db       *pgxpool.Pool
+	now      func() time.Time
+	fail2ban *Fail2Ban
 }
 
 func NewService(db *pgxpool.Pool) *Service {
 	return &Service{
-		db:  db,
-		now: time.Now,
+		db:       db,
+		now:      time.Now,
+		fail2ban: NewFail2Ban(db),
 	}
+}
+
+func (s *Service) Fail2Ban() *Fail2Ban {
+	return s.fail2ban
 }
 
 func (s *Service) CountUsers(ctx context.Context) (int, error) {

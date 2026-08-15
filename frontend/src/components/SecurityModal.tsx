@@ -1,6 +1,6 @@
-import { FormEvent, useState } from 'react';
+import { FormEvent, useEffect, useState } from 'react';
 import { api, ApiError } from '../api';
-import type { TOTPSetupResponse, User } from '../types';
+import type { IPBan, MyIPResponse, TOTPSetupResponse, User, WhitelistEntry } from '../types';
 import { QRCodeSVG } from './QRCodeSVG';
 
 interface Props {
@@ -8,7 +8,7 @@ interface Props {
   onClose: () => void;
   onUserUpdated: (updated: User) => void;
   onPasswordChanged: () => void;
-  defaultTab?: 'password' | '2fa';
+  defaultTab?: 'password' | '2fa' | 'ip';
 }
 
 export default function SecurityModal({
@@ -18,7 +18,7 @@ export default function SecurityModal({
   onPasswordChanged,
   defaultTab = 'password',
 }: Props) {
-  const [tab, setTab] = useState<'password' | '2fa'>(
+  const [tab, setTab] = useState<'password' | '2fa' | 'ip'>(
     user.mustChangePassword ? 'password' : defaultTab
   );
 
@@ -40,6 +40,16 @@ export default function SecurityModal({
   const [copiedKey, setCopiedKey] = useState(false);
   const [copiedCodes, setCopiedCodes] = useState(false);
 
+  // IP Security & Fail2ban state
+  const [myIP, setMyIP] = useState<MyIPResponse | null>(null);
+  const [bans, setBans] = useState<IPBan[]>([]);
+  const [whitelist, setWhitelist] = useState<WhitelistEntry[]>([]);
+  const [newWhitelistIP, setNewWhitelistIP] = useState('');
+  const [newWhitelistDesc, setNewWhitelistDesc] = useState('');
+  const [ipBusy, setIpBusy] = useState(false);
+  const [ipError, setIpError] = useState<string | null>(null);
+  const [ipSuccess, setIpSuccess] = useState<string | null>(null);
+
   // Password validation checks
   const lenValid = newPassword.length >= 12 && newPassword.length <= 128;
   const letterValid = /[a-zA-Z]/.test(newPassword);
@@ -47,6 +57,31 @@ export default function SecurityModal({
   const symbolValid = /[^a-zA-Z0-9]/.test(newPassword);
   const matchValid = newPassword.length > 0 && newPassword === confirmPassword;
   const allPasswordValid = lenValid && letterValid && digitValid && symbolValid && matchValid;
+
+  useEffect(() => {
+    if (tab === 'ip' && user.role === 'ADMIN') {
+      loadIPSecurity();
+    }
+  }, [tab, user.role]);
+
+  async function loadIPSecurity() {
+    setIpBusy(true);
+    setIpError(null);
+    try {
+      const [ipRes, bansRes, wlRes] = await Promise.all([
+        api<MyIPResponse>('/api/security/my-ip'),
+        api<IPBan[]>('/api/security/bans'),
+        api<WhitelistEntry[]>('/api/security/whitelist'),
+      ]);
+      setMyIP(ipRes);
+      setBans(bansRes || []);
+      setWhitelist(wlRes || []);
+    } catch (err) {
+      setIpError(err instanceof ApiError ? err.message : 'Не удалось загрузить данные IP-безопасности');
+    } finally {
+      setIpBusy(false);
+    }
+  }
 
   async function handlePasswordSubmit(e: FormEvent) {
     e.preventDefault();
@@ -127,6 +162,66 @@ export default function SecurityModal({
     }
   }
 
+  async function handleUnban(ip: string) {
+    setIpBusy(true);
+    setIpError(null);
+    try {
+      await api(`/api/security/bans/${encodeURIComponent(ip)}`, { method: 'DELETE' });
+      setIpSuccess(`IP ${ip} успешно разблокирован`);
+      await loadIPSecurity();
+    } catch (err) {
+      setIpError(err instanceof ApiError ? err.message : 'Не удалось разблокировать IP');
+    } finally {
+      setIpBusy(false);
+    }
+  }
+
+  async function handleAddWhitelist(e: FormEvent) {
+    e.preventDefault();
+    if (!newWhitelistIP.trim()) return;
+    setIpBusy(true);
+    setIpError(null);
+    setIpSuccess(null);
+    try {
+      await api('/api/security/whitelist', {
+        method: 'POST',
+        body: JSON.stringify({
+          ipOrCidr: newWhitelistIP.trim(),
+          description: newWhitelistDesc.trim(),
+        }),
+      });
+      setIpSuccess(`Адрес ${newWhitelistIP} добавлен в белый список`);
+      setNewWhitelistIP('');
+      setNewWhitelistDesc('');
+      await loadIPSecurity();
+    } catch (err) {
+      setIpError(err instanceof ApiError ? err.message : 'Не удалось добавить IP в белый список');
+    } finally {
+      setIpBusy(false);
+    }
+  }
+
+  async function handleRemoveWhitelist(id: number, ipOrCidr: string) {
+    if (!confirm(`Удалить ${ipOrCidr} из белого списка?`)) return;
+    setIpBusy(true);
+    setIpError(null);
+    try {
+      await api(`/api/security/whitelist/${id}`, { method: 'DELETE' });
+      setIpSuccess(`Запись ${ipOrCidr} удалена из белого списка`);
+      await loadIPSecurity();
+    } catch (err) {
+      setIpError(err instanceof ApiError ? err.message : 'Не удалось удалить запись');
+    } finally {
+      setIpBusy(false);
+    }
+  }
+
+  async function handleWhitelistMyIP() {
+    if (!myIP?.ip) return;
+    setNewWhitelistIP(myIP.ip);
+    setNewWhitelistDesc('Текущий IP администратора');
+  }
+
   function copyText(text: string, isCodes = false) {
     navigator.clipboard.writeText(text);
     if (isCodes) {
@@ -184,13 +279,26 @@ export default function SecurityModal({
               className={`modal-tab ${tab === '2fa' ? 'active' : ''}`}
               onClick={() => setTab('2fa')}
             >
-              🛡️ 2FA (Google Authenticator)
+              🛡️ 2FA (Authenticator)
               {twoFactorEnabled ? (
                 <span className="badge success" style={{ marginLeft: 8 }}>ВКЛ</span>
               ) : (
                 <span className="badge" style={{ marginLeft: 8, opacity: 0.6 }}>ВЫКЛ</span>
               )}
             </button>
+            {user.role === 'ADMIN' && (
+              <button
+                className={`modal-tab ${tab === 'ip' ? 'active' : ''}`}
+                onClick={() => setTab('ip')}
+              >
+                🚫 IP-защита & Whitelist
+                {bans.length > 0 && (
+                  <span className="badge badge-danger" style={{ marginLeft: 8 }}>
+                    {bans.length} бан
+                  </span>
+                )}
+              </button>
+            )}
           </div>
         )}
 
@@ -448,6 +556,170 @@ export default function SecurityModal({
                   </div>
                 </form>
               )}
+            </div>
+          )}
+
+          {tab === 'ip' && user.role === 'ADMIN' && (
+            <div className="ip-security-content">
+              {ipError && <div className="alert danger">{ipError}</div>}
+              {ipSuccess && <div className="alert success">{ipSuccess}</div>}
+
+              {/* Current Admin IP Banner */}
+              <div className="status-banner" style={{ background: 'var(--surface-soft)', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <div style={{ display: 'flex', gap: 12, alignItems: 'center' }}>
+                  <span style={{ fontSize: '24px' }}>🌐</span>
+                  <div>
+                    <div style={{ fontSize: '0.85rem', color: 'var(--muted)' }}>Ваш текущий IP-адрес:</div>
+                    <strong style={{ fontSize: '1.1rem', letterSpacing: '0.05em' }}>{myIP?.ip || 'Определение…'}</strong>
+                    {myIP?.whitelisted ? (
+                      <span className="badge success" style={{ marginLeft: 10 }}>✓ В белом списке</span>
+                    ) : (
+                      <span className="badge" style={{ marginLeft: 10, opacity: 0.8 }}>Защищен лимитами</span>
+                    )}
+                  </div>
+                </div>
+                {myIP && !myIP.whitelisted && (
+                  <button
+                    type="button"
+                    className="button small primary"
+                    onClick={handleWhitelistMyIP}
+                  >
+                    + Добавить мой IP в Whitelist
+                  </button>
+                )}
+              </div>
+
+              {/* Active Bans Section */}
+              <div className="security-sub-section">
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+                  <h3 style={{ margin: 0, fontSize: '15px' }}>🚫 Активные блокировки Fail2ban ({bans.length})</h3>
+                  <button type="button" className="button small secondary" onClick={loadIPSecurity} disabled={ipBusy}>
+                    {ipBusy ? 'Обновление…' : '↻ Обновить'}
+                  </button>
+                </div>
+                <p className="muted" style={{ fontSize: '0.8rem', margin: '0 0 10px' }}>
+                  IP-адреса, превысившие 5 неудачных попыток входа за 10 минут (бан на 15 минут).
+                </p>
+
+                {bans.length === 0 ? (
+                  <div className="empty-state-box">
+                    <span>🛡️ Нет заблокированных IP-адресов. Все входящие запросы в норме.</span>
+                  </div>
+                ) : (
+                  <div className="table-wrapper">
+                    <table className="table">
+                      <thead>
+                        <tr>
+                          <th>IP адрес</th>
+                          <th>Попыток</th>
+                          <th>Последняя попытка</th>
+                          <th>Заблокирован до</th>
+                          <th>Действие</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {bans.map((b) => (
+                          <tr key={b.ip}>
+                            <td><code>{b.ip}</code></td>
+                            <td><span className="badge badge-danger">{b.failedAttempts}</span></td>
+                            <td className="muted" style={{ fontSize: '0.8rem' }}>
+                              {new Date(b.lastFailedAt).toLocaleTimeString()}
+                            </td>
+                            <td>
+                              <strong style={{ color: 'var(--danger)' }}>
+                                {b.bannedUntil ? new Date(b.bannedUntil).toLocaleTimeString() : '—'}
+                              </strong>
+                            </td>
+                            <td>
+                              <button
+                                type="button"
+                                className="button small"
+                                onClick={() => handleUnban(b.ip)}
+                                disabled={ipBusy}
+                              >
+                                Разблокировать
+                              </button>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </div>
+
+              {/* Whitelist Section */}
+              <div className="security-sub-section" style={{ marginTop: 24, paddingTop: 18, borderTop: '1px solid var(--border)' }}>
+                <h3 style={{ margin: '0 0 4px', fontSize: '15px' }}>🛡️ Белый список IP / Подсетей (Whitelist)</h3>
+                <p className="muted" style={{ fontSize: '0.8rem', margin: '0 0 12px' }}>
+                  Адреса и диапазоны CIDR из белого списка никогда не блокируются и не получают задержек при входе.
+                </p>
+
+                <form onSubmit={handleAddWhitelist} className="whitelist-add-form">
+                  <input
+                    type="text"
+                    placeholder="IP или CIDR (напр. 198.51.100.42 или 192.168.1.0/24)"
+                    value={newWhitelistIP}
+                    onChange={(e) => setNewWhitelistIP(e.target.value)}
+                    required
+                    style={{ flex: 2 }}
+                  />
+                  <input
+                    type="text"
+                    placeholder="Описание (напр. Домашний VPN)"
+                    value={newWhitelistDesc}
+                    onChange={(e) => setNewWhitelistDesc(e.target.value)}
+                    style={{ flex: 2 }}
+                  />
+                  <button type="submit" className="button primary" disabled={ipBusy || !newWhitelistIP.trim()}>
+                    + Добавить
+                  </button>
+                </form>
+
+                <div className="table-wrapper" style={{ marginTop: 12 }}>
+                  <table className="table">
+                    <thead>
+                      <tr>
+                        <th>IP / CIDR</th>
+                        <th>Описание</th>
+                        <th>Кем добавлен</th>
+                        <th>Дата</th>
+                        <th></th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {whitelist.map((w) => {
+                        const isLoopback = w.ipOrCidr === '127.0.0.1/32' || w.ipOrCidr === '::1/128';
+                        return (
+                          <tr key={w.id}>
+                            <td><code>{w.ipOrCidr}</code></td>
+                            <td>{w.description || <span className="muted">—</span>}</td>
+                            <td className="muted" style={{ fontSize: '0.8rem' }}>{w.createdBy}</td>
+                            <td className="muted" style={{ fontSize: '0.8rem' }}>
+                              {new Date(w.createdAt).toLocaleDateString()}
+                            </td>
+                            <td style={{ textAlign: 'right' }}>
+                              {!isLoopback ? (
+                                <button
+                                  type="button"
+                                  className="button small danger"
+                                  onClick={() => handleRemoveWhitelist(w.id, w.ipOrCidr)}
+                                  disabled={ipBusy}
+                                  title="Удалить из белого списка"
+                                >
+                                  ✕
+                                </button>
+                              ) : (
+                                <span className="muted" style={{ fontSize: '0.75rem' }}>системный</span>
+                              )}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
             </div>
           )}
         </div>

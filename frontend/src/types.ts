@@ -28,6 +28,29 @@ export interface LoginResponse {
   requires2fa?: boolean;
 }
 
+export interface IPBan {
+  ip: string;
+  failedAttempts: number;
+  firstFailedAt: string;
+  lastFailedAt: string;
+  bannedUntil: string | null;
+  reason: string;
+  createdAt: string;
+}
+
+export interface WhitelistEntry {
+  id: number;
+  ipOrCidr: string;
+  description: string;
+  createdBy: string;
+  createdAt: string;
+}
+
+export interface MyIPResponse {
+  ip: string;
+  whitelisted: boolean;
+}
+
 export interface UserSettings {
   userId: string;
   language: 'ru' | 'en';

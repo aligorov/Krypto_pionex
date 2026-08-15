@@ -77,6 +77,13 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /api/auth/2fa/enable", s.withSession(http.HandlerFunc(s.enable2FA)))
 	mux.Handle("POST /api/auth/2fa/disable", s.withSession(http.HandlerFunc(s.disable2FA)))
 
+	mux.Handle("GET /api/security/bans", s.withRole(auth.RoleAdmin, http.HandlerFunc(s.listIPBans)))
+	mux.Handle("DELETE /api/security/bans/{ip}", s.withRole(auth.RoleAdmin, http.HandlerFunc(s.unbanIP)))
+	mux.Handle("GET /api/security/whitelist", s.withRole(auth.RoleAdmin, http.HandlerFunc(s.listWhitelist)))
+	mux.Handle("POST /api/security/whitelist", s.withRole(auth.RoleAdmin, http.HandlerFunc(s.addWhitelist)))
+	mux.Handle("DELETE /api/security/whitelist/{id}", s.withRole(auth.RoleAdmin, http.HandlerFunc(s.removeWhitelist)))
+	mux.Handle("GET /api/security/my-ip", s.withSession(http.HandlerFunc(s.myIP)))
+
 	mux.Handle("GET /api/dashboard", s.withSession(http.HandlerFunc(s.dashboard)))
 	mux.Handle("GET /api/users", s.withRole(auth.RoleAdmin, http.HandlerFunc(s.listUsers)))
 	mux.Handle("POST /api/users", s.withRole(auth.RoleAdmin, http.HandlerFunc(s.createUser)))
@@ -163,6 +170,19 @@ func (s *Server) bootstrapStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) login(w http.ResponseWriter, r *http.Request) {
+	clientIP := requestIP(r)
+	if banned, until, _ := s.auth.Fail2Ban().CheckIP(r.Context(), clientIP); banned {
+		retryAfterSec := int(time.Until(until).Seconds())
+		if retryAfterSec < 1 {
+			retryAfterSec = 1
+		}
+		w.Header().Set("Retry-After", strconv.Itoa(retryAfterSec))
+		writeJSON(w, http.StatusTooManyRequests, map[string]string{
+			"error": fmt.Sprintf("Слишком много неудачных попыток. IP %s заблокирован до %s.", clientIP, until.Format("15:04:05")),
+		})
+		return
+	}
+
 	var input struct {
 		Username string `json:"username"`
 		Password string `json:"password"`
@@ -179,6 +199,15 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
+		banned, until, _ := s.auth.Fail2Ban().RecordFailure(r.Context(), clientIP, input.Username, err.Error())
+		if banned {
+			retryAfterSec := int(time.Until(until).Seconds())
+			w.Header().Set("Retry-After", strconv.Itoa(retryAfterSec))
+			writeJSON(w, http.StatusTooManyRequests, map[string]string{
+				"error": fmt.Sprintf("Превышен лимит попыток. IP %s заблокирован на 15 минут.", clientIP),
+			})
+			return
+		}
 		status := http.StatusUnauthorized
 		if errors.Is(err, auth.ErrAccountLocked) {
 			status = http.StatusLocked
@@ -187,8 +216,9 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, status, map[string]string{"error": err.Error()})
 		return
 	}
+	_ = s.auth.Fail2Ban().RecordSuccess(r.Context(), clientIP)
 	sessionToken, csrfToken, expiresAt, err := s.auth.CreateSession(
-		r.Context(), user.ID, requestIP(r), r.UserAgent(),
+		r.Context(), user.ID, clientIP, r.UserAgent(),
 	)
 	if err != nil {
 		s.fail(w, r, err)
@@ -389,6 +419,78 @@ func (s *Server) disable2FA(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.auditMutation(r, "user.2fa.disable", "user", principal.UserID, nil)
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (s *Server) myIP(w http.ResponseWriter, r *http.Request) {
+	ip := requestIP(r)
+	ipStr := ""
+	if ip != nil {
+		ipStr = ip.String()
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ip":          ipStr,
+		"whitelisted": s.auth.Fail2Ban().IsWhitelisted(ip),
+	})
+}
+
+func (s *Server) listIPBans(w http.ResponseWriter, r *http.Request) {
+	bans, err := s.auth.Fail2Ban().ListBans(r.Context())
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, bans)
+}
+
+func (s *Server) unbanIP(w http.ResponseWriter, r *http.Request) {
+	ip := r.PathValue("ip")
+	if err := s.auth.Fail2Ban().UnbanIP(r.Context(), ip); err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	s.auditMutation(r, "security.ip.unban", "ip_ban", ip, nil)
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (s *Server) listWhitelist(w http.ResponseWriter, r *http.Request) {
+	list, err := s.auth.Fail2Ban().ListWhitelist(r.Context())
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, list)
+}
+
+func (s *Server) addWhitelist(w http.ResponseWriter, r *http.Request) {
+	principal := principalFromContext(r.Context())
+	var input struct {
+		IPOrCIDR    string `json:"ipOrCidr"`
+		Description string `json:"description"`
+	}
+	if !decodeJSON(w, r, &input) {
+		return
+	}
+	if err := s.auth.Fail2Ban().AddWhitelist(r.Context(), input.IPOrCIDR, input.Description, principal.Username); err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	s.auditMutation(r, "security.whitelist.add", "whitelist", input.IPOrCIDR, nil)
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (s *Server) removeWhitelist(w http.ResponseWriter, r *http.Request) {
+	idStr := r.PathValue("id")
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid whitelist entry ID"})
+		return
+	}
+	if err := s.auth.Fail2Ban().RemoveWhitelist(r.Context(), id); err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	s.auditMutation(r, "security.whitelist.remove", "whitelist", idStr, nil)
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -1096,11 +1198,7 @@ func requestSecure(r *http.Request) bool {
 }
 
 func requestIP(r *http.Request) net.IP {
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		host = r.RemoteAddr
-	}
-	return net.ParseIP(host)
+	return auth.ExtractClientIP(r)
 }
 
 func queryLimit(r *http.Request, fallback int) int {
