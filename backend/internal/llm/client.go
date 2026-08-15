@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -72,7 +73,7 @@ func (c *Client) callGemini(
 	if baseURL == "" {
 		baseURL = "https://generativelanguage.googleapis.com/v1beta"
 	}
-	endpoint := fmt.Sprintf("%s/models/%s:generateContent?key=%s", baseURL, model, settings.APIKey)
+	endpoint := fmt.Sprintf("%s/models/%s:generateContent?key=%s", baseURL, url.PathEscape(model), url.QueryEscape(settings.APIKey))
 
 	type part struct {
 		Text string `json:"text"`
@@ -355,7 +356,7 @@ func (c *Client) ListAvailableModels(ctx context.Context, settings Settings) ([]
 		if baseURL == "" {
 			baseURL = "https://generativelanguage.googleapis.com/v1beta"
 		}
-		endpoint := fmt.Sprintf("%s/models?key=%s", baseURL, settings.APIKey)
+		endpoint := fmt.Sprintf("%s/models?key=%s", baseURL, url.QueryEscape(settings.APIKey))
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 		if err != nil {
 			return nil, err
