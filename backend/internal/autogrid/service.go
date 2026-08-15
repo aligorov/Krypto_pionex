@@ -1281,20 +1281,61 @@ func clampDecimal(value, minimum, maximum decimal.Decimal) decimal.Decimal {
 }
 
 // AIKitProposal returns the native AI Kit strategy plus an adapted futures
-// range proposal centered on the live PERP price.
+// range proposal centered on the live PERP price. If Pionex AI Kit returns
+// BOT_INTERNAL_ERROR (common on altcoins/perp-only tokens), it falls back
+// to our quantitative ATR + Support/Resistance grid model.
 func (s *Service) AIKitProposal(
 	ctx context.Context,
 	accountService *accounts.Service,
 	symbol string,
 ) (*pionex.SpotGridAIStrategy, decimal.Decimal, decimal.Decimal, error) {
 	strategy, err := s.AIKitStrategy(ctx, accountService, symbol)
-	if err != nil {
-		return nil, decimal.Zero, decimal.Zero, err
+	price, priceErr := s.perpPrice(ctx, symbol)
+	if priceErr != nil {
+		return nil, decimal.Zero, decimal.Zero, priceErr
 	}
-	price, err := s.perpPrice(ctx, symbol)
+
 	if err != nil {
-		return nil, decimal.Zero, decimal.Zero, err
+		// Fallback: calculate quantitative ATR & Support/Resistance proposal
+		candles, kErr := s.publicAPI.GetKlines(ctx, symbol, "15M", 192)
+		if kErr != nil || len(candles) < 20 {
+			return nil, decimal.Zero, decimal.Zero, fmt.Errorf("AI Kit недоступен на Pionex для %s (токен без спотовой AI-модели)", symbol)
+		}
+		regime := marketdata.DetectRegime(candles)
+		windowLow, windowHigh := math.MaxFloat64, 0.0
+		for _, c := range candles {
+			l, _ := c.Low.Float64()
+			h, _ := c.High.Float64()
+			windowLow = math.Min(windowLow, l)
+			windowHigh = math.Max(windowHigh, h)
+		}
+		curPrice, _ := price.Float64()
+		halfBand := math.Max(regime.ParkinsonVolatility, 2.0) / 200
+		volLower := curPrice * (1 - halfBand)
+		volUpper := curPrice * (1 + halfBand)
+		atrBuffer := curPrice * (math.Max(regime.ATRPct, 0.5) / 100) * 0.5
+		lowBound := math.Max(windowLow-atrBuffer, volLower)
+		highBound := math.Min(windowHigh+atrBuffer, volUpper)
+		if !(lowBound < curPrice && curPrice < highBound && lowBound > 0) {
+			lowBound, highBound = volLower, volUpper
+		}
+		gridNum := int(math.Round((highBound - lowBound) / (curPrice * (math.Max(regime.ATRPct, 0.3) / 100))))
+		if gridNum < 15 {
+			gridNum = 20
+		} else if gridNum > 150 {
+			gridNum = 150
+		}
+		fallbackStrategy := &pionex.SpotGridAIStrategy{
+			StrategyID:  "local-sr-atr-model",
+			High:        decimal.NewFromFloat(highBound),
+			Low:         decimal.NewFromFloat(lowBound),
+			GridCount:   gridNum,
+			Annualized:  decimal.NewFromFloat(regime.ParkinsonVolatility * 2.5),
+			MaxDrawDown: decimal.NewFromFloat(regime.ATRPct * 0.5),
+		}
+		return fallbackStrategy, fallbackStrategy.Low, fallbackStrategy.High, nil
 	}
+
 	lower, upper := AIAdaptedRange(strategy.High, strategy.Low, price)
 	return strategy, lower, upper, nil
 }
