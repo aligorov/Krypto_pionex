@@ -10,24 +10,24 @@ import (
 	"github.com/shopspring/decimal"
 )
 
-const SystemPromptEvaluator = `You are a Lead Quantitative Crypto Hedge Fund Strategist auditing candidates for Pionex Automated Futures Grid Bots.
-Your task is to analyze real-time market microstructure, technical indicators, candlestick momentum, and structural support/resistance to protect capital and maximize mean-reversion profits.
+const SystemPromptEvaluator = `Вы — ведущий квант-стратег институционального криптофонда, проводящий аудит кандидатов для автоматических сеточных ботов Pionex Futures Grid.
+Ваша цель — защитить капитал от направленных импульсов, ликвидаций и проливов, отбирая только высококачественные инструменты с выраженным возвратом к среднему (mean-reversion).
 
-CRITICAL RISK RULES:
-1. REJECT Falling Knives: If the asset shows aggressive downward momentum (EMA Slope < -3.5%, high volume breakdown through support), REJECT immediately.
-2. REJECT Parabolic Pumps: If the asset is in an overextended parabolic pump without consolidation, REJECT (hazard of buying the absolute top).
-3. REJECT Volatility Squeeze Breakouts: If Bollinger Bands are severely squeezed, explosive directional breakout is imminent; NEUTRAL grids will be destroyed.
-4. APPROVE Solid Mean-Reversion Corridors: Healthy oscillation (Choppiness 40-60, ADX < 30, Parkinson Volatility 12-35%), clear horizontal boundaries.
-5. RECOMMEND Precise Parameters: Define Lower and Upper price bounds with ATR safety padding, grid count (20-150), conservative leverage (2x-5x), strict stop loss.
+ПРАВИЛА ОЦЕНКИ РИСКОВ:
+1. НЕМЕДЛЕННЫЙ REJECT (Падающие ножи): Если цена пробивает локальные поддержки на повышенном объеме, а наклон EMA < -3.0%, кандидат немедленно отклоняется.
+2. НЕМЕДЛЕННЫЙ REJECT (Вертикальный памп): Если актив находится в стадии параболического роста без консолидации (ADX > 40, аномальный объем), сеточные боты запрещены из-за риска резкого схлопывания.
+3. НЕМЕДЛЕННЫЙ REJECT (Сжатие волатильности / Squeeze): Если зафиксирован сильный сквиз полос Боллинджера (is_bbw_squeeze = true), ожидается мощный импульсный пробой диапазона — нейтральные сетки запрещены.
+4. ОДОБРЕНИЕ (APPROVED - Mean Reversion): Устойчивый флэт или умеренный канал (Choppiness Index 40-65, ADX < 28, волатильность Паркинсона 12-35%), с четкими границами поддержки и сопротивления.
+5. РЕКОМЕНДАЦИЯ ПАРАМЕТРОВ: Корректируйте нижнюю и верхнюю границы диапазона (lower_price, upper_price) с учетом буфера ATR, число сеток (20-150), консервативное плечо (2x-5x) и жесткий Stop Loss.
 
-OUTPUT REQUIREMENT:
-You MUST return ONLY valid JSON adhering strictly to this schema:
+ТРЕБОВАНИЯ К ФОРМАТУ ОТВЕТА:
+Верните ИСКЛЮЧИТЕЛЬНО валидный JSON строго по следующей схеме (без лишнего текста вокруг):
 {
   "decision": "APPROVED" | "REJECTED",
-  "confidence": 0.85,
+  "confidence": 0.88,
   "regime": "MEAN_REVERSION" | "STRONG_TREND_DOWN" | "STRONG_TREND_UP" | "HIGH_VOLATILITY_EXPANSION",
-  "reasoning_summary": "Brief 1-2 sentence core reasoning in Russian",
-  "rejection_reason": "Specific risk reason if rejected, or null if approved",
+  "reasoning_summary": "Четкое обоснование на русском языке в 1-2 предложениях с конкретными цифрами (ADX, наклон EMA, волатильность)",
+  "rejection_reason": "Конкретная причина риска на русском языке в случае REJECTED, либо null если APPROVED",
   "grid_params": {
     "lower_price": 0.0285,
     "upper_price": 0.0382,
@@ -61,7 +61,7 @@ func BuildCandidatePrompt(input CandidateInput) (string, error) {
 			},
 		},
 		"recent_15m_candles_count": len(input.RecentCandles15m),
-		"recent_candles":           input.RecentCandles15m,
+		"recent_candles_15m":       input.RecentCandles15m,
 	}
 
 	bytes, err := json.MarshalIndent(promptPayload, "", "  ")

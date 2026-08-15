@@ -108,8 +108,8 @@ func (s *Service) TestConnection(ctx context.Context, settings Settings) (string
 		return "", 0, errors.New("API-ключ не заполнен")
 	}
 
-	testPrompt := "Respond ONLY with valid JSON: {\"status\": \"ok\", \"model\": \"" + settings.Model + "\", \"timestamp\": " + fmt.Sprintf("%d", time.Now().Unix()) + "}"
-	rawResp, latencyMs, err := s.client.ExecutePrompt(ctx, settings, "You are a quantitative API tester. Return valid JSON only.", testPrompt)
+	testPrompt := fmt.Sprintf(`{"action": "ping", "provider": "%s", "model": "%s", "timestamp": %d}. Return ONLY valid JSON: {"status": "ok", "message": "API connection verified", "model": "%s"}`, settings.Provider, settings.Model, time.Now().Unix(), settings.Model)
+	rawResp, latencyMs, err := s.client.ExecutePrompt(ctx, settings, "You are a quantitative API tester. Return strictly valid JSON with no markdown.", testPrompt)
 	if err != nil {
 		return "", latencyMs, err
 	}
