@@ -10,9 +10,9 @@ interface Props {
 const MODEL_PRESETS: Record<string, string[]> = {
   gemini: [
     'gemini-2.0-flash',
-    'gemini-2.5-flash',
-    'gemini-2.0-flash-thinking-exp-01-21',
+    'gemini-2.0-flash-lite',
     'gemini-2.0-pro-exp-02-05',
+    'gemini-1.5-flash',
     'gemini-1.5-pro',
   ],
   anthropic: [
