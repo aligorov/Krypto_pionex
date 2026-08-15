@@ -2,15 +2,19 @@ services:
   postgres:
     image: postgres:16-alpine
     container_name: pionex_postgres
+    restart: unless-stopped
     environment:
       POSTGRES_USER: pionex
       POSTGRES_PASSWORD: pionex_password
       POSTGRES_DB: pionex_bot
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./migrations:/docker-entrypoint-initdb.d
+    networks:
+      - default
+      - crypto_bot_net
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U pionex -d pionex_bot"]
       interval: 5s
@@ -22,13 +26,17 @@ services:
       context: .
       dockerfile: docker/Dockerfile.backend
     container_name: pionex_backend
+    restart: unless-stopped
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     environment:
-      DATABASE_URL: postgres://pionex:pionex_password@postgres:5432/pionex_bot?sslmode=disable
+      DATABASE_URL: postgres://pionex:pionex_password@pionex_postgres:5432/pionex_bot?sslmode=disable
     depends_on:
       postgres:
         condition: service_healthy
+    networks:
+      - default
+      - crypto_bot_net
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:8080/ready"]
       interval: 10s
@@ -41,11 +49,20 @@ services:
       context: .
       dockerfile: docker/Dockerfile.quant
     container_name: pionex_quant
+    restart: unless-stopped
     environment:
-      DATABASE_URL: postgres://pionex:pionex_password@postgres:5432/pionex_bot?sslmode=disable
+      DATABASE_URL: postgres://pionex:pionex_password@pionex_postgres:5432/pionex_bot?sslmode=disable
     depends_on:
       postgres:
         condition: service_healthy
+    networks:
+      - default
+      - crypto_bot_net
 
 volumes:
   postgres_data:
+
+networks:
+  crypto_bot_net:
+    external: true
+    name: crypto-bot_bot-network
