@@ -525,7 +525,11 @@ func (worker *Worker) deployReal(
 		return err
 	}
 	if settings.AccountID == nil {
-		return errors.New("REAL AutoGrid account is missing")
+		resolved, err := worker.service.resolveAccount(ctx)
+		if err != nil {
+			return fmt.Errorf("REAL AutoGrid account is missing: %w", err)
+		}
+		settings.AccountID = resolved
 	}
 	client, err := worker.service.PrivateClient(ctx, worker.accounts, *settings.AccountID)
 	if err != nil {

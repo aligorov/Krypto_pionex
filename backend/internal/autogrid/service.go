@@ -720,6 +720,9 @@ func (s *Service) validateSettings(
 		input.SlippageBps.IsNegative() {
 		return errors.New("invalid scanner risk thresholds")
 	}
+	if input.PnLTargetMode == "" {
+		input.PnLTargetMode = "DYNAMIC"
+	}
 	if input.PnLTargetMode != "FIXED" && input.PnLTargetMode != "DYNAMIC" {
 		return errors.New("PnL target mode must be DYNAMIC or FIXED")
 	}
