@@ -118,6 +118,7 @@ export const CandlestickChart: React.FC<CandlestickChartProps> = ({
     });
     candleSeriesRef.current = candleSeries;
 
+    // Draw Upper Bound
     if (upperPrice && upperPrice > 0) {
       candleSeries.createPriceLine({
         price: upperPrice,
@@ -125,10 +126,11 @@ export const CandlestickChart: React.FC<CandlestickChartProps> = ({
         lineWidth: 2,
         lineStyle: LineStyle.Dashed,
         axisLabelVisible: true,
-        title: `ВЕРХ (${upperPrice})`,
+        title: `ВЕРХ [${upperPrice}]`,
       });
     }
 
+    // Draw Lower Bound
     if (lowerPrice && lowerPrice > 0) {
       candleSeries.createPriceLine({
         price: lowerPrice,
@@ -136,10 +138,11 @@ export const CandlestickChart: React.FC<CandlestickChartProps> = ({
         lineWidth: 2,
         lineStyle: LineStyle.Dashed,
         axisLabelVisible: true,
-        title: `НИЗ (${lowerPrice})`,
+        title: `НИЗ [${lowerPrice}]`,
       });
     }
 
+    // Draw Stop Loss
     if (stopLoss && stopLoss > 0) {
       candleSeries.createPriceLine({
         price: stopLoss,
@@ -147,10 +150,11 @@ export const CandlestickChart: React.FC<CandlestickChartProps> = ({
         lineWidth: 2,
         lineStyle: LineStyle.Solid,
         axisLabelVisible: true,
-        title: `СТОП (${stopLoss})`,
+        title: `СТОП-ЛОСС [${stopLoss}]`,
       });
     }
 
+    // Draw Current Price Line
     if (currentPrice && currentPrice > 0) {
       candleSeries.createPriceLine({
         price: currentPrice,
@@ -158,25 +162,40 @@ export const CandlestickChart: React.FC<CandlestickChartProps> = ({
         lineWidth: 1,
         lineStyle: LineStyle.Solid,
         axisLabelVisible: true,
-        title: `ТЕКУЩАЯ (${currentPrice})`,
+        title: `ТЕКУЩАЯ [${currentPrice}]`,
       });
     }
 
+    // Generate and Draw Full Grid Levels Ladder
+    const effectiveGridCount = gridCount && gridCount >= 2 ? gridCount : 20;
+    const computedLevels: GridLevel[] = [];
+
     if (gridLevels && gridLevels.length > 0) {
-      const step = Math.max(1, Math.floor(gridLevels.length / 15));
-      gridLevels.forEach((lvl, idx) => {
-        if (idx % step === 0) {
-          candleSeries.createPriceLine({
-            price: lvl.price,
-            color: lvl.side === 'buy' ? 'rgba(16, 185, 129, 0.4)' : 'rgba(239, 68, 68, 0.4)',
-            lineWidth: 1,
-            lineStyle: LineStyle.Dotted,
-            axisLabelVisible: false,
-            title: lvl.side === 'buy' ? 'BUY' : 'SELL',
-          });
-        }
-      });
+      computedLevels.push(...gridLevels);
+    } else if (lowerPrice && upperPrice && upperPrice > lowerPrice) {
+      const ratio = Math.pow(upperPrice / lowerPrice, 1 / effectiveGridCount);
+      const mid = currentPrice && currentPrice > 0 ? currentPrice : (lowerPrice + upperPrice) / 2;
+
+      for (let i = 1; i < effectiveGridCount; i++) {
+        const lvlPrice = lowerPrice * Math.pow(ratio, i);
+        computedLevels.push({
+          price: lvlPrice,
+          side: lvlPrice <= mid ? 'buy' : 'sell',
+        });
+      }
     }
+
+    // Draw all intermediate grid levels
+    computedLevels.forEach((lvl) => {
+      candleSeries.createPriceLine({
+        price: lvl.price,
+        color: lvl.side === 'buy' ? 'rgba(34, 197, 94, 0.7)' : 'rgba(244, 63, 94, 0.7)',
+        lineWidth: 1,
+        lineStyle: LineStyle.Dotted,
+        axisLabelVisible: true,
+        title: lvl.side === 'buy' ? 'BUY' : 'SELL',
+      });
+    });
 
     const handleResize = () => {
       if (chartContainerRef.current && chartRef.current) {
@@ -195,7 +214,7 @@ export const CandlestickChart: React.FC<CandlestickChartProps> = ({
       window.removeEventListener('resize', handleResize);
       chart.remove();
     };
-  }, [symbol, interval, lowerPrice, upperPrice, stopLoss, currentPrice]);
+  }, [symbol, interval, lowerPrice, upperPrice, stopLoss, currentPrice, gridCount, gridLevels]);
 
   return (
     <div style={{
@@ -232,7 +251,7 @@ export const CandlestickChart: React.FC<CandlestickChartProps> = ({
           </span>
           {gridCount && (
             <span style={{ fontSize: '12px', color: '#64748b' }}>
-              • {gridCount} уровней
+              • {gridCount} уровней сетки
             </span>
           )}
           {lastCandle && (
@@ -331,20 +350,20 @@ export const CandlestickChart: React.FC<CandlestickChartProps> = ({
         borderTop: '1px solid #1e293b',
         backgroundColor: '#090d16',
         fontSize: '11px',
-        color: '#64748b',
+        color: '#94a3b8',
         flexWrap: 'wrap',
       }}>
         <span style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
           <span style={{ display: 'inline-block', width: '10px', height: '2px', backgroundColor: '#f59e0b' }}></span>
-          Границы сетки ({lowerPrice || '—'} – {upperPrice || '—'})
+          Границы ({lowerPrice || '—'} – {upperPrice || '—'})
         </span>
         <span style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
-          <span style={{ display: 'inline-block', width: '10px', height: '2px', backgroundColor: '#10b981' }}></span>
-          Buy уровни
+          <span style={{ display: 'inline-block', width: '10px', height: '2px', backgroundColor: '#22c55e' }}></span>
+          🟢 Buy ордера сетки
         </span>
         <span style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
-          <span style={{ display: 'inline-block', width: '10px', height: '2px', backgroundColor: '#ef4444' }}></span>
-          Sell уровни
+          <span style={{ display: 'inline-block', width: '10px', height: '2px', backgroundColor: '#f43f5e' }}></span>
+          🔴 Sell ордера сетки
         </span>
         {stopLoss && (
           <span style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
