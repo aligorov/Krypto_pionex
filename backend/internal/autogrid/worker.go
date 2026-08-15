@@ -432,7 +432,7 @@ func (worker *Worker) deployPaper(
 			  AND stopped_at > NOW() - INTERVAL '1 hour'
 		) recent_stops
 	`, settings.ID).Scan(&recentStopLossCount); err == nil && recentStopLossCount >= 3 {
-		log.Printf("[PORTFOLIO_CIRCUIT_BREAKER] %d stop-losses occurred in the last 1h; holding new deployments", recentStopLossCount)
+		worker.logger.Warn("Portfolio circuit breaker: recent stop-losses holding new deployments", "recentStopLossCount", recentStopLossCount)
 		return nil
 	}
 	for _, candidate := range candidates {
@@ -555,7 +555,7 @@ func (worker *Worker) deployReal(
 		  AND closed_reason IN ('STOP_LOSS', 'STOP_LOSS_NATIVE', 'loss_stop')
 		  AND stopped_at > NOW() - INTERVAL '1 hour'
 	`).Scan(&recentStopLossCountReal); err == nil && recentStopLossCountReal >= 3 {
-		log.Printf("[PORTFOLIO_CIRCUIT_BREAKER] %d real stop-losses occurred in the last 1h; holding new deployments", recentStopLossCountReal)
+		worker.logger.Warn("Portfolio circuit breaker: recent real stop-losses holding new deployments", "recentStopLossCountReal", recentStopLossCountReal)
 		return nil
 	}
 	deployErrors := make([]string, 0)
@@ -1436,20 +1436,20 @@ func (worker *Worker) enrichAndAuditCandidatesWithLLM(
 			ProposedLeverage:    candidate.RecommendedLeverage,
 			RecentCandles15m:    candleSummaries,
 		}
-		if assumptions, ok := candidate.ModelAssumptions.(map[string]any); ok {
-			if v, ok := assumptions["adx"].(float64); ok {
+		if candidate.ModelAssumptions != nil {
+			if v, ok := candidate.ModelAssumptions["adx"].(float64); ok {
 				input.ADX = v
 			}
-			if v, ok := assumptions["atrPct"].(float64); ok {
+			if v, ok := candidate.ModelAssumptions["atrPct"].(float64); ok {
 				input.ATRPct = v
 			}
-			if v, ok := assumptions["choppiness"].(float64); ok {
+			if v, ok := candidate.ModelAssumptions["choppiness"].(float64); ok {
 				input.Choppiness = v
 			}
-			if v, ok := assumptions["emaSlopePct"].(float64); ok {
+			if v, ok := candidate.ModelAssumptions["emaSlopePct"].(float64); ok {
 				input.EMASlopePct = v
 			}
-			if v, ok := assumptions["isSqueeze"].(bool); ok {
+			if v, ok := candidate.ModelAssumptions["isSqueeze"].(bool); ok {
 				input.IsSqueeze = v
 			}
 		}

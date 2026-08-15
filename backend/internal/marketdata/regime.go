@@ -20,6 +20,7 @@ type RegimeResult struct {
 	EMASlopePct      float64 `json:"emaSlopePct"`      // EMA20 slope over ~10 candles, %
 	RangePositionPct float64 `json:"rangePositionPct"` // 0 = at window low, 100 = at window high
 	ATRPct           float64 `json:"atrPct"`           // ATR(14) / price * 100
+	ParkinsonVolatility float64 `json:"parkinsonVolatility"` // Parkinson intra-candle volatility %
 }
 
 const (
@@ -87,6 +88,7 @@ func DetectRegime(candles []pionex.KlineCandle) RegimeResult {
 	if result.Regime != "RANGE" && (result.ADX < adxTrendThreshold || result.Choppiness > 45.0) {
 		result.Regime = "RANGE"
 	}
+	result.ParkinsonVolatility = parkinsonVolatility(candles, 96.0)
 	return result
 }
 

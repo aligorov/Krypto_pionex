@@ -105,6 +105,7 @@ func main() {
 		accountService := accounts.NewService(dbPool)
 		riskEngine := risk.NewEngine(dbPool)
 		autoService := autogrid.NewService(dbPool, riskEngine)
+		llmService := llm.NewService(dbPool, logger)
 		auditStore := audit.NewStore(dbPool)
 		logStore := observability.NewStore(dbPool)
 
