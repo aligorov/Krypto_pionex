@@ -73,10 +73,13 @@ func DetectRegime(candles []pionex.KlineCandle) RegimeResult {
 	}
 
 	// Oscillation overrides:
-	// 1. A high Choppiness Index (>58) confirms a consolidating market.
-	// 2. Midline crossings (>=3) confirm choppy oscillation around the midpoint.
-	if result.Choppiness >= chopRangeThreshold || midlineCrossings(candles) >= 3 {
-		result.Regime = "RANGE"
+	// Only override to RANGE if ADX is not in a strong trending state (< 32.0)
+	// and Choppiness is not in extreme trending territory (> 38.2).
+	isStrongTrend := result.ADX > 32.0 || result.Choppiness < 38.2
+	if !isStrongTrend {
+		if result.Choppiness >= chopRangeThreshold || midlineCrossings(candles) >= 3 {
+			result.Regime = "RANGE"
+		}
 	}
 
 	// A strong ADX or low Choppiness reading is required to commit a directional grid;
@@ -167,9 +170,14 @@ func midlineCrossings(candles []pionex.KlineCandle) int {
 	if len(candles) < 10 {
 		return 0
 	}
-	low, _ := candles[0].Low.Float64()
-	high, _ := candles[0].High.Float64()
-	for _, candle := range candles[1:] {
+	start := 0
+	if len(candles) > 36 {
+		start = len(candles) - 36
+	}
+	recent := candles[start:]
+	low, _ := recent[0].Low.Float64()
+	high, _ := recent[0].High.Float64()
+	for _, candle := range recent[1:] {
 		candleLow, _ := candle.Low.Float64()
 		candleHigh, _ := candle.High.Float64()
 		low = math.Min(low, candleLow)
@@ -182,7 +190,7 @@ func midlineCrossings(candles []pionex.KlineCandle) int {
 	crossings := 0
 	above := false
 	initialized := false
-	for _, candle := range candles {
+	for _, candle := range recent {
 		closePrice, _ := candle.Close.Float64()
 		currentlyAbove := closePrice > midline
 		if initialized && currentlyAbove != above {

@@ -434,6 +434,19 @@ func (worker *Worker) deployPaper(
 		if tag.RowsAffected() > 0 || activeCount >= settings.MaxActiveBots {
 			continue
 		}
+		// Cooldown check: do not reopen a symbol if it stopped out within 2 hours
+		var recentlyStopped bool
+		if err := worker.db.QueryRow(ctx, `
+			SELECT EXISTS (
+				SELECT 1 FROM paper_grid_bots
+				WHERE settings_id = $1 AND symbol = $2
+				  AND status = 'COMPLETED'
+				  AND closed_reason IN ('STOP_LOSS', 'STOP_LOSS_NATIVE')
+				  AND closed_at > NOW() - INTERVAL '2 hours'
+			)
+		`, settings.ID, candidate.Symbol).Scan(&recentlyStopped); err == nil && recentlyStopped {
+			continue
+		}
 		target, maxLoss := computeBotTargets(settings, candidate)
 		lev := candidate.RecommendedLeverage
 		if lev < 2 && settings.Leverage >= 2 {
@@ -525,6 +538,19 @@ func (worker *Worker) deployReal(
 			return fmt.Errorf("check duplicate real grid: %w", err)
 		}
 		if exists {
+			continue
+		}
+		// Cooldown check: do not reopen a symbol if it stopped out within 2 hours
+		var recentlyStoppedReal bool
+		if err := worker.db.QueryRow(ctx, `
+			SELECT EXISTS (
+				SELECT 1 FROM grid_bots
+				WHERE account_id = $1 AND symbol = $2
+				  AND status = 'STOPPED'
+				  AND closed_reason IN ('STOP_LOSS', 'STOP_LOSS_NATIVE', 'loss_stop')
+				  AND stopped_at > NOW() - INTERVAL '2 hours'
+			)
+		`, *settings.AccountID, candidate.Symbol).Scan(&recentlyStoppedReal); err == nil && recentlyStoppedReal {
 			continue
 		}
 		realLev := candidate.RecommendedLeverage
