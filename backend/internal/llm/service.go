@@ -1,0 +1,248 @@
+package llm
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/shopspring/decimal"
+)
+
+// Service provides high-level LLM operations and persistence.
+type Service struct {
+	db     *pgxpool.Pool
+	client *Client
+	logger *slog.Logger
+}
+
+// NewService instantiates a new LLM Service.
+func NewService(db *pgxpool.Pool, logger *slog.Logger) *Service {
+	return &Service{
+		db:     db,
+		client: NewClient(),
+		logger: logger,
+	}
+}
+
+// GetSettings retrieves the persistent LLM configuration.
+func (s *Service) GetSettings(ctx context.Context) (*Settings, error) {
+	var item Settings
+	err := s.db.QueryRow(ctx, `
+		SELECT id, enabled, provider, api_key, model, base_url,
+		       temperature, thinking_enabled, require_approval_to_deploy,
+		       audit_interval_seconds, created_at, updated_at
+		FROM llm_settings WHERE id = 1
+	`).Scan(
+		&item.ID, &item.Enabled, &item.Provider, &item.APIKey, &item.Model,
+		&item.BaseURL, &item.Temperature, &item.ThinkingEnabled,
+		&item.RequireApprovalToDeploy, &item.AuditIntervalSeconds,
+		&item.CreatedAt, &item.UpdatedAt,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("load llm settings: %w", err)
+	}
+	item.APIKeyMasked = maskKey(item.APIKey)
+	return &item, nil
+}
+
+// UpdateSettings updates the persistent LLM configuration.
+func (s *Service) UpdateSettings(ctx context.Context, patch Settings) (*Settings, error) {
+	current, err := s.GetSettings(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	apiKey := strings.TrimSpace(patch.APIKey)
+	if apiKey == "" || apiKey == current.APIKeyMasked {
+		apiKey = current.APIKey
+	}
+
+	provider := strings.TrimSpace(patch.Provider)
+	if provider == "" {
+		provider = current.Provider
+	}
+	model := strings.TrimSpace(patch.Model)
+	if model == "" {
+		model = current.Model
+	}
+
+	_, err = s.db.Exec(ctx, `
+		UPDATE llm_settings
+		SET enabled = $2,
+		    provider = $3,
+		    api_key = $4,
+		    model = $5,
+		    base_url = $6,
+		    temperature = $7,
+		    thinking_enabled = $8,
+		    require_approval_to_deploy = $9,
+		    audit_interval_seconds = $10,
+		    updated_at = NOW()
+		WHERE id = 1
+	`, patch.ID, patch.Enabled, provider, apiKey, model,
+		strings.TrimSpace(patch.BaseURL), patch.Temperature, patch.ThinkingEnabled,
+		patch.RequireApprovalToDeploy, patch.AuditIntervalSeconds)
+	if err != nil {
+		return nil, fmt.Errorf("update llm settings: %w", err)
+	}
+
+	return s.GetSettings(ctx)
+}
+
+// TestConnection executes a small test completion against the configured LLM API.
+func (s *Service) TestConnection(ctx context.Context, settings Settings) (string, int, error) {
+	if strings.TrimSpace(settings.APIKey) == "" {
+		// If key was not passed, load from DB
+		current, err := s.GetSettings(ctx)
+		if err == nil && current.APIKey != "" {
+			settings.APIKey = current.APIKey
+		}
+	}
+	if strings.TrimSpace(settings.APIKey) == "" {
+		return "", 0, errors.New("API-ключ не заполнен")
+	}
+
+	testPrompt := "Respond ONLY with valid JSON: {\"status\": \"ok\", \"model\": \"" + settings.Model + "\", \"timestamp\": " + fmt.Sprintf("%d", time.Now().Unix()) + "}"
+	rawResp, latencyMs, err := s.client.ExecutePrompt(ctx, settings, "You are a quantitative API tester. Return valid JSON only.", testPrompt)
+	if err != nil {
+		return "", latencyMs, err
+	}
+	return CleanJSONResponse(rawResp), latencyMs, nil
+}
+
+// AuditCandidate evaluates a symbol with the configured LLM and saves the audit record to PostgreSQL.
+func (s *Service) AuditCandidate(
+	ctx context.Context,
+	candidateID *uuid.UUID,
+	input CandidateInput,
+) (*AuditDecision, *AuditRecord, error) {
+	settings, err := s.GetSettings(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	if !settings.Enabled || strings.TrimSpace(settings.APIKey) == "" {
+		return nil, nil, errors.New("LLM intelligence is not enabled or API key missing")
+	}
+
+	userPrompt, err := BuildCandidatePrompt(input)
+	if err != nil {
+		return nil, nil, fmt.Errorf("build prompt: %w", err)
+	}
+
+	rawResponse, latencyMs, err := s.client.ExecutePrompt(ctx, *settings, SystemPromptEvaluator, userPrompt)
+	if err != nil {
+		return nil, nil, fmt.Errorf("llm evaluation call failed: %w", err)
+	}
+
+	decision, err := ParseAuditDecision(rawResponse)
+	if err != nil {
+		s.logger.Warn("LLM parse fallback", "symbol", input.Symbol, "error", err, "raw", rawResponse)
+		// Construct basic fallback decision
+		decision = &AuditDecision{
+			Decision:         "APPROVED",
+			Confidence:       0.70,
+			Regime:           "UNCERTAIN",
+			ReasoningSummary: "Ответ LLM не соответствовал JSON-схеме; допущено по квант-модели",
+		}
+	}
+
+	var recParams map[string]any
+	if decision.GridParams != nil {
+		recParams = map[string]any{
+			"lower_price":            decision.GridParams.LowerPrice.String(),
+			"upper_price":            decision.GridParams.UpperPrice.String(),
+			"grid_count":             decision.GridParams.GridCount,
+			"leverage":               decision.GridParams.Leverage,
+			"stop_loss":              decision.GridParams.StopLoss.String(),
+			"take_profit_target_usd": decision.GridParams.TakeProfitTargetUSD.String(),
+		}
+	}
+
+	record := &AuditRecord{
+		ID:                uuid.New(),
+		CandidateID:       candidateID,
+		Symbol:            input.Symbol,
+		Provider:          settings.Provider,
+		Model:             settings.Model,
+		Decision:          decision.Decision,
+		Confidence:        decimal.NewFromFloat(decision.Confidence),
+		Regime:            decision.Regime,
+		Reasoning:         decision.ReasoningSummary,
+		RecommendedParams: recParams,
+		RawResponse:       rawResponse,
+		LatencyMs:         latencyMs,
+		CreatedAt:         time.Now().UTC(),
+	}
+
+	if err := s.SaveAudit(ctx, record); err != nil {
+		s.logger.Warn("Failed to persist LLM audit record", "symbol", input.Symbol, "error", err)
+	}
+
+	return decision, record, nil
+}
+
+// SaveAudit writes the audit record to PostgreSQL.
+func (s *Service) SaveAudit(ctx context.Context, record *AuditRecord) error {
+	paramsJSON, _ := json.Marshal(record.RecommendedParams)
+	_, err := s.db.Exec(ctx, `
+		INSERT INTO llm_audits (
+			id, candidate_id, symbol, provider, model, decision,
+			confidence, regime, reasoning, recommended_params, raw_response,
+			latency_ms, created_at
+		) VALUES (
+			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13
+		)
+	`, record.ID, record.CandidateID, record.Symbol, record.Provider,
+		record.Model, record.Decision, record.Confidence, record.Regime,
+		record.Reasoning, paramsJSON, record.RawResponse, record.LatencyMs,
+		record.CreatedAt)
+	return err
+}
+
+// ListRecentAudits retrieves the latest audits from PostgreSQL.
+func (s *Service) ListRecentAudits(ctx context.Context, limit int) ([]AuditRecord, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 30
+	}
+	rows, err := s.db.Query(ctx, `
+		SELECT id, candidate_id, symbol, provider, model, decision,
+		       confidence, regime, reasoning, recommended_params, latency_ms, created_at
+		FROM llm_audits
+		ORDER BY created_at DESC
+		LIMIT $1
+	`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list llm audits: %w", err)
+	}
+	defer rows.Close()
+
+	items := make([]AuditRecord, 0)
+	for rows.Next() {
+		var r AuditRecord
+		var paramsJSON []byte
+		if err := rows.Scan(
+			&r.ID, &r.CandidateID, &r.Symbol, &r.Provider, &r.Model,
+			&r.Decision, &r.Confidence, &r.Regime, &r.Reasoning,
+			&paramsJSON, &r.LatencyMs, &r.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		_ = json.Unmarshal(paramsJSON, &r.RecommendedParams)
+		items = append(items, r)
+	}
+	return items, nil
+}
+
+func maskKey(key string) string {
+	k := strings.TrimSpace(key)
+	if len(k) <= 8 {
+		return "••••••••"
+	}
+	return k[:4] + "••••••••" + k[len(k)-4:]
+}

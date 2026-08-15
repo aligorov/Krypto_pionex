@@ -454,3 +454,33 @@ export interface AutoGridPreset {
     aiKitEnabled?: boolean;
   };
 }
+
+export interface LLMSettings {
+  id: number;
+  enabled: boolean;
+  provider: 'gemini' | 'anthropic' | 'openrouter' | 'custom';
+  apiKey?: string;
+  apiKeyMasked: string;
+  model: string;
+  baseUrl: string;
+  temperature: number;
+  thinkingEnabled: boolean;
+  requireApprovalToDeploy: boolean;
+  auditIntervalSeconds: number;
+  updatedAt: string;
+}
+
+export interface LLMAuditRecord {
+  id: string;
+  candidateId?: string;
+  symbol: string;
+  provider: string;
+  model: string;
+  decision: 'APPROVED' | 'REJECTED';
+  confidence: string;
+  regime: string;
+  reasoning: string;
+  recommendedParams?: Record<string, any>;
+  latencyMs: number;
+  createdAt: string;
+}

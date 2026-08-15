@@ -229,7 +229,13 @@ export default function Candidates({ canOperate: _canOperate }: Props) {
                       </span>
                     </td>
                     <td>{candidate.symbol}</td>
-                    <td><small>{candidate.rejectionReason ?? '—'}</small></td>
+                    <td>
+                      {candidate.rejectionReason?.startsWith('AI:') ? (
+                        <span style={{ color: '#f87171' }}>🧠 {candidate.rejectionReason}</span>
+                      ) : (
+                        <small>{candidate.rejectionReason ?? '—'}</small>
+                      )}
+                    </td>
                     <td>{candidate.volatilityPct}%</td>
                     <td>{candidate.volume24h}</td>
                   </tr>
@@ -268,6 +274,17 @@ function CandidateRow({
       <td>
         <strong>{candidate.symbol}</strong>
         <small>{candidate.currentPrice}</small>
+        {assumptions['llmConfidence'] !== undefined && (
+          <div style={{ marginTop: '3px' }}>
+            <span
+              className="badge"
+              style={{ background: 'rgba(59, 130, 246, 0.15)', color: '#60a5fa', border: '1px solid rgba(59, 130, 246, 0.3)', fontSize: '10px', padding: '1px 5px', cursor: 'help' }}
+              title={`🧠 AI Мозг (${assumptions['llmRegime'] || 'Аудит'}): ${assumptions['llmReasoning'] || ''}`}
+            >
+              🧠 AI {Math.round(Number(assumptions['llmConfidence']) * 100)}%
+            </span>
+          </div>
+        )}
       </td>
       <td><strong>{Number(candidate.score).toFixed(3)}</strong></td>
       <td>

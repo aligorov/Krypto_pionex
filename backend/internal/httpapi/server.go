@@ -21,6 +21,7 @@ import (
 	"github.com/aligorov/pionex-bot/backend/internal/auth"
 	"github.com/aligorov/pionex-bot/backend/internal/autogrid"
 	"github.com/aligorov/pionex-bot/backend/internal/controlplane"
+	"github.com/aligorov/pionex-bot/backend/internal/llm"
 	"github.com/aligorov/pionex-bot/backend/internal/observability"
 	"github.com/aligorov/pionex-bot/backend/internal/risk"
 )
@@ -38,6 +39,7 @@ type Server struct {
 	accounts     *accounts.Service
 	autogrid     *autogrid.Service
 	control      *controlplane.Service
+	llm          *llm.Service
 	version      string
 	commit       string
 	buildTime    string
@@ -51,6 +53,7 @@ func NewServer(
 	accountService *accounts.Service,
 	autoGridService *autogrid.Service,
 	controlService *controlplane.Service,
+	llmService *llm.Service,
 	version, commit, buildTime string,
 	mcpHandler http.Handler,
 	frontendDist string,
@@ -59,6 +62,7 @@ func NewServer(
 	return &Server{
 		auth: authService, accounts: accountService,
 		autogrid: autoGridService, control: controlService,
+		llm: llmService,
 		version: version, commit: commit, buildTime: buildTime,
 		mcpHandler: mcpHandler, frontendDist: frontendDist, logger: logger,
 	}
@@ -83,6 +87,11 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /api/security/whitelist", s.withRole(auth.RoleAdmin, http.HandlerFunc(s.addWhitelist)))
 	mux.Handle("DELETE /api/security/whitelist/{id}", s.withRole(auth.RoleAdmin, http.HandlerFunc(s.removeWhitelist)))
 	mux.Handle("GET /api/security/my-ip", s.withSession(http.HandlerFunc(s.myIP)))
+
+	mux.Handle("GET /api/llm/settings", s.withSession(http.HandlerFunc(s.getLLMSettings)))
+	mux.Handle("PUT /api/llm/settings", s.withRole(auth.RoleAdmin, http.HandlerFunc(s.updateLLMSettings)))
+	mux.Handle("POST /api/llm/test", s.withRole(auth.RoleAdmin, http.HandlerFunc(s.testLLMConnection)))
+	mux.Handle("GET /api/llm/audits", s.withSession(http.HandlerFunc(s.listLLMAudits)))
 
 	mux.Handle("GET /api/dashboard", s.withSession(http.HandlerFunc(s.dashboard)))
 	mux.Handle("GET /api/users", s.withRole(auth.RoleAdmin, http.HandlerFunc(s.listUsers)))
@@ -1240,4 +1249,77 @@ func randomID() string {
 		return fmt.Sprintf("%d", time.Now().UnixNano())
 	}
 	return hex.EncodeToString(buffer)
+}
+
+func (s *Server) getLLMSettings(w http.ResponseWriter, r *http.Request) {
+	if s.llm == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "LLM service is not initialized"})
+		return
+	}
+	settings, err := s.llm.GetSettings(r.Context())
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, settings)
+}
+
+func (s *Server) updateLLMSettings(w http.ResponseWriter, r *http.Request) {
+	if s.llm == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "LLM service is not initialized"})
+		return
+	}
+	var input llm.Settings
+	if !decodeJSON(w, r, &input) {
+		return
+	}
+	settings, err := s.llm.UpdateSettings(r.Context(), input)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	s.auditMutation(r, "llm.settings.update", "llm_settings", "1", map[string]any{
+		"enabled":  settings.Enabled,
+		"provider": settings.Provider,
+		"model":    settings.Model,
+	})
+	writeJSON(w, http.StatusOK, settings)
+}
+
+func (s *Server) testLLMConnection(w http.ResponseWriter, r *http.Request) {
+	if s.llm == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "LLM service is not initialized"})
+		return
+	}
+	var input llm.Settings
+	if r.Body != nil && r.ContentLength > 0 {
+		_ = decodeJSON(w, r, &input)
+	}
+	resp, latencyMs, err := s.llm.TestConnection(r.Context(), input)
+	if err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":        false,
+			"error":     err.Error(),
+			"latencyMs": latencyMs,
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":        true,
+		"response":  resp,
+		"latencyMs": latencyMs,
+	})
+}
+
+func (s *Server) listLLMAudits(w http.ResponseWriter, r *http.Request) {
+	if s.llm == nil {
+		writeJSON(w, http.StatusOK, []any{})
+		return
+	}
+	audits, err := s.llm.ListRecentAudits(r.Context(), 50)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, audits)
 }

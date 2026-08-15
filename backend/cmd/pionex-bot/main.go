@@ -16,6 +16,7 @@ import (
 	"github.com/aligorov/pionex-bot/backend/internal/controlplane"
 	"github.com/aligorov/pionex-bot/backend/internal/database"
 	"github.com/aligorov/pionex-bot/backend/internal/httpapi"
+	"github.com/aligorov/pionex-bot/backend/internal/llm"
 	"github.com/aligorov/pionex-bot/backend/internal/mcpserver"
 	"github.com/aligorov/pionex-bot/backend/internal/observability"
 	"github.com/aligorov/pionex-bot/backend/internal/risk"
@@ -69,8 +70,9 @@ func main() {
 		accountService := accounts.NewService(dbPool)
 		riskEngine := risk.NewEngine(dbPool)
 		autoService := autogrid.NewService(dbPool, riskEngine)
+		llmService := llm.NewService(dbPool, logger)
 
-		autoWorker := autogrid.NewWorker(dbPool, autoService, accountService, riskEngine, logger)
+		autoWorker := autogrid.NewWorker(dbPool, autoService, accountService, riskEngine, llmService, logger)
 		go autoWorker.Run(ctx)
 
 		// Start Telegram Outbox Dispatcher Loop
@@ -123,6 +125,7 @@ func main() {
 			accountService,
 			autoService,
 			controlService,
+			llmService,
 			Version,
 			GitCommit,
 			BuildTime,

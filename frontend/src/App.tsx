@@ -10,6 +10,7 @@ import RiskSettings from './components/RiskSettings';
 import AuditLogs from './components/AuditLogs';
 import MCPServer from './components/MCPServer';
 import SecurityModal from './components/SecurityModal';
+import { LLMSettingsModal } from './components/LLMSettingsModal';
 
 type Tab = 'overview' | 'autogrid' | 'candidates' | 'bots' | 'accounts' | 'risk' | 'audit' | 'mcp';
 
@@ -30,7 +31,8 @@ export default function App() {
 
   const [activeTab, setActiveTab] = useState<Tab>('overview');
   const [showSecurityModal, setShowSecurityModal] = useState(false);
-  const [securityTab, setSecurityTab] = useState<'password' | '2fa'>('password');
+  const [showLLMModal, setShowLLMModal] = useState(false);
+  const [securityTab, setSecurityTab] = useState<'password' | '2fa' | 'ip'>('password');
 
   const loadOverview = useCallback(() => {
     api<Dashboard>('/api/dashboard')
@@ -278,7 +280,15 @@ export default function App() {
               )}
             </div>
           </div>
-          <div style={{ display: 'flex', gap: 6 }}>
+          <div style={{ display: 'flex', gap: 6, marginBottom: 6 }}>
+            <button
+              className="button small"
+              onClick={() => setShowLLMModal(true)}
+              title="Настройка AI Мозга (Gemini / Claude / OpenRouter)"
+              style={{ flex: 1, borderColor: '#3b82f6', color: '#60a5fa' }}
+            >
+              🧠 AI Мозг
+            </button>
             <button
               className="button small"
               onClick={() => {
@@ -290,7 +300,9 @@ export default function App() {
             >
               🛡️ Защита
             </button>
-            <button className="button small" onClick={handleLogout}>Выйти</button>
+          </div>
+          <div>
+            <button className="button small" onClick={handleLogout} style={{ width: '100%' }}>Выйти</button>
           </div>
         </div>
       </aside>
@@ -343,6 +355,10 @@ export default function App() {
             setLoginSuccessMessage('Пароль успешно изменён! Пожалуйста, войдите с новым паролем.');
           }}
         />
+      )}
+
+      {showLLMModal && (
+        <LLMSettingsModal onClose={() => setShowLLMModal(false)} />
       )}
     </div>
   );

@@ -43,3 +43,14 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   }
   return await response.json() as T;
 }
+
+export function describeError(err: unknown): string {
+  if (err instanceof ApiError) {
+    return err.message;
+  }
+  if (err instanceof Error) {
+    return err.message;
+  }
+  return String(err);
+}
+

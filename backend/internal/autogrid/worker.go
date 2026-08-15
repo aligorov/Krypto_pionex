@@ -10,9 +10,11 @@ import (
 
 	"github.com/aligorov/pionex-bot/backend/internal/accounts"
 	"github.com/aligorov/pionex-bot/backend/internal/grid"
+	"github.com/aligorov/pionex-bot/backend/internal/llm"
 	"github.com/aligorov/pionex-bot/backend/internal/marketdata"
 	"github.com/aligorov/pionex-bot/backend/internal/pionex"
 	"github.com/aligorov/pionex-bot/backend/internal/risk"
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/shopspring/decimal"
@@ -25,6 +27,7 @@ type Worker struct {
 	risk         *risk.Engine
 	scanner      *marketdata.Scanner
 	publicClient *pionex.Client
+	llm          *llm.Service
 	logger       *slog.Logger
 	owner        string
 }
@@ -40,12 +43,14 @@ func NewWorker(
 	service *Service,
 	accountService *accounts.Service,
 	riskEngine *risk.Engine,
+	llmService *llm.Service,
 	logger *slog.Logger,
 ) *Worker {
 	publicClient := service.PublicAPI()
 	return &Worker{
 		db: db, service: service, accounts: accountService, risk: riskEngine,
 		scanner: marketdata.NewScanner(publicClient), publicClient: publicClient,
+		llm:    llmService,
 		logger: logger,
 		owner:  fmt.Sprintf("autogrid-%d", time.Now().UnixNano()),
 	}
@@ -226,6 +231,14 @@ func (worker *Worker) scanAndDeploy(
 		if err := worker.enrichCandidatesWithAIKit(ctx, *settings, scanID); err != nil {
 			worker.logger.Warn(
 				"Pionex AI Kit enrichment failed (advisory only)",
+				"component", "autogrid_worker", "scan_id", scanID, "error", err,
+			)
+		}
+	}
+	if worker.llm != nil {
+		if err := worker.enrichAndAuditCandidatesWithLLM(ctx, *settings, scanID); err != nil {
+			worker.logger.Warn(
+				"LLM intelligence audit failed",
 				"component", "autogrid_worker", "scan_id", scanID, "error", err,
 			)
 		}
@@ -1360,4 +1373,121 @@ func terminalOutcome(reasonBy string) (string, string) {
 	default:
 		return "STOPPED", "EXTERNAL_CLOSE"
 	}
+}
+
+// enrichAndAuditCandidatesWithLLM executes pre-flight evaluation on ACCEPTED
+// candidates through the configured LLM provider (Gemini / Anthropic / OpenRouter).
+func (worker *Worker) enrichAndAuditCandidatesWithLLM(
+	ctx context.Context,
+	settings Settings,
+	scanID string,
+) error {
+	if worker.llm == nil {
+		return nil
+	}
+	llmSettings, err := worker.llm.GetSettings(ctx)
+	if err != nil || !llmSettings.Enabled || strings.TrimSpace(llmSettings.APIKey) == "" {
+		return nil
+	}
+	candidates, err := worker.service.listCandidates(ctx, scanID)
+	if err != nil {
+		return err
+	}
+	auditedCount := 0
+	for _, candidate := range candidates {
+		if candidate.Decision != "ACCEPTED" || auditedCount >= 5 {
+			continue
+		}
+		candUUID, err := uuid.Parse(candidate.ID)
+		if err != nil {
+			continue
+		}
+		candles, err := worker.publicClient.GetKlines(ctx, candidate.Symbol, "15M", 30)
+		if err != nil {
+			worker.logger.Warn("Failed to fetch klines for LLM candidate audit", "symbol", candidate.Symbol, "error", err)
+			continue
+		}
+		candleSummaries := make([]llm.CandleSummary, 0, len(candles))
+		for _, c := range candles {
+			o, _ := c.Open.Float64()
+			h, _ := c.High.Float64()
+			l, _ := c.Low.Float64()
+			cl, _ := c.Close.Float64()
+			v, _ := c.Volume.Float64()
+			candleSummaries = append(candleSummaries, llm.CandleSummary{
+				Time:   time.Unix(c.Time/1000, 0).Format("15:04"),
+				Open:   o,
+				High:   h,
+				Low:    l,
+				Close:  cl,
+				Volume: v,
+			})
+		}
+		curPrice, _ := candidate.CurrentPrice.Float64()
+		vol, _ := candidate.VolatilityPct.Float64()
+		lowPrice, _ := candidate.LowerPrice.Float64()
+		highPrice, _ := candidate.UpperPrice.Float64()
+		vol24h, _ := candidate.Volume24h.Float64()
+
+		input := llm.CandidateInput{
+			Symbol:              candidate.Symbol,
+			CurrentPrice:        curPrice,
+			Volume24h:           vol24h,
+			VolatilityParkinson: vol,
+			RecommendedTrend:    candidate.RecommendedTrend,
+			ProposedLowerPrice:  lowPrice,
+			ProposedUpperPrice:  highPrice,
+			ProposedGridCount:   candidate.GridNum,
+			ProposedLeverage:    candidate.RecommendedLeverage,
+			RecentCandles15m:    candleSummaries,
+		}
+		if assumptions, ok := candidate.ModelAssumptions.(map[string]any); ok {
+			if v, ok := assumptions["adx"].(float64); ok {
+				input.ADX = v
+			}
+			if v, ok := assumptions["atrPct"].(float64); ok {
+				input.ATRPct = v
+			}
+			if v, ok := assumptions["choppiness"].(float64); ok {
+				input.Choppiness = v
+			}
+			if v, ok := assumptions["emaSlopePct"].(float64); ok {
+				input.EMASlopePct = v
+			}
+			if v, ok := assumptions["isSqueeze"].(bool); ok {
+				input.IsSqueeze = v
+			}
+		}
+
+		decision, record, err := worker.llm.AuditCandidate(ctx, &candUUID, input)
+		if err != nil {
+			worker.logger.Warn("LLM candidate audit failed", "symbol", candidate.Symbol, "error", err)
+			continue
+		}
+		auditedCount++
+
+		if decision.Decision == "REJECTED" {
+			reason := "Отклонено AI-моделью"
+			if decision.RejectionReason != nil && *decision.RejectionReason != "" {
+				reason = "AI: " + *decision.RejectionReason
+			} else if decision.ReasoningSummary != "" {
+				reason = "AI: " + decision.ReasoningSummary
+			}
+			_, _ = worker.db.Exec(ctx, `
+				UPDATE autogrid_candidates
+				SET decision = 'REJECTED',
+				    rejection_reason = $3,
+				    model_assumptions = model_assumptions || jsonb_build_object('llmAuditId', $4::TEXT, 'llmConfidence', $5::NUMERIC, 'llmReasoning', $6::TEXT)
+				WHERE id = $1 AND scan_id = $2
+			`, candidate.ID, scanID, reason, record.ID.String(), decision.Confidence, decision.ReasoningSummary)
+			worker.logger.Info("Candidate rejected by LLM intelligence", "symbol", candidate.Symbol, "reason", reason)
+		} else {
+			_, _ = worker.db.Exec(ctx, `
+				UPDATE autogrid_candidates
+				SET model_assumptions = model_assumptions || jsonb_build_object('llmAuditId', $3::TEXT, 'llmConfidence', $4::NUMERIC, 'llmReasoning', $5::TEXT, 'llmRegime', $6::TEXT)
+				WHERE id = $1 AND scan_id = $2
+			`, candidate.ID, scanID, record.ID.String(), decision.Confidence, decision.ReasoningSummary, decision.Regime)
+		}
+	}
+	return nil
 }
