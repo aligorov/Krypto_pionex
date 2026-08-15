@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { api } from '../api';
 import { describeError } from './AutoGridAutopilot';
+import { CandlestickChart } from './CandlestickChart';
 import type { AIKitResponse, AutoGridCandidate, AutoGridState } from '../types';
 
 interface Props {
@@ -22,6 +23,7 @@ export default function Candidates({ canOperate: _canOperate }: Props) {
   const [aiKit, setAiKit] = useState<Record<string, AIKitState>>({});
   const [sortKey, setSortKey] = useState<SortKey>('createdAt');
   const [sortOrder, setSortOrder] = useState<SortOrder>('desc');
+  const [selectedForChart, setSelectedForChart] = useState<AutoGridCandidate | null>(null);
 
   const load = useCallback(async () => {
     try {
@@ -110,13 +112,53 @@ export default function Candidates({ canOperate: _canOperate }: Props) {
         </div>
       )}
 
+      {/* Chart Modal */}
+      {selectedForChart && (
+        <div
+          style={{
+            position: 'fixed',
+            inset: 0,
+            backgroundColor: 'rgba(0, 0, 0, 0.75)',
+            zIndex: 1000,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            padding: '24px',
+          }}
+          onClick={() => setSelectedForChart(null)}
+        >
+          <div
+            style={{
+              width: '1000px',
+              maxWidth: '95vw',
+              height: '600px',
+              maxHeight: '90vh',
+              borderRadius: '12px',
+              overflow: 'hidden',
+              boxShadow: '0 25px 50px -12px rgba(0, 0, 0, 0.5)',
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <CandlestickChart
+              symbol={selectedForChart.symbol}
+              lowerPrice={Number(selectedForChart.lowerPrice)}
+              upperPrice={Number(selectedForChart.upperPrice)}
+              currentPrice={Number(selectedForChart.currentPrice)}
+              gridCount={selectedForChart.gridNum}
+              direction={selectedForChart.recommendedTrend?.toUpperCase() || 'NEUTRAL'}
+              onClose={() => setSelectedForChart(null)}
+            />
+          </div>
+        </div>
+      )}
+
       <div className="panel">
         <div className="panel-heading" style={{ flexWrap: 'wrap', gap: '1rem' }}>
           <div>
             <span className="eyebrow">LAST SCAN</span>
             <h3>Кандидаты последнего скана ({accepted.length})</h3>
           </div>
-          
+
           <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', flexWrap: 'wrap' }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem', fontSize: '0.85rem' }}>
               <span className="muted">Сортировка:</span>
@@ -142,7 +184,7 @@ export default function Candidates({ canOperate: _canOperate }: Props) {
                 Волатильность {sortKey === 'volatilityPct' ? (sortOrder === 'desc' ? '↓' : '↑') : ''}
               </button>
             </div>
-            
+
             <span className="muted">
               {scan
                 ? `${new Date(scan.startedAt).toLocaleString()} · ${scan.candidatesFound} пар`
@@ -182,6 +224,7 @@ export default function Candidates({ canOperate: _canOperate }: Props) {
                     EV / Sharpe {sortKey === 'expectedValuePct' ? (sortOrder === 'desc' ? '↓' : '↑') : ''}
                   </th>
                   <th>AI Kit</th>
+                  <th>График</th>
                 </tr>
               </thead>
               <tbody>
@@ -191,6 +234,7 @@ export default function Candidates({ canOperate: _canOperate }: Props) {
                     candidate={candidate}
                     aiKit={aiKit[candidate.symbol]}
                     onFetchAIKit={() => void fetchAIKit(candidate.symbol)}
+                    onOpenChart={() => setSelectedForChart(candidate)}
                   />
                 ))}
               </tbody>
@@ -218,6 +262,7 @@ export default function Candidates({ canOperate: _canOperate }: Props) {
                   <th>Причина</th>
                   <th>Волатильность</th>
                   <th>Объём 24ч</th>
+                  <th>График</th>
                 </tr>
               </thead>
               <tbody>
@@ -228,7 +273,7 @@ export default function Candidates({ canOperate: _canOperate }: Props) {
                         {formatTime(candidate.createdAt)}
                       </span>
                     </td>
-                    <td>{candidate.symbol}</td>
+                    <td><strong>{candidate.symbol}</strong></td>
                     <td>
                       {candidate.rejectionReason?.startsWith('AI:') ? (
                         <span style={{ color: '#f87171' }}>🧠 {candidate.rejectionReason}</span>
@@ -238,6 +283,15 @@ export default function Candidates({ canOperate: _canOperate }: Props) {
                     </td>
                     <td>{candidate.volatilityPct}%</td>
                     <td>{candidate.volume24h}</td>
+                    <td>
+                      <button
+                        className="button small"
+                        onClick={() => setSelectedForChart(candidate)}
+                        title="Открыть интерактивный график"
+                      >
+                        📊
+                      </button>
+                    </td>
                   </tr>
                 ))}
               </tbody>
@@ -253,10 +307,12 @@ function CandidateRow({
   candidate,
   aiKit,
   onFetchAIKit,
+  onOpenChart,
 }: {
   candidate: AutoGridCandidate;
   aiKit?: AIKitState;
   onFetchAIKit: () => void;
+  onOpenChart: () => void;
 }) {
   const assumptions = candidate.modelAssumptions as Record<string, unknown>;
   const regime = String(assumptions['regime'] ?? '—');
@@ -272,7 +328,9 @@ function CandidateRow({
         </span>
       </td>
       <td>
-        <strong>{candidate.symbol}</strong>
+        <strong style={{ cursor: 'pointer', color: '#38bdf8' }} onClick={onOpenChart} title="Открыть график">
+          {candidate.symbol}
+        </strong>
         <small>{candidate.currentPrice}</small>
         {assumptions['llmConfidence'] !== undefined && (
           <div style={{ marginTop: '3px' }}>
@@ -331,6 +389,15 @@ function CandidateRow({
             {aiKit?.error && <small>{aiKit.error}</small>}
           </div>
         )}
+      </td>
+      <td>
+        <button
+          className="button small"
+          onClick={onOpenChart}
+          title="Открыть график со слоем сетки"
+        >
+          📊
+        </button>
       </td>
     </tr>
   );

@@ -5,6 +5,8 @@ __pycache__/
 
 # Frontend build output
 frontend/dist/
+frontend/node_modules/
+node_modules/
 
 # Local env / logs / scratch
 .env

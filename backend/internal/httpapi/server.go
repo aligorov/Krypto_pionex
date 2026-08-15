@@ -23,6 +23,7 @@ import (
 	"github.com/aligorov/pionex-bot/backend/internal/controlplane"
 	"github.com/aligorov/pionex-bot/backend/internal/llm"
 	"github.com/aligorov/pionex-bot/backend/internal/observability"
+	"github.com/aligorov/pionex-bot/backend/internal/pionex"
 	"github.com/aligorov/pionex-bot/backend/internal/risk"
 )
 
@@ -132,6 +133,7 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /api/orders", s.withSession(http.HandlerFunc(s.listOrders)))
 	mux.Handle("GET /api/logs", s.withSession(http.HandlerFunc(s.listLogs)))
 	mux.Handle("GET /api/audit", s.withSession(http.HandlerFunc(s.listAudit)))
+	mux.Handle("GET /api/market/candles", s.withSession(http.HandlerFunc(s.getMarketCandles)))
 
 	mux.Handle("GET /api/mcp/tokens", s.withSession(http.HandlerFunc(s.listTokens)))
 	mux.Handle("POST /api/mcp/tokens", s.withSession(http.HandlerFunc(s.createToken)))
@@ -1347,3 +1349,74 @@ func (s *Server) listLLMAudits(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, audits)
 }
+
+func (s *Server) getMarketCandles(w http.ResponseWriter, r *http.Request) {
+	symbol := strings.TrimSpace(r.URL.Query().Get("symbol"))
+	if symbol == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "symbol is required"})
+		return
+	}
+	interval := strings.TrimSpace(r.URL.Query().Get("interval"))
+	if interval == "" {
+		interval = "15M"
+	}
+	limitStr := strings.TrimSpace(r.URL.Query().Get("limit"))
+	limit := 100
+	if limitStr != "" {
+		if val, err := strconv.Atoi(limitStr); err == nil && val > 0 && val <= 500 {
+			limit = val
+		}
+	}
+
+	pionexSymbol := strings.ReplaceAll(symbol, "/", "_")
+	client := pionex.NewClient("", "", "")
+	klines, err := client.GetKlines(r.Context(), pionexSymbol, interval, limit)
+	if err != nil {
+		altSymbol := strings.TrimSuffix(pionexSymbol, "_PERP")
+		klines, err = client.GetKlines(r.Context(), altSymbol, interval, limit)
+		if err != nil {
+			writeJSON(w, http.StatusOK, map[string]any{
+				"symbol":   symbol,
+				"interval": interval,
+				"candles":  []any{},
+				"error":    err.Error(),
+			})
+			return
+		}
+	}
+
+	type candleOut struct {
+		Time   int64   `json:"time"`
+		Open   float64 `json:"open"`
+		High   float64 `json:"high"`
+		Low    float64 `json:"low"`
+		Close  float64 `json:"close"`
+		Volume float64 `json:"volume"`
+	}
+	out := make([]candleOut, len(klines))
+	for i, k := range klines {
+		o, _ := k.Open.Float64()
+		h, _ := k.High.Float64()
+		l, _ := k.Low.Float64()
+		c, _ := k.Close.Float64()
+		v, _ := k.Volume.Float64()
+		candleTime := k.Time
+		if candleTime > 10000000000 {
+			candleTime = candleTime / 1000
+		}
+		out[i] = candleOut{
+			Time:   candleTime,
+			Open:   o,
+			High:   h,
+			Low:    l,
+			Close:  c,
+			Volume: v,
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"symbol":   symbol,
+		"interval": interval,
+		"candles":  out,
+	})
+}
+

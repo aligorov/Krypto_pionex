@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { api } from '../api';
 import { describeError } from './AutoGridAutopilot';
+import { CandlestickChart } from './CandlestickChart';
 import type { AIKitResponse, AutoGridClosedBot, AutoGridBot, AutoGridState } from '../types';
 
 interface Props {
@@ -12,6 +13,7 @@ const closableStatuses = ['RUNNING', 'PENDING_SUBMISSION', 'SUBMISSION_UNKNOWN',
 export default function Bots({ canOperate }: Props) {
   const [state, setState] = useState<AutoGridState | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [selectedBotForChart, setSelectedBotForChart] = useState<AutoGridBot | null>(null);
 
   const load = useCallback(async () => {
     try {
@@ -37,6 +39,44 @@ export default function Bots({ canOperate }: Props) {
         <div className="alert danger">
           <span>{error}</span>
           <button onClick={() => setError(null)}>×</button>
+        </div>
+      )}
+
+      {selectedBotForChart && (
+        <div
+          style={{
+            position: 'fixed',
+            inset: 0,
+            backgroundColor: 'rgba(0, 0, 0, 0.75)',
+            zIndex: 1000,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            padding: '24px',
+          }}
+          onClick={() => setSelectedBotForChart(null)}
+        >
+          <div
+            style={{
+              width: '1000px',
+              maxWidth: '95vw',
+              height: '600px',
+              maxHeight: '90vh',
+              borderRadius: '12px',
+              overflow: 'hidden',
+              boxShadow: '0 25px 50px -12px rgba(0, 0, 0, 0.5)',
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <CandlestickChart
+              symbol={selectedBotForChart.symbol}
+              lowerPrice={Number(selectedBotForChart.lowerPrice)}
+              upperPrice={Number(selectedBotForChart.upperPrice)}
+              direction={selectedBotForChart.direction}
+              gridCount={selectedBotForChart.gridNum}
+              onClose={() => setSelectedBotForChart(null)}
+            />
+          </div>
         </div>
       )}
 
@@ -74,7 +114,13 @@ export default function Bots({ canOperate }: Props) {
               </thead>
               <tbody>
                 {state.activeBots.map((bot) => (
-                  <BotRow key={bot.id} bot={bot} canOperate={canOperate} onClosed={load} />
+                  <BotRow
+                    key={bot.id}
+                    bot={bot}
+                    canOperate={canOperate}
+                    onClosed={load}
+                    onOpenChart={() => setSelectedBotForChart(bot)}
+                  />
                 ))}
               </tbody>
             </table>
@@ -135,10 +181,12 @@ function BotRow({
   bot,
   canOperate,
   onClosed,
+  onOpenChart,
 }: {
   bot: AutoGridBot;
   canOperate: boolean;
   onClosed: () => Promise<void>;
+  onOpenChart: () => void;
 }) {
   const [closing, setClosing] = useState(false);
   const [adjusting, setAdjusting] = useState(false);
@@ -198,7 +246,15 @@ function BotRow({
   return (
     <>
       <tr>
-        <td><strong>{bot.symbol}</strong></td>
+        <td>
+          <strong
+            style={{ cursor: 'pointer', color: '#38bdf8' }}
+            onClick={onOpenChart}
+            title="Открыть интерактивный график"
+          >
+            {bot.symbol}
+          </strong>
+        </td>
         <td><span className={`badge ${bot.source === 'REAL' ? 'danger' : 'neutral'}`}>{bot.source}</span></td>
         <td>
           <span className={`badge ${bot.status === 'RUNNING' ? 'success' : 'warning'}`}>{bot.status}</span>
@@ -218,6 +274,13 @@ function BotRow({
         {canOperate && (
           <td>
             <div className="row-actions">
+              <button
+                className="button small"
+                onClick={onOpenChart}
+                title="Посмотреть свечной график"
+              >
+                📊
+              </button>
               <button
                 className="button small"
                 disabled={adjusting || bot.status !== 'RUNNING'}
