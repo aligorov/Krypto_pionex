@@ -99,13 +99,13 @@ def claim_job(conn):
             WITH next_job AS (
                 SELECT id FROM backtest_jobs
                 WHERE status = 'QUEUED'
-                   OR (status = 'RUNNING' AND updated_at < NOW() - INTERVAL '30 minutes')
+                   OR (status = 'RUNNING' AND created_at < NOW() - INTERVAL '30 minutes')
                 ORDER BY created_at
                 FOR UPDATE SKIP LOCKED
                 LIMIT 1
             )
             UPDATE backtest_jobs AS job
-            SET status = 'RUNNING', updated_at = NOW()
+            SET status = 'RUNNING'
             FROM next_job
             WHERE job.id = next_job.id
             RETURNING job.id, job.symbol, job.interval, job.params
