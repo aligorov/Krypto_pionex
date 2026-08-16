@@ -199,15 +199,54 @@ func (worker *Worker) loadBacktestSummary(ctx context.Context, symbol, interval 
 		summary.State = "pending"
 		return summary
 	default:
-		// Nothing usable: enqueue a fresh job (idempotent — a QUEUED/RUNNING
-		// twin was already handled above).
+		// Nothing usable: enqueue a fresh job, then WAIT for the quant
+		// worker to finish it (typically ~30s) instead of punting the
+		// candidate to the next scan — a 5-minute gap kills entries.
 		_, _ = worker.db.Exec(ctx, `
 			INSERT INTO backtest_jobs (symbol, interval, params)
 			VALUES ($1, $2, $3::jsonb)
 		`, symbol, interval, `{"train_bars":240,"test_bars":60,"purge_bars":6,"stop_loss_pct":8}`)
-		summary.State = "pending"
-		return summary
+		return worker.waitForBacktest(ctx, symbol, interval, 75*time.Second)
 	}
+}
+
+// waitForBacktest polls the job queue until the result lands or the
+// deadline passes. The quant worker completes jobs in ~30s.
+func (worker *Worker) waitForBacktest(ctx context.Context, symbol, interval string, timeout time.Duration) BacktestJobSummary {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			return BacktestJobSummary{Interval: interval, State: "pending"}
+		case <-time.After(5 * time.Second):
+		}
+		var status string
+		var resultBytes []byte
+		err := worker.db.QueryRow(ctx, `
+			SELECT status, result FROM backtest_jobs
+			WHERE symbol = $1 AND interval = $2
+			ORDER BY created_at DESC LIMIT 1
+		`, symbol, interval).Scan(&status, &resultBytes)
+		if err != nil || status != "DONE" {
+			continue
+		}
+		var result struct {
+			Folds      int     `json:"folds"`
+			OOSPct     float64 `json:"oos_return_pct"`
+			MaxDD      float64 `json:"oos_max_drawdown"`
+			RoundTrips int     `json:"round_trips"`
+			StopHits   int     `json:"stop_hits"`
+		}
+		if json.Unmarshal(resultBytes, &result) == nil && result.Folds > 0 {
+			return BacktestJobSummary{
+				Interval: interval, State: "done",
+				Folds: result.Folds, OOSPct: result.OOSPct,
+				MaxDD: result.MaxDD, RoundTrips: result.RoundTrips,
+				StopHits: result.StopHits,
+			}
+		}
+	}
+	return BacktestJobSummary{Interval: interval, State: "pending"}
 }
 
 // backtestGate runs the full multi-TF evaluation for a candidate.
