@@ -423,8 +423,20 @@ func volumeProfileBounds(candles []pionex.KlineCandle, cover float64) (float64, 
 			continue
 		}
 		// Spread each candle's volume uniformly over the bins it spans.
-		fromBin := int(math.Max(0, math.Floor((low-windowLow)/binWidth)))
-		toBin := int(math.Min(bins-1, math.Floor((high-windowLow)/binWidth)))
+		// Both ends are clamped: a doji candle sitting exactly on the window
+		// high (low == high == windowHigh) makes the ratio land exactly on
+		// `bins` after floor, which would index one past the histogram.
+		fromBin := int(math.Floor((low - windowLow) / binWidth))
+		if fromBin < 0 {
+			fromBin = 0
+		}
+		if fromBin > bins-1 {
+			fromBin = bins - 1
+		}
+		toBin := int(math.Floor((high - windowLow) / binWidth))
+		if toBin > bins-1 {
+			toBin = bins - 1
+		}
 		if toBin < fromBin {
 			toBin = fromBin
 		}
@@ -475,7 +487,8 @@ func volumeProfileBounds(candles []pionex.KlineCandle, cover float64) (float64, 
 func supportResistanceRange(
 	candles []pionex.KlineCandle,
 	price, volatilityPct float64,
-) (float64, float64) {	windowLow, windowHigh := math.MaxFloat64, 0.0
+) (float64, float64) {
+	windowLow, windowHigh := math.MaxFloat64, 0.0
 	for _, candle := range candles {
 		low, _ := candle.Low.Float64()
 		high, _ := candle.High.Float64()

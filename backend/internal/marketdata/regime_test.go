@@ -114,4 +114,3 @@ func TestBollingerBandWidthAndSqueeze(t *testing.T) {
 		t.Fatalf("expected isSqueeze to be true for flat channel, got %v (bbw=%f)", isSqueeze, bbw)
 	}
 }
-

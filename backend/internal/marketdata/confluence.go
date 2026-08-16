@@ -39,12 +39,12 @@ type ConfluenceVote struct {
 }
 
 type ConfluenceResult struct {
-	Verdict    string  `json:"verdict"`
-	Strength   float64 `json:"strength"` // 0..1 weighted support for the verdict
-	LongScore  float64 `json:"longScore"`
-	ShortScore float64 `json:"shortScore"`
-	RangeScore float64 `json:"rangeScore"`
-	HurstGate  string  `json:"hurstGate"`
+	Verdict    string           `json:"verdict"`
+	Strength   float64          `json:"strength"` // 0..1 weighted support for the verdict
+	LongScore  float64          `json:"longScore"`
+	ShortScore float64          `json:"shortScore"`
+	RangeScore float64          `json:"rangeScore"`
+	HurstGate  string           `json:"hurstGate"`
 	Votes      []ConfluenceVote `json:"votes"`
 }
 

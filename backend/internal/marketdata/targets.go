@@ -39,11 +39,11 @@ type DynamicTargetsInput struct {
 }
 
 type DynamicTargets struct {
-	TargetUSDT    float64
-	MaxLossUSDT   float64
-	TargetPct     float64
-	LossPct       float64
-	VolSource     string
+	TargetUSDT     float64
+	MaxLossUSDT    float64
+	TargetPct      float64
+	LossPct        float64
+	VolSource      string
 	DrawdownSource string
 }
 
@@ -101,4 +101,3 @@ func ValidateMinGridStep(stepPct, feeBps, slippageBps float64) bool {
 	frictionPct := 2.0 * (feeBps + slippageBps) / 100.0 // Bps to percent
 	return stepPct >= frictionPct*1.5                   // Ensure at least 50% margin over friction
 }
-

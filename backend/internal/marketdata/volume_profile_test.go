@@ -101,3 +101,34 @@ func TestSupportResistanceRangeVolumeAnchored(t *testing.T) {
 		t.Fatalf("wick zone above the volume band must be trimmed, got upper %.2f", upper)
 	}
 }
+
+// Regression (prod panic 2026-08-16, v1.2.0): a doji candle with
+// low == high == windowHigh must not index past the histogram.
+func TestVolumeProfileBoundsDojiAtWindowExtremes(t *testing.T) {
+	candles := make([]pionex.KlineCandle, 0, 12)
+	for i := 0; i < 10; i++ {
+		candles = append(candles, candleAt(100, 110, 10))
+	}
+	dojiHigh := pionex.KlineCandle{ // doji pinned exactly on the window high
+		Open:   decimal.NewFromFloat(110),
+		Close:  decimal.NewFromFloat(110),
+		Low:    decimal.NewFromFloat(110),
+		High:   decimal.NewFromFloat(110),
+		Volume: decimal.NewFromFloat(5),
+	}
+	dojiLow := pionex.KlineCandle{ // doji pinned exactly on the window low
+		Open:   decimal.NewFromFloat(100),
+		Close:  decimal.NewFromFloat(100),
+		Low:    decimal.NewFromFloat(100),
+		High:   decimal.NewFromFloat(100),
+		Volume: decimal.NewFromFloat(5),
+	}
+	candles = append(candles, dojiHigh, dojiLow)
+	lower, upper, ok := volumeProfileBounds(candles, 0.7)
+	if !ok {
+		t.Fatalf("bounds must be computable for doji extremes")
+	}
+	if lower >= upper {
+		t.Fatalf("bounds must be non-degenerate, got [%.2f, %.2f]", lower, upper)
+	}
+}

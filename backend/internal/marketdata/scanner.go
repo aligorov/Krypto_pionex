@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"sync"
@@ -175,19 +177,34 @@ func (s *Scanner) ScanMarkets(
 				if ctx.Err() != nil {
 					return
 				}
-				candles, candleErr := s.client.GetKlines(
-					ctx, job.item.symbol.Symbol, config.Interval, config.LookbackCandles,
-				)
-				if candleErr != nil {
-					results <- scanResult{candidate: rejectedDataCandidate(job.item, candleErr)}
-					continue
-				}
-				candidate, metricErr := scoreCandidate(job.item.symbol, job.item.ticker, job.item.amount, candles, config)
-				if metricErr != nil {
-					results <- scanResult{candidate: rejectedDataCandidate(job.item, metricErr)}
-					continue
-				}
-				results <- scanResult{candidate: candidate}
+				// A quant bug in one symbol's candles must never kill the
+				// backend: recover per job, report the symbol as rejected
+				// and keep the worker pool alive.
+				func() {
+					defer func() {
+						if r := recover(); r != nil {
+							slog.Error("L2 scan worker panic recovered",
+								"symbol", job.item.symbol.Symbol,
+								"panic", r, "stack", string(debug.Stack()))
+							results <- scanResult{candidate: rejectedDataCandidate(
+								job.item, fmt.Errorf("internal scanner panic: %v", r),
+							)}
+						}
+					}()
+					candles, candleErr := s.client.GetKlines(
+						ctx, job.item.symbol.Symbol, config.Interval, config.LookbackCandles,
+					)
+					if candleErr != nil {
+						results <- scanResult{candidate: rejectedDataCandidate(job.item, candleErr)}
+						return
+					}
+					candidate, metricErr := scoreCandidate(job.item.symbol, job.item.ticker, job.item.amount, candles, config)
+					if metricErr != nil {
+						results <- scanResult{candidate: rejectedDataCandidate(job.item, metricErr)}
+						return
+					}
+					results <- scanResult{candidate: candidate}
+				}()
 			}
 		}()
 	}
@@ -522,44 +539,44 @@ func scoreCandidate(
 		Hurst: bundle.Hurst, ConfluenceVerdict: confluence.Verdict,
 		ConfluenceStrength: confluence.Strength,
 		IsSqueeze:          regime.IsSqueeze,
-		Decision: decision, RejectionReason: strings.Join(reasons, "; "),
+		Decision:           decision, RejectionReason: strings.Join(reasons, "; "),
 		LowerPrice: lower, UpperPrice: upper, GridNum: gridNum,
 		RecommendedLeverage: leverage, RecommendedTrend: recommendedTrend,
 		ModelAssumptions: map[string]any{
-			"model":              "neutral_grid_capture_proxy_v3_multitier",
-			"interval":           config.Interval,
-			"lookbackCandles":    len(sorted),
-			"feeBpsPerFill":      config.FeeBps,
-			"slippageBpsPerFill": config.SlippageBps,
-			"captureEfficiency":  0.40,
-			"recommendedTrend":   recommendedTrend,
-			"regime":             regime.Regime,
-			"adx":                regime.ADX,
-			"rsi":                regime.RSI,
-			"choppiness":         regime.Choppiness,
-			"isSqueeze":          regime.IsSqueeze,
-			"emaSlopePct":        regime.EMASlopePct,
-			"rangePositionPct":   regime.RangePositionPct,
-			"atrPct":             regime.ATRPct,
+			"model":               "neutral_grid_capture_proxy_v3_multitier",
+			"interval":            config.Interval,
+			"lookbackCandles":     len(sorted),
+			"feeBpsPerFill":       config.FeeBps,
+			"slippageBpsPerFill":  config.SlippageBps,
+			"captureEfficiency":   0.40,
+			"recommendedTrend":    recommendedTrend,
+			"regime":              regime.Regime,
+			"adx":                 regime.ADX,
+			"rsi":                 regime.RSI,
+			"choppiness":          regime.Choppiness,
+			"isSqueeze":           regime.IsSqueeze,
+			"emaSlopePct":         regime.EMASlopePct,
+			"rangePositionPct":    regime.RangePositionPct,
+			"atrPct":              regime.ATRPct,
 			"volatilityParkinson": volParkinson,
-			"hurst":              bundle.Hurst,
+			"hurst":               bundle.Hurst,
 			"confluence": map[string]any{
-				"verdict":     confluence.Verdict,
-				"strength":    confluence.Strength,
-				"longScore":   confluence.LongScore,
-				"shortScore":  confluence.ShortScore,
-				"rangeScore":  confluence.RangeScore,
-				"hurstGate":   confluence.HurstGate,
-				"obvDivDir":   bundle.OBVDiv.Direction,
-				"iftRsi":      bundle.IFT.Current,
-				"avwapZ":      bundle.AVWAP.ZScore,
+				"verdict":        confluence.Verdict,
+				"strength":       confluence.Strength,
+				"longScore":      confluence.LongScore,
+				"shortScore":     confluence.ShortScore,
+				"rangeScore":     confluence.RangeScore,
+				"hurstGate":      confluence.HurstGate,
+				"obvDivDir":      bundle.OBVDiv.Direction,
+				"iftRsi":         bundle.IFT.Current,
+				"avwapZ":         bundle.AVWAP.ZScore,
 				"keltnerSqueeze": bundle.Keltner.InSqueeze,
 			},
-			"rangeSource":        "support_resistance_atr_buffered",
-			"fundingIncluded":    false,
-			"pricePrecision":     symbol.GetPricePrecision(),
-			"amountPrecision":    symbol.GetAmountPrecision(),
-			"warning":            "backtest proxy is not live trading performance",
+			"rangeSource":     "support_resistance_atr_buffered",
+			"fundingIncluded": false,
+			"pricePrecision":  symbol.GetPricePrecision(),
+			"amountPrecision": symbol.GetAmountPrecision(),
+			"warning":         "backtest proxy is not live trading performance",
 		},
 	}, nil
 }
@@ -754,4 +771,3 @@ func scannerScore(
 func clamp(value, minimum, maximum float64) float64 {
 	return math.Max(minimum, math.Min(maximum, value))
 }
-

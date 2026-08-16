@@ -9,12 +9,12 @@ import "math"
 // voice (IFT-RSI), fair-price stretch (anchored VWAP) and volatility phase
 // (Keltner squeeze).
 type IndicatorBundle struct {
-	Hurst       float64          // DFA estimate, ~0.5 random walk; <0.45 mean-reverting, >0.58 trending
-	HurstOK     bool             // enough data for a meaningful estimate
-	OBVDiv      OBVDivergence    // volume flow versus price pivots
-	IFT         IFTRSIResult     // early momentum turn (Vervoort inverse Fisher on RSI)
-	AVWAP       AVWAPResult      // stretch versus volume-weighted fair price since anchor
-	Keltner     KeltnerSqueeze   // volatility phase: squeeze / release direction
+	Hurst   float64        // DFA estimate, ~0.5 random walk; <0.45 mean-reverting, >0.58 trending
+	HurstOK bool           // enough data for a meaningful estimate
+	OBVDiv  OBVDivergence  // volume flow versus price pivots
+	IFT     IFTRSIResult   // early momentum turn (Vervoort inverse Fisher on RSI)
+	AVWAP   AVWAPResult    // stretch versus volume-weighted fair price since anchor
+	Keltner KeltnerSqueeze // volatility phase: squeeze / release direction
 }
 
 // OBVDivergence detects a regular divergence between price pivots and the
@@ -30,8 +30,8 @@ type OBVDivergence struct {
 }
 
 type IFTRSIResult struct {
-	Current float64 // latest inverse-Fisher value, -1..+1
-	Prev    float64
+	Current     float64 // latest inverse-Fisher value, -1..+1
+	Prev        float64
 	CrossedUp   bool // crossed above -0.5 from below (early bullish turn)
 	CrossedDown bool // crossed below +0.5 from above (early bearish turn)
 }
@@ -43,9 +43,9 @@ type AVWAPResult struct {
 }
 
 type KeltnerSqueeze struct {
-	InSqueeze   bool // BB(20,2) fully inside KC(20,1.5×ATR)
+	InSqueeze    bool // BB(20,2) fully inside KC(20,1.5×ATR)
 	JustReleased bool
-	ReleaseDir  int // +1 up, -1 down, 0 none — sign of the release candle
+	ReleaseDir   int // +1 up, -1 down, 0 none — sign of the release candle
 }
 
 // ComputeIndicatorBundle derives all confluence inputs from one series.
