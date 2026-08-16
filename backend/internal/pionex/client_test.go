@@ -21,8 +21,8 @@ func TestCreateFuturesGridBotOfficialContract(t *testing.T) {
 			t.Fatalf("Failed to decode request body: %v", err)
 		}
 
-		if req.Base != "BTC" || req.Quote != "USDT" {
-			t.Errorf("Expected base BTC quote USDT, got %s %s", req.Base, req.Quote)
+		if req.Base != "BTC.PERP" && req.Base != "BTC" || req.Quote != "USDT" {
+			t.Errorf("Expected base BTC.PERP/BTC quote USDT, got %s %s", req.Base, req.Quote)
 		}
 
 		if req.BUOrderData.Row != 10 {

@@ -57,6 +57,12 @@ func (manager *LifecycleManager) CreateGridBot(
 	baseCoin := strings.TrimSuffix(strings.TrimSuffix(input.Params.Base, ".PERP"), "_PERP")
 	symbol := fmt.Sprintf("%s_%s_PERP", baseCoin, input.Params.Quote)
 	input.Params.Base = fmt.Sprintf("%s.PERP", baseCoin)
+	if input.Params.BUOrderData.Trend == "no_trend" || input.Params.BUOrderData.Trend == "" {
+		input.Params.BUOrderData.Trend = "neutral"
+	}
+	if input.Params.BUOrderData.GridTypeCamel == "" {
+		input.Params.BUOrderData.GridTypeCamel = input.Params.BUOrderData.GridType
+	}
 	if err := manager.validatePionexSymbol(ctx, symbol); err != nil {
 		return "", err
 	}
@@ -190,9 +196,9 @@ func validateCreateInput(input CreateInput) error {
 		return errors.New("grid_type must be arithmetic or geometric")
 	}
 	switch data.Trend {
-	case "long", "short", "no_trend":
+	case "long", "short", "neutral", "no_trend":
 	default:
-		return errors.New("grid trend must be long, short or no_trend")
+		return errors.New("grid trend must be long, short, neutral or no_trend")
 	}
 	return nil
 }
