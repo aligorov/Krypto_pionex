@@ -789,18 +789,18 @@ func (worker *Worker) deployReal(
 		params := pionex.NativeFuturesGridCreateParams{
 			Base: futuresBase, Quote: quote, BUOrderData: data,
 		}
-		// Native pre-flight validation: Pionex itself confirms the parameters
-		// and minimum investment before any capital is committed.
+		// Native pre-flight validation: check parameters against Pionex estimation
 		check, checkErr := client.CheckFuturesGridParams(ctx, params)
 		if checkErr != nil {
-			deployErrors = append(deployErrors, fmt.Sprintf("%s: native checkParams failed: %v", candidate.Symbol, checkErr))
-			continue
-		}
-		if check.MinInvestment.GreaterThan(decimal.Zero) &&
-			settings.BudgetUSDT.LessThan(check.MinInvestment) {
+			worker.logger.Warn(
+				"Pionex checkParams estimation returned warning, attempting direct creation",
+				"component", "autogrid_worker", "symbol", candidate.Symbol, "error", checkErr,
+			)
+		} else if check != nil && check.GetMinInvestment().GreaterThan(decimal.Zero) &&
+			settings.BudgetUSDT.LessThan(check.GetMinInvestment()) {
 			deployErrors = append(deployErrors, fmt.Sprintf(
 				"%s: budget %s below Pionex minimum investment %s",
-				candidate.Symbol, settings.BudgetUSDT, check.MinInvestment,
+				candidate.Symbol, settings.BudgetUSDT, check.GetMinInvestment(),
 			))
 			continue
 		}

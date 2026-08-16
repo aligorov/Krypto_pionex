@@ -307,8 +307,9 @@ func scoreCandidate(
 	if upperFloat > lowerFloat && upperFloat > 0 {
 		rangeFraction = (upperFloat - lowerFloat) / upperFloat / 2
 	}
-	lower := decimal.NewFromFloat(lowerFloat)
-	upper := decimal.NewFromFloat(upperFloat)
+	pricePrec := symbol.GetPricePrecision()
+	lower := decimal.NewFromFloat(lowerFloat).Round(int32(pricePrec))
+	upper := decimal.NewFromFloat(upperFloat).Round(int32(pricePrec))
 
 	leverage := config.BaseLeverage
 	if config.AdaptiveLeverage {
