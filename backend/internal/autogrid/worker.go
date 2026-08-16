@@ -1075,6 +1075,19 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 	for _, bot := range bots {
 		remote, getErr := client.GetFuturesGridBot(ctx, bot.remoteID)
 		if getErr != nil {
+			errStr := strings.ToLower(getErr.Error())
+			if strings.Contains(errStr, "not_found") || strings.Contains(errStr, "not found") || strings.Contains(errStr, "404") || strings.Contains(errStr, "invalid_order") {
+				_, _ = worker.db.Exec(ctx, `
+					UPDATE grid_bots
+					SET status = 'STOPPED', closed_reason = 'NOT_FOUND_ON_EXCHANGE',
+					    reconciliation_state = 'REMOTE_TERMINAL_CONFIRMED',
+					    closed_at = NOW(), last_reconciled_at = NOW(), last_error = NULL, updated_at = NOW()
+					WHERE id = $1
+				`, bot.id)
+				worker.logger.Info("Pionex grid not found on exchange, marked STOPPED",
+					"component", "autogrid_worker", "symbol", bot.symbol, "bot_id", bot.id)
+				continue
+			}
 			_, _ = worker.db.Exec(ctx, `
 				UPDATE grid_bots
 				SET reconciliation_state = 'REMOTE_READ_FAILED',
@@ -1591,7 +1604,7 @@ func databaseTrend(trend string) string {
 
 func terminalRemoteGridStatus(status string) bool {
 	normalized := strings.ToLower(strings.TrimSpace(status))
-	for _, marker := range []string{"cancel", "closed", "finish", "stopped", "liquidat", "expired"} {
+	for _, marker := range []string{"cancel", "closed", "close", "finish", "stopped", "stop", "liquidat", "expired", "inactive", "terminate", "complete", "failed"} {
 		if strings.Contains(normalized, marker) {
 			return true
 		}
@@ -1608,7 +1621,7 @@ func terminalOutcome(reasonBy string) (string, string) {
 		return "COMPLETED", "TAKE_PROFIT_NATIVE"
 	case strings.Contains(normalized, "loss_stop"):
 		return "STOPPED", "STOP_LOSS_NATIVE"
-	case strings.Contains(normalized, "user_cancel"):
+	case strings.Contains(normalized, "user_cancel"), strings.Contains(normalized, "user"):
 		return "STOPPED", "USER_CANCEL"
 	case strings.Contains(normalized, "liquidat"):
 		return "LIQUIDATED", "LIQUIDATION"
