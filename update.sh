@@ -32,9 +32,12 @@ fi
 echo ">> Stopping existing containers..."
 docker compose down
 
-echo ">> Building backend and web UI..."
+echo ">> Building backend, web UI and quant worker..."
 RELEASE_VERSION=$(tr -d '[:space:]' < VERSION 2>/dev/null || echo dev)
 docker compose build --build-arg VERSION="$RELEASE_VERSION" backend
+# The quant worker must rebuild with the backend: it polls the backtest_jobs
+# queue, and a stale image silently leaves every job QUEUED forever.
+docker compose build quant-worker
 
 echo ">> Starting all services in background..."
 docker compose up -d
