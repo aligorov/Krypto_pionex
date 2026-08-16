@@ -952,6 +952,21 @@ func (worker *Worker) cancelRealBot(
 		CloseSellMode: "TO_USDT", Immediate: true,
 	})
 	if cancelErr != nil {
+		errStr := strings.ToLower(cancelErr.Error())
+		if strings.Contains(errStr, "already_closed") || strings.Contains(errStr, "already closed") ||
+			strings.Contains(errStr, "not_found") || strings.Contains(errStr, "not found") ||
+			strings.Contains(errStr, "not_exist") || strings.Contains(errStr, "invalid_order") {
+			_, _ = worker.db.Exec(ctx, `
+				UPDATE grid_bots
+				SET status = 'STOPPED', closed_reason = 'ALREADY_CLOSED',
+				    reconciliation_state = 'REMOTE_TERMINAL_CONFIRMED',
+				    closed_at = NOW(), last_reconciled_at = NOW(), last_error = NULL, updated_at = NOW()
+				WHERE id = $1
+			`, botID)
+			worker.logger.Info("Pionex grid already closed remotely, marked STOPPED",
+				"component", "autogrid_worker", "bot_id", botID, "remote_id", remoteID)
+			return nil
+		}
 		state := "CANCEL_FAILED"
 		if pionex.IsOutcomeUnknown(cancelErr) {
 			state = "CANCEL_OUTCOME_UNKNOWN"
@@ -1086,15 +1101,17 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 		remote, getErr := client.GetFuturesGridBot(ctx, bot.remoteID)
 		if getErr != nil {
 			errStr := strings.ToLower(getErr.Error())
-			if strings.Contains(errStr, "not_found") || strings.Contains(errStr, "not found") || strings.Contains(errStr, "404") || strings.Contains(errStr, "invalid_order") {
+			if strings.Contains(errStr, "not_found") || strings.Contains(errStr, "not found") ||
+				strings.Contains(errStr, "already_closed") || strings.Contains(errStr, "already closed") ||
+				strings.Contains(errStr, "not_exist") || strings.Contains(errStr, "404") || strings.Contains(errStr, "invalid_order") {
 				_, _ = worker.db.Exec(ctx, `
 					UPDATE grid_bots
-					SET status = 'STOPPED', closed_reason = 'NOT_FOUND_ON_EXCHANGE',
+					SET status = 'STOPPED', closed_reason = 'ALREADY_CLOSED',
 					    reconciliation_state = 'REMOTE_TERMINAL_CONFIRMED',
 					    closed_at = NOW(), last_reconciled_at = NOW(), last_error = NULL, updated_at = NOW()
 					WHERE id = $1
 				`, bot.id)
-				worker.logger.Info("Pionex grid not found on exchange, marked STOPPED",
+				worker.logger.Info("Pionex grid not found or already closed on exchange, marked STOPPED",
 					"component", "autogrid_worker", "symbol", bot.symbol, "bot_id", bot.id)
 				continue
 			}
