@@ -59,7 +59,7 @@ export default function AutoGridAutopilot({ canOperate, accountsHref }: Props) {
   const [clearingPaper, setClearingPaper] = useState(false);
 
   async function handleClearPaper() {
-    if (!window.confirm('Сбросить историю и накопленный PnL симуляции (PAPER)? Завершенные боты будут удалены.')) {
+    if (!window.confirm('Сбросить всю историю и накопленный PnL симуляции (PAPER)? Все симуляционные боты будут удалены.')) {
       return;
     }
     setClearingPaper(true);
@@ -67,9 +67,9 @@ export default function AutoGridAutopilot({ canOperate, accountsHref }: Props) {
     try {
       const res = await api<{ success: boolean; deletedCount: number }>('/api/autogrid/paper/clear', {
         method: 'POST',
-        body: JSON.stringify({ includeRunning: false }),
+        body: JSON.stringify({ includeRunning: true }),
       });
-      setMessage({ kind: 'success', text: `История симуляции очищена (${res.deletedCount} ботов удалено).` });
+      setMessage({ kind: 'success', text: `История симуляции полностью очищена (${res.deletedCount} ботов удалено).` });
       await load();
     } catch (clearErr) {
       setMessage({ kind: 'danger', text: describeError(clearErr) });
@@ -196,14 +196,14 @@ export default function AutoGridAutopilot({ canOperate, accountsHref }: Props) {
             <>
               <button
                 className="button primary"
-                disabled={busy !== null || running}
+                disabled={busy !== null || settings.status === 'RUNNING'}
                 onClick={() => void runAction('start')}
               >
                 {busy === 'start' ? 'Запуск…' : 'Запустить'}
               </button>
               <button
                 className="button"
-                disabled={busy !== null || settings.status === 'STOPPED'}
+                disabled={busy !== null}
                 onClick={() => void runAction('scan')}
               >
                 {busy === 'scan' ? 'Скан…' : 'Скан сейчас'}
