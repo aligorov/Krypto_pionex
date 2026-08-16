@@ -67,6 +67,10 @@ func (manager *LifecycleManager) CreateGridBot(
 	if err != nil {
 		return "", err
 	}
+	extraMargin := decimal.Zero
+	if input.Params.BUOrderData.ExtraMargin != nil {
+		extraMargin = *input.Params.BUOrderData.ExtraMargin
+	}
 	var gridID string
 	err = manager.db.QueryRow(ctx, `
 		INSERT INTO grid_bots (
@@ -87,7 +91,7 @@ func (manager *LifecycleManager) CreateGridBot(
 		input.Params.BUOrderData.Bottom, input.Params.BUOrderData.Top,
 		input.Params.BUOrderData.Row, input.Params.BUOrderData.Leverage,
 		input.Params.BUOrderData.QuoteInvestment,
-		input.Params.BUOrderData.ExtraMargin,
+		extraMargin,
 		input.Params.BUOrderData.LossStop,
 		input.Params.BUOrderData.ProfitStop,
 		fingerprint,
