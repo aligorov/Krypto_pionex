@@ -1611,7 +1611,13 @@ func (s *Server) testTelegramConnection(w http.ResponseWriter, r *http.Request) 
 		s.fail(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"success": true, "message": "Тестовое сообщение успешно отправлено в Telegram"})
+	message := "Тестовое сообщение успешно отправлено в Telegram"
+	// The test bypasses the enabled flag; without this hint a green test
+	// hides the fact that real events are being dropped at the producer.
+	if stored, err := s.telegram.GetSettings(r.Context()); err == nil && !stored.Enabled {
+		message += " ⚠️ НО тумблер «Включено» выключен — реальные уведомления отправляться не будут. Включи и сохрани настройки."
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"success": true, "message": message})
 }
 
 func (s *Server) getBotHistory(w http.ResponseWriter, r *http.Request) {
