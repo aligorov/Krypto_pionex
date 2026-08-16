@@ -137,16 +137,19 @@ func (s *Scanner) ScanMarkets(
 		return ranked[i].amount.GreaterThan(ranked[j].amount)
 	})
 
-	// Expand pool limit beyond MaxSymbols to discover quality pairs from top 60-80
-	poolLimit := config.MaxSymbols * 3
-	if poolLimit < 60 {
-		poolLimit = 60
+	// Scan all available trading PERP pairs across Pionex (no artificial cap)
+	// Filter out only zero-volume / dead markets
+	activeRanked := make([]rankedSymbol, 0, len(ranked))
+	for _, r := range ranked {
+		if r.amount.GreaterThan(decimal.NewFromInt(10000)) { // Min 10k USD 24h turnover to avoid completely dead books
+			activeRanked = append(activeRanked, r)
+		}
 	}
-	if len(ranked) > poolLimit {
-		ranked = ranked[:poolLimit]
+	if len(activeRanked) == 0 {
+		activeRanked = ranked
 	}
 
-	// L2 Concurrent Worker Pool for Deep Kline Analysis
+	// L2 Concurrent Worker Pool for Deep Kline Analysis across all Pionex pairs
 	type scanJob struct {
 		item rankedSymbol
 	}
@@ -154,16 +157,16 @@ func (s *Scanner) ScanMarkets(
 		candidate ScannerCandidate
 	}
 
-	workerCount := 8
-	if len(ranked) < workerCount {
-		workerCount = len(ranked)
+	workerCount := 16
+	if len(activeRanked) < workerCount {
+		workerCount = len(activeRanked)
 	}
 	if workerCount < 1 {
 		workerCount = 1
 	}
 
-	jobs := make(chan scanJob, len(ranked))
-	results := make(chan scanResult, len(ranked))
+	jobs := make(chan scanJob, len(activeRanked))
+	results := make(chan scanResult, len(activeRanked))
 	var wg sync.WaitGroup
 
 	for w := 0; w < workerCount; w++ {
@@ -191,7 +194,7 @@ func (s *Scanner) ScanMarkets(
 		}()
 	}
 
-	for _, item := range ranked {
+	for _, item := range activeRanked {
 		jobs <- scanJob{item: item}
 	}
 	close(jobs)
@@ -462,8 +465,8 @@ func validateConfig(config ScanConfig) error {
 	if config.LookbackCandles < 30 || config.LookbackCandles > 500 {
 		return errors.New("lookback candles must be between 30 and 500")
 	}
-	if config.MaxSymbols < 1 || config.MaxSymbols > 100 {
-		return errors.New("max symbols per scan must be between 1 and 100")
+	if config.MaxSymbols < 1 || config.MaxSymbols > 500 {
+		return errors.New("max symbols per scan must be between 1 and 500")
 	}
 	if config.BaseLeverage < 1 || config.BaseLeverage > 100 {
 		return errors.New("base leverage must be between 1 and 100")

@@ -707,8 +707,8 @@ func (s *Service) validateSettings(
 	if input.LookbackCandles < 30 || input.LookbackCandles > 500 {
 		return errors.New("lookback candles must be between 30 and 500")
 	}
-	if input.MaxSymbolsPerScan < 1 || input.MaxSymbolsPerScan > 100 {
-		return errors.New("max symbols per scan must be between 1 and 100")
+	if input.MaxSymbolsPerScan < 1 || input.MaxSymbolsPerScan > 500 {
+		return errors.New("max symbols per scan must be between 1 and 500")
 	}
 	if input.ScanIntervalSeconds < 60 || input.ScanIntervalSeconds > 86400 {
 		return errors.New("scan interval must be between 60 and 86400 seconds")
