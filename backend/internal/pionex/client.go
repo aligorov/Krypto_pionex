@@ -121,27 +121,97 @@ type NativeFuturesGridCreateResult struct {
 }
 
 type FuturesGridOrder struct {
-	BUOrderID   string `json:"buOrderId"`
-	Base        string `json:"base"`
-	Quote       string `json:"quote"`
-	Status      string `json:"status"`
-	ReasonBy    string `json:"reasonBy"`
-	BUOrderData struct {
-		Status            string          `json:"status"`
-		ReasonBy          string          `json:"reasonBy"`
-		Top               decimal.Decimal  `json:"top"`
-		Bottom            decimal.Decimal  `json:"bottom"`
-		Row               int             `json:"row"`
-		GridType          string          `json:"gridType"`
-		Trend             string          `json:"trend"`
-		Leverage          int             `json:"leverage"`
-		OpenPrice         decimal.Decimal  `json:"openPrice"`
-		Position          decimal.Decimal  `json:"position"`
-		PositionOpenPrice decimal.Decimal  `json:"positionOpenPrice"`
-		ProfitWithdrawn   decimal.Decimal  `json:"profitWithdrawn"`
-		RiskStatus        string          `json:"riskStatus"`
-		LiquidationPrice  decimal.Decimal  `json:"liquidationPrice"`
-	} `json:"buOrderData"`
+	BUOrderID   string              `json:"buOrderId"`
+	Base        string              `json:"base"`
+	Quote       string              `json:"quote"`
+	Status      string              `json:"status"`
+	ReasonBy    string              `json:"reasonBy"`
+	BUOrderData BUOrderDataResponse `json:"buOrderData"`
+}
+
+type BUOrderDataResponse struct {
+	Status               string          `json:"status"`
+	ReasonBy             string          `json:"reasonBy"`
+	TopRaw               json.RawMessage `json:"top"`
+	BottomRaw            json.RawMessage `json:"bottom"`
+	Row                  int             `json:"row"`
+	GridType             string          `json:"gridType"`
+	Trend                string          `json:"trend"`
+	Leverage             int             `json:"leverage"`
+	OpenPriceRaw         json.RawMessage `json:"openPrice"`
+	PositionRaw          json.RawMessage `json:"position"`
+	PositionOpenPriceRaw json.RawMessage `json:"positionOpenPrice"`
+	ProfitWithdrawnRaw   json.RawMessage `json:"profitWithdrawn"`
+	TotalProfitRaw       json.RawMessage `json:"totalProfit"`
+	RiskStatus           string          `json:"riskStatus"`
+	LiquidationPriceRaw  json.RawMessage `json:"liquidationPrice"`
+
+	Top               decimal.Decimal `json:"-"`
+	Bottom            decimal.Decimal `json:"-"`
+	OpenPrice         decimal.Decimal `json:"-"`
+	Position          decimal.Decimal `json:"-"`
+	PositionOpenPrice decimal.Decimal `json:"-"`
+	ProfitWithdrawn   decimal.Decimal `json:"-"`
+	LiquidationPrice  decimal.Decimal `json:"-"`
+}
+
+func parseDecimalRaw(raw json.RawMessage) decimal.Decimal {
+	if len(raw) == 0 {
+		return decimal.Zero
+	}
+	s := strings.Trim(string(raw), "\" \t\n\r")
+	if s == "" || s == "null" {
+		return decimal.Zero
+	}
+	d, err := decimal.NewFromString(s)
+	if err != nil {
+		return decimal.Zero
+	}
+	return d
+}
+
+func (b *BUOrderDataResponse) UnmarshalJSON(data []byte) error {
+	type Alias BUOrderDataResponse
+	var aux Alias
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	*b = BUOrderDataResponse(aux)
+	b.Top = parseDecimalRaw(b.TopRaw)
+	b.Bottom = parseDecimalRaw(b.BottomRaw)
+	b.OpenPrice = parseDecimalRaw(b.OpenPriceRaw)
+	b.Position = parseDecimalRaw(b.PositionRaw)
+	b.PositionOpenPrice = parseDecimalRaw(b.PositionOpenPriceRaw)
+	b.ProfitWithdrawn = parseDecimalRaw(b.ProfitWithdrawnRaw)
+	if b.ProfitWithdrawn.IsZero() {
+		b.ProfitWithdrawn = parseDecimalRaw(b.TotalProfitRaw)
+	}
+	b.LiquidationPrice = parseDecimalRaw(b.LiquidationPriceRaw)
+	return nil
+}
+
+func (f *FuturesGridOrder) UnmarshalJSON(data []byte) error {
+	type Alias FuturesGridOrder
+	var aux struct {
+		Alias
+		KeyID   string `json:"keyId"`
+		OrderID string `json:"orderId"`
+		ID      string `json:"id"`
+	}
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	*f = FuturesGridOrder(aux.Alias)
+	if f.BUOrderID == "" {
+		if aux.OrderID != "" {
+			f.BUOrderID = aux.OrderID
+		} else if aux.KeyID != "" {
+			f.BUOrderID = aux.KeyID
+		} else if aux.ID != "" {
+			f.BUOrderID = aux.ID
+		}
+	}
+	return nil
 }
 
 func (c *Client) CreateFuturesGridBot(
