@@ -879,6 +879,28 @@ func (worker *Worker) deployReal(
 			}
 		}
 
+		// Pre-deploy distance check: the current price must have room to
+		// the anti-hunt stop BEFORE the bot opens — deploying with price
+		// hugging the lower bound means instant STRUCT_INVALID and a
+		// wasted create fee (prod: ENSO closed in the same second).
+		if trend != "short" {
+			minDistance := atrPrice.Mul(decimal.NewFromFloat(1.5))
+			if candidate.CurrentPrice.Sub(antiHuntStop).LessThan(minDistance) {
+				deployErrors = append(deployErrors, fmt.Sprintf(
+					"%s: price %s too close to anti-hunt stop %s (< 1.5 ATR room) — skipped",
+					candidate.Symbol, candidate.CurrentPrice.String(), antiHuntStop.String()))
+				continue
+			}
+		} else {
+			minDistance := atrPrice.Mul(decimal.NewFromFloat(1.5))
+			if antiHuntStop.Sub(candidate.CurrentPrice).LessThan(minDistance) {
+				deployErrors = append(deployErrors, fmt.Sprintf(
+					"%s: price %s too close to anti-hunt stop %s (< 1.5 ATR room) — skipped",
+					candidate.Symbol, candidate.CurrentPrice.String(), antiHuntStop.String()))
+				continue
+			}
+		}
+
 		botLev := settings.Leverage
 		if settings.AdaptiveLeverageEnabled {
 			dyn := ComputeDynamicLeverage(atrPct, settings.Leverage)
