@@ -65,12 +65,23 @@ func DetectRegime(candles []pionex.KlineCandle) RegimeResult {
 	if reference > 0 {
 		result.EMASlopePct = (result.EMAFast - reference) / reference * 100
 	}
+	startClose, _ := candles[0].Close.Float64()
+	endClose := closes[len(closes)-1]
+	windowReturnPct := 0.0
+	if startClose > 0 && endClose > 0 {
+		windowReturnPct = (endClose - startClose) / startClose * 100
+	}
 
 	switch {
 	case result.EMAFast > result.EMASlow && result.EMASlopePct > 0.15:
 		result.Regime = "TREND_UP"
 	case result.EMAFast < result.EMASlow && result.EMASlopePct < -0.15:
-		result.Regime = "TREND_DOWN"
+		if windowReturnPct > 3.0 {
+			// Macro window is up, local pullback is a range/consolidation or dip, not macro downtrend
+			result.Regime = "RANGE"
+		} else {
+			result.Regime = "TREND_DOWN"
+		}
 	}
 
 	// Oscillation overrides:

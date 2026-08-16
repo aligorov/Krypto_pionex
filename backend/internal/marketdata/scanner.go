@@ -331,7 +331,18 @@ func scoreCandidate(
 		leverage = 2
 	}
 
+	var change24hPct float64
+	if ticker.Open.GreaterThan(decimal.Zero) {
+		change24hPct, _ = ticker.Close.Sub(ticker.Open).Div(ticker.Open).Mul(decimal.NewFromInt(100)).Float64()
+	}
+
 	recommendedTrend := regime.RecommendedTrend()
+	// Counter-trend guard: If 24h momentum is strongly positive (+3%+), never open a SHORT grid.
+	if change24hPct >= 3.0 && recommendedTrend == "short" {
+		recommendedTrend = "no_trend"
+	} else if change24hPct <= -6.0 && recommendedTrend == "long" {
+		recommendedTrend = "no_trend"
+	}
 	if rangeFraction < 0.005 {
 		recommendedTrend = "no_trend"
 	}
