@@ -43,6 +43,12 @@ type CreateInput struct {
 	// the supervision loop uses the numbers the market offered at open.
 	PnLTargetUSDT *decimal.Decimal
 	MaxLossUSDT   *decimal.Decimal
+	// AntiHuntStop persists the deploy-time invalidation level so the
+	// supervision loop can close before the exchange stop is hunted.
+	AntiHuntStop *decimal.Decimal
+	// StructContext snapshots the deploy-time confluence/structure thesis
+	// (Hurst, verdict, invalidation) for later drift detection.
+	StructContext map[string]any
 }
 
 func NewLifecycleManager(db *pgxpool.Pool, pionexClient *pionex.Client) *LifecycleManager {
@@ -113,10 +119,10 @@ func (manager *LifecycleManager) CreateGridBot(
 				grid_type, lower_price, upper_price, grid_num, leverage,
 				quote_investment, extra_margin, stop_loss, take_profit,
 				request_fingerprint, execution_mode, reconciliation_state,
-				pnl_target_usdt, max_loss_usdt
+				pnl_target_usdt, max_loss_usdt, anti_hunt_stop_price, struct_context
 			) VALUES (
 				$1, $2, $3, 'PENDING_SUBMISSION', $4, $5, $6, $7, $8, $9,
-				$10, $11, $12, $13, $14, 'REAL', 'PENDING', $15, $16
+				$10, $11, $12, $13, $14, 'REAL', 'PENDING', $15, $16, $17, $18
 			)
 			ON CONFLICT (request_fingerprint) DO NOTHING
 			RETURNING id
@@ -132,6 +138,8 @@ func (manager *LifecycleManager) CreateGridBot(
 			fingerprint,
 			input.PnLTargetUSDT,
 			input.MaxLossUSDT,
+			input.AntiHuntStop,
+			input.StructContext,
 		).Scan(&gridID)
 		if errors.Is(insertErr, pgx.ErrNoRows) {
 			loadErr := tx.QueryRow(ctx, `

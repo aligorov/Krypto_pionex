@@ -26,6 +26,7 @@ type Settings struct {
 	Temperature             float64   `json:"temperature"`
 	ThinkingEnabled         bool      `json:"thinkingEnabled"`
 	RequireApprovalToDeploy bool      `json:"requireApprovalToDeploy"`
+	RequireAuditForReal     bool      `json:"requireAuditForReal"`
 	AuditIntervalSeconds    int       `json:"auditIntervalSeconds"`
 	CreatedAt               time.Time `json:"createdAt"`
 	UpdatedAt               time.Time `json:"updatedAt"`
@@ -58,6 +59,23 @@ type RecommendedGridParams struct {
 	TakeProfitTargetUSD decimal.Decimal `json:"take_profit_target_usd"`
 }
 
+// NewsCatalyst is the structured news verdict the model must return for
+// every candidate. A HIGH/CRITICAL catalyst vetoes the candidate regardless
+// of the model's overall decision — news can only block an entry, never
+// create one (latency makes LLM unsuited as a directional signal).
+type NewsCatalyst struct {
+	Detected bool   `json:"detected"`
+	Type     string `json:"type"`     // UNLOCK, DELIST, EXPLOIT, FUNDING_SKEW, REGULATORY, PUMP_DUMP, NONE
+	Severity string `json:"severity"` // LOW, MEDIUM, HIGH, CRITICAL
+	Summary  string `json:"summary"`
+	ETAHours int    `json:"eta_hours"`
+}
+
+// BlocksEntry reports whether the catalyst severity hard-vetoes a deploy.
+func (n *NewsCatalyst) BlocksEntry() bool {
+	return n != nil && n.Detected && (n.Severity == "HIGH" || n.Severity == "CRITICAL")
+}
+
 // AuditDecision carries the parsed structured verdict from LLM.
 type AuditDecision struct {
 	Decision         string                 `json:"decision"` // APPROVED or REJECTED
@@ -65,6 +83,7 @@ type AuditDecision struct {
 	Regime           string                 `json:"regime"`
 	ReasoningSummary string                 `json:"reasoning_summary"`
 	RejectionReason  *string                `json:"rejection_reason"`
+	NewsCatalyst     *NewsCatalyst          `json:"news_catalyst,omitempty"`
 	GridParams       *RecommendedGridParams `json:"grid_params,omitempty"`
 }
 
@@ -89,6 +108,8 @@ type CandidateInput struct {
 	Choppiness           float64         `json:"choppiness_index"`
 	EMASlopePct          float64         `json:"ema_slope_pct"`
 	IsSqueeze            bool            `json:"is_bbw_squeeze"`
+	Hurst                float64         `json:"hurst_exponent"`
+	ConfluenceVerdict    string          `json:"confluence_verdict"`
 	RecommendedTrend     string          `json:"recommended_trend"`
 	ProposedLowerPrice   float64         `json:"proposed_lower_price"`
 	ProposedUpperPrice   float64         `json:"proposed_upper_price"`

@@ -35,6 +35,9 @@ type ScannerCandidate struct {
 	ATRPct              float64 `json:"atrPct"`
 	Choppiness          float64 `json:"choppiness"`
 	BBWPercentile       float64 `json:"bbwPercentile"`
+	Hurst               float64 `json:"hurst"`
+	ConfluenceVerdict   string  `json:"confluenceVerdict"`
+	ConfluenceStrength  float64 `json:"confluenceStrength"`
 	IsSqueeze           bool    `json:"isSqueeze"`
 	Decision            string
 	RejectionReason     string
@@ -435,6 +438,34 @@ func scoreCandidate(
 		}
 	}
 
+	// --- Confluence engine (v1.2: soft multiplier + direction veto).
+	// Independent information classes only — Hurst regime memory, OBV flow,
+	// one IFT-RSI momentum voice, anchored-VWAP stretch, Keltner phase —
+	// computed on the already-fetched L2 candles, zero extra API calls.
+	series := ExtractSeries(sorted)
+	bundle := ComputeIndicatorBundle(series)
+	confluence := EvaluateConfluence(regime, bundle)
+	switch {
+	case recommendedTrend == "long" && confluence.Verdict == ConfluenceSupportShort:
+		reasons = append(reasons, fmt.Sprintf(
+			"confluence veto: flow supports SHORT (long %.2f vs short %.2f)",
+			confluence.LongScore, confluence.ShortScore))
+		recommendedTrend = "no_trend"
+	case recommendedTrend == "short" && confluence.Verdict == ConfluenceSupportLong:
+		reasons = append(reasons, fmt.Sprintf(
+			"confluence veto: flow supports LONG (short %.2f vs long %.2f)",
+			confluence.ShortScore, confluence.LongScore))
+		recommendedTrend = "no_trend"
+	}
+	// Hard regime veto: a persistently trending memory (Hurst > 0.60)
+	// loads one-sided inventory into a fresh neutral grid — the exact
+	// failure the daily-loss breaker only sees after the damage.
+	if recommendedTrend == "no_trend" && HurstHardVetoNeutral(bundle) {
+		reasons = append(reasons, fmt.Sprintf(
+			"confluence veto: Hurst %.2f > 0.60 — persistent trend regime, neutral grid would load one-sided inventory",
+			bundle.Hurst))
+	}
+
 	decision := "ACCEPTED"
 	if len(reasons) > 0 {
 		decision = "REJECTED"
@@ -466,6 +497,18 @@ func scoreCandidate(
 		score = clamp(score*(0.9+0.1*squeezeFit), 0, 1)
 	}
 
+	// Confluence score shaping: aligned verdicts lift the candidate up to
+	// +20%, a directional conflict cuts it by 15% (size down, never pick a
+	// side automatically).
+	switch {
+	case confluence.Verdict == ConfluenceConflict:
+		score = clamp(score*0.85, 0, 1)
+	case (recommendedTrend == "no_trend" && confluence.Verdict == ConfluenceSupportRange) ||
+		(recommendedTrend == "long" && confluence.Verdict == ConfluenceSupportLong) ||
+		(recommendedTrend == "short" && confluence.Verdict == ConfluenceSupportShort):
+		score = clamp(score*(0.8+0.2*confluence.Strength), 0, 1)
+	}
+
 	return ScannerCandidate{
 		Symbol: symbol.Symbol, BaseCurrency: symbol.BaseCurrency,
 		QuoteCurrency: symbol.QuoteCurrency, Price: price,
@@ -476,7 +519,9 @@ func scoreCandidate(
 		Regime: regime.Regime, ADXPct: regime.ADX,
 		RangePositionPct: regime.RangePositionPct, ATRPct: regime.ATRPct,
 		Choppiness: regime.Choppiness, BBWPercentile: regime.BBWPercentile,
-		IsSqueeze: regime.IsSqueeze,
+		Hurst: bundle.Hurst, ConfluenceVerdict: confluence.Verdict,
+		ConfluenceStrength: confluence.Strength,
+		IsSqueeze:          regime.IsSqueeze,
 		Decision: decision, RejectionReason: strings.Join(reasons, "; "),
 		LowerPrice: lower, UpperPrice: upper, GridNum: gridNum,
 		RecommendedLeverage: leverage, RecommendedTrend: recommendedTrend,
@@ -497,6 +542,19 @@ func scoreCandidate(
 			"rangePositionPct":   regime.RangePositionPct,
 			"atrPct":             regime.ATRPct,
 			"volatilityParkinson": volParkinson,
+			"hurst":              bundle.Hurst,
+			"confluence": map[string]any{
+				"verdict":     confluence.Verdict,
+				"strength":    confluence.Strength,
+				"longScore":   confluence.LongScore,
+				"shortScore":  confluence.ShortScore,
+				"rangeScore":  confluence.RangeScore,
+				"hurstGate":   confluence.HurstGate,
+				"obvDivDir":   bundle.OBVDiv.Direction,
+				"iftRsi":      bundle.IFT.Current,
+				"avwapZ":      bundle.AVWAP.ZScore,
+				"keltnerSqueeze": bundle.Keltner.InSqueeze,
+			},
 			"rangeSource":        "support_resistance_atr_buffered",
 			"fundingIncluded":    false,
 			"pricePrecision":     symbol.GetPricePrecision(),

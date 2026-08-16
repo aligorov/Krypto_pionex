@@ -10,6 +10,7 @@ const (
 	ActionCloseTakeProfit = "CLOSE_TAKE_PROFIT"
 	ActionCloseStopLoss  = "CLOSE_STOP_LOSS"
 	ActionCloseRangeBreak = "CLOSE_RANGE_BREAK"
+	ActionCloseStructInvalid = "CLOSE_STRUCT_INVALID"
 	ActionAdjustUp       = "ADJUST_UP"
 	ActionAdjustDown     = "ADJUST_DOWN"
 )
@@ -28,6 +29,10 @@ type botActionInput struct {
 	RangeBreakBuffer decimal.Decimal // percent beyond the range before acting
 	AdjustmentsLeft  int
 	Regime           string // RANGE, TREND_UP, TREND_DOWN ("" = unknown)
+	// AntiHuntStop is the deploy-time invalidation level: price beyond it
+	// against the bot's direction means the thesis the grid was opened
+	// under is dead — close before the exchange stop gets swept.
+	AntiHuntStop *decimal.Decimal
 }
 
 type manageDecision struct {
@@ -90,6 +95,25 @@ func decideBotAction(input botActionInput) manageDecision {
 	if input.MaxLoss.GreaterThan(decimal.Zero) && total.LessThanOrEqual(input.MaxLoss.Neg()) {
 		return manageDecision{Action: ActionCloseStopLoss, Reason: "STOP_LOSS"}
 	}
+
+	// 4.5 Structural invalidation: the deploy-time anti-hunt level marks
+	// where the opening thesis is dead. Unlike the range break it acts
+	// regardless of regime — a sweep beyond it against the direction is
+	// the documented exit-before-the-crowd point, before inventory loads.
+	if input.AntiHuntStop != nil && input.AntiHuntStop.GreaterThan(decimal.Zero) &&
+		input.CurrentPrice.GreaterThan(decimal.Zero) {
+		stopBroken := false
+		switch input.Direction {
+		case "SHORT":
+			stopBroken = input.CurrentPrice.GreaterThan(*input.AntiHuntStop)
+		default: // LONG and NEUTRAL both hold long-side inventory on a break down
+			stopBroken = input.CurrentPrice.LessThan(*input.AntiHuntStop)
+		}
+		if stopBroken {
+			return manageDecision{Action: ActionCloseStructInvalid, Reason: "STRUCT_INVALID_ANTI_HUNT"}
+		}
+	}
+
 	if !input.CurrentPrice.GreaterThan(decimal.Zero) || !input.Upper.GreaterThan(input.Lower) {
 		return manageDecision{Action: ActionHold}
 	}

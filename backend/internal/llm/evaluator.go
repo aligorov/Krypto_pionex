@@ -42,6 +42,9 @@ QUANTITATIVE AUDIT RULES:
    - Optimize lower_price and upper_price bounds with ATR(14) safety padding.
    - Recommend grid_count (20-150), conservative leverage (2x-3x), and strict stop_loss.
 
+NEWS CATALYST VETO RULE:
+The news_catalyst object is MANDATORY for every response. severity HIGH or CRITICAL (imminent cliff unlock >3% of supply, active exploit/hack, delisting, regulatory ban) OVERRIDES your overall decision: the candidate must then be REJECTED regardless of technicals. News may only block an entry, never justify one.
+
 OUTPUT FORMAT INSTRUCTIONS:
 You MUST respond ONLY with a single valid, well-formed JSON object strictly matching this schema (no introductory text, no conversational explanations, no markdown formatting outside standard json):
 {
@@ -50,6 +53,13 @@ You MUST respond ONLY with a single valid, well-formed JSON object strictly matc
   "regime": "MEAN_REVERSION" | "STRONG_TREND_DOWN" | "STRONG_TREND_UP" | "HIGH_VOLATILITY_EXPANSION" | "LOW_LIQUIDITY_CHOP",
   "reasoning_summary": "Concise 1-2 sentence quantitative & fundamental rationale citing exact indicator values (ADX, EMA slope, Volatility, Squeeze, News/Catalysts)",
   "rejection_reason": "Specific risk reason if REJECTED, or null if APPROVED",
+  "news_catalyst": {
+    "detected": false,
+    "type": "NONE" | "UNLOCK" | "DELIST" | "EXPLOIT" | "FUNDING_SKEW" | "REGULATORY" | "PUMP_DUMP",
+    "severity": "NONE" | "LOW" | "MEDIUM" | "HIGH" | "CRITICAL",
+    "summary": "One sentence naming the catalyst with concrete numbers (supply %, amount, date) or 'none found'",
+    "eta_hours": 0
+  },
   "grid_params": {
     "lower_price": 0.0285,
     "upper_price": 0.0382,
@@ -92,6 +102,8 @@ func BuildCandidatePrompt(input CandidateInput) (string, error) {
 			"choppiness_index":       fmt.Sprintf("%.2f", input.Choppiness),
 			"ema_slope_pct":          fmt.Sprintf("%.2f%%", input.EMASlopePct),
 			"is_bbw_squeeze":         input.IsSqueeze,
+			"hurst_exponent":         fmt.Sprintf("%.3f", input.Hurst),
+			"confluence_verdict":     input.ConfluenceVerdict,
 			"proposed_trend":         input.RecommendedTrend,
 			"proposed_bounds": map[string]any{
 				"lower":      input.ProposedLowerPrice,
@@ -144,13 +156,22 @@ func ParseAuditDecision(rawResponse string) (*AuditDecision, error) {
 		TakeProfitTargetUSD any `json:"take_profit_target_usd"`
 	}
 
+	type rawNewsCatalyst struct {
+		Detected any    `json:"detected"`
+		Type     string `json:"type"`
+		Severity string `json:"severity"`
+		Summary  string `json:"summary"`
+		ETAHours any    `json:"eta_hours"`
+	}
+
 	type rawVerdict struct {
-		Decision         string         `json:"decision"`
-		Confidence       any            `json:"confidence"`
-		Regime           string         `json:"regime"`
-		ReasoningSummary string         `json:"reasoning_summary"`
-		RejectionReason  *string        `json:"rejection_reason"`
-		GridParams       *rawGridParams `json:"grid_params"`
+		Decision         string           `json:"decision"`
+		Confidence       any              `json:"confidence"`
+		Regime           string           `json:"regime"`
+		ReasoningSummary string           `json:"reasoning_summary"`
+		RejectionReason  *string          `json:"rejection_reason"`
+		NewsCatalyst     *rawNewsCatalyst `json:"news_catalyst"`
+		GridParams       *rawGridParams   `json:"grid_params"`
 	}
 
 	var parsed rawVerdict
@@ -179,6 +200,19 @@ func ParseAuditDecision(rawResponse string) (*AuditDecision, error) {
 		ReasoningSummary: parsed.ReasoningSummary,
 		RejectionReason:  parsed.RejectionReason,
 	}
+	if parsed.NewsCatalyst != nil {
+		severity := strings.ToUpper(strings.TrimSpace(parsed.NewsCatalyst.Severity))
+		if severity == "" {
+			severity = "NONE"
+		}
+		audit.NewsCatalyst = &NewsCatalyst{
+			Detected: parseToBool(parsed.NewsCatalyst.Detected, strings.ToUpper(strings.TrimSpace(parsed.NewsCatalyst.Type)) != "NONE" && severity != "NONE"),
+			Type:     strings.ToUpper(strings.TrimSpace(parsed.NewsCatalyst.Type)),
+			Severity: severity,
+			Summary:  parsed.NewsCatalyst.Summary,
+			ETAHours: parseToInt(parsed.NewsCatalyst.ETAHours, 0),
+		}
+	}
 
 	if parsed.GridParams != nil {
 		grid := &RecommendedGridParams{
@@ -196,6 +230,25 @@ func ParseAuditDecision(rawResponse string) (*AuditDecision, error) {
 	}
 
 	return audit, nil
+}
+
+func parseToBool(val any, defaultVal bool) bool {
+	if val == nil {
+		return defaultVal
+	}
+	switch v := val.(type) {
+	case bool:
+		return v
+	case string:
+		parsed := strings.ToLower(strings.TrimSpace(v))
+		if parsed == "true" || parsed == "yes" {
+			return true
+		}
+		if parsed == "false" || parsed == "no" {
+			return false
+		}
+	}
+	return defaultVal
 }
 
 func parseToFloat(val any, defaultVal float64) float64 {

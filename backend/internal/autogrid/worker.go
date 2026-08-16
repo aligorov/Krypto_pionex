@@ -887,6 +887,11 @@ func (worker *Worker) deployReal(
 			Params:             params,
 			PnLTargetUSDT:      botTarget,
 			MaxLossUSDT:        botMaxLoss,
+			// Persist the deploy-time invalidation level and thesis so the
+			// supervision loop can exit before the exchange stop is swept.
+			// Confluence readings ride in model_assumptions JSONB.
+			AntiHuntStop: &antiHuntStop,
+			StructContext: deployStructContext(candidate, antiHuntStop),
 		})
 		if createErr != nil {
 			if errors.Is(createErr, grid.ErrDuplicateActiveBot) {
@@ -1120,6 +1125,30 @@ func (worker *Worker) autotuneIfDue(ctx context.Context, settings Settings) {
 	}
 }
 
+// deployStructContext snapshots the market thesis a bot is opened under:
+// confluence readings from the candidate's model_assumptions plus the
+// invalidation level the supervision loop will act on.
+func deployStructContext(candidate Candidate, antiHuntStop decimal.Decimal) map[string]any {
+	context := map[string]any{
+		"invalidation": antiHuntStop.String(),
+		"deployedAt":   time.Now().UTC().Format(time.RFC3339),
+	}
+	if candidate.ModelAssumptions != nil {
+		if hurst, ok := candidate.ModelAssumptions["hurst"].(float64); ok {
+			context["hurst"] = hurst
+		}
+		if confluence, ok := candidate.ModelAssumptions["confluence"].(map[string]any); ok {
+			if verdict, ok := confluence["verdict"].(string); ok {
+				context["confluenceVerdict"] = verdict
+			}
+			if strength, ok := confluence["strength"].(float64); ok {
+				context["confluenceStrength"] = strength
+			}
+		}
+	}
+	return context
+}
+
 // pinManagedAccount persists the implicitly resolved AutoGrid account into
 // the settings row so deploys and supervision can never diverge (manual and
 // autopilot REAL deploys already run under the resolved account). Best-effort:
@@ -1175,7 +1204,7 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 		SELECT id, account_id, bu_order_id, status, symbol, direction,
 		       lower_price, upper_price, grid_num, adjustments_count,
 		       pnl_target_usdt, max_loss_usdt, quote_investment,
-		       COALESCE(bot_number, 0)
+		       anti_hunt_stop_price, COALESCE(bot_number, 0)
 		FROM grid_bots
 		WHERE autogrid_settings_id = $1 AND bu_order_id IS NOT NULL
 		  AND status IN ('RUNNING', 'STOP_REQUESTED', 'STOPPING')
@@ -1189,6 +1218,7 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 		lower, upper                                            decimal.Decimal
 		rowNum, adjustments                                     int
 		pnlTarget, maxLoss                                      *decimal.Decimal
+		antiHuntStop                                            *decimal.Decimal
 		investment                                              decimal.Decimal
 		botNumber                                               int
 	}
@@ -1198,8 +1228,8 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 		if err := rows.Scan(
 			&item.id, &item.accountID, &item.remoteID, &item.localStatus, &item.symbol,
 			&item.direction, &item.lower, &item.upper, &item.rowNum,
-			&item.adjustments, &item.pnlTarget, &item.maxLoss, &item.investment,
-			&item.botNumber,
+			&item.adjustments, &item.pnlTarget, &item.maxLoss, &item.antiHuntStop,
+			&item.investment, &item.botNumber,
 		); err != nil {
 			rows.Close()
 			return clampInterval(settings.ManageIntervalSeconds), err
@@ -1386,9 +1416,10 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 			RangeBreakBuffer: settings.RangeBreakBufferPct,
 			AdjustmentsLeft:  settings.MaxAdjustmentsPerBot - bot.adjustments,
 			Regime:           regime,
+			AntiHuntStop:     bot.antiHuntStop,
 		})
 		switch decision.Action {
-		case ActionCloseTakeProfit, ActionCloseStopLoss, ActionCloseRangeBreak:
+		case ActionCloseTakeProfit, ActionCloseStopLoss, ActionCloseRangeBreak, ActionCloseStructInvalid:
 			totalPnL := realized.Add(unrealized)
 			_, _ = worker.db.Exec(ctx, `
 				UPDATE grid_bots
@@ -1673,7 +1704,8 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 	rows, err := worker.db.Query(ctx, `
 		SELECT id, COALESCE(bot_number, 0), symbol, direction, entry_price, leverage, quote_investment,
 		       lower_price, upper_price, pnl_target_usdt, max_loss_usdt,
-		       grid_num, last_grid_level, realized_pnl_usdt, COALESCE(adjustments_count, 0)
+		       grid_num, last_grid_level, realized_pnl_usdt, COALESCE(adjustments_count, 0),
+		       anti_hunt_stop_price
 		FROM paper_grid_bots
 		WHERE settings_id = $1 AND status = 'RUNNING'
 	`, settings.ID)
@@ -1688,6 +1720,7 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 		leverage                     int
 		investment, lower, upper     decimal.Decimal
 		pnlTarget, maxLoss            *decimal.Decimal
+		antiHuntStop                 *decimal.Decimal
 		gridNum                      int
 		lastLevel                    *int
 		realized                     decimal.Decimal
@@ -1699,8 +1732,8 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 		if err := rows.Scan(
 			&item.id, &item.botNumber, &item.symbol, &item.direction, &item.entry,
 			&item.leverage, &item.investment, &item.lower, &item.upper,
-			&item.pnlTarget, &item.maxLoss, &item.gridNum, &item.lastLevel,
-			&item.realized, &item.adjustmentsCount,
+			&item.pnlTarget, &item.maxLoss, &item.antiHuntStop, &item.gridNum,
+			&item.lastLevel, &item.realized, &item.adjustmentsCount,
 		); err != nil {
 			rows.Close()
 			return err
@@ -1802,9 +1835,11 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 			RangeBreakBuffer: settings.RangeBreakBufferPct,
 			AdjustmentsLeft:  settings.MaxAdjustmentsPerBot - bot.adjustmentsCount,
 			Regime:           regime,
+			AntiHuntStop:     bot.antiHuntStop,
 		})
 
-		if decision.Action == ActionCloseTakeProfit || decision.Action == ActionCloseStopLoss || decision.Action == ActionCloseRangeBreak {
+		if decision.Action == ActionCloseTakeProfit || decision.Action == ActionCloseStopLoss ||
+			decision.Action == ActionCloseRangeBreak || decision.Action == ActionCloseStructInvalid {
 			_, err := worker.db.Exec(ctx, `
 				UPDATE paper_grid_bots
 				SET status = 'COMPLETED', closed_reason = $2,
@@ -2135,6 +2170,14 @@ func (worker *Worker) enrichAndAuditCandidatesWithLLM(
 			if v, ok := candidate.ModelAssumptions["isSqueeze"].(bool); ok {
 				input.IsSqueeze = v
 			}
+			if v, ok := candidate.ModelAssumptions["hurst"].(float64); ok {
+				input.Hurst = v
+			}
+			if confluence, ok := candidate.ModelAssumptions["confluence"].(map[string]any); ok {
+				if verdict, ok := confluence["verdict"].(string); ok {
+					input.ConfluenceVerdict = verdict
+				}
+			}
 		}
 
 		auditCtx, auditCancel := context.WithTimeout(ctx, 15*time.Second)
@@ -2142,9 +2185,39 @@ func (worker *Worker) enrichAndAuditCandidatesWithLLM(
 		auditCancel()
 		if err != nil {
 			worker.logger.Warn("LLM candidate audit failed", "symbol", candidate.Symbol, "error", err)
+			// Fail-closed: when the operator requires a completed audit for
+			// REAL money, a transport failure blocks the candidate instead
+			// of letting it pass unchecked.
+			if llmSettings.RequireAuditForReal && settings.ExecutionMode == "REAL" {
+				_, _ = worker.db.Exec(ctx, `
+					UPDATE autogrid_candidates
+					SET decision = 'REJECTED',
+					    rejection_reason = $3,
+					    model_assumptions = model_assumptions || jsonb_build_object('llmAuditError', $4::TEXT)
+					WHERE id = $1 AND scan_id = $2
+				`, candidate.ID, scanID, "LLM audit unavailable (fail-closed)", err.Error())
+			}
 			continue
 		}
 		auditedCount++
+
+		// News-catalyst veto: a HIGH/CRITICAL catalyst overrides the model's
+		// own verdict — news may only block an entry, never create one.
+		if decision.NewsCatalyst.BlocksEntry() {
+			vetoReason := fmt.Sprintf("AI news veto [%s/%s]: %s",
+				decision.NewsCatalyst.Type, decision.NewsCatalyst.Severity, decision.NewsCatalyst.Summary)
+			_, _ = worker.db.Exec(ctx, `
+				UPDATE autogrid_candidates
+				SET decision = 'REJECTED',
+				    rejection_reason = $3,
+				    model_assumptions = model_assumptions || jsonb_build_object('llmCatalyst', $4::JSONB)
+				WHERE id = $1 AND scan_id = $2
+			`, candidate.ID, scanID, vetoReason, decision.NewsCatalyst)
+			worker.logger.Info("Candidate vetoed by news catalyst",
+				"symbol", candidate.Symbol, "type", decision.NewsCatalyst.Type,
+				"severity", decision.NewsCatalyst.Severity)
+			continue
+		}
 
 		if decision.Decision == "REJECTED" {
 			reason := "Отклонено AI-моделью"
