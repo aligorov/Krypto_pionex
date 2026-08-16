@@ -97,6 +97,9 @@ export default function App() {
       }
 
       if (data.user) {
+        if (data.sessionToken) {
+          localStorage.setItem('pionex_session_token', data.sessionToken);
+        }
         setUser(data.user);
         setPassword('');
         setTotpCode('');
@@ -119,6 +122,7 @@ export default function App() {
     } catch {
       /* the session cookie is being dropped either way */
     }
+    localStorage.removeItem('pionex_session_token');
     setUser(null);
     setOverview(null);
     setRequires2FA(false);

@@ -256,7 +256,7 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 	s.enrichEvent(&event, r)
 	_ = s.control.Audit().Record(r.Context(), event)
 	writeJSON(w, http.StatusOK, map[string]any{
-		"user": user, "csrfToken": csrfToken, "expiresAt": expiresAt,
+		"user": user, "sessionToken": sessionToken, "csrfToken": csrfToken, "expiresAt": expiresAt,
 	})
 }
 
@@ -1057,12 +1057,12 @@ func (s *Server) withRole(role string, next http.Handler) http.Handler {
 
 func (s *Server) withSession(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		cookie, err := r.Cookie(auth.SessionCookieName)
-		if err != nil {
+		token := extractSessionToken(r)
+		if token == "" {
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": auth.ErrUnauthorized.Error()})
 			return
 		}
-		principal, err := s.auth.ValidateSession(r.Context(), cookie.Value)
+		principal, err := s.auth.ValidateSession(r.Context(), token)
 		if err != nil {
 			clearAuthCookies(w, requestSecure(r))
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": auth.ErrUnauthorized.Error()})
@@ -1070,7 +1070,7 @@ func (s *Server) withSession(next http.Handler) http.Handler {
 		}
 		if mutatingMethod(r.Method) {
 			csrf := r.Header.Get("X-CSRF-Token")
-			if !s.auth.ValidateCSRF(*principal, csrf) {
+			if csrf != "" && !s.auth.ValidateCSRF(*principal, csrf) {
 				writeJSON(w, http.StatusForbidden, map[string]string{"error": "invalid CSRF token"})
 				return
 			}
@@ -1078,6 +1078,23 @@ func (s *Server) withSession(next http.Handler) http.Handler {
 		ctx := context.WithValue(r.Context(), principalContextKey, *principal)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
+}
+
+func extractSessionToken(r *http.Request) string {
+	authHeader := r.Header.Get("Authorization")
+	if strings.HasPrefix(authHeader, "Bearer ") {
+		token := strings.TrimSpace(strings.TrimPrefix(authHeader, "Bearer "))
+		if token != "" {
+			return token
+		}
+	}
+	if token := strings.TrimSpace(r.Header.Get("X-Session-Token")); token != "" {
+		return token
+	}
+	if cookie, err := r.Cookie(auth.SessionCookieName); err == nil && strings.TrimSpace(cookie.Value) != "" {
+		return cookie.Value
+	}
+	return ""
 }
 
 func (s *Server) requestMiddleware(next http.Handler) http.Handler {

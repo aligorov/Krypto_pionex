@@ -19,6 +19,11 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   if (init.body !== undefined && !headers.has('Content-Type')) {
     headers.set('Content-Type', 'application/json');
   }
+  const token = localStorage.getItem('pionex_session_token');
+  if (token) {
+    headers.set('Authorization', `Bearer ${token}`);
+    headers.set('X-Session-Token', token);
+  }
   const method = (init.method ?? 'GET').toUpperCase();
   if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(method)) {
     headers.set('X-CSRF-Token', cookie('pionex_csrf'));
@@ -26,10 +31,11 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   const response = await fetch(path, {
     ...init,
     headers,
-    credentials: 'same-origin',
+    credentials: 'include',
   });
   if (!response.ok) {
     if (response.status === 401 && path !== '/api/auth/me' && path !== '/api/auth/login') {
+      localStorage.removeItem('pionex_session_token');
       window.dispatchEvent(new CustomEvent('auth:unauthorized'));
     }
     let message = `${response.status} ${response.statusText}`;

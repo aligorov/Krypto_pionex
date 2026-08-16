@@ -23,6 +23,7 @@ export interface TOTPSetupResponse {
 
 export interface LoginResponse {
   user?: User;
+  sessionToken?: string;
   csrfToken?: string;
   expiresAt?: string;
   requires2fa?: boolean;
