@@ -243,7 +243,8 @@ func (c *Client) GetFuturesGridBot(ctx context.Context, buOrderID string) (*Futu
 }
 
 type CancelFuturesGridParams struct {
-	BUOrderID     string `json:"buOrderId"`
+	BUOrderID     string `json:"buOrderId,omitempty"`
+	BotOrderID    string `json:"botOrderId,omitempty"`
 	CloseNote     string `json:"closeNote,omitempty"`
 	CloseSellMode string `json:"closeSellModel,omitempty"`
 	Immediate     bool   `json:"immediate"`
@@ -251,6 +252,9 @@ type CancelFuturesGridParams struct {
 }
 
 func (c *Client) CancelFuturesGridBot(ctx context.Context, params CancelFuturesGridParams) error {
+	if params.BUOrderID != "" && params.BotOrderID == "" {
+		params.BotOrderID = params.BUOrderID
+	}
 	body, err := json.Marshal(params)
 	if err != nil {
 		return fmt.Errorf("marshal futures grid cancel request: %w", err)
