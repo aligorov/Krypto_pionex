@@ -154,6 +154,9 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /api/mcp/tokens", s.withSession(http.HandlerFunc(s.createToken)))
 	mux.Handle("DELETE /api/mcp/tokens/{id}", s.withSession(http.HandlerFunc(s.revokeToken)))
 
+	mux.Handle("GET /api/backtest/jobs", s.withSession(http.HandlerFunc(s.listBacktestJobs)))
+	mux.Handle("POST /api/backtest/jobs", s.withRole(auth.RoleOperator, http.HandlerFunc(s.createBacktestJob)))
+
 	mux.Handle("GET /api/telegram/settings", s.withSession(http.HandlerFunc(s.getTelegramSettings)))
 	mux.Handle("PUT /api/telegram/settings", s.withRole(auth.RoleAdmin, http.HandlerFunc(s.updateTelegramSettings)))
 	mux.Handle("POST /api/telegram/test", s.withRole(auth.RoleAdmin, http.HandlerFunc(s.testTelegramConnection)))
@@ -1528,6 +1531,35 @@ func (s *Server) getMarketCandles(w http.ResponseWriter, r *http.Request) {
 		"interval": interval,
 		"candles":  out,
 	})
+}
+
+func (s *Server) listBacktestJobs(w http.ResponseWriter, r *http.Request) {
+	jobs, err := s.control.ListBacktestJobs(r.Context(), 50)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"data": jobs})
+}
+
+func (s *Server) createBacktestJob(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		Symbol   string         `json:"symbol"`
+		Interval string         `json:"interval"`
+		Params   map[string]any `json:"params"`
+	}
+	if !decodeJSON(w, r, &input) {
+		return
+	}
+	job, err := s.control.CreateBacktestJob(r.Context(), input.Symbol, input.Interval, input.Params)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	s.auditMutation(r, "backtest.job.create", "backtest_jobs", job.ID, map[string]any{
+		"symbol": job.Symbol, "interval": job.Interval,
+	})
+	writeJSON(w, http.StatusOK, map[string]any{"data": job})
 }
 
 func (s *Server) getTelegramSettings(w http.ResponseWriter, r *http.Request) {

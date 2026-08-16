@@ -216,6 +216,7 @@ export default function Candidates({ canOperate: _canOperate }: Props) {
                     Score {sortKey === 'score' ? (sortOrder === 'desc' ? '↓' : '↑') : ''}
                   </th>
                   <th>Режим рынка</th>
+                  <th>Конгльюэнс</th>
                   <th>Позиция в диапазоне</th>
                   <th>Радар входа (Снайпер)</th>
                   <th onClick={() => handleSort('volatilityPct')} style={{ cursor: 'pointer', whiteSpace: 'nowrap' }}>
@@ -353,6 +354,9 @@ function CandidateRow({
       <td>
         <span className={`badge ${regimeBadge(regime)}`}>{regime}</span>
       </td>
+      <td>
+        <ConfluenceBadge assumptions={assumptions} />
+      </td>
       <td>{formatNumber(rangePosition)}%</td>
       <td>
         {candidate.recommendedTrend === 'long' ? (
@@ -453,4 +457,52 @@ function formatTime(dateStr: string): string {
   const d = new Date(dateStr);
   if (isNaN(d.getTime())) return '—';
   return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+}
+
+
+const CONFLUENCE_LABELS: Record<string, { text: string; color: string; bg: string; border: string }> = {
+  SUPPORT_LONG: { text: '▲ LONG', color: '#34d399', bg: 'rgba(16, 185, 129, 0.15)', border: 'rgba(16, 185, 129, 0.3)' },
+  SUPPORT_SHORT: { text: '▼ SHORT', color: '#f87171', bg: 'rgba(239, 68, 68, 0.15)', border: 'rgba(239, 68, 68, 0.3)' },
+  SUPPORT_RANGE: { text: '◆ RANGE', color: '#60a5fa', bg: 'rgba(59, 130, 246, 0.15)', border: 'rgba(59, 130, 246, 0.3)' },
+  CONFLICT: { text: '⚔ CONFLICT', color: '#fbbf24', bg: 'rgba(245, 158, 11, 0.15)', border: 'rgba(245, 158, 11, 0.3)' },
+  NEUTRAL: { text: '○ NEUTRAL', color: '#94a3b8', bg: 'rgba(148, 163, 184, 0.12)', border: 'rgba(148, 163, 184, 0.3)' },
+};
+
+function ConfluenceBadge({ assumptions }: { assumptions: Record<string, unknown> }) {
+  const confluence = assumptions['confluence'] as Record<string, unknown> | undefined;
+  const verdictRaw = confluence?.['verdict'];
+  if (typeof verdictRaw !== 'string') {
+    return <span className="muted">—</span>;
+  }
+  const verdict = verdictRaw as keyof typeof CONFLUENCE_LABELS;
+  const style = CONFLUENCE_LABELS[verdict] ?? CONFLUENCE_LABELS.NEUTRAL;
+  const strength = Number(confluence?.['strength'] ?? 0);
+  const hurst = assumptions['hurst'];
+  const gate = confluence?.['hurstGate'];
+  const title = [
+    `Конгльюэнс: ${verdict} (сила ${(strength * 100).toFixed(0)}%)`,
+    typeof hurst === 'number' ? `Hurst: ${hurst.toFixed(3)}` : null,
+    typeof gate === 'string' ? `Режим памяти: ${gate}` : null,
+    `Голоса: long ${Number(confluence?.['longScore'] ?? 0).toFixed(2)} / short ${Number(confluence?.['shortScore'] ?? 0).toFixed(2)} / range ${Number(confluence?.['rangeScore'] ?? 0).toFixed(2)}`,
+  ].filter(Boolean).join('\n');
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: '3px', alignItems: 'flex-start' }}>
+      <span
+        className="badge"
+        style={{ background: style.bg, color: style.color, border: `1px solid ${style.border}`, cursor: 'help' }}
+        title={title}
+      >
+        {style.text} {(strength * 100).toFixed(0)}%
+      </span>
+      {typeof hurst === 'number' && (
+        <small
+          className="muted"
+          style={{ cursor: 'help' }}
+          title="Hurst (DFA): <0.45 возврат к среднему, >0.58 трендовая опасность для сетки"
+        >
+          H {hurst.toFixed(2)}
+        </small>
+      )}
+    </div>
+  );
 }

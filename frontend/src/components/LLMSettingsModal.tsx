@@ -49,6 +49,7 @@ export function LLMSettingsModal({ onClose, onSaved }: Props) {
   const [baseUrl, setBaseUrl] = useState('');
   const [temperature, setTemperature] = useState(0.2);
   const [thinkingEnabled, setThinkingEnabled] = useState(true);
+  const [requireAuditForReal, setRequireAuditForReal] = useState(false);
   const [availableModels, setAvailableModels] = useState<string[]>([]);
   const [loadingModels, setLoadingModels] = useState(false);
 
@@ -67,6 +68,7 @@ export function LLMSettingsModal({ onClose, onSaved }: Props) {
       setBaseUrl(data.baseUrl || '');
       setTemperature(data.temperature ?? 0.2);
       setThinkingEnabled(data.thinkingEnabled ?? true);
+      setRequireAuditForReal(data.requireAuditForReal ?? false);
       setApiKey('');
     } catch (err) {
       setStatusMessage({ kind: 'danger', text: describeError(err) });
@@ -182,6 +184,7 @@ export function LLMSettingsModal({ onClose, onSaved }: Props) {
           baseUrl,
           temperature,
           thinkingEnabled,
+          requireAuditForReal,
           auditIntervalSeconds: 3600,
         }),
       });
@@ -375,6 +378,23 @@ export function LLMSettingsModal({ onClose, onSaved }: Props) {
                     type="checkbox"
                     checked={thinkingEnabled}
                     onChange={(e) => setThinkingEnabled(e.target.checked)}
+                    style={{ transform: 'scale(1.2)', cursor: 'pointer' }}
+                  />
+                </div>
+                <div
+                  className="form-group"
+                  style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '0.75rem' }}
+                >
+                  <div>
+                    <span style={{ fontSize: '0.85rem', fontWeight: 600, display: 'block' }}>Fail-Closed аудит (REAL)</span>
+                    <small className="muted">
+                      Нет ответа LLM = кандидат отклонён. Деплой на реальные деньги только после успешного аудита.
+                    </small>
+                  </div>
+                  <input
+                    type="checkbox"
+                    checked={requireAuditForReal}
+                    onChange={(e) => setRequireAuditForReal(e.target.checked)}
                     style={{ transform: 'scale(1.2)', cursor: 'pointer' }}
                   />
                 </div>

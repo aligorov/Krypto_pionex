@@ -508,8 +508,21 @@ export interface LLMSettings {
   temperature: number;
   thinkingEnabled: boolean;
   requireApprovalToDeploy: boolean;
+  requireAuditForReal?: boolean;
   auditIntervalSeconds: number;
   updatedAt: string;
+}
+
+export interface BacktestJob {
+  id: string;
+  symbol: string;
+  interval: string;
+  status: 'QUEUED' | 'RUNNING' | 'DONE' | 'FAILED';
+  params: Record<string, unknown>;
+  result: Record<string, unknown> | null;
+  error: string | null;
+  createdAt: string;
+  finishedAt: string | null;
 }
 
 export interface LLMAuditRecord {

@@ -949,3 +949,76 @@ func hashValue(value string) string {
 	hash := sha256.Sum256([]byte(value))
 	return hex.EncodeToString(hash[:])
 }
+
+// BacktestJob mirrors one row of the quant-worker job queue.
+type BacktestJob struct {
+	ID         string          `json:"id"`
+	Symbol     string          `json:"symbol"`
+	Interval   string          `json:"interval"`
+	Status     string          `json:"status"`
+	Params     map[string]any  `json:"params"`
+	Result     map[string]any  `json:"result"`
+	Error      *string         `json:"error"`
+	CreatedAt  time.Time       `json:"createdAt"`
+	FinishedAt *time.Time      `json:"finishedAt"`
+}
+
+// ListBacktestJobs returns the newest backtest jobs with their OOS reports.
+func (s *Service) ListBacktestJobs(ctx context.Context, limit int) ([]BacktestJob, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 50
+	}
+	rows, err := s.db.Query(ctx, `
+		SELECT id, symbol, interval, status, params, result, error, created_at, finished_at
+		FROM backtest_jobs
+		ORDER BY created_at DESC
+		LIMIT $1
+	`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list backtest jobs: %w", err)
+	}
+	defer rows.Close()
+	jobs := make([]BacktestJob, 0)
+	for rows.Next() {
+		var job BacktestJob
+		if err := rows.Scan(
+			&job.ID, &job.Symbol, &job.Interval, &job.Status,
+			&job.Params, &job.Result, &job.Error, &job.CreatedAt, &job.FinishedAt,
+		); err != nil {
+			return nil, fmt.Errorf("scan backtest job: %w", err)
+		}
+		jobs = append(jobs, job)
+	}
+	return jobs, rows.Err()
+}
+
+// CreateBacktestJob enqueues a walk-forward backtest for the quant worker.
+func (s *Service) CreateBacktestJob(
+	ctx context.Context, symbol, interval string, params map[string]any,
+) (*BacktestJob, error) {
+	symbol = strings.ToUpper(strings.TrimSpace(symbol))
+	if symbol == "" {
+		return nil, errors.New("symbol is required")
+	}
+	switch interval {
+	case "15M", "30M", "60M", "1H", "4H", "1D":
+	default:
+		interval = "60M"
+	}
+	if params == nil {
+		params = map[string]any{}
+	}
+	var job BacktestJob
+	err := s.db.QueryRow(ctx, `
+		INSERT INTO backtest_jobs (symbol, interval, params)
+		VALUES ($1, $2, $3)
+		RETURNING id, symbol, interval, status, params, result, error, created_at, finished_at
+	`, symbol, interval, params).Scan(
+		&job.ID, &job.Symbol, &job.Interval, &job.Status,
+		&job.Params, &job.Result, &job.Error, &job.CreatedAt, &job.FinishedAt,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("create backtest job: %w", err)
+	}
+	return &job, nil
+}

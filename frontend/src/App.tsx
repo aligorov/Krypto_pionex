@@ -12,8 +12,9 @@ import MCPServer from './components/MCPServer';
 import SecurityModal from './components/SecurityModal';
 import { LLMSettingsModal } from './components/LLMSettingsModal';
 import { TelegramSettings } from './components/TelegramSettings';
+import BacktestLab from './components/BacktestLab';
 
-type Tab = 'overview' | 'autogrid' | 'candidates' | 'bots' | 'accounts' | 'risk' | 'telegram' | 'audit' | 'mcp';
+type Tab = 'overview' | 'autogrid' | 'candidates' | 'bots' | 'backtest' | 'accounts' | 'risk' | 'telegram' | 'audit' | 'mcp';
 
 const canOperate = (role: Role): boolean => role === 'OPERATOR' || role === 'ADMIN';
 const canManage = (role: Role): boolean => role === 'ADMIN';
@@ -247,6 +248,7 @@ export default function App() {
     { id: 'autogrid', label: 'Автопилот' },
     { id: 'candidates', label: 'Кандидаты' },
     { id: 'bots', label: 'Боты · PnL' },
+    { id: 'backtest', label: 'Бэктест-лаб' },
     { id: 'accounts', label: 'Pionex API' },
     { id: 'risk', label: 'Риск' },
     { id: 'telegram', label: 'Telegram' },
@@ -380,6 +382,7 @@ export default function App() {
         )}
         {activeTab === 'candidates' && <Candidates canOperate={canOperate(user.role)} />}
         {activeTab === 'bots' && <Bots canOperate={canOperate(user.role)} />}
+        {activeTab === 'backtest' && <BacktestLab canOperate={canOperate(user.role)} />}
         {activeTab === 'accounts' && <PionexAccounts canManage={canManage(user.role)} />}
         {activeTab === 'risk' && <RiskSettings canManage={canManage(user.role)} />}
         {activeTab === 'telegram' && <TelegramSettings />}
