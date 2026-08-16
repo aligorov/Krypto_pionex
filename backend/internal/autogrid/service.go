@@ -998,13 +998,12 @@ func (s *Service) listClosedBots(ctx context.Context, settingsID string) ([]Clos
 	items := make([]ClosedBot, 0)
 	rows, err := s.db.Query(ctx, `
 		SELECT id, symbol, direction, quote_investment,
-		       realized_pnl_usdt, closed_reason, status, closed_at
+		       realized_pnl_usdt, closed_reason, status, COALESCE(closed_at, updated_at)
 		FROM grid_bots
-		WHERE autogrid_settings_id = $1
+		WHERE (autogrid_settings_id = $1 OR autogrid_settings_id IS NOT NULL)
 		  AND status IN ('STOPPED', 'CANCELLED', 'COMPLETED', 'LIQUIDATED', 'FAILED')
-		  AND closed_at IS NOT NULL
-		ORDER BY closed_at DESC
-		LIMIT 25
+		ORDER BY COALESCE(closed_at, updated_at) DESC
+		LIMIT 100
 	`, settingsID)
 	if err != nil {
 		return nil, fmt.Errorf("list closed real AutoGrid bots: %w", err)
@@ -1025,13 +1024,12 @@ func (s *Service) listClosedBots(ctx context.Context, settingsID string) ([]Clos
 
 	rows, err = s.db.Query(ctx, `
 		SELECT id, symbol, direction, quote_investment,
-		       realized_pnl_usdt, closed_reason, status, closed_at
+		       realized_pnl_usdt, closed_reason, status, COALESCE(closed_at, updated_at)
 		FROM paper_grid_bots
-		WHERE settings_id = $1
+		WHERE (settings_id = $1 OR settings_id IS NOT NULL)
 		  AND status IN ('STOPPED', 'COMPLETED', 'EMERGENCY_STOPPED')
-		  AND closed_at IS NOT NULL
-		ORDER BY closed_at DESC
-		LIMIT 25
+		ORDER BY COALESCE(closed_at, updated_at) DESC
+		LIMIT 100
 	`, settingsID)
 	if err != nil {
 		return nil, fmt.Errorf("list closed paper AutoGrid bots: %w", err)
