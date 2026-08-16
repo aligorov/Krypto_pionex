@@ -240,12 +240,12 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 	secure := requestSecure(r)
 	http.SetCookie(w, &http.Cookie{
 		Name: auth.SessionCookieName, Value: sessionToken, Path: "/",
-		HttpOnly: true, Secure: secure, SameSite: http.SameSiteStrictMode,
+		HttpOnly: true, Secure: secure, SameSite: http.SameSiteLaxMode,
 		Expires: expiresAt,
 	})
 	http.SetCookie(w, &http.Cookie{
 		Name: auth.CSRFCookieName, Value: csrfToken, Path: "/",
-		HttpOnly: false, Secure: secure, SameSite: http.SameSiteStrictMode,
+		HttpOnly: false, Secure: secure, SameSite: http.SameSiteLaxMode,
 		Expires: expiresAt,
 	})
 	principal := auth.Principal{
@@ -1225,13 +1225,17 @@ func clearAuthCookies(w http.ResponseWriter, secure bool) {
 		http.SetCookie(w, &http.Cookie{
 			Name: name, Value: "", Path: "/", MaxAge: -1, Expires: time.Unix(1, 0),
 			HttpOnly: name == auth.SessionCookieName, Secure: secure,
-			SameSite: http.SameSiteStrictMode,
+			SameSite: http.SameSiteLaxMode,
 		})
 	}
 }
 
 func requestSecure(r *http.Request) bool {
-	return r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")
+	return r.TLS != nil ||
+		strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https") ||
+		strings.EqualFold(r.Header.Get("X-Forwarded-Ssl"), "on") ||
+		strings.Contains(r.Header.Get("CF-Visitor"), "https") ||
+		r.Header.Get("X-Forwarded-Port") == "443"
 }
 
 func requestIP(r *http.Request) net.IP {

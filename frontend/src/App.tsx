@@ -58,8 +58,14 @@ export default function App() {
       .finally(() => {
         if (active) setBooting(false);
       });
+    const handleUnauthorized = () => {
+      setUser(null);
+      setOverview(null);
+    };
+    window.addEventListener('auth:unauthorized', handleUnauthorized);
     return () => {
       active = false;
+      window.removeEventListener('auth:unauthorized', handleUnauthorized);
     };
   }, []);
 

@@ -29,6 +29,9 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
     credentials: 'same-origin',
   });
   if (!response.ok) {
+    if (response.status === 401 && path !== '/api/auth/me' && path !== '/api/auth/login') {
+      window.dispatchEvent(new CustomEvent('auth:unauthorized'));
+    }
     let message = `${response.status} ${response.statusText}`;
     try {
       const body = await response.json() as { error?: string };
