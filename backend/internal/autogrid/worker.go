@@ -96,6 +96,7 @@ func (worker *Worker) processNext(ctx context.Context) error {
 	executionCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 	defer cancel()
 	result := map[string]any{}
+	worker.logger.Info("Executing AutoGrid command", "component", "autogrid_worker", "command_type", command.CommandType, "command_id", command.ID)
 	switch command.CommandType {
 	case "autogrid.start":
 		err = worker.start(executionCtx, command)
@@ -122,11 +123,13 @@ func (worker *Worker) processNext(ctx context.Context) error {
 }
 
 func (worker *Worker) claim(ctx context.Context) (*queuedCommand, error) {
-	// Auto-expire stale commands with expired lease from crashed/restarted processes
+	// Auto-expire stale commands from crashed processes, old queue items (>5 min), or excessive retries
 	_, _ = worker.db.Exec(ctx, `
 		UPDATE control_commands
 		SET status = 'EXPIRED', updated_at = NOW()
-		WHERE status = 'EXECUTING' AND lease_expiry < NOW() - INTERVAL '30 seconds'
+		WHERE (status = 'QUEUED' AND created_at < NOW() - INTERVAL '5 minutes')
+		   OR (status = 'EXECUTING' AND (lease_expiry IS NULL OR lease_expiry < NOW()))
+		   OR (attempts >= 3 AND status IN ('QUEUED', 'EXECUTING'))
 	`)
 	var command queuedCommand
 	err := worker.db.QueryRow(ctx, `
