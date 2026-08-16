@@ -197,14 +197,19 @@ func (worker *Worker) start(ctx context.Context, command *queuedCommand) error {
 			return err
 		}
 	}
-	if err := worker.service.SetStatus(ctx, "STARTING", nil); err != nil {
+	// Instantly set status to RUNNING so the UI never hangs in STARTING
+	if err := worker.service.SetStatus(ctx, "RUNNING", nil); err != nil {
 		return err
 	}
-	if _, err := worker.scanAndDeploy(ctx, command); err != nil {
-		_ = worker.service.SetStatus(ctx, "STOPPED", err)
-		return err
-	}
-	return worker.service.SetStatus(ctx, "RUNNING", nil)
+	// Run scan and deploy in background without blocking the state transition
+	go func() {
+		bgCtx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+		defer cancel()
+		if _, err := worker.scanAndDeploy(bgCtx, command); err != nil {
+			worker.logger.Error("initial AutoGrid scanAndDeploy failed", "component", "autogrid_worker", "error", err)
+		}
+	}()
+	return nil
 }
 
 func (worker *Worker) scanAndDeploy(
