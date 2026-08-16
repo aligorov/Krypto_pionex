@@ -307,10 +307,11 @@ func (worker *Worker) enrichCandidatesWithAIKit(
 		if err != nil {
 			continue
 		}
-		strategy, err := client.GetSpotGridAIStrategy(ctx, base, quote)
+		spotBase := strings.TrimSuffix(strings.TrimSuffix(base, ".PERP"), "_PERP")
+		strategy, err := client.GetSpotGridAIStrategy(ctx, spotBase, quote)
 		if err != nil {
-			worker.logger.Warn(
-				"Pionex AI Kit lookup failed for candidate",
+			worker.logger.Debug(
+				"Pionex AI Kit not available for symbol (futures-only or no spot AI)",
 				"component", "autogrid_worker", "symbol", candidate.Symbol, "error", err,
 			)
 			continue

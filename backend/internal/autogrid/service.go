@@ -1227,6 +1227,7 @@ func (s *Service) AIKitStrategy(
 	if err != nil {
 		return nil, err
 	}
+	spotBase := strings.TrimSuffix(strings.TrimSuffix(base, ".PERP"), "_PERP")
 	accountID, err := s.resolveAccount(ctx)
 	if err != nil {
 		return nil, err
@@ -1235,7 +1236,7 @@ func (s *Service) AIKitStrategy(
 	if err != nil {
 		return nil, err
 	}
-	return client.GetSpotGridAIStrategy(ctx, base, quote)
+	return client.GetSpotGridAIStrategy(ctx, spotBase, quote)
 }
 
 type AdjustBotInput struct {
@@ -1990,7 +1991,8 @@ func (s *Service) AIKitSettingsFill(
 		if splitErr != nil {
 			continue
 		}
-		strategy, aiErr := client.GetSpotGridAIStrategy(ctx, base, quote)
+		spotBase := strings.TrimSuffix(strings.TrimSuffix(base, ".PERP"), "_PERP")
+		strategy, aiErr := client.GetSpotGridAIStrategy(ctx, spotBase, quote)
 		if aiErr != nil {
 			continue
 		}
