@@ -24,18 +24,22 @@ func TestComputeAdaptiveMeshBreakEvenFloor(t *testing.T) {
 }
 
 func TestComputeDynamicLeverage(t *testing.T) {
-	entry := decimal.NewFromFloat(100)
-	stop := decimal.NewFromFloat(98) // 2% stop distance
-
-	lev := ComputeDynamicLeverage(entry, stop, 1.5, 0.90, 3)
-	if lev < 2 || lev > 3 {
-		t.Errorf("expected leverage between 2 and 3, got %d", lev)
+	// Normal volatility (ATR 1.5%) -> full base leverage 4x
+	resNormal := ComputeDynamicLeverage(1.5, 4)
+	if resNormal.Leverage != 4 || resNormal.IsScaleDown {
+		t.Errorf("expected leverage 4 with no scale down, got %d (scale down: %v)", resNormal.Leverage, resNormal.IsScaleDown)
 	}
 
-	// High volatility asset (ATR 6.5%) should be penalized down to safe leverage
-	levHighVol := ComputeDynamicLeverage(entry, stop, 6.5, 0.90, 4)
-	if levHighVol > 2 {
-		t.Errorf("expected high vol leverage capped at 2, got %d", levHighVol)
+	// Elevated volatility (ATR 5.5%) -> 3x
+	resElevated := ComputeDynamicLeverage(5.5, 4)
+	if resElevated.Leverage != 3 || !resElevated.IsScaleDown {
+		t.Errorf("expected leverage 3 with scale down, got %d (scale down: %v)", resElevated.Leverage, resElevated.IsScaleDown)
+	}
+
+	// Extreme volatility (ATR 12.0%) -> 2x
+	resExtreme := ComputeDynamicLeverage(12.0, 4)
+	if resExtreme.Leverage != 2 || !resExtreme.IsScaleDown {
+		t.Errorf("expected leverage 2 with scale down, got %d (scale down: %v)", resExtreme.Leverage, resExtreme.IsScaleDown)
 	}
 }
 

@@ -333,6 +333,9 @@ export interface AutoGridBot {
   upperPrice: string;
   gridNum: number;
   leverage: number;
+  leverageReason?: string;
+  leverageMode?: string;
+  baseLeverage?: number;
   quoteInvestment: string;
   realizedPnlUsdt: string | null;
   unrealizedPnlUsdt: string | null;

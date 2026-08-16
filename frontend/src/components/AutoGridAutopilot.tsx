@@ -450,7 +450,7 @@ function SettingsSummary({ settings }: { settings: AutoGridSettings }) {
     ['Режим', settings.executionMode === 'REAL' ? 'REAL (нативные гриды)' : 'PAPER (симуляция)'],
     ['Бюджет на бота', `${settings.budgetUsdt} USDT`],
     ['Максимум ботов', String(settings.maxActiveBots)],
-    ['Плечо (базовое)', `${settings.leverage}x`],
+    ['Плечо', `${settings.leverage}x (${settings.adaptiveLeverageEnabled ? '🛡️ Адаптивное по ATR — защита от сквизов' : '⚡ Фиксированное на все пары'})`],
     ['Режим целей PnL', settings.pnlTargetMode === 'DYNAMIC'
       ? 'ДИНАМИЧЕСКИЙ — по волатильности пары (AI Kit → σ/ATR) и просадке, на каждого бота своя'
       : 'ФИКСИРОВАННЫЙ — одинаковая сумма на всех ботов'],
@@ -668,7 +668,21 @@ function SettingsForm({
         </label>
 
         <label>
-          Плечо
+          Режим плеча
+          <select
+            value={form.adaptiveLeverageEnabled ? 'ADAPTIVE' : 'FIXED'}
+            onChange={(event) =>
+              setForm((current) => ({
+                ...current,
+                adaptiveLeverageEnabled: event.target.value === 'ADAPTIVE',
+              }))}
+          >
+            <option value="ADAPTIVE">🛡️ АДАПТИВНОЕ (ATR Risk Guard — защита от сквизов на волатильных парах)</option>
+            <option value="FIXED">⚡ ФИКСИРОВАННОЕ (строго указанное плечо на все пары)</option>
+          </select>
+        </label>
+        <label>
+          {form.adaptiveLeverageEnabled ? 'Базовое / Макс. плечо' : 'Фиксированное плечо'}
           <input {...field('leverage')} inputMode="numeric" />
         </label>
         <label>
@@ -741,18 +755,7 @@ function SettingsForm({
             onChange={(event) => setForm((current) => ({ ...current, aiKitEnabled: event.target.checked }))}
           />
         </div>
-        <div className="toggle-row">
-          <div>
-            <strong>Адаптивное плечо</strong>
-            <span>Ограничение плеча по волатильности</span>
-          </div>
-          <input
-            type="checkbox"
-            checked={form.adaptiveLeverageEnabled}
-            onChange={(event) =>
-              setForm((current) => ({ ...current, adaptiveLeverageEnabled: event.target.checked }))}
-          />
-        </div>
+
         <div className="toggle-row">
           <div>
             <strong>Плотная сетка (geometric)</strong>

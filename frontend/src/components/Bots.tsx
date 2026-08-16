@@ -270,7 +270,23 @@ function BotRow({
           {bot.lowerPrice} – {bot.upperPrice}
           <small>{bot.gridNum} уровней</small>
         </td>
-        <td>{bot.leverage}x</td>
+        <td>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '2px' }}>
+            <span>
+              <strong>{bot.leverage}x</strong>
+              {bot.leverageMode === 'ADAPTIVE' && bot.baseLeverage && bot.leverage < bot.baseLeverage ? (
+                <span title={bot.leverageReason} style={{ marginLeft: 4, cursor: 'help' }}>🛡️</span>
+              ) : (
+                <span title={bot.leverageReason || 'Базовое плечо'} style={{ marginLeft: 4 }}>🟢</span>
+              )}
+            </span>
+            {bot.leverageReason && (
+              <span style={{ fontSize: '0.70rem', color: '#94a3b8', whiteSpace: 'nowrap' }} title={bot.leverageReason}>
+                {bot.leverageReason}
+              </span>
+            )}
+          </div>
+        </td>
         <td>{bot.quoteInvestment}</td>
         <td className={pnlClass(realized)}>{bot.realizedPnlUsdt ?? '—'}</td>
         <td className={pnlClass(unrealized)}>{bot.unrealizedPnlUsdt ?? '—'}</td>

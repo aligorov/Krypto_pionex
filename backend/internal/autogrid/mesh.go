@@ -1,6 +1,7 @@
 package autogrid
 
 import (
+	"fmt"
 	"math"
 
 	"github.com/shopspring/decimal"
@@ -112,52 +113,71 @@ func ComputeAdaptiveMesh(
 	}
 }
 
-// ComputeDynamicLeverage computes safe volatility-adjusted leverage (1.5x to 3.5x).
-// Formula: Leverage = Clamp( MaxRiskBudget (2.5%) / DistanceToStopLossPct, 2, MaxAllowed )
+// DynamicLeverageResult holds the determined leverage and human-readable explanation.
+type DynamicLeverageResult struct {
+	Leverage    int    `json:"leverage"`
+	Reason      string `json:"reason"`
+	IsScaleDown bool   `json:"isScaleDown"`
+}
+
+// ComputeDynamicLeverage computes safe volatility-adjusted leverage based on ATR and base leverage.
 func ComputeDynamicLeverage(
-	entryPrice decimal.Decimal,
-	stopLossPrice decimal.Decimal,
 	atrPct float64,
-	confidence float64,
-	maxAllowedLev int,
-) int {
-	if maxAllowedLev < 2 {
-		maxAllowedLev = 2
+	baseLev int,
+) DynamicLeverageResult {
+	if baseLev < 1 {
+		baseLev = 1
 	}
-	if maxAllowedLev > 4 {
-		maxAllowedLev = 4
-	}
-
-	if confidence <= 0 {
-		confidence = 0.80
+	if baseLev > 10 {
+		baseLev = 10
 	}
 
-	distPct := 2.5
-	if entryPrice.GreaterThan(decimal.Zero) && stopLossPrice.GreaterThan(decimal.Zero) {
-		diff := entryPrice.Sub(stopLossPrice).Abs()
-		d, _ := diff.Div(entryPrice).Mul(decimal.NewFromInt(100)).Float64()
-		if d > 0.5 {
-			distPct = d
+	// Normal Volatility (ATR <= 4.0%): Keep full base leverage
+	if atrPct <= 4.0 {
+		return DynamicLeverageResult{
+			Leverage:    baseLev,
+			Reason:      fmt.Sprintf("Базовое (ATR %.1f%%)", atrPct),
+			IsScaleDown: false,
 		}
 	}
 
-	// 2.5% max risk budget per position stop-out
-	const maxRiskBudgetPct = 2.5
-	rawLev := (maxRiskBudgetPct / distPct) * confidence
-
-	// High volatility penalty: if ATR > 4%, cap leverage to 2x
-	if atrPct > 4.0 && rawLev > 2.0 {
-		rawLev = 2.0
+	// Elevated Volatility (4.0% < ATR <= 7.0%): Step down by 1x (min 2x)
+	if atrPct <= 7.0 {
+		scaled := baseLev - 1
+		if scaled < 2 {
+			scaled = 2
+		}
+		if scaled >= baseLev {
+			return DynamicLeverageResult{
+				Leverage:    baseLev,
+				Reason:      fmt.Sprintf("Базовое (ATR %.1f%%)", atrPct),
+				IsScaleDown: false,
+			}
+		}
+		return DynamicLeverageResult{
+			Leverage:    scaled,
+			Reason:      fmt.Sprintf("ATR %.1f%% — снижено с %dx для защиты", atrPct, baseLev),
+			IsScaleDown: true,
+		}
 	}
 
-	lev := int(math.Round(rawLev))
-	if lev < 2 {
-		lev = 2
+	// Extreme Volatility (ATR > 7.0%): Step down by 2x (min 2x)
+	scaled := baseLev - 2
+	if scaled < 2 {
+		scaled = 2
 	}
-	if lev > maxAllowedLev {
-		lev = maxAllowedLev
+	if scaled >= baseLev {
+		return DynamicLeverageResult{
+			Leverage:    baseLev,
+			Reason:      fmt.Sprintf("Базовое (ATR %.1f%%)", atrPct),
+			IsScaleDown: false,
+		}
 	}
-	return lev
+	return DynamicLeverageResult{
+		Leverage:    scaled,
+		Reason:      fmt.Sprintf("ATR %.1f%% (риск сквиза) — защита %dx", atrPct, scaled),
+		IsScaleDown: true,
+	}
 }
 
 // ComputeAntiHuntStop calculates a stop loss price positioned 1.5x ATR beyond visible S/R.

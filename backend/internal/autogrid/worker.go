@@ -487,10 +487,13 @@ func (worker *Worker) deployPaper(
 		)
 
 		botLev := settings.Leverage
+		levReason := fmt.Sprintf("Фиксированное (%dx)", settings.Leverage)
+		levMode := "FIXED"
 		if settings.AdaptiveLeverageEnabled {
-			botLev = ComputeDynamicLeverage(
-				candidate.CurrentPrice, antiHuntStop, atrPct, 0.85, settings.Leverage,
-			)
+			dyn := ComputeDynamicLeverage(atrPct, settings.Leverage)
+			botLev = dyn.Leverage
+			levReason = dyn.Reason
+			levMode = "ADAPTIVE"
 		}
 
 		confluence := EvaluateConfluence(candidate, nil, nil)
@@ -545,6 +548,9 @@ func (worker *Worker) deployPaper(
 					'gridFillsSimulated', false,
 					'pnlTargetSource', $12::TEXT,
 					'confluenceStatus', $15::TEXT,
+					'leverageReason', $19::TEXT,
+					'leverageMode', $20::TEXT,
+					'baseLeverage', $21::INT,
 					'warning', 'paper PnL is not a native Pionex grid backtest'
 				),
 				$13, $14,
@@ -557,7 +563,8 @@ func (worker *Worker) deployPaper(
 			mesh.LowerPrice, mesh.UpperPrice, mesh.GridNum,
 			botLev, settings.BudgetUSDT,
 			candidate.CurrentPrice, settings.PnLTargetMode, target, maxLoss,
-			confluence.Status, mesh.GridStepPct, confluence.Score, antiHuntStop)
+			confluence.Status, mesh.GridStepPct, confluence.Score, antiHuntStop,
+			levReason, levMode, settings.Leverage)
 		if err != nil {
 			return fmt.Errorf("deploy paper grid %s: %w", candidate.Symbol, err)
 		}
@@ -673,9 +680,8 @@ func (worker *Worker) deployReal(
 
 		botLev := settings.Leverage
 		if settings.AdaptiveLeverageEnabled {
-			botLev = ComputeDynamicLeverage(
-				candidate.CurrentPrice, antiHuntStop, atrPct, 0.85, settings.Leverage,
-			)
+			dyn := ComputeDynamicLeverage(atrPct, settings.Leverage)
+			botLev = dyn.Leverage
 		}
 
 		if err := worker.risk.ValidateNewGrid(

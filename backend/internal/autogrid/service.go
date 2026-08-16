@@ -155,6 +155,9 @@ type ActiveBot struct {
 	AdjustmentsCount    int              `json:"adjustmentsCount"`
 	PnLTargetUSDT       *decimal.Decimal `json:"pnlTargetUsdt"`
 	MaxLossUSDT         *decimal.Decimal `json:"maxLossUsdt"`
+	LeverageReason      string           `json:"leverageReason,omitempty"`
+	LeverageMode        string           `json:"leverageMode,omitempty"`
+	BaseLeverage        int              `json:"baseLeverage,omitempty"`
 	UpdatedAt           time.Time        `json:"updatedAt"`
 }
 
@@ -877,7 +880,8 @@ func (s *Service) listActiveBots(ctx context.Context, settingsID string) ([]Acti
 		SELECT id, symbol, status, direction, grid_type, lower_price,
 		       upper_price, grid_num, leverage, quote_investment,
 		       realized_pnl_usdt, unrealized_pnl_usdt,
-		       pnl_target_usdt, max_loss_usdt, updated_at
+		       pnl_target_usdt, max_loss_usdt, updated_at,
+		       model_state
 		FROM paper_grid_bots
 		WHERE settings_id = $1 AND status = 'RUNNING'
 		ORDER BY opened_at DESC
@@ -890,14 +894,27 @@ func (s *Service) listActiveBots(ctx context.Context, settingsID string) ([]Acti
 		var item ActiveBot
 		item.Source = "PAPER"
 		item.ReconciliationState = "SIMULATION"
+		var rawModelState any
 		if err := rows.Scan(
 			&item.ID, &item.Symbol, &item.Status, &item.Direction,
 			&item.GridType, &item.LowerPrice, &item.UpperPrice,
 			&item.GridNum, &item.Leverage, &item.QuoteInvestment,
 			&item.RealizedPNLUSDT, &item.UnrealizedPNLUSDT,
 			&item.PnLTargetUSDT, &item.MaxLossUSDT, &item.UpdatedAt,
+			&rawModelState,
 		); err != nil {
 			return nil, fmt.Errorf("scan paper AutoGrid bot: %w", err)
+		}
+		if ms, ok := rawModelState.(map[string]any); ok {
+			if reason, ok := ms["leverageReason"].(string); ok {
+				item.LeverageReason = reason
+			}
+			if mode, ok := ms["leverageMode"].(string); ok {
+				item.LeverageMode = mode
+			}
+			if base, ok := ms["baseLeverage"].(float64); ok {
+				item.BaseLeverage = int(base)
+			}
 		}
 		items = append(items, item)
 	}
