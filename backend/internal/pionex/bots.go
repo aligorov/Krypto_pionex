@@ -55,13 +55,25 @@ func (c *Client) GetSpotGridAIStrategy(
 // verdict returned by POST /api/v1/bot/orders/futuresGrid/checkParams.
 type FuturesGridCheckParamsResult struct {
 	MinInvestment           decimal.Decimal `json:"min_investment"`
+	MinInvestmentCamel      decimal.Decimal `json:"minInvestment,omitempty"`
 	MaxInvestment           decimal.Decimal `json:"max_investment"`
+	MaxInvestmentCamel      decimal.Decimal `json:"maxInvestment,omitempty"`
 	Slippage                decimal.Decimal `json:"slippage"`
 	EstimatePerVolume       decimal.Decimal `json:"estimate_per_volume"`
 	EstimateInvestment      decimal.Decimal `json:"estimate_investment"`
 	EstimateFee             decimal.Decimal `json:"estimate_fee"`
 	EstimateLiquidationUp   decimal.Decimal `json:"estimate_liquidation_price_up"`
 	EstimateLiquidationDown decimal.Decimal `json:"estimate_liquidation_price_down"`
+}
+
+func (r *FuturesGridCheckParamsResult) GetMinInvestment() decimal.Decimal {
+	if r == nil {
+		return decimal.Zero
+	}
+	if r.MinInvestment.GreaterThan(decimal.Zero) {
+		return r.MinInvestment
+	}
+	return r.MinInvestmentCamel
 }
 
 // CheckFuturesGridParams validates grid parameters against Pionex before any

@@ -100,8 +100,9 @@ type BUOrderData struct {
 	Trend               string           `json:"trend"`
 	Leverage            int              `json:"leverage"`
 	ExtraMargin         decimal.Decimal  `json:"extraMargin,omitempty"`
-	QuoteInvestment     decimal.Decimal  `json:"quoteInvestment"`
-	LossStopType        string           `json:"lossStopType,omitempty"`
+	QuoteInvestment      decimal.Decimal  `json:"quoteInvestment"`
+	QuoteInvestmentSnake decimal.Decimal  `json:"quote_investment,omitempty"`
+	LossStopType         string           `json:"lossStopType,omitempty"`
 	LossStop            *decimal.Decimal `json:"lossStop,omitempty"`
 	ProfitStopType      string           `json:"profitStopType,omitempty"`
 	ProfitStop          *decimal.Decimal `json:"profitStop,omitempty"`

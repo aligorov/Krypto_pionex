@@ -16,11 +16,33 @@ type SymbolInfo struct {
 	QuoteCurrency   string          `json:"quoteCurrency"`
 	Type            string          `json:"type"`
 	MinAmount       decimal.Decimal `json:"minAmount"`
+	BasePrecision   int             `json:"basePrecision"`
+	QuotePrecision  int             `json:"quotePrecision"`
 	PricePrecision  int             `json:"pricePrecision"`
 	AmountPrecision int             `json:"amountPrecision"`
 	MinNotional     decimal.Decimal `json:"minNotional"`
 	Enabled         bool            `json:"enable"`
 	Status          string          `json:"status"`
+}
+
+func (s SymbolInfo) GetPricePrecision() int {
+	if s.QuotePrecision > 0 {
+		return s.QuotePrecision
+	}
+	if s.PricePrecision > 0 {
+		return s.PricePrecision
+	}
+	return 4
+}
+
+func (s SymbolInfo) GetAmountPrecision() int {
+	if s.BasePrecision > 0 {
+		return s.BasePrecision
+	}
+	if s.AmountPrecision > 0 {
+		return s.AmountPrecision
+	}
+	return 2
 }
 
 func (symbol SymbolInfo) IsTrading() bool {
