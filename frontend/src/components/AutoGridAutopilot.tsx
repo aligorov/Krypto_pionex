@@ -1,6 +1,6 @@
 import { FormEvent, useCallback, useEffect, useMemo, useState } from 'react';
 import { api, ApiError } from '../api';
-import type { Account, AutoGridPreset, AutoGridSettings, AutoGridState, PreparedCommand } from '../types';
+import type { Account, AutoGridPreset, AutoGridSettings, AutoGridState } from '../types';
 
 interface Props {
   canOperate: boolean;
@@ -139,16 +139,14 @@ export default function AutoGridAutopilot({ canOperate, accountsHref }: Props) {
     setBusy(action);
     setMessage(null);
     try {
-      const prepared = await api<PreparedCommand>(`/api/autogrid/actions/${action}`, {
+      const res = await api<{ success: boolean; message?: string; confirmationCode?: string }>(`/api/autogrid/actions/${action}`, {
         method: 'POST',
         body: JSON.stringify({ idempotencyKey: `ui-${action}-${Date.now()}` }),
       });
-      const code = prepared.confirmationCode;
+      const code = res.confirmationCode;
       setMessage({
         kind: 'success',
-        text: code
-          ? `Команда создана. Код подтверждения: ${code} — введите его в командной очереди (POST /api/control/commands/{id}/confirm) или через MCP.`
-          : 'Команда принята в очередь; воркер подтвердит итог в этом состоянии.',
+        text: res.message || (code ? `Команда создана. Код: ${code}` : 'Действие успешно выполнено.'),
       });
       await load();
     } catch (error) {
@@ -159,7 +157,20 @@ export default function AutoGridAutopilot({ canOperate, accountsHref }: Props) {
   }
 
   if (!state || !settings) {
-    return <div className="empty-state">Загрузка состояния автопилота…</div>;
+    return (
+      <div className="section-stack">
+        {message && (
+          <div className={`alert ${message.kind === 'success' ? 'success' : 'danger'}`}>
+            <span>{message.text}</span>
+            <button className="button secondary" style={{ marginLeft: 12, padding: '2px 8px' }} onClick={() => void load()}>Повторить</button>
+          </div>
+        )}
+        <div className="empty-state">
+          <div>Загрузка состояния автопилота…</div>
+          <button className="button secondary" style={{ marginTop: 12 }} onClick={() => void load()}>Обновить сейчас</button>
+        </div>
+      </div>
+    );
   }
 
   return (

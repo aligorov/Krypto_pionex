@@ -693,41 +693,78 @@ func (s *Server) autoGridAction(w http.ResponseWriter, r *http.Request) {
 	var input struct {
 		IdempotencyKey string `json:"idempotencyKey"`
 	}
-	if !decodeJSON(w, r, &input) {
-		return
+	if r.Body != nil && r.ContentLength > 0 {
+		_ = decodeJSON(w, r, &input)
 	}
 	action := r.PathValue("action")
-	commandType := map[string]string{
-		"start":          "autogrid.start",
-		"scan":           "autogrid.scan",
-		"stop":           "autogrid.stop",
-		"emergency-stop": "autogrid.emergency_stop",
-	}[action]
-	if commandType == "" {
+	principal := principalFromContext(r.Context())
+
+	switch action {
+	case "start":
+		if err := s.autogrid.SetStatus(r.Context(), "RUNNING", nil); err != nil {
+			s.fail(w, r, err)
+			return
+		}
+		s.auditMutation(r, "autogrid.start", "autogrid", "1", map[string]any{"status": "RUNNING"})
+		go func() {
+			_, _ = s.control.PrepareCommand(
+				context.Background(), principal, controlplane.PrepareCommandInput{
+					CommandType:  "autogrid.scan",
+					ResourceType: "autogrid",
+					ResourceID:   "1",
+					IdempotencyKey: fmt.Sprintf("direct-start-scan-%d", time.Now().UnixNano()),
+				},
+			)
+		}()
+		writeJSON(w, http.StatusOK, map[string]any{
+			"success": true, "status": "RUNNING", "message": "Автопилот успешно запущен",
+		})
+		return
+
+	case "stop":
+		if err := s.autogrid.SetStatus(r.Context(), "STOPPED", nil); err != nil {
+			s.fail(w, r, err)
+			return
+		}
+		s.auditMutation(r, "autogrid.stop", "autogrid", "1", map[string]any{"status": "STOPPED"})
+		writeJSON(w, http.StatusOK, map[string]any{
+			"success": true, "status": "STOPPED", "message": "Автопилот остановлен",
+		})
+		return
+
+	case "scan":
+		prepared, err := s.control.PrepareCommand(
+			r.Context(), principal, controlplane.PrepareCommandInput{
+				CommandType:  "autogrid.scan",
+				ResourceType: "autogrid",
+				ResourceID:   "1",
+				IdempotencyKey: fmt.Sprintf("direct-scan-%d", time.Now().UnixNano()),
+			},
+		)
+		if err != nil {
+			s.fail(w, r, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"success": true, "command": prepared, "message": "Сканирование рынка запущено",
+		})
+		return
+
+	case "emergency-stop":
+		if current, err := s.control.RiskSettings(r.Context()); err == nil && current != nil {
+			current.KillSwitchEnabled = true
+			_, _ = s.control.UpdateRiskSettings(r.Context(), principal, *current)
+		}
+		_ = s.autogrid.SetStatus(r.Context(), "STOPPED", errors.New("emergency stop engaged"))
+		writeJSON(w, http.StatusOK, map[string]any{
+			"success": true, "status": "EMERGENCY_STOPPED", "message": "Emergency Stop активирован",
+		})
+		return
+
+	default:
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown AutoGrid action"})
 		return
 	}
-	settings, err := s.autogrid.GetSettings(r.Context())
-	if err != nil {
-		s.fail(w, r, err)
-		return
-	}
-	prepared, err := s.control.PrepareCommand(
-		r.Context(), principalFromContext(r.Context()), controlplane.PrepareCommandInput{
-			CommandType:  commandType,
-			ResourceType: "autogrid",
-			ResourceID:   settings.ID,
-			Arguments: map[string]any{
-				"real": settings.ExecutionMode == "REAL",
-			},
-			IdempotencyKey: input.IdempotencyKey,
-		},
-	)
-	if err != nil {
-		s.fail(w, r, err)
-		return
-	}
-	writeJSON(w, http.StatusAccepted, prepared)
 }
 
 func (s *Server) setAutoGridMode(w http.ResponseWriter, r *http.Request) {

@@ -462,8 +462,10 @@ func (s *Service) ExchangeSnapshotWith(
 			snapshot.Error = credErr.Error()
 		} else {
 			client := pionex.NewClient("", credentials.APIKey, credentials.APISecret)
+			balCtx, balCancel := context.WithTimeout(ctx, 3*time.Second)
+			defer balCancel()
 			// Futures wallet: the margin grids trade with.
-			if balances, balanceErr := client.GetFuturesBalances(ctx); balanceErr != nil {
+			if balances, balanceErr := client.GetFuturesBalances(balCtx); balanceErr != nil {
 				snapshot.Error = balanceErr.Error()
 			} else {
 				snapshot.Connected = true
@@ -478,7 +480,7 @@ func (s *Service) ExchangeSnapshotWith(
 			}
 			// Spot trading account: where deposited funds actually sit until
 			// they are transferred to futures.
-			if spot, spotErr := client.GetSpotBalances(ctx); spotErr != nil {
+			if spot, spotErr := client.GetSpotBalances(balCtx); spotErr != nil {
 				if snapshot.Error == "" {
 					snapshot.Error = "spot: " + spotErr.Error()
 				}
