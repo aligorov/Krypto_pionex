@@ -93,8 +93,11 @@ func (manager *LifecycleManager) CreateGridBot(
 			return fmt.Errorf("begin grid create transaction: %w", txErr)
 		}
 		defer tx.Rollback(ctx)
-		if _, lockErr := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`,
-			input.AccountID+"\x00"+symbol); lockErr != nil {
+		// Two-key advisory lock (account, symbol): a NUL separator inside a
+		// text parameter is rejected by PostgreSQL (22021), and a printable
+		// separator could collide with symbol characters.
+		if _, lockErr := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))`,
+			input.AccountID, symbol); lockErr != nil {
 			return fmt.Errorf("acquire grid create lock: %w", lockErr)
 		}
 		var activeID string
