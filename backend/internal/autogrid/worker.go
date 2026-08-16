@@ -1123,7 +1123,8 @@ func (worker *Worker) cancelRealBot(
 		errStr := strings.ToLower(cancelErr.Error())
 		if strings.Contains(errStr, "already_closed") || strings.Contains(errStr, "already closed") ||
 			strings.Contains(errStr, "not_found") || strings.Contains(errStr, "not found") ||
-			strings.Contains(errStr, "not_exist") || strings.Contains(errStr, "invalid_order") {
+			strings.Contains(errStr, "not_exist") || strings.Contains(errStr, "invalid_order") ||
+			strings.Contains(errStr, "forbidden current state") || strings.Contains(errStr, "can not cancel") {
 			_, _ = worker.db.Exec(ctx, `
 				UPDATE grid_bots
 				SET status = 'STOPPED', closed_reason = 'ALREADY_CLOSED',
@@ -1361,7 +1362,8 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 			errStr := strings.ToLower(getErr.Error())
 			if strings.Contains(errStr, "not_found") || strings.Contains(errStr, "not found") ||
 				strings.Contains(errStr, "already_closed") || strings.Contains(errStr, "already closed") ||
-				strings.Contains(errStr, "not_exist") || strings.Contains(errStr, "404") || strings.Contains(errStr, "invalid_order") {
+				strings.Contains(errStr, "not_exist") || strings.Contains(errStr, "404") || strings.Contains(errStr, "invalid_order") ||
+				strings.Contains(errStr, "forbidden current state") || strings.Contains(errStr, "can not cancel") {
 				_, _ = worker.db.Exec(ctx, `
 					UPDATE grid_bots
 					SET status = 'STOPPED', closed_reason = 'ALREADY_CLOSED',
