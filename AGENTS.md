@@ -18,7 +18,7 @@ This repository (/Users/aleksey/Documents/Krypto_pionex) is a standalone, produc
    - Pionex Spot Grid AI strategy parameters MUST NOT be applied to Futures Grid bots.
 
 4. **Native Futures Grid Lifecycle Integrity**:
-   - Native Futures Grid Bots are created strictly via `/api/v1/bot/futuresGrid/create`.
+   - Native Futures Grid Bots are created strictly via `/api/v1/bot/orders/futuresGrid/create`.
    - A grid bot is never declared `RUNNING` until the remote `buOrderId` is received, validated, and persisted.
 
 5. **Durable Risk Engine**:

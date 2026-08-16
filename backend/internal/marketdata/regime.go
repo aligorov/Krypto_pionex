@@ -76,7 +76,14 @@ func DetectRegime(candles []pionex.KlineCandle) RegimeResult {
 
 	switch {
 	case result.EMAFast > result.EMASlow && result.EMASlopePct > 0.15:
-		result.Regime = "TREND_UP"
+		if windowReturnPct < -3.0 {
+			// Mirror of the short-side macro guard: the macro window is down,
+			// so a local up-pullback is a relief rally in a downtrend, not an
+			// uptrend. Without this the engine longs into obvious shorts.
+			result.Regime = "RANGE"
+		} else {
+			result.Regime = "TREND_UP"
+		}
 	case result.EMAFast < result.EMASlow && result.EMASlopePct < -0.15:
 		if windowReturnPct > 3.0 {
 			// Macro window is up, local pullback is a range/consolidation or dip, not macro downtrend
@@ -241,13 +248,17 @@ func ema(values []float64, period int) float64 {
 	return result
 }
 
-// adx implements Wilder's Average Directional Index over OHLC candles.
+// adx implements Wilder's Average Directional Index over OHLC candles:
+// +DI/-DI are Wilder-smoothed, DX is derived per candle, and ADX is the
+// Wilder-smoothed average of the DX series. Returning raw DX (as this
+// function did before) made the trend thresholds classify noise as trend
+// and trend as noise.
 func adx(candles []pionex.KlineCandle, period int) float64 {
 	if len(candles) < period*2+1 {
 		return 0
 	}
-	type smooth struct{ tr, plusDM, minusDM float64 }
-	var plusDI, minusDI, trSmooth, plusSmooth, minusSmooth float64
+	var trSmooth, plusSmooth, minusSmooth float64
+	dxs := make([]float64, 0, len(candles))
 	first := true
 	for index := 1; index < len(candles); index++ {
 		high, _ := candles[index].High.Float64()
@@ -275,18 +286,29 @@ func adx(candles []pionex.KlineCandle, period int) float64 {
 		trSmooth = trSmooth - trSmooth/float64(period) + tr
 		plusSmooth = plusSmooth - plusSmooth/float64(period) + plusDM
 		minusSmooth = minusSmooth - minusSmooth/float64(period) + minusDM
+
+		if trSmooth > 0 {
+			plusDI := 100 * plusSmooth / trSmooth
+			minusDI := 100 * minusSmooth / trSmooth
+			sum := plusDI + minusDI
+			if sum > 0 {
+				dxs = append(dxs, clamp(100*math.Abs(plusDI-minusDI)/sum, 0, 100))
+			}
+		}
 	}
-	if trSmooth <= 0 {
+	if len(dxs) == 0 {
 		return 0
 	}
-	plusDI = 100 * plusSmooth / trSmooth
-	minusDI = 100 * minusSmooth / trSmooth
-	sum := plusDI + minusDI
-	if sum <= 0 {
-		return 0
+	if len(dxs) < period {
+		return mean(dxs)
 	}
-	dx := 100 * math.Abs(plusDI-minusDI) / sum
-	return clamp(dx, 0, 100)
+	// Wilder ADX: seed with the mean of the first `period` DX values, then
+	// smooth each subsequent DX with the (period-1)/period recursion.
+	result := mean(dxs[:period])
+	for _, dx := range dxs[period:] {
+		result = (result*float64(period-1) + dx) / float64(period)
+	}
+	return clamp(result, 0, 100)
 }
 
 func atrPercent(candles []pionex.KlineCandle, period int) float64 {

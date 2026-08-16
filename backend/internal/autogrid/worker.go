@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"strings"
 	"time"
 
@@ -593,6 +594,49 @@ func (worker *Worker) deployPaper(
 	return nil
 }
 
+// revalidateCandidateTrend recomputes the market regime from fresh candles
+// immediately before real capital is committed. A full scan takes minutes,
+// so a direction decided at scan start can be stale — or outright wrong —
+// by deploy time. The planned trend must survive a fresh look.
+func (worker *Worker) revalidateCandidateTrend(
+	ctx context.Context,
+	candidate Candidate,
+	settings Settings,
+) (bool, string) {
+	candles, err := worker.publicClient.GetKlines(ctx, candidate.Symbol, settings.CandleInterval, settings.LookbackCandles)
+	if err != nil || len(candles) < 30 {
+		return false, "fresh candle fetch failed; refusing to deploy on stale data"
+	}
+	regime := marketdata.DetectRegime(candles)
+	freshTrend := regime.RecommendedTrend()
+
+	tickers, tickerErr := worker.publicClient.GetTickers(ctx, candidate.Symbol, "PERP")
+	if tickerErr == nil && len(tickers) > 0 && tickers[0].Open.GreaterThan(decimal.Zero) {
+		change24h, _ := tickers[0].Close.Sub(tickers[0].Open).
+			Div(tickers[0].Open).Mul(decimal.NewFromInt(100)).Float64()
+		if change24h >= 3.0 && freshTrend == "short" {
+			freshTrend = "no_trend"
+		} else if change24h <= -3.0 && freshTrend == "long" {
+			freshTrend = "no_trend"
+		}
+		if freshTrend == "no_trend" && (math.Abs(change24h) > 8.0) {
+			return false, fmt.Sprintf("fresh 24h change %+.1f%% too strong for a neutral grid", change24h)
+		}
+	}
+
+	planned := strings.ToLower(strings.TrimSpace(candidate.RecommendedTrend))
+	if planned == "" {
+		planned = "no_trend"
+	}
+	if planned != freshTrend {
+		return false, fmt.Sprintf("trend changed since scan: planned %s, fresh %s", planned, freshTrend)
+	}
+	if freshTrend == "no_trend" && (regime.ADX > 32.0 || math.Abs(regime.EMASlopePct) > 3.0) {
+		return false, fmt.Sprintf("fresh regime too strong for neutral grid (ADX %.1f, EMA slope %.2f%%)", regime.ADX, regime.EMASlopePct)
+	}
+	return true, freshTrend
+}
+
 func (worker *Worker) deployReal(
 	ctx context.Context,
 	settings Settings,
@@ -645,6 +689,11 @@ func (worker *Worker) deployReal(
 			continue
 		}
 		if !isEntryTimingFavorable(candidate) {
+			continue
+		}
+		if ok, reason := worker.revalidateCandidateTrend(ctx, candidate, settings); !ok {
+			worker.logger.Info("skip real deploy after fresh trend revalidation",
+				"component", "autogrid_worker", "symbol", candidate.Symbol, "reason", reason)
 			continue
 		}
 		var exists bool
@@ -1148,7 +1197,8 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 			status, closedReason := terminalOutcome(reasonBy)
 			_, _ = worker.db.Exec(ctx, `
 				UPDATE grid_bots
-				SET status = $2, closed_reason = $3,
+				SET status = $2,
+				    closed_reason = COALESCE(NULLIF(closed_reason, ''), $3),
 				    reconciliation_state = 'REMOTE_TERMINAL_CONFIRMED',
 				    last_remote_status = $4, realized_pnl_usdt = $5,
 				    unrealized_pnl_usdt = 0, closed_at = NOW(),
@@ -1267,8 +1317,14 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 				})
 			}
 		case ActionAdjustUp, ActionAdjustDown:
+			if !price.GreaterThan(decimal.Zero) {
+				worker.logger.Error("adjust native grid range skipped: no live price",
+					"component", "autogrid_worker", "bot_id", bot.id, "symbol", bot.symbol)
+				break
+			}
 			if err := client.AdjustFuturesGridBot(ctx, pionex.AdjustFuturesGridParams{
 				BUOrderID: bot.remoteID, Type: "adjust_params",
+				ExtraMargin: false, OpenPrice: &price,
 				Bottom: &decision.NewLower, Top: &decision.NewUpper, Row: bot.rowNum,
 			}); err != nil {
 				worker.logger.Error("adjust native grid range",
@@ -1297,13 +1353,18 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 		}
 	}
 
-	// Synchronize closed bots with exchange history to fill accurate realized PnL
+	// Synchronize closed bots with exchange history to fill accurate realized PnL.
+	// The old query excluded zero-PnL REMOTE_TERMINAL_CONFIRMED bots — exactly
+	// the population written by the ALREADY_CLOSED paths without PnL — which
+	// permanently understated realized results. Bounded to a 48h window so the
+	// per-cycle work stays finite.
 	closedRows, err := worker.db.Query(ctx, `
 		SELECT id, bu_order_id
 		FROM grid_bots
 		WHERE bu_order_id IS NOT NULL
 		  AND status IN ('STOPPED', 'COMPLETED', 'CANCELLED', 'LIQUIDATED')
-		  AND (realized_pnl_usdt IS NULL OR (realized_pnl_usdt = 0 AND reconciliation_state != 'REMOTE_TERMINAL_CONFIRMED'))
+		  AND (realized_pnl_usdt IS NULL OR realized_pnl_usdt = 0)
+		  AND COALESCE(closed_at, updated_at) > NOW() - INTERVAL '48 hours'
 		ORDER BY created_at DESC
 		LIMIT 20
 	`)
@@ -1336,7 +1397,137 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 		}
 	}
 
+	worker.reconcileUnknownSubmissions(ctx, client)
+
 	return clampInterval(settings.ManageIntervalSeconds), nil
+}
+
+// reconcileUnknownSubmissions resolves grid bots whose create outcome is
+// unknown or that crashed between intent and submission. Without it, a
+// transport failure after POST futuresGrid/create can leave a live exchange
+// grid running forever with no stop-loss, no PnL accounting and no way to
+// redeploy the symbol. Remote orders from the documented
+// GET /api/v1/bot/orders list are matched by symbol and creation time:
+// a unique match adopts the remote buOrderId; a provably absent bot (lists
+// fully paginated without error) is cleared so the symbol is freed.
+func (worker *Worker) reconcileUnknownSubmissions(ctx context.Context, client *pionex.Client) {
+	rows, err := worker.db.Query(ctx, `
+		SELECT id, symbol, quote_investment, EXTRACT(EPOCH FROM created_at) * 1000
+		FROM grid_bots
+		WHERE bu_order_id IS NULL
+		  AND status IN ('SUBMISSION_UNKNOWN', 'PENDING_SUBMISSION')
+		  AND created_at > NOW() - INTERVAL '48 hours'
+		  AND created_at < NOW() - INTERVAL '90 seconds'
+		ORDER BY created_at
+		LIMIT 10
+	`)
+	if err != nil {
+		return
+	}
+	type unknownBot struct {
+		id, symbol string
+		investment decimal.Decimal
+		createdMS  float64
+	}
+	pending := make([]unknownBot, 0, 10)
+	for rows.Next() {
+		var item unknownBot
+		if err := rows.Scan(&item.id, &item.symbol, &item.investment, &item.createdMS); err == nil {
+			pending = append(pending, item)
+		}
+	}
+	rows.Close()
+	if len(pending) == 0 {
+		return
+	}
+
+	remoteOrders := make([]pionex.BotOrder, 0, 64)
+	listsComplete := true
+	for _, listStatus := range []string{"running", "finished"} {
+		token := ""
+		for page := 0; page < 10; page++ {
+			orders, next, listErr := client.ListBotOrders(ctx, listStatus, token)
+			if listErr != nil {
+				worker.logger.Warn("list bot orders for unknown-submission reconciliation",
+					"component", "autogrid_worker", "status", listStatus, "error", listErr)
+				listsComplete = false
+				break
+			}
+			remoteOrders = append(remoteOrders, orders...)
+			if next == "" {
+				break
+			}
+			token = next
+		}
+	}
+
+	for _, bot := range pending {
+		matches := make([]pionex.BotOrder, 0, 2)
+		for _, order := range remoteOrders {
+			if order.BUOrderID == "" {
+				continue
+			}
+			if strings.ToUpper(order.Base+"_"+order.Quote+"_PERP") != strings.ToUpper(bot.symbol) {
+				continue
+			}
+			if order.CreateTimeMS <= 0 || math.Abs(float64(order.CreateTimeMS)-bot.createdMS) > 10*60*1000 {
+				continue
+			}
+			if investment, ok := order.GridInvestment(); ok && investment.GreaterThan(decimal.Zero) &&
+				bot.investment.GreaterThan(decimal.Zero) {
+				tolerance := bot.investment.Div(decimal.NewFromInt(50)) // 2%
+				diff := investment.Sub(bot.investment).Abs()
+				if diff.GreaterThan(tolerance) {
+					continue
+				}
+			}
+			matches = append(matches, order)
+		}
+		if len(matches) == 1 {
+			tag, err := worker.db.Exec(ctx, `
+				UPDATE grid_bots
+				SET bu_order_id = $2, status = 'RUNNING',
+				    reconciliation_state = 'REMOTE_ID_PERSISTED',
+				    last_remote_status = 'ADOPTED_AFTER_UNKNOWN_SUBMISSION',
+				    last_error = NULL, updated_at = NOW()
+				WHERE id = $1 AND bu_order_id IS NULL
+				  AND status IN ('SUBMISSION_UNKNOWN', 'PENDING_SUBMISSION')
+			`, bot.id, matches[0].BUOrderID)
+			if err == nil && tag.RowsAffected() == 1 {
+				worker.logger.Info("adopted remotely created grid after unknown submission",
+					"component", "autogrid_worker", "symbol", bot.symbol,
+					"bu_order_id", matches[0].BUOrderID)
+				_ = QueueTelegramEvent(ctx, worker.db, "EMERGENCY", map[string]any{
+					"message": fmt.Sprintf("Bot %s: create outcome was unknown; exchange bot %s adopted and is now managed",
+						bot.symbol, matches[0].BUOrderID),
+				})
+			}
+			continue
+		}
+		if len(matches) > 1 {
+			worker.logger.Warn("ambiguous remote matches for unknown submission; manual review required",
+				"component", "autogrid_worker", "symbol", bot.symbol, "matches", len(matches))
+			continue
+		}
+		// No running or finished order matches. Only clear the row when both
+		// lists paginated to the end without errors, otherwise the bot may
+		// simply live on a page we could not reach.
+		if !listsComplete || time.Since(time.UnixMilli(int64(bot.createdMS))) < 30*time.Minute {
+			continue
+		}
+		tag, err := worker.db.Exec(ctx, `
+			UPDATE grid_bots
+			SET status = 'FAILED', closed_reason = 'NOT_CREATED_ON_EXCHANGE',
+			    reconciliation_state = 'REMOTE_TERMINAL_CONFIRMED',
+			    last_error = NULL, closed_at = NOW(), updated_at = NOW()
+			WHERE id = $1 AND bu_order_id IS NULL
+			  AND status IN ('SUBMISSION_UNKNOWN', 'PENDING_SUBMISSION')
+		`, bot.id)
+		if err == nil && tag.RowsAffected() == 1 {
+			worker.logger.Info("cleared unknown submission: no matching exchange bot exists",
+				"component", "autogrid_worker", "symbol", bot.symbol)
+		}
+	}
 }
 
 // managePaperBots marks paper bots to market and closes them when the same
@@ -1582,6 +1773,12 @@ func (worker *Worker) scheduleDueScan(ctx context.Context) error {
 			 WHERE settings_id = $1 AND status = 'SUCCEEDED'
 			 ORDER BY completed_at DESC LIMIT 1),
 			true
+		)
+		AND NOT EXISTS (
+			SELECT 1 FROM control_commands
+			WHERE command_type = 'autogrid.scan'
+			  AND status IN ('QUEUED', 'EXECUTING')
+			  AND created_at > NOW() - INTERVAL '30 minutes'
 		)
 	`, settings.ID, settings.ScanIntervalSeconds).Scan(&due)
 	if err != nil || !due {

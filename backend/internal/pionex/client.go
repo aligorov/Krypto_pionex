@@ -29,6 +29,7 @@ type Client struct {
 	httpClient     *http.Client
 	publicLimiter  *RateLimiter
 	privateLimiter *RateLimiter
+	clock          *Clock
 	now            func() time.Time
 }
 
@@ -48,8 +49,11 @@ func NewClientWithHTTPClient(baseURL, apiKey, apiSecret string, httpClient *http
 		baseURL:        strings.TrimRight(baseURL, "/"),
 		signer:         NewSigner(apiKey, apiSecret),
 		httpClient:     httpClient,
-		publicLimiter:  NewRateLimiter(20, 20),
+		// Pionex documents a global 10 req/s per IP limit for all public
+		// endpoints; the previous 20/s burst guaranteed 429 blackouts.
+		publicLimiter:  NewRateLimiter(10, 10),
 		privateLimiter: NewRateLimiter(10, 10),
+		clock:          NewClock(),
 		now:            time.Now,
 	}
 }
@@ -280,7 +284,6 @@ func (c *Client) GetFuturesGridBot(ctx context.Context, buOrderID string) (*Futu
 
 type CancelFuturesGridParams struct {
 	BUOrderID     string `json:"buOrderId,omitempty"`
-	BotOrderID    string `json:"botOrderId,omitempty"`
 	CloseNote     string `json:"closeNote,omitempty"`
 	CloseSellMode string `json:"closeSellModel,omitempty"`
 	Immediate     bool   `json:"immediate"`
@@ -288,9 +291,6 @@ type CancelFuturesGridParams struct {
 }
 
 func (c *Client) CancelFuturesGridBot(ctx context.Context, params CancelFuturesGridParams) error {
-	if params.BUOrderID != "" && params.BotOrderID == "" {
-		params.BotOrderID = params.BUOrderID
-	}
 	body, err := json.Marshal(params)
 	if err != nil {
 		return fmt.Errorf("marshal futures grid cancel request: %w", err)
@@ -375,7 +375,7 @@ func (c *Client) do(
 		if err := json.Unmarshal(responseBody, &envelope); err != nil {
 			return &APIError{
 				StatusCode:     resp.StatusCode,
-				Message:        "invalid JSON response",
+				Message:        "invalid JSON response: " + bodySnippet(responseBody),
 				OutcomeUnknown: method != http.MethodGet && resp.StatusCode >= 500,
 			}
 		}
@@ -383,6 +383,23 @@ func (c *Client) do(
 			message := envelope.Message
 			if message == "" {
 				message = http.StatusText(resp.StatusCode)
+			}
+			// A rejected timestamp means the local clock drifted past the
+			// +/-20s signing window: resync the offset immediately so the
+			// next signed request passes, and retry idempotent GETs at once.
+			if private && strings.Contains(strings.ToLower(message+" "+envelope.Code), "timestamp") {
+				syncCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+				if syncErr := c.clock.SyncWithServer(syncCtx, c.baseURL); syncErr == nil {
+					cancel()
+					if method == http.MethodGet && attempt < attempts {
+						if err := waitRetry(ctx, attempt); err != nil {
+							return err
+						}
+						continue
+					}
+				} else {
+					cancel()
+				}
 			}
 			return &APIError{StatusCode: resp.StatusCode, Code: envelope.Code, Message: message}
 		}
@@ -434,7 +451,7 @@ func (c *Client) newSignedRequest(
 	if query == nil {
 		query = url.Values{}
 	}
-	timestamp := c.now().UnixMilli()
+	timestamp := c.clock.NowMilli()
 	signature, err := c.signer.SignRequest(method, path, query, body, timestamp)
 	if err != nil {
 		return nil, fmt.Errorf("sign pionex request: %w", err)
@@ -456,6 +473,23 @@ func cloneValues(values url.Values) url.Values {
 		cloned[key] = append([]string(nil), items...)
 	}
 	return cloned
+}
+
+// bodySnippet renders the first bytes of a non-JSON response body so gateway
+// HTML error pages (openresty 4xx/5xx) surface their actual reason in logs.
+func bodySnippet(body []byte) string {
+	const limit = 160
+	snippet := strings.Map(func(r rune) rune {
+		if r == '\n' || r == '\r' || r == '\t' {
+			return ' '
+		}
+		return r
+	}, string(body))
+	snippet = strings.TrimSpace(snippet)
+	if len(snippet) > limit {
+		snippet = snippet[:limit] + "..."
+	}
+	return snippet
 }
 
 func waitRetry(ctx context.Context, attempt int) error {

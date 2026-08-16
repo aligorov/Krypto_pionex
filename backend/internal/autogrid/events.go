@@ -130,7 +130,7 @@ func QueueTelegramEvent(
 	case "STOP_LOSS":
 		shouldSend = notifyStop
 		tmpl = tmplStop
-	case "RANGE_ADJUST":
+	case "RANGE_ADJUST", "ADJUST_RANGE":
 		shouldSend = notifyAdjust
 		tmpl = tmplAdjust
 	case "DIGEST":

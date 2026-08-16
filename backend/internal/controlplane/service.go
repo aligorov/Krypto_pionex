@@ -681,8 +681,7 @@ func (s *Service) executeCommand(
 		status = "QUEUED"
 		result["executor"] = "native_grid_worker"
 		result["message"] = "durable stop request queued; remote terminal and flat-position verification are still required"
-	case "grid.create", "grid.reduce", "pattern.cancel", "position.emergency_close",
-		"scanner.run", "autogrid.start", "autogrid.scan",
+	case "autogrid.start", "autogrid.scan",
 		"autogrid.stop", "autogrid.emergency_stop":
 		if entryCommand(commandType, arguments) {
 			allowed, reason, checkErr := s.entryAllowed(ctx, commandType)
@@ -823,11 +822,18 @@ func (s *Service) getConfig(ctx context.Context, key string, includeSensitive bo
 	return &item, nil
 }
 
+// validateCommand accepts only command types that have a live executor:
+// kill_switch.set / account.set_enabled execute inline in ExecuteCommand,
+// grid.stop turns into a durable stop request the autogrid worker's
+// reconcile loop acts on, and the autogrid.* family is claimed by the
+// autogrid worker. Types whose domain executors were never implemented
+// (grid.create, grid.reduce, pattern.cancel, position.emergency_close,
+// scanner.run) used to queue silently and expire 15 minutes later — they are
+// rejected at prepare time now so nobody trusts a dead red button.
 func validateCommand(commandType string) error {
 	switch commandType {
-	case "kill_switch.set", "account.set_enabled", "scanner.run",
-		"grid.create", "grid.stop", "grid.reduce",
-		"pattern.cancel", "position.emergency_close",
+	case "kill_switch.set", "account.set_enabled",
+		"grid.stop",
 		"autogrid.start", "autogrid.scan", "autogrid.stop",
 		"autogrid.emergency_stop":
 		return nil
@@ -874,9 +880,6 @@ func boolArgument(arguments map[string]any, key string) (bool, bool) {
 }
 
 func entryCommand(commandType string, arguments map[string]any) bool {
-	if commandType == "grid.create" {
-		return true
-	}
 	if commandType == "autogrid.start" {
 		real, ok := boolArgument(arguments, "real")
 		return ok && real
@@ -886,12 +889,6 @@ func entryCommand(commandType string, arguments map[string]any) bool {
 
 func executorFor(commandType string) string {
 	switch commandType {
-	case "grid.create", "grid.reduce":
-		return "native_grid_worker"
-	case "pattern.cancel", "position.emergency_close":
-		return "futures_execution_worker"
-	case "scanner.run":
-		return "market_scanner_worker"
 	case "autogrid.start", "autogrid.scan", "autogrid.stop", "autogrid.emergency_stop":
 		return "autogrid_worker"
 	default:

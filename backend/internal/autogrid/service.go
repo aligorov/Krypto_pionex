@@ -1261,27 +1261,47 @@ func (s *Service) AdjustBot(
 	}
 	var buOrderID *string
 	var accountID *string
+	var botSymbol string
+	var botLeverage int
 	var currentLower, currentUpper decimal.Decimal
 	var currentRow int
 	if err := s.db.QueryRow(ctx, `
-		SELECT bu_order_id, account_id, lower_price, upper_price, grid_num
+		SELECT bu_order_id, account_id, symbol, COALESCE(leverage, 1),
+		       lower_price, upper_price, grid_num
 		FROM grid_bots
 		WHERE id = $1 AND autogrid_settings_id = $2 AND status = 'RUNNING'
-	`, botID, settingsID).Scan(&buOrderID, &accountID, &currentLower, &currentUpper, &currentRow); err == nil {
+	`, botID, settingsID).Scan(&buOrderID, &accountID, &botSymbol, &botLeverage,
+		&currentLower, &currentUpper, &currentRow); err == nil {
 		if buOrderID == nil || *buOrderID == "" {
 			return "", errors.New("real bot has no remote buOrderId yet")
+		}
+		// invest_in commits new real margin: it is an entry-class action and
+		// must clear the same durable gates as a deployment (kill switch,
+		// leverage cap, daily loss, account and symbol exposure).
+		if input.Mode == "invest_in" {
+			if !input.QuoteInvestment.GreaterThan(decimal.Zero) {
+				return "", errors.New("invest_in requires a positive quoteInvestment")
+			}
+			if err := s.risk.ValidateNewGrid(ctx, *accountID, botSymbol, botLeverage, input.QuoteInvestment); err != nil {
+				return "", fmt.Errorf("invest_in rejected by risk engine: %w", err)
+			}
 		}
 		client, err := s.PrivateClient(ctx, accountService, *accountID)
 		if err != nil {
 			return "", err
 		}
+		openPrice := decimal.Zero
+		if tickers, tickerErr := client.GetTickers(ctx, botSymbol, ""); tickerErr == nil && len(tickers) > 0 {
+			openPrice = tickers[0].Close
+		}
+		if !openPrice.GreaterThan(decimal.Zero) {
+			return "", errors.New("adjust requires a live market price (openPrice) but the ticker is unavailable")
+		}
 		params := pionex.AdjustFuturesGridParams{
 			BUOrderID: *buOrderID, Type: input.Mode,
+			ExtraMargin: false, OpenPrice: &openPrice,
 		}
 		if input.Mode == "invest_in" {
-			if !input.QuoteInvestment.GreaterThan(decimal.Zero) {
-				return "", errors.New("invest_in requires a positive quoteInvestment")
-			}
 			params.QuoteInvestment = &input.QuoteInvestment
 		} else {
 			params.Bottom = &input.Lower

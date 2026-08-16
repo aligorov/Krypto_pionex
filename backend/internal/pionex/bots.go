@@ -96,9 +96,13 @@ func (c *Client) CheckFuturesGridParams(
 // AdjustFuturesGridParams adjusts a running native futures grid bot through
 // POST /api/v1/bot/orders/futuresGrid/adjustParams. Type is "invest_in"
 // (add quoteInvestment) or "adjust_params" (move bottom/top/row).
+// extraMargin and openPrice are REQUIRED by the official contract for every
+// type; openPrice is the current market price used to re-anchor the grid.
 type AdjustFuturesGridParams struct {
 	BUOrderID       string           `json:"buOrderId"`
 	Type            string           `json:"type"`
+	ExtraMargin     bool             `json:"extraMargin"`
+	OpenPrice       *decimal.Decimal `json:"openPrice,omitempty"`
 	Bottom          *decimal.Decimal `json:"bottom,omitempty"`
 	Top             *decimal.Decimal `json:"top,omitempty"`
 	Row             int              `json:"row,omitempty"`
@@ -114,6 +118,91 @@ func (c *Client) AdjustFuturesGridBot(
 		return fmt.Errorf("marshal futures grid adjust request: %w", err)
 	}
 	return c.do(ctx, http.MethodPost, "/api/v1/bot/orders/futuresGrid/adjustParams", nil, body, true, 1, nil)
+}
+
+// BotOrder is an entry of the documented account-wide bot order list
+// (GET /api/v1/bot/orders). The shape is shared across bot types, so the
+// type-specific grid payload stays raw.
+type BotOrder struct {
+	BUOrderID    string          `json:"buOrderId"`
+	BUOrderType  string          `json:"buOrderType"`
+	Status       string          `json:"status"`
+	Canceling    bool            `json:"canceling"`
+	Base         string          `json:"base"`
+	Quote        string          `json:"quote"`
+	CreateTimeMS int64           `json:"createTime"`
+	BUOrderData  json.RawMessage `json:"buOrderData"`
+}
+
+// GridInvestment extracts the quote investment from the dynamic buOrderData
+// payload, tolerating camelCase and snake_case keys with string or numeric
+// values. Returns false when no investment field is present.
+func (order BotOrder) GridInvestment() (decimal.Decimal, bool) {
+	if len(order.BUOrderData) == 0 {
+		return decimal.Zero, false
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(order.BUOrderData, &payload); err != nil {
+		return decimal.Zero, false
+	}
+	for _, key := range []string{"quoteInvestment", "quote_investment", "investment", "investAmount"} {
+		raw, ok := payload[key]
+		if !ok {
+			continue
+		}
+		switch value := raw.(type) {
+		case string:
+			if parsed, err := decimal.NewFromString(value); err == nil {
+				return parsed, true
+			}
+		case float64:
+			return decimal.NewFromFloat(value), true
+		}
+	}
+	return decimal.Zero, false
+}
+
+// ListBotOrders pages through the documented bot order list
+// (GET /api/v1/bot/orders) filtered to futures grids. status is "running"
+// (default) or "finished"; pass an empty pageToken to start. The next token
+// is returned empty at the end of the list.
+func (c *Client) ListBotOrders(
+	ctx context.Context,
+	status, pageToken string,
+) ([]BotOrder, string, error) {
+	query := url.Values{"buOrderTypes": []string{"futures_grid"}}
+	if status != "" {
+		query.Set("status", status)
+	}
+	if pageToken != "" {
+		query.Set("pageToken", pageToken)
+	}
+	var raw json.RawMessage
+	if err := c.do(ctx, http.MethodGet, "/api/v1/bot/orders", query, nil, true, 1, &raw); err != nil {
+		return nil, "", err
+	}
+	var envelope struct {
+		Orders          []BotOrder `json:"orders"`
+		BotOrders       []BotOrder `json:"botOrders"`
+		Items           []BotOrder `json:"items"`
+		NextPageToken   string     `json:"nextPageToken"`
+		NextPageTokenAlt string    `json:"next_page_token"`
+	}
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		return nil, "", fmt.Errorf("decode bot order list: %w", err)
+	}
+	orders := envelope.Orders
+	if len(orders) == 0 {
+		orders = envelope.BotOrders
+	}
+	if len(orders) == 0 {
+		orders = envelope.Items
+	}
+	next := envelope.NextPageToken
+	if next == "" {
+		next = envelope.NextPageTokenAlt
+	}
+	return orders, next, nil
 }
 
 // SpotBalance is a trading-account balance entry from the official spot

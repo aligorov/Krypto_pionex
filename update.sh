@@ -9,7 +9,7 @@ echo "=================================================="
 git fetch -f --tags origin
 
 # Detect latest version tag
-LATEST_TAG=$(git tag -l "1.0.0.*" | sort -V | tail -n 1)
+LATEST_TAG=$(git tag -l "v1.*" "1.0.0.*" | sort -V | tail -n 1)
 if [ -z "$LATEST_TAG" ]; then
     LATEST_TAG="main"
 fi

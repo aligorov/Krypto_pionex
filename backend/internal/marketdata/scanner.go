@@ -335,12 +335,23 @@ func scoreCandidate(
 	if ticker.Open.GreaterThan(decimal.Zero) {
 		change24hPct, _ = ticker.Close.Sub(ticker.Open).Div(ticker.Open).Mul(decimal.NewFromInt(100)).Float64()
 	}
+	var change6hPct float64
+	if sixHCandles := int(periodsPerDay / 4); sixHCandles > 0 && len(sorted) > sixHCandles+1 {
+		startClose, _ := sorted[len(sorted)-1-sixHCandles].Close.Float64()
+		endClose, _ := sorted[len(sorted)-1].Close.Float64()
+		if startClose > 0 && endClose > 0 {
+			change6hPct = (endClose - startClose) / startClose * 100
+		}
+	}
 
 	recommendedTrend := regime.RecommendedTrend()
-	// Counter-trend guard: If 24h momentum is strongly positive (+3%+), never open a SHORT grid.
+	// Counter-trend guards, symmetric on both sides: a strongly trending
+	// 24h tape must not be fought with a directional grid in the opposite
+	// direction. The previous asymmetry (+3% blocked shorts while longs were
+	// allowed down to -6%) systematically longed into obvious downtrends.
 	if change24hPct >= 3.0 && recommendedTrend == "short" {
 		recommendedTrend = "no_trend"
-	} else if change24hPct <= -6.0 && recommendedTrend == "long" {
+	} else if change24hPct <= -3.0 && recommendedTrend == "long" {
 		recommendedTrend = "no_trend"
 	}
 	if rangeFraction < 0.005 {
@@ -375,8 +386,11 @@ func scoreCandidate(
 	if regime.IsSqueeze {
 		reasons = append(reasons, "volatility squeeze: impending explosive breakout")
 	}
-	if recommendedTrend == "no_trend" && (regime.ADX > 32.0 || math.Abs(regime.EMASlopePct) > 3.0) {
-		reasons = append(reasons, fmt.Sprintf("trend too strong for neutral grid (ADX: %.1f, EMA slope: %.2f%%)", regime.ADX, regime.EMASlopePct))
+	if recommendedTrend == "no_trend" && (regime.ADX > 32.0 || math.Abs(regime.EMASlopePct) > 3.0 ||
+		math.Abs(change24hPct) > 8.0 || math.Abs(change6hPct) > 4.0) {
+		reasons = append(reasons, fmt.Sprintf(
+			"trend too strong for neutral grid (ADX: %.1f, EMA slope: %.2f%%, 24h: %+.1f%%, 6h: %+.1f%%)",
+			regime.ADX, regime.EMASlopePct, change24hPct, change6hPct))
 	}
 
 	// Anti-FOMO Overbought / Oversold protection:

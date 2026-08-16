@@ -5,36 +5,104 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
 
 	"github.com/shopspring/decimal"
 )
 
-// FuturesOrderRequest represents params to place an ordinary Futures order.
+// FuturesOrderRequest represents params to place an ordinary Futures order
+// via /uapi/v1/trade/order. The documented quantity field is "size" (string)
+// and the documented type enum is LIMIT / MARKET_QTY / IOC / FOK / POSTONLY.
 type FuturesOrderRequest struct {
 	Symbol        string          `json:"symbol"`
 	Side          string          `json:"side"` // BUY, SELL
-	OrderType     string          `json:"type"` // LIMIT, MARKET
+	OrderType     string          `json:"type"`
 	ClientOrderID string          `json:"clientOrderId"`
 	Price         decimal.Decimal `json:"price,omitempty"`
-	Amount        decimal.Decimal `json:"amount"`
+	Size          decimal.Decimal `json:"size"`
 }
 
 // FuturesOrderResult represents the returned order placement response.
+// orderId is documented as int64 but is decoded tolerantly because Pionex
+// mixes numeric and string ids across endpoints.
 type FuturesOrderResult struct {
-	OrderID       string `json:"orderId"`
+	OrderID       string
 	ClientOrderID string `json:"clientOrderId"`
 }
 
+func (r *FuturesOrderResult) UnmarshalJSON(data []byte) error {
+	var raw map[string]any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return fmt.Errorf("decode futures order result: %w", err)
+	}
+	if value, ok := raw["orderId"]; ok {
+		r.OrderID = fmt.Sprintf("%v", value)
+	}
+	if value, ok := raw["clientOrderId"]; ok {
+		r.ClientOrderID = fmt.Sprintf("%v", value)
+	}
+	return nil
+}
+
 // FuturesPosition represents current active futures position details.
+// Field aliases follow both the legacy and documented naming
+// (positionSide/avgPrice/netSize/unrealizedPnL), and leverage tolerates
+// string or numeric encoding.
 type FuturesPosition struct {
-	Symbol           string          `json:"symbol"`
-	Side             string          `json:"side"` // LONG, SHORT
-	Amount           decimal.Decimal `json:"amount"`
-	EntryPrice       decimal.Decimal `json:"entryPrice"`
-	MarkPrice        decimal.Decimal `json:"markPrice"`
-	UnrealizedPNL    decimal.Decimal `json:"unrealizedPnl"`
-	Leverage         int             `json:"leverage"`
-	LiquidationPrice decimal.Decimal `json:"liquidationPrice"`
+	Symbol           string
+	Side             string
+	Amount           decimal.Decimal
+	EntryPrice       decimal.Decimal
+	MarkPrice        decimal.Decimal
+	UnrealizedPNL    decimal.Decimal
+	Leverage         int
+	LiquidationPrice decimal.Decimal
+}
+
+func (p *FuturesPosition) UnmarshalJSON(data []byte) error {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	pick := func(keys ...string) json.RawMessage {
+		for _, key := range keys {
+			if value, ok := raw[key]; ok && string(value) != "null" {
+				return value
+			}
+		}
+		return nil
+	}
+	decodeDecimal := func(target *decimal.Decimal, keys ...string) {
+		if value := pick(keys...); value != nil {
+			_ = json.Unmarshal(value, target)
+		}
+	}
+	decodeString := func(target *string, keys ...string) {
+		if value := pick(keys...); value != nil {
+			_ = json.Unmarshal(value, target)
+		}
+	}
+	decodeString(&p.Symbol, "symbol")
+	decodeString(&p.Side, "side", "positionSide")
+	decodeDecimal(&p.Amount, "amount", "netSize")
+	decodeDecimal(&p.EntryPrice, "entryPrice", "avgPrice")
+	decodeDecimal(&p.MarkPrice, "markPrice")
+	decodeDecimal(&p.UnrealizedPNL, "unrealizedPnl", "unrealizedPnL")
+	decodeDecimal(&p.LiquidationPrice, "liquidationPrice")
+	if value := pick("leverage"); value != nil {
+		var asInt int
+		if err := json.Unmarshal(value, &asInt); err == nil {
+			p.Leverage = asInt
+		} else {
+			var asString string
+			if err := json.Unmarshal(value, &asString); err == nil {
+				if parsed, err := strconv.Atoi(asString); err == nil {
+					p.Leverage = parsed
+				}
+			}
+		}
+	}
+	return nil
 }
 
 // PlaceFuturesOrder places an ordinary futures order using official endpoint /uapi/v1/trade/order.
