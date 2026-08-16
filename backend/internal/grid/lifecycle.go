@@ -91,6 +91,8 @@ func (manager *LifecycleManager) CreateGridBot(
 		input.Params.BUOrderData.LossStop,
 		input.Params.BUOrderData.ProfitStop,
 		fingerprint,
+		input.PnLTargetUSDT,
+		input.MaxLossUSDT,
 	).Scan(&gridID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		err = manager.db.QueryRow(ctx, `
