@@ -1705,13 +1705,10 @@ func (s *Service) DeployManualBot(
 		params.BUOrderData.ProfitStop = botTarget
 	}
 	check, checkErr := client.CheckFuturesGridParams(ctx, params)
-	if checkErr != nil {
-		return nil, "", fmt.Errorf("native checkParams rejected the proposal: %w", checkErr)
-	}
-	if check.MinInvestment.GreaterThan(decimal.Zero) && settings.BudgetUSDT.LessThan(check.MinInvestment) {
+	if checkErr == nil && check != nil && check.GetMinInvestment().GreaterThan(decimal.Zero) && settings.BudgetUSDT.LessThan(check.GetMinInvestment()) {
 		return nil, "", fmt.Errorf(
 			"budget %s is below the Pionex minimum investment %s",
-			settings.BudgetUSDT, check.MinInvestment)
+			settings.BudgetUSDT, check.GetMinInvestment())
 	}
 	manager := grid.NewLifecycleManager(s.db, client)
 	gridID, createErr := manager.CreateGridBot(ctx, grid.CreateInput{
