@@ -25,7 +25,7 @@ export default function Bots({ canOperate }: Props) {
 
   useEffect(() => {
     void load();
-    const timer = window.setInterval(() => void load(), 10000);
+    const timer = window.setInterval(() => void load(), 3000);
     return () => window.clearInterval(timer);
   }, [load]);
 
@@ -88,7 +88,12 @@ export default function Bots({ canOperate }: Props) {
             <span className="eyebrow">ACTIVE BOTS</span>
             <h3>Активные боты ({state.activeBots.length})</h3>
           </div>
-          <span className="muted">PnL обновляется циклом reconcile · ¹цель/стоп свои у каждого бота (динамические при открытии)</span>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+            <span className="muted">PnL обновляется циклом reconcile</span>
+            <button className="button secondary" style={{ padding: '4px 10px' }} onClick={() => void load()}>
+              🔄 Обновить
+            </button>
+          </div>
         </div>
         {state.activeBots.length === 0 ? (
           <div className="empty-state">Активных ботов нет — запустите автопилот или сделайте скан.</div>
