@@ -1301,13 +1301,12 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 	closedRows, err := worker.db.Query(ctx, `
 		SELECT id, bu_order_id
 		FROM grid_bots
-		WHERE autogrid_settings_id = $1
+		WHERE bu_order_id IS NOT NULL
 		  AND status IN ('STOPPED', 'COMPLETED', 'CANCELLED', 'LIQUIDATED')
-		  AND bu_order_id IS NOT NULL
-		  AND (realized_pnl_usdt IS NULL OR realized_pnl_usdt = 0)
+		  AND (realized_pnl_usdt IS NULL OR (realized_pnl_usdt = 0 AND reconciliation_state != 'REMOTE_TERMINAL_CONFIRMED'))
 		ORDER BY created_at DESC
-		LIMIT 10
-	`, settings.ID)
+		LIMIT 20
+	`)
 	if err == nil {
 		type closedBotItem struct {
 			id, remoteID string
@@ -1326,13 +1325,13 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 				if profit.IsZero() {
 					profit = remote.BUOrderData.TotalProfit
 				}
-				if !profit.IsZero() {
-					_, _ = worker.db.Exec(ctx, `
-						UPDATE grid_bots
-						SET realized_pnl_usdt = $2, updated_at = NOW()
-						WHERE id = $1
-					`, item.id, profit)
-				}
+				_, _ = worker.db.Exec(ctx, `
+					UPDATE grid_bots
+					SET realized_pnl_usdt = $2,
+					    reconciliation_state = 'REMOTE_TERMINAL_CONFIRMED',
+					    updated_at = NOW()
+					WHERE id = $1
+				`, item.id, profit)
 			}
 		}
 	}

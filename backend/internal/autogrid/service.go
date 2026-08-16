@@ -1033,7 +1033,7 @@ func (s *Service) listClosedBots(ctx context.Context, settingsID string) ([]Clos
 	items := make([]ClosedBot, 0)
 	rows, err := s.db.Query(ctx, `
 		SELECT id, COALESCE(bot_number, 0), symbol, direction, quote_investment,
-		       realized_pnl_usdt, closed_reason, status, COALESCE(closed_at, updated_at)
+		       COALESCE(realized_pnl_usdt, 0), closed_reason, status, COALESCE(closed_at, updated_at)
 		FROM grid_bots
 		WHERE (autogrid_settings_id = $1 OR autogrid_settings_id IS NOT NULL)
 		  AND status IN ('STOPPED', 'CANCELLED', 'COMPLETED', 'LIQUIDATED', 'FAILED')
@@ -1059,7 +1059,7 @@ func (s *Service) listClosedBots(ctx context.Context, settingsID string) ([]Clos
 
 	rows, err = s.db.Query(ctx, `
 		SELECT id, COALESCE(bot_number, 0), symbol, direction, quote_investment,
-		       realized_pnl_usdt, closed_reason, status, COALESCE(closed_at, updated_at)
+		       COALESCE(realized_pnl_usdt, 0), closed_reason, status, COALESCE(closed_at, updated_at)
 		FROM paper_grid_bots
 		WHERE (settings_id = $1 OR settings_id IS NOT NULL)
 		  AND status IN ('STOPPED', 'COMPLETED', 'EMERGENCY_STOPPED')
