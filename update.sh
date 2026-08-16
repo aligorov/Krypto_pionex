@@ -15,7 +15,17 @@ if [ -z "$LATEST_TAG" ]; then
 fi
 
 echo ">> Switching to latest release: $LATEST_TAG"
+SELF_HASH_BEFORE=$(md5sum "$0" 2>/dev/null | cut -d' ' -f1)
 git checkout -f "$LATEST_TAG"
+# A checkout can replace this very script. bash keeps reading the old fd,
+# so deploy-script changes would only apply on the NEXT run — a silent
+# bootstrap trap. Re-exec once when the running script differs from the
+# checked-out one.
+SELF_HASH_AFTER=$(md5sum "$0" 2>/dev/null | cut -d' ' -f1)
+if [ -n "$SELF_HASH_BEFORE" ] && [ "$SELF_HASH_BEFORE" != "$SELF_HASH_AFTER" ]; then
+    echo ">> update.sh changed with this release — restarting the updater once"
+    exec bash "$0"
+fi
 
 # One-time migration to passwordless network-trust auth (Zero-ENV / zero
 # secrets): volumes initialized before v1.1.2 carry a password-based host
