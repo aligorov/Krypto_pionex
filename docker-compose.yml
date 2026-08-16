@@ -5,12 +5,13 @@ services:
     restart: unless-stopped
     environment:
       POSTGRES_USER: pionex
-      # Never commit the real password: compose reads it from the local
-      # .env file (see .env.example). On an existing volume the password is
-      # only set at first init — rotate with ALTER USER when upgrading.
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env (see .env.example)}
       POSTGRES_DB: pionex_bot
-    # Postgres is purely internal and accessed via Docker network crypto_bot_net
+      # Zero-ENV, Zero-secrets: the database is reachable only inside the
+      # private compose network, so no password exists anywhere in the
+      # project (nothing to commit, leak or rotate). Auth is the network
+      # boundary itself; the extra superuser role is locked by migration
+      # 0016. Never publish this container's port.
+      POSTGRES_HOST_AUTH_METHOD: trust
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./migrations:/docker-entrypoint-initdb.d
@@ -32,7 +33,7 @@ services:
     ports:
       - "127.0.0.1:8080:8080"
     environment:
-      DATABASE_URL: postgres://pionex:${POSTGRES_PASSWORD}@postgres:5432/pionex_bot?sslmode=disable
+      DATABASE_URL: postgres://pionex@postgres:5432/pionex_bot?sslmode=disable
     depends_on:
       postgres:
         condition: service_healthy
@@ -53,7 +54,7 @@ services:
     container_name: pionex_quant
     restart: unless-stopped
     environment:
-      DATABASE_URL: postgres://pionex:${POSTGRES_PASSWORD}@postgres:5432/pionex_bot?sslmode=disable
+      DATABASE_URL: postgres://pionex@postgres:5432/pionex_bot?sslmode=disable
     depends_on:
       postgres:
         condition: service_healthy

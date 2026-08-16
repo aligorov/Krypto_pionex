@@ -24,7 +24,7 @@ docker run --rm -v "$ROOT_DIR/backend":/app -w /app golang:1.25-alpine go test -
 
 echo "[2/5] Building Docker Images (Backend & Quant Worker)..."
 cd "$ROOT_DIR"
-docker compose build backend quant-worker
+docker compose build --build-arg VERSION="$VERSION" --build-arg GIT_COMMIT="$COMMIT" --build-arg BUILD_TIME="$BUILD_TIME" backend quant-worker
 
 echo "[3/5] Starting Temporary Container Smoke Test..."
 docker compose up -d postgres backend

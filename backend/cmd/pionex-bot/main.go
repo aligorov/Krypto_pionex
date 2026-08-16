@@ -89,10 +89,9 @@ func main() {
 		autoWorker := autogrid.NewWorker(dbPool, autoService, accountService, riskEngine, llmService, logger)
 		go autoWorker.Run(ctx)
 
-		// Start Telegram Outbox Dispatcher Loop
-		tgToken := os.Getenv("TELEGRAM_BOT_TOKEN")
-		tgChat := os.Getenv("TELEGRAM_CHAT_ID")
-		dispatcher := telegram.NewOutboxDispatcher(dbPool, tgToken, tgChat)
+		// Start Telegram Outbox Dispatcher Loop. Credentials come from the
+		// telegram_settings table only — Zero-ENV policy, no fallbacks.
+		dispatcher := telegram.NewOutboxDispatcher(dbPool, "", "")
 		go func() {
 			ticker := time.NewTicker(10 * time.Second)
 			defer ticker.Stop()
