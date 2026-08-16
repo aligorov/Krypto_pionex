@@ -93,7 +93,7 @@ func (worker *Worker) processNext(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	executionCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	executionCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancel()
 	result := map[string]any{}
 	switch command.CommandType {
@@ -1520,7 +1520,9 @@ func (worker *Worker) enrichAndAuditCandidatesWithLLM(
 			}
 		}
 
-		decision, record, err := worker.llm.AuditCandidate(ctx, &candidate.ID, input)
+		auditCtx, auditCancel := context.WithTimeout(ctx, 15*time.Second)
+		decision, record, err := worker.llm.AuditCandidate(auditCtx, &candidate.ID, input)
+		auditCancel()
 		if err != nil {
 			worker.logger.Warn("LLM candidate audit failed", "symbol", candidate.Symbol, "error", err)
 			continue

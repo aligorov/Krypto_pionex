@@ -145,7 +145,9 @@ func (s *Scanner) ScanMarkets(
 			activeRanked = append(activeRanked, r)
 		}
 	}
-	if len(activeRanked) == 0 {
+	if len(activeRanked) > 50 {
+		activeRanked = activeRanked[:50]
+	} else if len(activeRanked) == 0 {
 		activeRanked = ranked
 	}
 
