@@ -1201,7 +1201,7 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 	rows, err := worker.db.Query(ctx, `
 		SELECT id, COALESCE(bot_number, 0), symbol, direction, entry_price, leverage, quote_investment,
 		       lower_price, upper_price, pnl_target_usdt, max_loss_usdt,
-		       grid_num, last_grid_level, realized_pnl_usdt
+		       grid_num, last_grid_level, realized_pnl_usdt, COALESCE(adjustments_count, 0)
 		FROM paper_grid_bots
 		WHERE settings_id = $1 AND status = 'RUNNING'
 	`, settings.ID)
@@ -1219,6 +1219,7 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 		gridNum                      int
 		lastLevel                    *int
 		realized                     decimal.Decimal
+		adjustmentsCount             int
 	}
 	bots := make([]paperBot, 0)
 	for rows.Next() {
@@ -1227,7 +1228,7 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 			&item.id, &item.botNumber, &item.symbol, &item.direction, &item.entry,
 			&item.leverage, &item.investment, &item.lower, &item.upper,
 			&item.pnlTarget, &item.maxLoss, &item.gridNum, &item.lastLevel,
-			&item.realized,
+			&item.realized, &item.adjustmentsCount,
 		); err != nil {
 			rows.Close()
 			return err
@@ -1235,6 +1236,9 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 		bots = append(bots, item)
 	}
 	rows.Close()
+
+	effectiveFeeBps := settings.FeeBps.Add(settings.SlippageBps)
+	feeRate := effectiveFeeBps.Div(decimal.NewFromInt(10000))
 
 	for _, bot := range bots {
 		price, ok := priceBySymbol[bot.symbol]
@@ -1247,6 +1251,7 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 		if bot.direction == "NEUTRAL" {
 			// Native-grid simulation: each level pair crossed accrues one
 			// filled round trip; inventory below the midpoint is marked.
+			// Trading fees and slippage are fully deducted per crossing.
 			currentLevel = gridLevelForPrice(bot.lower, bot.upper, bot.gridNum, price)
 			previousLevel := currentLevel
 			if bot.lastLevel != nil {
@@ -1255,15 +1260,19 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 			var crossingProfit decimal.Decimal
 			crossingProfit, unrealized = neutralGridPaperPNL(
 				bot.lower, bot.upper, bot.gridNum, bot.investment,
-				previousLevel, currentLevel, price, settings.FeeBps,
+				previousLevel, currentLevel, price, effectiveFeeBps,
 			)
 			realized = realized.Add(crossingProfit)
 		} else {
+			// Directional grid: account for entry taker fee and slippage
+			entryCost := bot.investment.Mul(decimal.NewFromInt(int64(bot.leverage))).Mul(feeRate)
 			switch bot.direction {
 			case "LONG":
-				unrealized = bot.investment.Mul(decimal.NewFromInt(int64(bot.leverage))).Mul(price.Div(bot.entry).Sub(decimal.NewFromInt(1)))
+				gross := bot.investment.Mul(decimal.NewFromInt(int64(bot.leverage))).Mul(price.Div(bot.entry).Sub(decimal.NewFromInt(1)))
+				unrealized = gross.Sub(entryCost)
 			case "SHORT":
-				unrealized = bot.investment.Mul(decimal.NewFromInt(int64(bot.leverage))).Mul(decimal.NewFromInt(1).Sub(price.Div(bot.entry)))
+				gross := bot.investment.Mul(decimal.NewFromInt(int64(bot.leverage))).Mul(decimal.NewFromInt(1).Sub(price.Div(bot.entry)))
+				unrealized = gross.Sub(entryCost)
 			}
 		}
 		botTarget, botMaxLoss := settings.PnLTargetUSDT, settings.MaxLossUSDT
@@ -1282,6 +1291,14 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 			peakPnL = decimal.Zero
 		}
 
+		// Lazily detect regime only when price escapes the range
+		regime := ""
+		buffer := settings.RangeBreakBufferPct.Div(decimal.NewFromInt(100))
+		if price.LessThan(bot.lower.Mul(decimal.NewFromInt(1).Sub(buffer))) ||
+			price.GreaterThan(bot.upper.Mul(decimal.NewFromInt(1).Add(buffer))) {
+			regime = worker.regimeForSymbol(ctx, bot.symbol)
+		}
+
 		decision := decideBotAction(botActionInput{
 			Direction:        bot.direction,
 			Lower:            bot.lower,
@@ -1294,8 +1311,8 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 			PnLTarget:        botTarget,
 			MaxLoss:          botMaxLoss,
 			RangeBreakBuffer: settings.RangeBreakBufferPct,
-			AdjustmentsLeft:  settings.MaxAdjustmentsPerBot,
-			Regime:           "",
+			AdjustmentsLeft:  settings.MaxAdjustmentsPerBot - bot.adjustmentsCount,
+			Regime:           regime,
 		})
 
 		if decision.Action == ActionCloseTakeProfit || decision.Action == ActionCloseStopLoss || decision.Action == ActionCloseRangeBreak {
