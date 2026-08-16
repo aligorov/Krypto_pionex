@@ -303,10 +303,17 @@ func TestNeutralGridPaperPNLInventoryBelowMid(t *testing.T) {
 	if !unrealized.IsNegative() {
 		t.Fatalf("inventory at range bottom must be under water, got %s", unrealized)
 	}
-	// Price above the midpoint: no inventory, no unrealized.
+	// Bidirectional inventory model (v1.1.3): above the midpoint the grid
+	// holds SHORT inventory, so a price above the short entry is also under
+	// water — symmetric to the long case below the midpoint.
 	_, unrealized = neutralGridPaperPNL(lower, upper, 20, investment, 10, 10, mustDecimal("118"), mustDecimal("5"))
+	if !unrealized.IsNegative() {
+		t.Fatalf("short inventory above mid must be under water, got %s", unrealized)
+	}
+	// At the midpoint itself there is no inventory in either direction.
+	_, unrealized = neutralGridPaperPNL(lower, upper, 20, investment, 10, 10, mustDecimal("110"), mustDecimal("5"))
 	if !unrealized.IsZero() {
-		t.Fatalf("no inventory above mid, got %s", unrealized)
+		t.Fatalf("no inventory at mid, got %s", unrealized)
 	}
 }
 
