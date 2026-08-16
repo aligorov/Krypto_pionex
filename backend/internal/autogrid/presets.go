@@ -12,11 +12,11 @@ import (
 // control of those. Applying a preset goes through the normal settings
 // validation and durable risk gates (autopilot must be STOPPED).
 type Preset struct {
-	ID          string     `json:"id"`
-	Title       string     `json:"title"`
-	Phase       string     `json:"phase"`
-	Description string     `json:"description"`
-	WhenToUse   string     `json:"whenToUse"`
+	ID          string      `json:"id"`
+	Title       string      `json:"title"`
+	Phase       string      `json:"phase"`
+	Description string      `json:"description"`
+	WhenToUse   string      `json:"whenToUse"`
 	Patch       PresetPatch `json:"patch"`
 }
 
@@ -88,7 +88,7 @@ func MarketPhasePresets() []Preset {
 				ScanIntervalSeconds: intPtr(900), MinVolume24h: decimalPtr("500000"),
 				MinVolatilityPct: decimalPtr("1.5"), MaxVolatilityPct: decimalPtr("12"),
 				MaxDrawdownPct: decimalPtr("15"), MinProfitFactor: decimalPtr("1.05"),
-				PnLTargetMode: stringPtr("DYNAMIC"),
+				PnLTargetMode:         stringPtr("DYNAMIC"),
 				ManageIntervalSeconds: intPtr(60), RangeBreakBufferPct: decimalPtr("1"),
 				MaxAdjustmentsPerBot: intPtr(2), AIKitEnabled: boolPtr(true),
 				AIAutotuneEnabled: boolPtr(true),
@@ -112,7 +112,7 @@ func MarketPhasePresets() []Preset {
 				ScanIntervalSeconds: intPtr(900), MinVolume24h: decimalPtr("500000"),
 				MinVolatilityPct: decimalPtr("2"), MaxVolatilityPct: decimalPtr("40"),
 				MaxDrawdownPct: decimalPtr("18"), MinProfitFactor: decimalPtr("1.05"),
-				PnLTargetMode: stringPtr("DYNAMIC"),
+				PnLTargetMode:         stringPtr("DYNAMIC"),
 				ManageIntervalSeconds: intPtr(60), RangeBreakBufferPct: decimalPtr("1.5"),
 				MaxAdjustmentsPerBot: intPtr(4), AIKitEnabled: boolPtr(true),
 				AIAutotuneEnabled: boolPtr(true),
@@ -135,7 +135,7 @@ func MarketPhasePresets() []Preset {
 				ScanIntervalSeconds: intPtr(900), MinVolume24h: decimalPtr("500000"),
 				MinVolatilityPct: decimalPtr("2"), MaxVolatilityPct: decimalPtr("40"),
 				MaxDrawdownPct: decimalPtr("15"), MinProfitFactor: decimalPtr("1.05"),
-				PnLTargetMode: stringPtr("DYNAMIC"),
+				PnLTargetMode:         stringPtr("DYNAMIC"),
 				ManageIntervalSeconds: intPtr(45), RangeBreakBufferPct: decimalPtr("1"),
 				MaxAdjustmentsPerBot: intPtr(2), AIKitEnabled: boolPtr(true),
 				AIAutotuneEnabled: boolPtr(true),
@@ -158,7 +158,7 @@ func MarketPhasePresets() []Preset {
 				ScanIntervalSeconds: intPtr(600), MinVolume24h: decimalPtr("1000000"),
 				MinVolatilityPct: decimalPtr("6"), MaxVolatilityPct: decimalPtr("45"),
 				MaxDrawdownPct: decimalPtr("20"), MinProfitFactor: decimalPtr("1.05"),
-				PnLTargetMode: stringPtr("DYNAMIC"),
+				PnLTargetMode:         stringPtr("DYNAMIC"),
 				ManageIntervalSeconds: intPtr(45), RangeBreakBufferPct: decimalPtr("2"),
 				MaxAdjustmentsPerBot: intPtr(3), AIKitEnabled: boolPtr(true),
 			},
@@ -180,7 +180,7 @@ func MarketPhasePresets() []Preset {
 				ScanIntervalSeconds: intPtr(900), MinVolume24h: decimalPtr("1000000"),
 				MinVolatilityPct: decimalPtr("2"), MaxVolatilityPct: decimalPtr("12"),
 				MaxDrawdownPct: decimalPtr("12"), MinProfitFactor: decimalPtr("1.1"),
-				PnLTargetMode: stringPtr("DYNAMIC"),
+				PnLTargetMode:         stringPtr("DYNAMIC"),
 				ManageIntervalSeconds: intPtr(60), RangeBreakBufferPct: decimalPtr("1"),
 				MaxAdjustmentsPerBot: intPtr(2), AIKitEnabled: boolPtr(true),
 				AIAutotuneEnabled: boolPtr(true),

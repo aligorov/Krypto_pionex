@@ -6,13 +6,13 @@ import (
 
 // Management actions for a running native grid bot.
 const (
-	ActionHold           = "HOLD"
-	ActionCloseTakeProfit = "CLOSE_TAKE_PROFIT"
-	ActionCloseStopLoss  = "CLOSE_STOP_LOSS"
-	ActionCloseRangeBreak = "CLOSE_RANGE_BREAK"
+	ActionHold               = "HOLD"
+	ActionCloseTakeProfit    = "CLOSE_TAKE_PROFIT"
+	ActionCloseStopLoss      = "CLOSE_STOP_LOSS"
+	ActionCloseRangeBreak    = "CLOSE_RANGE_BREAK"
 	ActionCloseStructInvalid = "CLOSE_STRUCT_INVALID"
-	ActionAdjustUp       = "ADJUST_UP"
-	ActionAdjustDown     = "ADJUST_DOWN"
+	ActionAdjustUp           = "ADJUST_UP"
+	ActionAdjustDown         = "ADJUST_DOWN"
 )
 
 type botActionInput struct {
@@ -36,10 +36,10 @@ type botActionInput struct {
 }
 
 type manageDecision struct {
-	Action            string
-	Reason            string
-	NewLower          decimal.Decimal
-	NewUpper          decimal.Decimal
+	Action   string
+	Reason   string
+	NewLower decimal.Decimal
+	NewUpper decimal.Decimal
 }
 
 // decideBotAction is the pure supervision policy for a running bot:
@@ -51,12 +51,13 @@ type manageDecision struct {
 //     shift when the regime allows, otherwise close to avoid trend damage.
 //
 // Break matrix (down / up):
-//   LONG   down: TREND_DOWN or unknown -> close; RANGE/TREND_UP -> shift down
-//   LONG   up:   follow with shift up (inventory was sold into strength)
-//   SHORT  up:   TREND_UP or unknown -> close; RANGE/TREND_DOWN -> shift up
-//   SHORT  down: follow with shift down (shorts harvest the fall)
-//   NEUTRAL: adverse break closes unless the regime still supports a shift;
-//   the profitable side of a neutral grid keeps shifting with the market.
+//
+//	LONG   down: TREND_DOWN or unknown -> close; RANGE/TREND_UP -> shift down
+//	LONG   up:   follow with shift up (inventory was sold into strength)
+//	SHORT  up:   TREND_UP or unknown -> close; RANGE/TREND_DOWN -> shift up
+//	SHORT  down: follow with shift down (shorts harvest the fall)
+//	NEUTRAL: adverse break closes unless the regime still supports a shift;
+//	the profitable side of a neutral grid keeps shifting with the market.
 func decideBotAction(input botActionInput) manageDecision {
 	total := input.RealizedPNL.Add(input.UnrealizedPNL)
 

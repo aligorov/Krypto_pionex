@@ -64,6 +64,7 @@ func (worker *Worker) Run(ctx context.Context) {
 	defer commandTicker.Stop()
 	defer scheduleTicker.Stop()
 	defer reconcileTicker.Stop()
+	worker.sweepRestartGhosts(ctx)
 	worker.logger.Info("AutoGrid worker started", "component", "autogrid_worker")
 	for {
 		select {
@@ -93,6 +94,31 @@ func (worker *Worker) Run(ctx context.Context) {
 				}
 			})
 		}
+	}
+}
+
+// sweepRestartGhosts closes what a restart killed mid-flight: scans stuck
+// RUNNING and commands stuck EXECUTING from a previous process would
+// otherwise lie to the UI forever ("scan in progress") and block scan
+// scheduling via the dedup guard.
+func (worker *Worker) sweepRestartGhosts(ctx context.Context) {
+	tag, err := worker.db.Exec(ctx, `
+		UPDATE autogrid_scan_runs
+		SET status = 'FAILED', error_message = 'interrupted by backend restart'
+		WHERE status = 'RUNNING' AND started_at < NOW() - INTERVAL '2 minutes'
+	`)
+	if err == nil && tag.RowsAffected() > 0 {
+		worker.logger.Warn("marked interrupted scan runs as FAILED",
+			"component", "autogrid_worker", "count", tag.RowsAffected())
+	}
+	tag, err = worker.db.Exec(ctx, `
+		UPDATE control_commands
+		SET status = 'EXPIRED', lease_owner = NULL, lease_expiry = NULL
+		WHERE status IN ('QUEUED', 'EXECUTING') AND created_at < NOW() - INTERVAL '15 minutes'
+	`)
+	if err == nil && tag.RowsAffected() > 0 {
+		worker.logger.Warn("expired stale control commands",
+			"component", "autogrid_worker", "count", tag.RowsAffected())
 	}
 }
 
@@ -347,14 +373,14 @@ func (worker *Worker) enrichCandidatesWithAIKit(
 			WHERE id = $1 AND scan_id = $2
 		`, candidate.ID, scanID, map[string]any{
 			"aiKit": map[string]any{
-				"annualized":    strategy.Annualized,
-				"volatility":    strategy.Volatility,
-				"maxDrawDown":   strategy.MaxDrawDown,
-				"spotHigh":      strategy.High,
-				"spotLow":       strategy.Low,
-				"gridCount":     strategy.GridCount,
+				"annualized":      strategy.Annualized,
+				"volatility":      strategy.Volatility,
+				"maxDrawDown":     strategy.MaxDrawDown,
+				"spotHigh":        strategy.High,
+				"spotLow":         strategy.Low,
+				"gridCount":       strategy.GridCount,
 				"gridCountSource": "pionex_ai_kit",
-				"boundary": "AI_GRID_COUNT_ADOPTED_WITH_CLAMP_2_500_RANGE_STAYS_SCANNER_SR",
+				"boundary":        "AI_GRID_COUNT_ADOPTED_WITH_CLAMP_2_500_RANGE_STAYS_SCANNER_SR",
 			},
 		}, strategy.GridCount); err != nil {
 			return fmt.Errorf("persist AI Kit advisory for %s: %w", candidate.Symbol, err)
@@ -444,7 +470,6 @@ func isEntryTimingFavorable(candidate Candidate) bool {
 		return rangePos >= 20.0 && rangePos <= 80.0
 	}
 }
-
 
 func (worker *Worker) deployPaper(
 	ctx context.Context,
@@ -890,7 +915,7 @@ func (worker *Worker) deployReal(
 			// Persist the deploy-time invalidation level and thesis so the
 			// supervision loop can exit before the exchange stop is swept.
 			// Confluence readings ride in model_assumptions JSONB.
-			AntiHuntStop: &antiHuntStop,
+			AntiHuntStop:  &antiHuntStop,
 			StructContext: deployStructContext(candidate, antiHuntStop),
 		})
 		if createErr != nil {
@@ -1713,18 +1738,18 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 		return err
 	}
 	type paperBot struct {
-		id                           string
-		botNumber                    int
-		symbol, direction            string
-		entry                        decimal.Decimal
-		leverage                     int
-		investment, lower, upper     decimal.Decimal
-		pnlTarget, maxLoss            *decimal.Decimal
-		antiHuntStop                 *decimal.Decimal
-		gridNum                      int
-		lastLevel                    *int
-		realized                     decimal.Decimal
-		adjustmentsCount             int
+		id                       string
+		botNumber                int
+		symbol, direction        string
+		entry                    decimal.Decimal
+		leverage                 int
+		investment, lower, upper decimal.Decimal
+		pnlTarget, maxLoss       *decimal.Decimal
+		antiHuntStop             *decimal.Decimal
+		gridNum                  int
+		lastLevel                *int
+		realized                 decimal.Decimal
+		adjustmentsCount         int
 	}
 	bots := make([]paperBot, 0)
 	for rows.Next() {

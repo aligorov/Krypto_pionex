@@ -9,15 +9,15 @@ import (
 )
 
 type ConfluenceEvaluation struct {
-	Score              float64  `json:"score"`              // 0 to 100
-	IsFired            bool     `json:"isFired"`            // True if Score >= 75
-	Status             string   `json:"status"`             // 'ARMED', 'WAITING', 'OVERHEATED', 'TRIGGERED'
-	Factor1LevelScore  float64  `json:"factor1LevelScore"`  // max 35
-	Factor2MomentumScore float64 `json:"factor2MomentumScore"`// max 35
-	Factor3CandleScore float64  `json:"factor3CandleScore"` // max 30
-	RejectionReasons   []string `json:"rejectionReasons"`
-	TargetEntryPrice   decimal.Decimal `json:"targetEntryPrice"`
-	DistanceToEntryPct float64  `json:"distanceToEntryPct"`
+	Score                float64         `json:"score"`                // 0 to 100
+	IsFired              bool            `json:"isFired"`              // True if Score >= 75
+	Status               string          `json:"status"`               // 'ARMED', 'WAITING', 'OVERHEATED', 'TRIGGERED'
+	Factor1LevelScore    float64         `json:"factor1LevelScore"`    // max 35
+	Factor2MomentumScore float64         `json:"factor2MomentumScore"` // max 35
+	Factor3CandleScore   float64         `json:"factor3CandleScore"`   // max 30
+	RejectionReasons     []string        `json:"rejectionReasons"`
+	TargetEntryPrice     decimal.Decimal `json:"targetEntryPrice"`
+	DistanceToEntryPct   float64         `json:"distanceToEntryPct"`
 }
 
 // EvaluateConfluence evaluates a candidate pair against the 3-factor institutional confluence model.

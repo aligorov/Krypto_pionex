@@ -12,16 +12,16 @@ import (
 )
 
 type BotExecutionEvent struct {
-	ID         string           `json:"id"`
-	BotID      string           `json:"botId"`
-	BotNumber  int              `json:"botNumber"`
-	BotSource  string           `json:"botSource"`
-	Symbol     string           `json:"symbol"`
-	EventType  string           `json:"eventType"`
-	Price      *decimal.Decimal `json:"price"`
-	PnLUSDT    *decimal.Decimal `json:"pnlUsdt"`
-	Details    map[string]any   `json:"details"`
-	CreatedAt  time.Time        `json:"createdAt"`
+	ID        string           `json:"id"`
+	BotID     string           `json:"botId"`
+	BotNumber int              `json:"botNumber"`
+	BotSource string           `json:"botSource"`
+	Symbol    string           `json:"symbol"`
+	EventType string           `json:"eventType"`
+	Price     *decimal.Decimal `json:"price"`
+	PnLUSDT   *decimal.Decimal `json:"pnlUsdt"`
+	Details   map[string]any   `json:"details"`
+	CreatedAt time.Time        `json:"createdAt"`
 }
 
 // LogBotEvent records a durable lifecycle history event for any bot

@@ -246,12 +246,12 @@ func TestAllPresetsFitValidation(t *testing.T) {
 			ExecutionMode: "PAPER", BudgetUSDT: mustDecimal("100"),
 			MinSharpe: mustDecimal("0.1"), MinEVPct: mustDecimal("0"),
 			FeeBps: mustDecimal("5"), SlippageBps: mustDecimal("2"),
-			MinVolume24h: mustDecimal("500000"),
+			MinVolume24h:     mustDecimal("500000"),
 			MinVolatilityPct: mustDecimal("1"), MaxVolatilityPct: mustDecimal("40"),
 			MaxDrawdownPct: mustDecimal("30"), MinProfitFactor: mustDecimal("1"),
 			PnLTargetUSDT: mustDecimal("0"), MaxLossUSDT: mustDecimal("0"),
 			RangeBreakBufferPct: mustDecimal("1"),
-			StopLossMode: "NONE", CandleInterval: "60M",
+			StopLossMode:        "NONE", CandleInterval: "60M",
 		}, preset)
 		if input.Leverage < 1 || input.Leverage > 100 {
 			t.Fatalf("%s: leverage %d out of bounds", preset.ID, input.Leverage)

@@ -10,10 +10,10 @@ import (
 func TestEvaluateConfluenceLongPullback(t *testing.T) {
 	// Candidate at 20% of channel (pullback zone) with healthy ADX and Choppiness
 	cand := Candidate{
-		Symbol:       "TEST_USDT_PERP",
-		CurrentPrice: decimal.NewFromFloat(0.044),
-		LowerPrice:   decimal.NewFromFloat(0.040),
-		UpperPrice:   decimal.NewFromFloat(0.060),
+		Symbol:           "TEST_USDT_PERP",
+		CurrentPrice:     decimal.NewFromFloat(0.044),
+		LowerPrice:       decimal.NewFromFloat(0.040),
+		UpperPrice:       decimal.NewFromFloat(0.060),
 		RecommendedTrend: "long",
 		ModelAssumptions: map[string]any{
 			"rangePositionPct": 20.0,
@@ -47,10 +47,10 @@ func TestEvaluateConfluenceLongPullback(t *testing.T) {
 func TestEvaluateConfluenceAntiFOMORejection(t *testing.T) {
 	// Long candidate at 85% of channel (pumping on top)
 	cand := Candidate{
-		Symbol:       "PUMP_TOP_USDT_PERP",
-		CurrentPrice: decimal.NewFromFloat(0.058),
-		LowerPrice:   decimal.NewFromFloat(0.040),
-		UpperPrice:   decimal.NewFromFloat(0.060),
+		Symbol:           "PUMP_TOP_USDT_PERP",
+		CurrentPrice:     decimal.NewFromFloat(0.058),
+		LowerPrice:       decimal.NewFromFloat(0.040),
+		UpperPrice:       decimal.NewFromFloat(0.060),
 		RecommendedTrend: "long",
 		ModelAssumptions: map[string]any{
 			"rangePositionPct": 90.0,

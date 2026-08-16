@@ -3,11 +3,11 @@ package autogrid
 import (
 	"context"
 	"encoding/json"
-	"strconv"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strconv"
 	"sync/atomic"
 	"testing"
 	"time"
