@@ -182,11 +182,11 @@ func (c *Client) ListBotOrders(
 		return nil, "", err
 	}
 	var envelope struct {
-		Orders          []BotOrder `json:"orders"`
-		BotOrders       []BotOrder `json:"botOrders"`
-		Items           []BotOrder `json:"items"`
-		NextPageToken   string     `json:"nextPageToken"`
-		NextPageTokenAlt string    `json:"next_page_token"`
+		Orders           []BotOrder `json:"orders"`
+		BotOrders        []BotOrder `json:"botOrders"`
+		Items            []BotOrder `json:"items"`
+		NextPageToken    string     `json:"nextPageToken"`
+		NextPageTokenAlt string     `json:"next_page_token"`
 	}
 	if err := json.Unmarshal(raw, &envelope); err != nil {
 		return nil, "", fmt.Errorf("decode bot order list: %w", err)

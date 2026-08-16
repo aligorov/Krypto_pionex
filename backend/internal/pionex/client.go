@@ -46,9 +46,9 @@ func NewClientWithHTTPClient(baseURL, apiKey, apiSecret string, httpClient *http
 		httpClient = &http.Client{Timeout: RequestTimeout}
 	}
 	return &Client{
-		baseURL:        strings.TrimRight(baseURL, "/"),
-		signer:         NewSigner(apiKey, apiSecret),
-		httpClient:     httpClient,
+		baseURL:    strings.TrimRight(baseURL, "/"),
+		signer:     NewSigner(apiKey, apiSecret),
+		httpClient: httpClient,
 		// Pionex documents a global 10 req/s per IP limit for all public
 		// endpoints; the previous 20/s burst guaranteed 429 blackouts.
 		publicLimiter:  NewRateLimiter(10, 10),

@@ -115,7 +115,8 @@ func (worker *Worker) sweepRestartGhosts(ctx context.Context) {
 	tag, err = worker.db.Exec(ctx, `
 		UPDATE control_commands
 		SET status = 'EXPIRED', lease_owner = NULL, lease_expiry = NULL
-		WHERE status IN ('QUEUED', 'EXECUTING') AND created_at < NOW() - INTERVAL '15 minutes'
+		WHERE (status = 'QUEUED' AND created_at < NOW() - INTERVAL '15 minutes')
+		   OR (status = 'EXECUTING' AND lease_expiry IS NOT NULL AND lease_expiry < NOW())
 	`)
 	if err == nil && tag.RowsAffected() > 0 {
 		worker.logger.Warn("expired stale control commands",

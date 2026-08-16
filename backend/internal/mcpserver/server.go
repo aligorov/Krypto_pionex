@@ -650,10 +650,10 @@ func registerAutoGridTools(
 			return nil, DataOutput{}, err
 		}
 		data, err := services.Control.PrepareCommand(ctx, principal, controlplane.PrepareCommandInput{
-			CommandType:  commandType,
-			ResourceType: "autogrid",
-			ResourceID:   settings.ID,
-			Arguments:    map[string]any{"real": settings.ExecutionMode == "REAL"},
+			CommandType:    commandType,
+			ResourceType:   "autogrid",
+			ResourceID:     settings.ID,
+			Arguments:      map[string]any{"real": settings.ExecutionMode == "REAL"},
 			IdempotencyKey: fmt.Sprintf("mcp-%s-%s-%d", commandType, settings.ID, time.Now().UnixNano()),
 		})
 		return nil, DataOutput{Data: data}, err
@@ -729,7 +729,6 @@ func registerAutoGridTools(
 			"ok": err == nil, "source": source, "mode": adjust.Mode,
 		}}, err
 	})
-
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "autogrid_mode_set",
@@ -843,7 +842,7 @@ func registerAutoGridTools(
 			return nil, DataOutput{}, err
 		}
 		return nil, DataOutput{Data: map[string]any{
-			"symbol":   input.Symbol,
+			"symbol": input.Symbol,
 			"advisory": map[string]any{
 				"boundary": "Pionex AI Kit parameters are Spot-only and are never applied to Futures Grid bots",
 			},

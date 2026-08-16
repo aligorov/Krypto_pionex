@@ -24,13 +24,13 @@ func TestGetSpotGridAIStrategyContract(t *testing.T) {
 		resp := APIEnvelope[SpotGridAIStrategy]{
 			Result: true, Code: "200", Timestamp: 1620000000000,
 			Data: SpotGridAIStrategy{
-				High:         decimal.NewFromFloat(70000),
-				Low:          decimal.NewFromFloat(60000),
-				GridCount:    33,
-				Annualized:   decimal.NewFromFloat(0.24),
-				Volatility:   decimal.NewFromFloat(0.05),
-				MaxDrawDown:  decimal.NewFromFloat(0.08),
-				StrategyID:   "spot-grid-ai-1",
+				High:        decimal.NewFromFloat(70000),
+				Low:         decimal.NewFromFloat(60000),
+				GridCount:   33,
+				Annualized:  decimal.NewFromFloat(0.24),
+				Volatility:  decimal.NewFromFloat(0.05),
+				MaxDrawDown: decimal.NewFromFloat(0.08),
+				StrategyID:  "spot-grid-ai-1",
 				Options: []AIOption{{
 					Period: 7, GridCount: 21,
 					SuitabilityMin: decimal.NewFromInt(100),

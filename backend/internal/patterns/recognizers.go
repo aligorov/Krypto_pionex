@@ -17,8 +17,8 @@ type Candle struct {
 
 // PatternSignal represents a detected trade opportunity.
 type PatternSignal struct {
-	PatternType string          // BOS, CHOCH, FVG, ORDER_BLOCK, ENGULFING, PIN_BAR
-	Side        string          // LONG, SHORT
+	PatternType string // BOS, CHOCH, FVG, ORDER_BLOCK, ENGULFING, PIN_BAR
+	Side        string // LONG, SHORT
 	Price       decimal.Decimal
 	StopLoss    decimal.Decimal
 	TakeProfit  decimal.Decimal

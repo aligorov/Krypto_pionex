@@ -952,15 +952,15 @@ func hashValue(value string) string {
 
 // BacktestJob mirrors one row of the quant-worker job queue.
 type BacktestJob struct {
-	ID         string          `json:"id"`
-	Symbol     string          `json:"symbol"`
-	Interval   string          `json:"interval"`
-	Status     string          `json:"status"`
-	Params     map[string]any  `json:"params"`
-	Result     map[string]any  `json:"result"`
-	Error      *string         `json:"error"`
-	CreatedAt  time.Time       `json:"createdAt"`
-	FinishedAt *time.Time      `json:"finishedAt"`
+	ID         string         `json:"id"`
+	Symbol     string         `json:"symbol"`
+	Interval   string         `json:"interval"`
+	Status     string         `json:"status"`
+	Params     map[string]any `json:"params"`
+	Result     map[string]any `json:"result"`
+	Error      *string        `json:"error"`
+	CreatedAt  time.Time      `json:"createdAt"`
+	FinishedAt *time.Time     `json:"finishedAt"`
 }
 
 // ListBacktestJobs returns the newest backtest jobs with their OOS reports.
@@ -1021,4 +1021,22 @@ func (s *Service) CreateBacktestJob(
 		return nil, fmt.Errorf("create backtest job: %w", err)
 	}
 	return &job, nil
+}
+
+// ActiveScanCommand returns the id of a running/queued autogrid scan, or ""
+// when none is active. Used to coalesce duplicate operator clicks into one.
+func (s *Service) ActiveScanCommand(ctx context.Context) (string, error) {
+	var id string
+	err := s.db.QueryRow(ctx, `
+		SELECT id FROM control_commands
+		WHERE command_type = 'autogrid.scan' AND status IN ('QUEUED', 'EXECUTING')
+		ORDER BY created_at DESC LIMIT 1
+	`).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("find active scan command: %w", err)
+	}
+	return id, nil
 }

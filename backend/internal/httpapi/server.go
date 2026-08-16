@@ -760,6 +760,16 @@ func (s *Server) autoGridAction(w http.ResponseWriter, r *http.Request) {
 		return
 
 	case "scan":
+		// Coalesce: a full-market scan runs 6-10 minutes; every extra click
+		// used to stack ANOTHER multi-minute command in the queue. When a
+		// scan is already queued or executing, attach to it instead.
+		if activeID, err := s.control.ActiveScanCommand(r.Context()); err == nil && activeID != "" {
+			writeJSON(w, http.StatusOK, map[string]any{
+				"success": true, "commandId": activeID,
+				"message": "Скан уже выполняется — новый не создан, дождитесь результата",
+			})
+			return
+		}
 		prepared, err := s.control.PrepareCommand(
 			r.Context(), principal, controlplane.PrepareCommandInput{
 				CommandType:    "autogrid.scan",

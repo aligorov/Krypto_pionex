@@ -16,15 +16,15 @@ import (
 )
 
 const (
-	totpStepSeconds = 30
-	totpDigits      = 6
-	totpSecretBytes = 20
-	recoveryCodeLen = 8
+	totpStepSeconds    = 30
+	totpDigits         = 6
+	totpSecretBytes    = 20
+	recoveryCodeLen    = 8
 	recoveryCodesCount = 8
 )
 
 var (
-	base32Encoder = base32.StdEncoding.WithPadding(base32.NoPadding)
+	base32Encoder      = base32.StdEncoding.WithPadding(base32.NoPadding)
 	ErrInvalidTOTPCode = errors.New("invalid two-factor authentication code")
 	ErrTOTPNotEnabled  = errors.New("two-factor authentication is not enabled")
 )
@@ -94,7 +94,7 @@ func GenerateTOTPCode(secret string, t time.Time) (string, error) {
 	hash := mac.Sum(nil)
 
 	offset := hash[len(hash)-1] & 0x0f
-	binaryCode := binary.BigEndian.Uint32(hash[offset : offset+4]) & 0x7fffffff
+	binaryCode := binary.BigEndian.Uint32(hash[offset:offset+4]) & 0x7fffffff
 	code := binaryCode % uint32(math.Pow10(totpDigits))
 
 	return fmt.Sprintf("%0*d", totpDigits, code), nil
