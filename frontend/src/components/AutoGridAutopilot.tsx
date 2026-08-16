@@ -89,7 +89,7 @@ export default function AutoGridAutopilot({ canOperate, accountsHref }: Props) {
 
   useEffect(() => {
     void load();
-    const timer = window.setInterval(() => void load(), 10000);
+    const timer = window.setInterval(() => void load(), 3000);
     return () => window.clearInterval(timer);
   }, [load]);
 

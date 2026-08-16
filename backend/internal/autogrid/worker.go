@@ -253,6 +253,10 @@ func (worker *Worker) scanAndDeploy(
 			)
 		}
 	}
+	// Always reload live settings right before deployment so fresh status and parameters are used
+	if live, getErr := worker.service.GetSettings(ctx); getErr == nil && live != nil {
+		settings = live
+	}
 	if settings.Status == "RUNNING" || settings.Status == "STARTING" {
 		if settings.ExecutionMode == "PAPER" {
 			if err := worker.deployPaper(ctx, *settings, scanID); err != nil {
