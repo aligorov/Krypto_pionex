@@ -962,9 +962,6 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 		return clampInterval(settings.ManageIntervalSeconds), err
 	}
 	client, err := worker.service.PrivateClient(ctx, worker.accounts, *settings.AccountID)
-	if err != nil {
-		return clampInterval(settings.ManageIntervalSeconds), err
-	}
 	priceBySymbol, priceErr := worker.priceMap(ctx)
 	if priceErr != nil {
 		worker.logger.Warn("fetch tickers for management", "component", "autogrid_worker", "error", priceErr)
@@ -972,7 +969,8 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 	rows, err := worker.db.Query(ctx, `
 		SELECT id, bu_order_id, status, symbol, direction,
 		       lower_price, upper_price, grid_num, adjustments_count,
-		       pnl_target_usdt, max_loss_usdt, quote_investment
+		       pnl_target_usdt, max_loss_usdt, quote_investment,
+		       COALESCE(bot_number, 0)
 		FROM grid_bots
 		WHERE autogrid_settings_id = $1 AND bu_order_id IS NOT NULL
 		  AND status IN ('RUNNING', 'STOP_REQUESTED', 'STOPPING')
@@ -987,6 +985,7 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 		rowNum, adjustments                           int
 		pnlTarget, maxLoss                            *decimal.Decimal
 		investment                                    decimal.Decimal
+		botNumber                                     int
 	}
 	bots := make([]managedBot, 0)
 	for rows.Next() {
@@ -995,6 +994,7 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 			&item.id, &item.remoteID, &item.localStatus, &item.symbol,
 			&item.direction, &item.lower, &item.upper, &item.rowNum,
 			&item.adjustments, &item.pnlTarget, &item.maxLoss, &item.investment,
+			&item.botNumber,
 		); err != nil {
 			rows.Close()
 			return clampInterval(settings.ManageIntervalSeconds), err
@@ -1108,15 +1108,6 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 			botMaxLoss = *bot.maxLoss
 		}
 
-		total := realized.Add(unrealized)
-		peakPnL := total
-		if realized.GreaterThan(peakPnL) {
-			peakPnL = realized
-		}
-		if peakPnL.IsNegative() {
-			peakPnL = decimal.Zero
-		}
-
 		decision := decideBotAction(botActionInput{
 			Direction:        bot.direction,
 			Lower:            bot.lower,
@@ -1124,7 +1115,7 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 			CurrentPrice:     price,
 			RealizedPNL:      realized,
 			UnrealizedPNL:    unrealized,
-			PeakPNL:          peakPnL,
+			PeakPNL:          realized.Add(unrealized),
 			Budget:           bot.investment,
 			PnLTarget:        botTarget,
 			MaxLoss:          botMaxLoss,
@@ -1134,6 +1125,7 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 		})
 		switch decision.Action {
 		case ActionCloseTakeProfit, ActionCloseStopLoss, ActionCloseRangeBreak:
+			totalPnL := realized.Add(unrealized)
 			_, _ = worker.db.Exec(ctx, `
 				UPDATE grid_bots
 				SET status = 'STOP_REQUESTED', closed_reason = $2, updated_at = NOW()
@@ -1146,7 +1138,24 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 			} else {
 				worker.logger.Info("management closed bot",
 					"component", "autogrid_worker", "symbol", bot.symbol,
-					"reason", decision.Reason, "pnl", realized.Add(unrealized).String())
+					"reason", decision.Reason, "pnl", totalPnL.String())
+
+				eventType := "STOP_LOSS"
+				if decision.Action == ActionCloseTakeProfit {
+					eventType = "TAKE_PROFIT"
+				}
+				pnlPct := decimal.Zero
+				if !bot.investment.IsZero() {
+					pnlPct = totalPnL.Div(bot.investment).Mul(decimal.NewFromInt(100)).Round(2)
+				}
+				_ = LogBotEvent(ctx, worker.db, bot.id, bot.botNumber, "REAL", bot.symbol, eventType, &price, &totalPnL, map[string]any{
+					"reason": decision.Reason, "pnlPct": pnlPct,
+				})
+				_ = QueueTelegramEvent(ctx, worker.db, eventType, map[string]any{
+					"bot_number": bot.botNumber, "symbol": bot.symbol,
+					"pnl_usdt": totalPnL.StringFixed(4), "pnl_pct": pnlPct.StringFixed(2),
+					"reason": decision.Reason,
+				})
 			}
 		case ActionAdjustUp, ActionAdjustDown:
 			if err := client.AdjustFuturesGridBot(ctx, pionex.AdjustFuturesGridParams{
@@ -1165,6 +1174,16 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 				worker.logger.Info("adjusted native grid range",
 					"component", "autogrid_worker", "symbol", bot.symbol,
 					"lower", decision.NewLower.String(), "upper", decision.NewUpper.String())
+
+				totalPnL := realized.Add(unrealized)
+				_ = LogBotEvent(ctx, worker.db, bot.id, bot.botNumber, "REAL", bot.symbol, "ADJUST_RANGE", &price, &totalPnL, map[string]any{
+					"reason": decision.Reason, "new_lower": decision.NewLower.String(), "new_upper": decision.NewUpper.String(),
+				})
+				_ = QueueTelegramEvent(ctx, worker.db, "ADJUST_RANGE", map[string]any{
+					"bot_number": bot.botNumber, "symbol": bot.symbol,
+					"lower_price": decision.NewLower.StringFixed(6), "upper_price": decision.NewUpper.StringFixed(6),
+					"reason": decision.Reason,
+				})
 			}
 		}
 	}
@@ -1310,6 +1329,32 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 			_ = QueueTelegramEvent(ctx, worker.db, eventType, map[string]any{
 				"bot_number": bot.botNumber, "symbol": bot.symbol,
 				"pnl_usdt": total.StringFixed(4), "pnl_pct": pnlPct.StringFixed(2),
+				"reason": decision.Reason,
+			})
+			continue
+		}
+
+		if decision.Action == ActionAdjustUp || decision.Action == ActionAdjustDown {
+			_, _ = worker.db.Exec(ctx, `
+				UPDATE paper_grid_bots
+				SET lower_price = $2, upper_price = $3,
+				    adjustments_count = adjustments_count + 1,
+				    mark_price = $4, unrealized_pnl_usdt = $5,
+				    realized_pnl_usdt = $6, last_grid_level = $7,
+				    updated_at = NOW()
+				WHERE id = $1
+			`, bot.id, decision.NewLower, decision.NewUpper, price, unrealized, realized, currentLevel)
+
+			worker.logger.Info("adjusted paper grid range on the fly",
+				"component", "autogrid_worker", "symbol", bot.symbol,
+				"lower", decision.NewLower.String(), "upper", decision.NewUpper.String())
+
+			_ = LogBotEvent(ctx, worker.db, bot.id, bot.botNumber, "PAPER", bot.symbol, "ADJUST_RANGE", &price, &total, map[string]any{
+				"reason": decision.Reason, "new_lower": decision.NewLower.String(), "new_upper": decision.NewUpper.String(),
+			})
+			_ = QueueTelegramEvent(ctx, worker.db, "ADJUST_RANGE", map[string]any{
+				"bot_number": bot.botNumber, "symbol": bot.symbol,
+				"lower_price": decision.NewLower.StringFixed(6), "upper_price": decision.NewUpper.StringFixed(6),
 				"reason": decision.Reason,
 			})
 			continue
