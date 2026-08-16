@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"math"
 	"runtime/debug"
+	"sort"
 	"strings"
 	"time"
 
@@ -737,11 +738,25 @@ func (worker *Worker) deployReal(
 	}
 	deployErrors := make([]string, 0)
 	backtestGateOn := worker.backtestGateEnabled(ctx)
+	// When the LLM brain is enabled, an UNAUDITED candidate is not
+	// deployable — regardless of why the audit is missing (beyond the
+	// per-scan audit cap, transport failure, timeout). This is the hard
+	// structural guarantee that closes the top-5 bypass.
+	llmBrainEnabled := false
+	if llmSettings, err := worker.llm.GetSettings(ctx); err == nil {
+		llmBrainEnabled = llmSettings.Enabled && strings.TrimSpace(llmSettings.APIKey) != ""
+	}
 	for _, candidate := range candidates {
 		if candidate.Decision != "ACCEPTED" || activeCount >= settings.MaxActiveBots {
 			continue
 		}
 		if !isEntryTimingFavorable(candidate) {
+			continue
+		}
+		if llmBrainEnabled && candidate.ModelAssumptions["llmAuditId"] == nil {
+			worker.logger.Warn("skip real deploy: no completed LLM audit for candidate",
+				"component", "autogrid_worker", "symbol", candidate.Symbol)
+			worker.rejectCandidate(ctx, candidate, "AI-аудит не завершён для этого кандидата (кап аудита/сбой LLM) — деплой заблокирован", nil)
 			continue
 		}
 		if ok, reason := worker.revalidateCandidateTrend(ctx, candidate, settings); !ok {
@@ -2175,6 +2190,11 @@ func (worker *Worker) enrichAndAuditCandidatesWithLLM(
 	if err != nil {
 		return err
 	}
+	// Audit in deploy priority order (score desc): the cap below must bite
+	// on the LEAST likely deploys, never on the ones deployReal would take.
+	sort.SliceStable(candidates, func(i, j int) bool {
+		return candidates[i].Score.GreaterThan(candidates[j].Score)
+	})
 	auditedCount := 0
 	for _, candidate := range candidates {
 		if candidate.Decision != "ACCEPTED" || auditedCount >= 5 {
