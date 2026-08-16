@@ -96,6 +96,7 @@ type BUOrderData struct {
 	Bottom              decimal.Decimal  `json:"bottom"`
 	Row                 int              `json:"row"`
 	GridType            string           `json:"grid_type"`
+	GridTypeCamel       string           `json:"gridType,omitempty"`
 	Trend               string           `json:"trend"`
 	Leverage            int              `json:"leverage"`
 	ExtraMargin         decimal.Decimal  `json:"extraMargin,omitempty"`

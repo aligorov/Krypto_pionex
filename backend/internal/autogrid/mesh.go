@@ -3,6 +3,7 @@ package autogrid
 import (
 	"fmt"
 	"math"
+	"strings"
 
 	"github.com/shopspring/decimal"
 )
@@ -194,7 +195,7 @@ func ComputeAntiHuntStop(
 	}
 	buffer := atrPrice.Mul(decimal.NewFromFloat(atrMult))
 
-	switch direction {
+	switch strings.ToUpper(strings.TrimSpace(direction)) {
 	case "SHORT":
 		// Stop is above upper resistance
 		return upperPrice.Add(buffer)

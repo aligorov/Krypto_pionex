@@ -480,9 +480,13 @@ func (worker *Worker) deployPaper(
 			atrPct, regime, settings.BudgetUSDT, settings.Leverage, 0.30,
 		)
 
+		trend := strings.ToLower(strings.TrimSpace(candidate.RecommendedTrend))
+		if trend == "no_trend" || trend == "" {
+			trend = "neutral"
+		}
 		atrPrice := candidate.CurrentPrice.Mul(decimal.NewFromFloat(atrPct / 100.0))
 		antiHuntStop := ComputeAntiHuntStop(
-			candidate.RecommendedTrend, mesh.LowerPrice, mesh.UpperPrice,
+			trend, mesh.LowerPrice, mesh.UpperPrice,
 			candidate.CurrentPrice, atrPrice, 1.5,
 		)
 
@@ -685,11 +689,50 @@ func (worker *Worker) deployReal(
 			atrPct, regime, settings.BudgetUSDT, settings.Leverage, 0.30,
 		)
 
+		pricePrecision := 6
+		if p, ok := candidate.ModelAssumptions["pricePrecision"].(float64); ok && p > 0 {
+			pricePrecision = int(p)
+		} else if pInt, ok := candidate.ModelAssumptions["pricePrecision"].(int); ok && pInt > 0 {
+			pricePrecision = pInt
+		} else if candidate.CurrentPrice.GreaterThan(decimal.Zero) {
+			exp := candidate.CurrentPrice.Exponent()
+			if exp < 0 {
+				pricePrecision = int(-exp)
+			}
+		}
+		if pricePrecision > 8 {
+			pricePrecision = 8
+		}
+
+		lowerPrice := mesh.LowerPrice.Round(int32(pricePrecision))
+		upperPrice := mesh.UpperPrice.Round(int32(pricePrecision))
+		if upperPrice.LessThanOrEqual(lowerPrice) {
+			minStep := decimal.New(1, -int32(pricePrecision))
+			upperPrice = lowerPrice.Add(minStep.Mul(decimal.NewFromInt(int64(mesh.GridNum))))
+		}
+
+		trend := strings.ToLower(strings.TrimSpace(candidate.RecommendedTrend))
+		if trend == "no_trend" || trend == "" {
+			trend = "neutral"
+		}
+
 		atrPrice := candidate.CurrentPrice.Mul(decimal.NewFromFloat(atrPct / 100.0))
 		antiHuntStop := ComputeAntiHuntStop(
-			candidate.RecommendedTrend, mesh.LowerPrice, mesh.UpperPrice,
+			trend, lowerPrice, upperPrice,
 			candidate.CurrentPrice, atrPrice, 1.5,
-		)
+		).Round(int32(pricePrecision))
+
+		// Safety check on StopLoss positioning
+		if trend == "short" {
+			if antiHuntStop.LessThanOrEqual(upperPrice) {
+				antiHuntStop = upperPrice.Mul(decimal.NewFromFloat(1.02)).Round(int32(pricePrecision))
+			}
+		} else {
+			// LONG or NEUTRAL: stop must be below lower boundary
+			if antiHuntStop.GreaterThanOrEqual(lowerPrice) {
+				antiHuntStop = lowerPrice.Mul(decimal.NewFromFloat(0.98)).Round(int32(pricePrecision))
+			}
+		}
 
 		botLev := settings.Leverage
 		if settings.AdaptiveLeverageEnabled {
@@ -709,13 +752,13 @@ func (worker *Worker) deployReal(
 			deployErrors = append(deployErrors, err.Error())
 			continue
 		}
+		gridTypeStr := mapGridType(settings.DensityGridEnabled)
 		data := pionex.BUOrderData{
-			Top: mesh.UpperPrice, Bottom: mesh.LowerPrice,
-			Row: mesh.GridNum, GridType: mapGridType(settings.DensityGridEnabled),
-			Trend:           candidate.RecommendedTrend,
+			Top: upperPrice, Bottom: lowerPrice,
+			Row: mesh.GridNum, GridType: gridTypeStr, GridTypeCamel: gridTypeStr,
+			Trend:           trend,
 			Leverage:        botLev,
-			QuoteInvestment: settings.BudgetUSDT,
-			InvestCoin:      "USDT", InvestmentFrom: "USER",
+			QuoteInvestment: settings.BudgetUSDT.Round(2),
 		}
 		if settings.StopLossMode == "ADAPTIVE_ATR" {
 			data.LossStopType = "price"
@@ -727,12 +770,13 @@ func (worker *Worker) deployReal(
 		// process is down. The management loop double-checks it locally.
 		botTarget, botMaxLoss := computeBotTargets(settings, candidate)
 		if botTarget != nil && botTarget.GreaterThan(decimal.Zero) {
+			targetVal := botTarget.Round(2)
 			data.ProfitStopType = "profit_amount"
-			data.ProfitStop = botTarget
-		} else if settings.SmartPNLEnabled && candidate.RecommendedTrend != "no_trend" {
-			profit := candidate.UpperPrice
-			if candidate.RecommendedTrend == "short" {
-				profit = candidate.LowerPrice
+			data.ProfitStop = &targetVal
+		} else if settings.SmartPNLEnabled && trend != "neutral" {
+			profit := upperPrice
+			if trend == "short" {
+				profit = lowerPrice
 			}
 			data.ProfitStopType = "price"
 			data.ProfitStop = &profit
@@ -755,24 +799,42 @@ func (worker *Worker) deployReal(
 			))
 			continue
 		}
-		if _, createErr := manager.CreateGridBot(ctx, grid.CreateInput{
+		botID, createErr := manager.CreateGridBot(ctx, grid.CreateInput{
 			AccountID:          *settings.AccountID,
 			AutoGridSettingsID: &settings.ID,
 			IdempotencyKey:     "autogrid:" + scanID + ":" + candidate.ID,
 			Params:             params,
 			PnLTargetUSDT:      botTarget,
 			MaxLossUSDT:        botMaxLoss,
-		}); createErr != nil {
+		})
+		if createErr != nil {
 			deployErrors = append(deployErrors, fmt.Sprintf("%s: create failed: %v", candidate.Symbol, createErr))
 			continue
 		}
 		activeCount++
+
+		var botNum int
+		_ = worker.db.QueryRow(ctx, `SELECT COALESCE(bot_number, 0) FROM grid_bots WHERE id = $1`, botID).Scan(&botNum)
+
+		_ = LogBotEvent(ctx, worker.db, botID, botNum, "REAL", candidate.Symbol, "CREATED", &candidate.CurrentPrice, nil, map[string]any{
+			"leverage": botLev, "gridNum": mesh.GridNum, "lowerPrice": lowerPrice, "upperPrice": upperPrice, "budget": settings.BudgetUSDT,
+		})
+		_ = QueueTelegramEvent(ctx, worker.db, "BOT_CREATED", map[string]any{
+			"bot_number": botNum, "symbol": candidate.Symbol, "direction": strings.ToUpper(trend),
+			"leverage": botLev, "lower_price": lowerPrice, "upper_price": upperPrice,
+			"grid_num": mesh.GridNum, "quote_investment": settings.BudgetUSDT, "source": "REAL",
+		})
 	}
 	if len(deployErrors) > 0 {
 		worker.logger.Warn(
 			"AutoGrid deploy skipped some candidates",
 			"component", "autogrid_worker", "skipped", strings.Join(deployErrors, " | "),
 		)
+		if activeCount == 0 {
+			_, _ = worker.db.Exec(ctx, `UPDATE autogrid_settings SET last_error = $1 WHERE id = $2`, deployErrors[0], settings.ID)
+		}
+	} else if activeCount > 0 {
+		_, _ = worker.db.Exec(ctx, `UPDATE autogrid_settings SET last_error = NULL WHERE id = $1`, settings.ID)
 	}
 	return nil
 }

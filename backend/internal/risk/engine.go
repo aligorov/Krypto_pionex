@@ -190,7 +190,7 @@ func (e *Engine) SetKillSwitch(ctx context.Context, enabled bool) error {
 	return nil
 }
 
-// ValidateDailyLoss checks if today's cumulative realized loss across bots has breached max_daily_loss_usd.
+// ValidateDailyLoss checks if today's cumulative realized loss across real bots has breached max_daily_loss_usd.
 func (e *Engine) ValidateDailyLoss(ctx context.Context) error {
 	settings, err := e.LoadSettings(ctx)
 	if err != nil {
@@ -202,11 +202,9 @@ func (e *Engine) ValidateDailyLoss(ctx context.Context) error {
 	var dailyRealizedLoss decimal.Decimal
 	err = e.db.QueryRow(ctx, `
 		SELECT COALESCE(SUM(CASE WHEN realized_pnl_usdt < 0 THEN -realized_pnl_usdt ELSE 0 END), 0)
-		FROM (
-			SELECT realized_pnl_usdt FROM grid_bots WHERE COALESCE(closed_at, updated_at) > NOW() - INTERVAL '24 hours' AND status = 'STOPPED'
-			UNION ALL
-			SELECT realized_pnl_usdt FROM paper_grid_bots WHERE closed_at > NOW() - INTERVAL '24 hours' AND status = 'COMPLETED'
-		) losses
+		FROM grid_bots
+		WHERE COALESCE(closed_at, updated_at) > NOW() - INTERVAL '24 hours'
+		  AND status = 'STOPPED'
 	`).Scan(&dailyRealizedLoss)
 	if err != nil {
 		return fmt.Errorf("risk engine: check daily loss: %w", err)

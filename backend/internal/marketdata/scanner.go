@@ -434,6 +434,8 @@ func scoreCandidate(
 			"volatilityParkinson": volParkinson,
 			"rangeSource":        "support_resistance_atr_buffered",
 			"fundingIncluded":    false,
+			"pricePrecision":     symbol.PricePrecision,
+			"amountPrecision":    symbol.AmountPrecision,
 			"warning":            "backtest proxy is not live trading performance",
 		},
 	}, nil
