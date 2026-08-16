@@ -78,20 +78,22 @@ type Account struct {
 }
 
 type GridBot struct {
-	ID              string    `json:"id"`
-	AccountID       string    `json:"accountId"`
-	Symbol          string    `json:"symbol"`
-	BUOrderID       *string   `json:"buOrderId"`
-	Status          string    `json:"status"`
-	Direction       string    `json:"direction"`
-	GridType        string    `json:"gridType"`
-	LowerPrice      string    `json:"lowerPrice"`
-	UpperPrice      string    `json:"upperPrice"`
-	GridNum         int       `json:"gridNum"`
-	Leverage        int       `json:"leverage"`
-	QuoteInvestment string    `json:"quoteInvestment"`
-	CreatedAt       time.Time `json:"createdAt"`
-	UpdatedAt       time.Time `json:"updatedAt"`
+	ID                  string    `json:"id"`
+	AccountID           string    `json:"accountId"`
+	Symbol              string    `json:"symbol"`
+	BUOrderID           *string   `json:"buOrderId"`
+	Status              string    `json:"status"`
+	Direction           string    `json:"direction"`
+	GridType            string    `json:"gridType"`
+	LowerPrice          string    `json:"lowerPrice"`
+	UpperPrice          string    `json:"upperPrice"`
+	GridNum             int       `json:"gridNum"`
+	Leverage            int       `json:"leverage"`
+	QuoteInvestment     string    `json:"quoteInvestment"`
+	ReconciliationState string    `json:"reconciliationState,omitempty"`
+	LastError           *string   `json:"lastError,omitempty"`
+	CreatedAt           time.Time `json:"createdAt"`
+	UpdatedAt           time.Time `json:"updatedAt"`
 }
 
 type PatternOrder struct {
@@ -382,7 +384,7 @@ func (s *Service) ListGridBots(ctx context.Context, limit int) ([]GridBot, error
 	rows, err := s.db.Query(ctx, `
 		SELECT id, account_id, symbol, bu_order_id, status, direction, grid_type,
 		       lower_price::TEXT, upper_price::TEXT, grid_num, leverage,
-		       quote_investment::TEXT, created_at, updated_at
+		       quote_investment::TEXT, reconciliation_state, last_error, created_at, updated_at
 		FROM grid_bots ORDER BY created_at DESC LIMIT $1
 	`, limit)
 	if err != nil {
@@ -396,6 +398,7 @@ func (s *Service) ListGridBots(ctx context.Context, limit int) ([]GridBot, error
 			&item.ID, &item.AccountID, &item.Symbol, &item.BUOrderID, &item.Status,
 			&item.Direction, &item.GridType, &item.LowerPrice, &item.UpperPrice,
 			&item.GridNum, &item.Leverage, &item.QuoteInvestment,
+			&item.ReconciliationState, &item.LastError,
 			&item.CreatedAt, &item.UpdatedAt,
 		); err != nil {
 			return nil, fmt.Errorf("scan grid bot: %w", err)

@@ -1075,17 +1075,10 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 	for _, bot := range bots {
 		if bot.localStatus != "RUNNING" {
 			var reconciliation string
-			if err := worker.db.QueryRow(ctx, `
-				SELECT COALESCE(reconciliation_state, '') FROM grid_bots WHERE id = $1
-			`, bot.id).Scan(&reconciliation); err == nil {
-				needsCancel := bot.localStatus == "STOP_REQUESTED" ||
-					bot.localStatus == "STOPPING" ||
-					reconciliation == "CANCEL_SUBMITTING" ||
-					reconciliation == "CANCEL_FAILED"
-				if needsCancel && reconciliation != "CANCEL_ACCEPTED_REMOTE_VERIFY_PENDING" {
-					if err := worker.cancelRealBot(ctx, client, bot.id, bot.remoteID, "autogrid stop"); err != nil {
-						worker.logger.Error("submit native cancel", "component", "autogrid_worker", "bot_id", bot.id, "error", err)
-					}
+			_ = worker.db.QueryRow(ctx, `SELECT COALESCE(reconciliation_state, '') FROM grid_bots WHERE id = $1`, bot.id).Scan(&reconciliation)
+			if reconciliation != "CANCEL_ACCEPTED_REMOTE_VERIFY_PENDING" && reconciliation != "REMOTE_TERMINAL_CONFIRMED" {
+				if err := worker.cancelRealBot(ctx, client, bot.id, bot.remoteID, "autogrid stop"); err != nil {
+					worker.logger.Error("submit native cancel", "component", "autogrid_worker", "bot_id", bot.id, "error", err)
 				}
 			}
 		}
