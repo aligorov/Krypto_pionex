@@ -10,11 +10,11 @@ import RiskSettings from './components/RiskSettings';
 import AuditLogs from './components/AuditLogs';
 import MCPServer from './components/MCPServer';
 import SecurityModal from './components/SecurityModal';
-import { LLMSettingsModal } from './components/LLMSettingsModal';
+import LLMSettings from './components/LLMSettings';
 import { TelegramSettings } from './components/TelegramSettings';
 import BacktestLab from './components/BacktestLab';
 
-type Tab = 'overview' | 'autogrid' | 'candidates' | 'bots' | 'backtest' | 'accounts' | 'risk' | 'telegram' | 'audit' | 'mcp';
+type Tab = 'overview' | 'autogrid' | 'candidates' | 'bots' | 'backtest' | 'llm' | 'accounts' | 'risk' | 'telegram' | 'audit' | 'mcp';
 
 const canOperate = (role: Role): boolean => role === 'OPERATOR' || role === 'ADMIN';
 const canManage = (role: Role): boolean => role === 'ADMIN';
@@ -34,7 +34,6 @@ export default function App() {
   const [activeTab, setActiveTab] = useState<Tab>('overview');
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [showSecurityModal, setShowSecurityModal] = useState(false);
-  const [showLLMModal, setShowLLMModal] = useState(false);
   const [securityTab, setSecurityTab] = useState<'password' | '2fa' | 'ip'>('password');
 
   const loadOverview = useCallback(() => {
@@ -251,6 +250,7 @@ export default function App() {
     { id: 'backtest', label: 'Бэктест-лаб' },
     { id: 'accounts', label: 'Pionex API' },
     { id: 'risk', label: 'Риск' },
+    { id: 'llm', label: 'AI Мозг' },
     { id: 'telegram', label: 'Telegram' },
     { id: 'audit', label: 'Аудит' },
     { id: 'mcp', label: 'MCP' },
@@ -317,7 +317,7 @@ export default function App() {
             <button
               className="button small"
               onClick={() => {
-                setShowLLMModal(true);
+                setActiveTab('llm');
                 setMobileMenuOpen(false);
               }}
               title="Настройка AI Мозга (Gemini / Claude / OpenRouter)"
@@ -385,6 +385,7 @@ export default function App() {
         {activeTab === 'backtest' && <BacktestLab canOperate={canOperate(user.role)} />}
         {activeTab === 'accounts' && <PionexAccounts canManage={canManage(user.role)} />}
         {activeTab === 'risk' && <RiskSettings canManage={canManage(user.role)} />}
+        {activeTab === 'llm' && <LLMSettings />}
         {activeTab === 'telegram' && <TelegramSettings />}
         {activeTab === 'audit' && <AuditLogs />}
         {activeTab === 'mcp' && <MCPServer canManage={canManage(user.role)} />}
@@ -405,9 +406,6 @@ export default function App() {
         />
       )}
 
-      {showLLMModal && (
-        <LLMSettingsModal onClose={() => setShowLLMModal(false)} />
-      )}
     </div>
   );
 }
