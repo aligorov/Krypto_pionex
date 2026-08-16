@@ -15,6 +15,7 @@ type RegimeResult struct {
 	RSI                 float64 `json:"rsi"`                 // Wilder RSI(14), momentum oscillator 0..100
 	Choppiness          float64 `json:"choppiness"`          // Dreiss Choppiness Index (14), 0..100 (>61.8 range, <38.2 trend)
 	BBWPct              float64 `json:"bbwPct"`              // Bollinger Band Width %
+	BBWPercentile       float64 `json:"bbwPercentile"`       // BBW rank within the window, 0..100 (low = tighter than most of the history)
 	IsSqueeze           bool    `json:"isSqueeze"`           // Volatility squeeze detected (breakout risk)
 	EMAFast             float64 `json:"emaFast"`             // EMA(20) of closes
 	EMASlow             float64 `json:"emaSlow"`             // EMA(50) of closes
@@ -56,6 +57,7 @@ func DetectRegime(candles []pionex.KlineCandle) RegimeResult {
 	result.RSI = CalculateRSI(candles, 14)
 	result.Choppiness = ChoppinessIndex(candles, adxPeriod)
 	result.BBWPct, result.IsSqueeze = BollingerBandWidth(candles, bbPeriod, 2.0)
+	result.BBWPercentile = bbwPercentileRank(candles, bbPeriod)
 	result.ATRPct = atrPercent(candles, adxPeriod)
 	result.RangePositionPct = rangePositionPct(candles)
 
@@ -354,11 +356,126 @@ func rangePositionPct(candles []pionex.KlineCandle) float64 {
 // supportResistanceRange blends the lookback window's support/resistance with
 // the volatility band and an ATR structural buffer so the deployed grid respects
 // market structure without clipping right on the edge.
+// bbwPercentileRank ranks the current Bollinger Band Width against the
+// widths computed over the whole window: 20 means bands are currently
+// tighter than 80% of the window — the documented entry regime for neutral
+// grids ("band width below its 20th percentile"). A rolling-average squeeze
+// flag only compares against the recent mean; the rank places the reading
+// in the full distribution.
+func bbwPercentileRank(candles []pionex.KlineCandle, period int) float64 {
+	if len(candles) < period+12 {
+		return 50.0
+	}
+	// Second return of BollingerBandWidth is the squeeze flag, not an
+	// ok-marker; the value is always computed once the window fits.
+	current, _ := BollingerBandWidth(candles, period, 2.0)
+	samples := 0
+	atOrBelow := 0
+	for end := period + 2; end <= len(candles); end++ {
+		historical, _ := BollingerBandWidth(candles[:end], period, 2.0)
+		samples++
+		if historical <= current {
+			atOrBelow++
+		}
+	}
+	if samples < 10 {
+		return 50.0
+	}
+	return float64(atOrBelow) / float64(samples) * 100.0
+}
+
+// volumeProfileBounds returns the price band that contains `cover` (0..1)
+// of the window's traded volume, expanded outward from the highest-volume
+// bin. Grid bounds anchored on real volume nodes are defended by actual
+// traded liquidity instead of raw candle extremes, which a single wick can
+// inflate.
+func volumeProfileBounds(candles []pionex.KlineCandle, cover float64) (float64, float64, bool) {
+	if len(candles) < 10 || cover <= 0 || cover > 1 {
+		return 0, 0, false
+	}
+	const bins = 48
+	windowLow, windowHigh := math.MaxFloat64, 0.0
+	totalVolume := 0.0
+	for _, candle := range candles {
+		low, _ := candle.Low.Float64()
+		high, _ := candle.High.Float64()
+		volume, _ := candle.Volume.Float64()
+		if high <= 0 || low <= 0 || volume <= 0 {
+			continue
+		}
+		windowLow = math.Min(windowLow, low)
+		windowHigh = math.Max(windowHigh, high)
+		totalVolume += volume
+	}
+	if totalVolume <= 0 || windowHigh <= windowLow {
+		return 0, 0, false
+	}
+	histogram := make([]float64, bins)
+	binWidth := (windowHigh - windowLow) / bins
+	if binWidth <= 0 {
+		return 0, 0, false
+	}
+	for _, candle := range candles {
+		low, _ := candle.Low.Float64()
+		high, _ := candle.High.Float64()
+		volume, _ := candle.Volume.Float64()
+		if volume <= 0 || high <= 0 || low <= 0 {
+			continue
+		}
+		// Spread each candle's volume uniformly over the bins it spans.
+		fromBin := int(math.Max(0, math.Floor((low-windowLow)/binWidth)))
+		toBin := int(math.Min(bins-1, math.Floor((high-windowLow)/binWidth)))
+		if toBin < fromBin {
+			toBin = fromBin
+		}
+		perBin := volume / float64(toBin-fromBin+1)
+		for b := fromBin; b <= toBin; b++ {
+			histogram[b] += perBin
+		}
+	}
+	peak := 0
+	for b := 1; b < bins; b++ {
+		if histogram[b] > histogram[peak] {
+			peak = b
+		}
+	}
+	target := totalVolume * cover
+	accumulated := histogram[peak]
+	lowerBin, upperBin := peak, peak
+	for accumulated < target && (lowerBin > 0 || upperBin < bins-1) {
+		nextLower := 0.0
+		if lowerBin > 0 {
+			nextLower = histogram[lowerBin-1]
+		}
+		nextUpper := 0.0
+		if upperBin < bins-1 {
+			nextUpper = histogram[upperBin+1]
+		}
+		if nextLower >= nextUpper && nextLower > 0 {
+			lowerBin--
+			accumulated += nextLower
+		} else if nextUpper > 0 {
+			upperBin++
+			accumulated += nextUpper
+		} else if nextLower > 0 {
+			lowerBin--
+			accumulated += nextLower
+		} else {
+			break
+		}
+	}
+	vpLower := windowLow + float64(lowerBin)*binWidth
+	vpUpper := windowLow + float64(upperBin+1)*binWidth
+	if vpUpper <= vpLower {
+		return 0, 0, false
+	}
+	return vpLower, vpUpper, true
+}
+
 func supportResistanceRange(
 	candles []pionex.KlineCandle,
 	price, volatilityPct float64,
-) (float64, float64) {
-	windowLow, windowHigh := math.MaxFloat64, 0.0
+) (float64, float64) {	windowLow, windowHigh := math.MaxFloat64, 0.0
 	for _, candle := range candles {
 		low, _ := candle.Low.Float64()
 		high, _ := candle.High.Float64()
@@ -378,6 +495,20 @@ func supportResistanceRange(
 
 	lower := math.Max(structLower, volLower)
 	upper := math.Min(structUpper, volUpper)
+
+	// Anchor the bounds on real traded volume where the profile agrees:
+	// wick-inflated extremes get pulled back to the band where liquidity
+	// actually changed hands. The result must still bracket the price and
+	// keep a sane minimum span — otherwise the structural bounds stand.
+	if vpLower, vpUpper, ok := volumeProfileBounds(candles, 0.7); ok {
+		tighterLower := math.Max(lower, vpLower-atrBuffer)
+		tighterUpper := math.Min(upper, vpUpper+atrBuffer)
+		if tighterLower < price && price < tighterUpper &&
+			tighterUpper-tighterLower >= price*0.02 {
+			lower, upper = tighterLower, tighterUpper
+		}
+	}
+
 	if !(lower < price && price < upper && lower > 0) {
 		return volLower, volUpper
 	}

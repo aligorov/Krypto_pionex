@@ -34,6 +34,7 @@ type ScannerCandidate struct {
 	RangePositionPct    float64 `json:"rangePositionPct"`
 	ATRPct              float64 `json:"atrPct"`
 	Choppiness          float64 `json:"choppiness"`
+	BBWPercentile       float64 `json:"bbwPercentile"`
 	IsSqueeze           bool    `json:"isSqueeze"`
 	Decision            string
 	RejectionReason     string
@@ -457,6 +458,14 @@ func scoreCandidate(
 	}
 	score = clamp(score*(0.7+0.3*entryFit), 0, 1)
 
+	// Squeeze-anchored neutral entries: bands tighter than most of the
+	// window (low BBW percentile rank) are the documented best-practice
+	// entry regime for range grids — reward, but never gate on it alone.
+	if regime.Regime == "RANGE" {
+		squeezeFit := clamp(1.0-regime.BBWPercentile/100.0, 0, 1)
+		score = clamp(score*(0.9+0.1*squeezeFit), 0, 1)
+	}
+
 	return ScannerCandidate{
 		Symbol: symbol.Symbol, BaseCurrency: symbol.BaseCurrency,
 		QuoteCurrency: symbol.QuoteCurrency, Price: price,
@@ -466,7 +475,8 @@ func scoreCandidate(
 		ProfitFactor: profitFactor, TurnoverProxy: turnover, Score: score,
 		Regime: regime.Regime, ADXPct: regime.ADX,
 		RangePositionPct: regime.RangePositionPct, ATRPct: regime.ATRPct,
-		Choppiness: regime.Choppiness, IsSqueeze: regime.IsSqueeze,
+		Choppiness: regime.Choppiness, BBWPercentile: regime.BBWPercentile,
+		IsSqueeze: regime.IsSqueeze,
 		Decision: decision, RejectionReason: strings.Join(reasons, "; "),
 		LowerPrice: lower, UpperPrice: upper, GridNum: gridNum,
 		RecommendedLeverage: leverage, RecommendedTrend: recommendedTrend,
