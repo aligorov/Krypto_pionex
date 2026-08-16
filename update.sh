@@ -5,6 +5,12 @@ echo "=================================================="
 echo "      UPDATING PIONEX AUTOGRID BOT SYSTEM         "
 echo "=================================================="
 
+# Fail closed: compose requires POSTGRES_PASSWORD from the local .env
+if [ ! -f .env ]; then
+    echo ">> ERROR: .env is missing. Copy .env.example to .env and set POSTGRES_PASSWORD."
+    exit 1
+fi
+
 # Force fetch all tags and branches from origin
 git fetch -f --tags origin
 

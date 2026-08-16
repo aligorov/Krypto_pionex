@@ -22,8 +22,8 @@ const (
 )
 
 var (
-	ErrIPBanned           = errors.New("ip address temporarily banned due to excessive failed attempts")
-	ErrInvalidIPOrCIDR    = errors.New("invalid IP or CIDR network format")
+	ErrIPBanned            = errors.New("ip address temporarily banned due to excessive failed attempts")
+	ErrInvalidIPOrCIDR     = errors.New("invalid IP or CIDR network format")
 	ErrCannotDeleteDefault = errors.New("cannot delete default loopback whitelist entry")
 )
 
@@ -68,39 +68,68 @@ func NewFail2Ban(db *pgxpool.Pool) *Fail2Ban {
 	return f
 }
 
-// ExtractClientIP extracts the real client IP, respecting proxy headers in order of authority.
+// ExtractClientIP resolves the client IP for ban accounting.
+//
+// Security model (audit SEC-002): forwarded headers are client-controlled
+// and must never be honored unconditionally — otherwise every request can
+// carry a fresh fake IP and the 5-attempt ban never triggers. Headers are
+// only read when the TCP peer itself is a trusted proxy (loopback or a
+// private network, i.e. our nginx / docker network). A direct public client
+// is always identified by its socket address.
+//
+// Header preference for trusted proxies:
+//  1. X-Real-IP — set (overwritten) by the local reverse proxy
+//  2. rightmost valid X-Forwarded-For entry — appended by the proxy closest
+//     to us, so it names the hop the proxy actually received the request
+//     from (leftmost entries are attacker-controllable)
+//  3. the proxy's own address
+//
+// Cloudflare deployments must make nginx overwrite X-Real-IP from
+// CF-Connecting-IP (realip module); the raw CF header is intentionally not
+// trusted because it passes through the proxy unvalidated.
 func ExtractClientIP(r *http.Request) net.IP {
-	// 1. Cloudflare header
-	if cfIP := strings.TrimSpace(r.Header.Get("CF-Connecting-IP")); cfIP != "" {
-		if ip := net.ParseIP(cfIP); ip != nil {
-			return ip
-		}
+	remote := remoteAddrIP(r)
+	if !isTrustedProxy(remote) {
+		return remote
 	}
-
-	// 2. Nginx / reverse proxy X-Real-IP
 	if realIP := strings.TrimSpace(r.Header.Get("X-Real-IP")); realIP != "" {
 		if ip := net.ParseIP(realIP); ip != nil {
 			return ip
 		}
 	}
-
-	// 3. X-Forwarded-For (client, proxy1, proxy2...)
 	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
 		parts := strings.Split(xff, ",")
-		for _, p := range parts {
-			trimmed := strings.TrimSpace(p)
-			if ip := net.ParseIP(trimmed); ip != nil {
+		for i := len(parts) - 1; i >= 0; i-- {
+			if ip := net.ParseIP(strings.TrimSpace(parts[i])); ip != nil {
 				return ip
 			}
 		}
 	}
+	return remote
+}
 
-	// 4. RemoteAddr fallback
+func remoteAddrIP(r *http.Request) net.IP {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		host = r.RemoteAddr
 	}
 	return net.ParseIP(host)
+}
+
+// isTrustedProxy reports whether the peer may set forwarding headers on
+// behalf of someone else: loopback (local reverse proxy) or RFC1918/ULA
+// (docker network). Public peers speak only for themselves.
+func isTrustedProxy(ip net.IP) bool {
+	if ip == nil {
+		return false
+	}
+	if ip.IsLoopback() {
+		return true
+	}
+	if ip.IsPrivate() {
+		return true
+	}
+	return ip.IsLinkLocalUnicast()
 }
 
 // ReloadWhitelist refreshes in-memory parsed CIDRs and exact IPs from PostgreSQL.

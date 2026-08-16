@@ -42,11 +42,24 @@ func main() {
 
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
-		dbURL = "postgres://pionex:pionex_password@localhost:5432/pionex_bot?sslmode=disable"
+		// No credentials may ship inside the binary (Zero-ENV policy,
+		// audit SEC-001): refuse to start instead of falling back to a
+		// known default password.
+		slog.Error("DATABASE_URL is required")
+		os.Exit(1)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	// Shared services: declared here so the worker goroutine and the HTTP
+	// server use the same instances (single Pionex rate budget, M1).
+	var (
+		accountService *accounts.Service
+		riskEngine     *risk.Engine
+		autoService    *autogrid.Service
+		llmService     *llm.Service
+	)
 
 	dbPool, err := pgxpool.New(ctx, dbURL)
 	if err != nil {
@@ -66,11 +79,12 @@ func main() {
 		}
 		slog.Info("PostgreSQL connection pool established")
 
-		// Initialize services & worker
-		accountService := accounts.NewService(dbPool)
-		riskEngine := risk.NewEngine(dbPool)
-		autoService := autogrid.NewService(dbPool, riskEngine)
-		llmService := llm.NewService(dbPool, logger)
+		// Initialize services & worker. One shared AutoGrid service keeps the
+		// worker, HTTP API and MCP inside a single Pionex rate budget (M1).
+		accountService = accounts.NewService(dbPool)
+		riskEngine = risk.NewEngine(dbPool)
+		autoService = autogrid.NewService(dbPool, riskEngine)
+		llmService = llm.NewService(dbPool, logger)
 
 		autoWorker := autogrid.NewWorker(dbPool, autoService, accountService, riskEngine, llmService, logger)
 		go autoWorker.Run(ctx)
@@ -102,10 +116,6 @@ func main() {
 	var handler http.Handler
 	if dbPool != nil {
 		authService := auth.NewService(dbPool)
-		accountService := accounts.NewService(dbPool)
-		riskEngine := risk.NewEngine(dbPool)
-		autoService := autogrid.NewService(dbPool, riskEngine)
-		llmService := llm.NewService(dbPool, logger)
 		auditStore := audit.NewStore(dbPool)
 		logStore := observability.NewStore(dbPool)
 

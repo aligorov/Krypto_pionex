@@ -15,28 +15,40 @@ func TestExtractClientIP(t *testing.T) {
 		expected string
 	}{
 		{
-			name:     "CF-Connecting-IP priority",
-			headers:  map[string]string{"CF-Connecting-IP": "203.0.113.195", "X-Forwarded-For": "198.51.100.1"},
+			// CF-Connecting-IP is never trusted directly: it passes through
+			// proxies unvalidated. X-Real-IP / rightmost XFF decide.
+			name:     "CF header ignored, X-Real-IP wins",
+			headers:  map[string]string{"CF-Connecting-IP": "203.0.113.195", "X-Real-IP": "198.51.100.42"},
 			remote:   "10.0.0.1:12345",
-			expected: "203.0.113.195",
+			expected: "198.51.100.42",
 		},
 		{
-			name:     "X-Real-IP when CF missing",
+			name:     "X-Real-IP behind trusted proxy",
 			headers:  map[string]string{"X-Real-IP": "198.51.100.42", "X-Forwarded-For": "192.168.1.1"},
 			remote:   "10.0.0.1:12345",
 			expected: "198.51.100.42",
 		},
 		{
-			name:     "X-Forwarded-For first client",
+			// Rightmost XFF entry is the hop our proxy received from;
+			// leftmost entries are attacker-controllable.
+			name:     "X-Forwarded-For rightmost entry",
 			headers:  map[string]string{"X-Forwarded-For": "192.0.2.1, 10.0.0.2, 127.0.0.1"},
 			remote:   "10.0.0.1:12345",
-			expected: "192.0.2.1",
+			expected: "127.0.0.1",
 		},
 		{
 			name:     "RemoteAddr fallback",
 			headers:  map[string]string{},
 			remote:   "198.51.100.99:54321",
 			expected: "198.51.100.99",
+		},
+		{
+			// A direct public client must not impersonate someone else via
+			// spoofed headers: headers are ignored for untrusted peers.
+			name:     "spoofed headers from public peer ignored",
+			headers:  map[string]string{"X-Real-IP": "1.2.3.4", "X-Forwarded-For": "5.6.7.8", "CF-Connecting-IP": "9.9.9.9"},
+			remote:   "203.0.113.7:4444",
+			expected: "203.0.113.7",
 		},
 	}
 

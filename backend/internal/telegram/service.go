@@ -81,7 +81,17 @@ func (s *Service) GetSettings(ctx context.Context) (*Settings, error) {
 }
 
 func (s *Service) UpdateSettings(ctx context.Context, item Settings) (*Settings, error) {
-	_, err := s.db.Exec(ctx, `
+	// The API never returns the raw token (audit SEC-003), so an unchanged
+	// token arrives empty or masked: keep the stored value in that case.
+	current, err := s.GetSettings(ctx)
+	if err != nil {
+		return nil, err
+	}
+	token := strings.TrimSpace(item.BotToken)
+	if token == "" || strings.Contains(token, "•") {
+		token = current.BotToken
+	}
+	_, err = s.db.Exec(ctx, `
 		UPDATE telegram_settings
 		SET enabled = $2,
 		    bot_token = $3,
@@ -102,7 +112,7 @@ func (s *Service) UpdateSettings(ctx context.Context, item Settings) (*Settings,
 		    updated_at = NOW()
 		WHERE id = 1
 	`,
-		item.ID, item.Enabled, item.BotToken, item.ChatID, item.TopicID,
+		item.ID, item.Enabled, token, item.ChatID, item.TopicID,
 		item.NotifyBotCreated, item.NotifyTakeProfit, item.NotifyStopLoss,
 		item.NotifyRangeAdjust, item.NotifyDigest, item.NotifyEmergency,
 		item.DigestIntervalMinutes, item.TemplateBotCreated, item.TemplateTakeProfit,
@@ -111,7 +121,25 @@ func (s *Service) UpdateSettings(ctx context.Context, item Settings) (*Settings,
 	if err != nil {
 		return nil, fmt.Errorf("update telegram settings: %w", err)
 	}
-	return s.GetSettings(ctx)
+	updated, err := s.GetSettings(ctx)
+	if err != nil {
+		return nil, err
+	}
+	updated.BotToken = MaskToken(updated.BotToken)
+	return updated, nil
+}
+
+// MaskToken renders a token safe for API responses: first and last 4
+// characters only. The raw token must never leave the server (SEC-003).
+func MaskToken(token string) string {
+	token = strings.TrimSpace(token)
+	if len(token) <= 8 {
+		if token == "" {
+			return ""
+		}
+		return "••••••••"
+	}
+	return token[:4] + "••••••••" + token[len(token)-4:]
 }
 
 func (s *Service) TestConnection(ctx context.Context, token, chatID, topicID string) error {

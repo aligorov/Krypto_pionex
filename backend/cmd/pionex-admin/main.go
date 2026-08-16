@@ -16,8 +16,6 @@ import (
 	"golang.org/x/term"
 )
 
-const defaultDatabaseURL = "postgres://pionex:pionex_password@localhost:5432/pionex_bot?sslmode=disable"
-
 func main() {
 	if len(os.Args) < 2 {
 		usage()
@@ -109,7 +107,8 @@ func listUsers(ctx context.Context, service *auth.Service) {
 func connect(ctx context.Context) (*pgxpool.Pool, error) {
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {
-		databaseURL = defaultDatabaseURL
+		// No credentials inside the binary (Zero-ENV policy, audit SEC-001).
+		return nil, errors.New("DATABASE_URL is required")
 	}
 	db, err := pgxpool.New(ctx, databaseURL)
 	if err != nil {

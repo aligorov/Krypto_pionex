@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"runtime/debug"
 	"strings"
 	"time"
 
@@ -70,23 +71,42 @@ func (worker *Worker) Run(ctx context.Context) {
 			worker.logger.Info("AutoGrid worker stopped", "component", "autogrid_worker")
 			return
 		case <-commandTicker.C:
-			if err := worker.processNext(ctx); err != nil && !errors.Is(err, pgx.ErrNoRows) {
-				worker.logger.Error("AutoGrid command failed", "component", "autogrid_worker", "error", err)
-			}
+			worker.runGuarded("command", func() {
+				if err := worker.processNext(ctx); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+					worker.logger.Error("AutoGrid command failed", "component", "autogrid_worker", "error", err)
+				}
+			})
 		case <-scheduleTicker.C:
-			if err := worker.scheduleDueScan(ctx); err != nil {
-				worker.logger.Error("schedule AutoGrid scan", "component", "autogrid_worker", "error", err)
-			}
+			worker.runGuarded("schedule", func() {
+				if err := worker.scheduleDueScan(ctx); err != nil {
+					worker.logger.Error("schedule AutoGrid scan", "component", "autogrid_worker", "error", err)
+				}
+			})
 		case <-reconcileTicker.C:
-			interval, err := worker.reconcileAndManage(ctx)
-			if err != nil {
-				worker.logger.Error("reconcile and manage Pionex grids", "component", "autogrid_worker", "error", err)
-			}
-			if seconds := interval; seconds >= 15 && seconds <= 3600 {
-				reconcileTicker.Reset(time.Duration(seconds) * time.Second)
-			}
+			worker.runGuarded("reconcile", func() {
+				interval, err := worker.reconcileAndManage(ctx)
+				if err != nil {
+					worker.logger.Error("reconcile and manage Pionex grids", "component", "autogrid_worker", "error", err)
+				}
+				if seconds := interval; seconds >= 15 && seconds <= 3600 {
+					reconcileTicker.Reset(time.Duration(seconds) * time.Second)
+				}
+			})
 		}
 	}
+}
+
+// runGuarded keeps a single poisoned row or unexpected panic from killing
+// the whole process: this goroutine also supervises real-money grids.
+func (worker *Worker) runGuarded(source string, fn func()) {
+	defer func() {
+		if r := recover(); r != nil {
+			worker.logger.Error("AutoGrid worker panic recovered",
+				"component", "autogrid_worker", "panic_source", source,
+				"panic", r, "stack", string(debug.Stack()))
+		}
+	}()
+	fn()
 }
 
 func (worker *Worker) processNext(ctx context.Context) error {
@@ -651,6 +671,13 @@ func (worker *Worker) deployReal(
 			return fmt.Errorf("REAL AutoGrid account is missing: %w", err)
 		}
 		settings.AccountID = resolved
+		// Pin the resolved account so reconcile/stop flows and future deploys
+		// cannot diverge from the account the bots were created under.
+		_, _ = worker.db.Exec(ctx, `
+			UPDATE autogrid_settings
+			SET account_id = $2, updated_at = NOW()
+			WHERE id = $1 AND account_id IS NULL
+		`, settings.ID, *resolved)
 	}
 	client, err := worker.service.PrivateClient(ctx, worker.accounts, *settings.AccountID)
 	if err != nil {
@@ -676,8 +703,8 @@ func (worker *Worker) deployReal(
 	var recentStopLossCountReal int
 	if err := worker.db.QueryRow(ctx, `
 		SELECT COUNT(*) FROM grid_bots
-		WHERE status = 'STOPPED'
-		  AND closed_reason IN ('STOP_LOSS', 'STOP_LOSS_NATIVE', 'loss_stop')
+		WHERE status IN ('STOPPED', 'LIQUIDATED')
+		  AND closed_reason IN ('STOP_LOSS', 'STOP_LOSS_NATIVE', 'LIQUIDATION', 'loss_stop')
 		  AND COALESCE(closed_at, updated_at) > NOW() - INTERVAL '1 hour'
 	`).Scan(&recentStopLossCountReal); err == nil && recentStopLossCountReal >= 3 {
 		worker.logger.Warn("Portfolio circuit breaker: recent real stop-losses holding new deployments", "recentStopLossCountReal", recentStopLossCountReal)
@@ -862,6 +889,12 @@ func (worker *Worker) deployReal(
 			MaxLossUSDT:        botMaxLoss,
 		})
 		if createErr != nil {
+			if errors.Is(createErr, grid.ErrDuplicateActiveBot) {
+				// A concurrent scan deployed this symbol first; not an error.
+				worker.logger.Info("skip real deploy: active grid already exists",
+					"component", "autogrid_worker", "symbol", candidate.Symbol)
+				continue
+			}
 			deployErrors = append(deployErrors, fmt.Sprintf("%s: create failed: %v", candidate.Symbol, createErr))
 			continue
 		}
@@ -933,25 +966,18 @@ func (worker *Worker) emergencyStop(ctx context.Context) error {
 		SET status = 'EMERGENCY_STOPPED', closed_reason = 'EMERGENCY_STOP', closed_at = NOW(), updated_at = NOW()
 		WHERE settings_id = $1 AND status = 'RUNNING'
 	`, settings.ID)
-	if settings.AccountID != nil {
-		if err := worker.cancelRealBots(ctx, settings); err != nil {
-			_ = worker.service.SetStatus(ctx, "EMERGENCY_STOPPED", err)
-			return err
-		}
+	// Real bots may live under an implicitly resolved account (settings
+	// account never selected); cancel them regardless of the settings value.
+	if err := worker.cancelRealBots(ctx, settings); err != nil {
+		_ = worker.service.SetStatus(ctx, "EMERGENCY_STOPPED", err)
+		return err
 	}
 	return worker.service.SetStatus(ctx, "EMERGENCY_STOPPED", nil)
 }
 
 func (worker *Worker) cancelRealBots(ctx context.Context, settings *Settings) error {
-	if settings.AccountID == nil {
-		return nil
-	}
-	client, err := worker.service.PrivateClient(ctx, worker.accounts, *settings.AccountID)
-	if err != nil {
-		return err
-	}
 	rows, err := worker.db.Query(ctx, `
-		SELECT id, bu_order_id
+		SELECT id, bu_order_id, account_id
 		FROM grid_bots
 		WHERE autogrid_settings_id = $1 AND bu_order_id IS NOT NULL
 		  AND status IN ('RUNNING', 'STOP_REQUESTED', 'STOPPING')
@@ -960,11 +986,11 @@ func (worker *Worker) cancelRealBots(ctx context.Context, settings *Settings) er
 		return fmt.Errorf("list real grids for emergency stop: %w", err)
 	}
 	defer rows.Close()
-	type target struct{ id, remoteID string }
+	type target struct{ id, remoteID, accountID string }
 	targets := make([]target, 0)
 	for rows.Next() {
 		var item target
-		if err := rows.Scan(&item.id, &item.remoteID); err != nil {
+		if err := rows.Scan(&item.id, &item.remoteID, &item.accountID); err != nil {
 			return err
 		}
 		targets = append(targets, item)
@@ -972,10 +998,30 @@ func (worker *Worker) cancelRealBots(ctx context.Context, settings *Settings) er
 	if err := rows.Err(); err != nil {
 		return err
 	}
+	if len(targets) == 0 {
+		return nil
+	}
+	clients := make(map[string]*pionex.Client)
+	clientFor := func(accountID string) (*pionex.Client, error) {
+		if cached, ok := clients[accountID]; ok {
+			return cached, nil
+		}
+		client, err := worker.service.PrivateClient(ctx, worker.accounts, accountID)
+		if err != nil {
+			return nil, err
+		}
+		clients[accountID] = client
+		return client, nil
+	}
 	cancelErrors := make([]string, 0)
-	for _, target := range targets {
-		if err := worker.cancelRealBot(ctx, client, target.id, target.remoteID, "autogrid emergency stop"); err != nil {
-			cancelErrors = append(cancelErrors, fmt.Sprintf("%s: %v", target.remoteID, err))
+	for _, item := range targets {
+		client, err := clientFor(item.accountID)
+		if err != nil {
+			cancelErrors = append(cancelErrors, fmt.Sprintf("%s: resolve client: %v", item.remoteID, err))
+			continue
+		}
+		if err := worker.cancelRealBot(ctx, client, item.id, item.remoteID, "autogrid emergency stop"); err != nil {
+			cancelErrors = append(cancelErrors, fmt.Sprintf("%s: %v", item.remoteID, err))
 		}
 	}
 	if len(cancelErrors) > 0 {
@@ -1074,6 +1120,31 @@ func (worker *Worker) autotuneIfDue(ctx context.Context, settings Settings) {
 	}
 }
 
+// pinManagedAccount persists the implicitly resolved AutoGrid account into
+// the settings row so deploys and supervision can never diverge (manual and
+// autopilot REAL deploys already run under the resolved account). Best-effort:
+// supervision itself follows each bot's own account_id, so a failure here is
+// logged but never blocks management.
+func (worker *Worker) pinManagedAccount(ctx context.Context, settings *Settings) {
+	if settings.AccountID != nil {
+		return
+	}
+	resolved, err := worker.service.resolveAccount(ctx)
+	if err != nil {
+		return
+	}
+	if _, err := worker.db.Exec(ctx, `
+		UPDATE autogrid_settings
+		SET account_id = $2, updated_at = NOW()
+		WHERE id = $1 AND account_id IS NULL
+	`, settings.ID, *resolved); err != nil {
+		worker.logger.Warn("persist resolved AutoGrid account",
+			"component", "autogrid_worker", "error", err)
+		return
+	}
+	settings.AccountID = resolved
+}
+
 func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 	settings, err := worker.service.GetSettings(ctx)
 	if err != nil {
@@ -1083,9 +1154,11 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 		worker.logger.Error("manage paper bots", "component", "autogrid_worker", "error", err)
 	}
 	worker.autotuneIfDue(ctx, *settings)
-	if settings.AccountID == nil {
-		return clampInterval(settings.ManageIntervalSeconds), nil
-	}
+	// Pin the implicitly resolved account into settings when possible so
+	// deploys and supervision stay on the same account. Supervision itself
+	// must not depend on it: real bots carry their own account_id and are
+	// managed regardless (orphaned bots must still receive stop requests).
+	worker.pinManagedAccount(ctx, settings)
 	var count int
 	if err := worker.db.QueryRow(ctx, `
 		SELECT COUNT(*) FROM grid_bots
@@ -1094,13 +1167,12 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 	`, settings.ID).Scan(&count); err != nil || count == 0 {
 		return clampInterval(settings.ManageIntervalSeconds), err
 	}
-	client, err := worker.service.PrivateClient(ctx, worker.accounts, *settings.AccountID)
 	priceBySymbol, priceErr := worker.priceMap(ctx)
 	if priceErr != nil {
 		worker.logger.Warn("fetch tickers for management", "component", "autogrid_worker", "error", priceErr)
 	}
 	rows, err := worker.db.Query(ctx, `
-		SELECT id, bu_order_id, status, symbol, direction,
+		SELECT id, account_id, bu_order_id, status, symbol, direction,
 		       lower_price, upper_price, grid_num, adjustments_count,
 		       pnl_target_usdt, max_loss_usdt, quote_investment,
 		       COALESCE(bot_number, 0)
@@ -1113,18 +1185,18 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 		return clampInterval(settings.ManageIntervalSeconds), err
 	}
 	type managedBot struct {
-		id, remoteID, localStatus, symbol, direction string
-		lower, upper                                  decimal.Decimal
-		rowNum, adjustments                           int
-		pnlTarget, maxLoss                            *decimal.Decimal
-		investment                                    decimal.Decimal
-		botNumber                                     int
+		id, accountID, remoteID, localStatus, symbol, direction string
+		lower, upper                                            decimal.Decimal
+		rowNum, adjustments                                     int
+		pnlTarget, maxLoss                                      *decimal.Decimal
+		investment                                              decimal.Decimal
+		botNumber                                               int
 	}
 	bots := make([]managedBot, 0)
 	for rows.Next() {
 		var item managedBot
 		if err := rows.Scan(
-			&item.id, &item.remoteID, &item.localStatus, &item.symbol,
+			&item.id, &item.accountID, &item.remoteID, &item.localStatus, &item.symbol,
 			&item.direction, &item.lower, &item.upper, &item.rowNum,
 			&item.adjustments, &item.pnlTarget, &item.maxLoss, &item.investment,
 			&item.botNumber,
@@ -1136,7 +1208,33 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 	}
 	rows.Close()
 
+	clients := make(map[string]*pionex.Client)
+	clientFor := func(accountID string) (*pionex.Client, error) {
+		if cached, ok := clients[accountID]; ok {
+			return cached, nil
+		}
+		client, err := worker.service.PrivateClient(ctx, worker.accounts, accountID)
+		if err != nil {
+			return nil, err
+		}
+		clients[accountID] = client
+		return client, nil
+	}
+
 	for _, bot := range bots {
+		client, clientErr := clientFor(bot.accountID)
+		if clientErr != nil {
+			worker.logger.Error("resolve Pionex client for managed bot",
+				"component", "autogrid_worker", "bot_id", bot.id,
+				"account_id", bot.accountID, "error", clientErr)
+			_, _ = worker.db.Exec(ctx, `
+				UPDATE grid_bots
+				SET reconciliation_state = 'REMOTE_READ_FAILED',
+				    last_error = $2, last_reconciled_at = NOW(), updated_at = NOW()
+				WHERE id = $1
+			`, bot.id, clientErr.Error())
+			continue
+		}
 		if bot.localStatus != "RUNNING" {
 			var reconciliation string
 			_ = worker.db.QueryRow(ctx, `SELECT COALESCE(reconciliation_state, '') FROM grid_bots WHERE id = $1`, bot.id).Scan(&reconciliation)
@@ -1359,7 +1457,7 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 	// permanently understated realized results. Bounded to a 48h window so the
 	// per-cycle work stays finite.
 	closedRows, err := worker.db.Query(ctx, `
-		SELECT id, bu_order_id
+		SELECT id, bu_order_id, account_id
 		FROM grid_bots
 		WHERE bu_order_id IS NOT NULL
 		  AND status IN ('STOPPED', 'COMPLETED', 'CANCELLED', 'LIQUIDATED')
@@ -1370,18 +1468,22 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 	`)
 	if err == nil {
 		type closedBotItem struct {
-			id, remoteID string
+			id, remoteID, accountID string
 		}
 		var unSynced []closedBotItem
 		for closedRows.Next() {
 			var item closedBotItem
-			if err := closedRows.Scan(&item.id, &item.remoteID); err == nil {
+			if err := closedRows.Scan(&item.id, &item.remoteID, &item.accountID); err == nil {
 				unSynced = append(unSynced, item)
 			}
 		}
 		closedRows.Close()
 		for _, item := range unSynced {
-			if remote, err := client.GetFuturesGridBot(ctx, item.remoteID); err == nil && remote != nil {
+			historyClient, clientErr := clientFor(item.accountID)
+			if clientErr != nil {
+				continue
+			}
+			if remote, remoteErr := historyClient.GetFuturesGridBot(ctx, item.remoteID); remoteErr == nil && remote != nil {
 				profit := remote.BUOrderData.ProfitWithdrawn
 				if profit.IsZero() {
 					profit = remote.BUOrderData.TotalProfit
@@ -1397,7 +1499,25 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 		}
 	}
 
-	worker.reconcileUnknownSubmissions(ctx, client)
+	// Unknown submissions are adopted per account: each pending row carries
+	// the account its client must authenticate as.
+	unknownAccountRows, err := worker.db.Query(ctx, `
+		SELECT DISTINCT account_id FROM grid_bots
+		WHERE bu_order_id IS NULL
+		  AND status IN ('SUBMISSION_UNKNOWN', 'PENDING_SUBMISSION')
+		  AND created_at > NOW() - INTERVAL '48 hours'
+	`)
+	if err == nil {
+		for unknownAccountRows.Next() {
+			var accountID string
+			if scanErr := unknownAccountRows.Scan(&accountID); scanErr == nil {
+				if unknownClient, clientErr := clientFor(accountID); clientErr == nil {
+					worker.reconcileUnknownSubmissions(ctx, unknownClient)
+				}
+			}
+		}
+		unknownAccountRows.Close()
+	}
 
 	return clampInterval(settings.ManageIntervalSeconds), nil
 }
@@ -1458,6 +1578,11 @@ func (worker *Worker) reconcileUnknownSubmissions(ctx context.Context, client *p
 				break
 			}
 			token = next
+			if page == 9 {
+				// Page budget exhausted with a continuation token: the listing
+				// is NOT complete — a live bot may sit on the next page.
+				listsComplete = false
+			}
 		}
 	}
 
@@ -1583,6 +1708,16 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 	for _, bot := range bots {
 		price, ok := priceBySymbol[bot.symbol]
 		if !ok || price.IsZero() {
+			continue
+		}
+		// A zero entry price cannot be divided against; repair it from the
+		// live price instead of panicking the supervision goroutine.
+		if bot.direction != "NEUTRAL" && !bot.entry.GreaterThan(decimal.Zero) {
+			worker.logger.Warn("repairing zero paper entry price from live tick",
+				"component", "autogrid_worker", "symbol", bot.symbol, "bot_id", bot.id)
+			_, _ = worker.db.Exec(ctx, `
+				UPDATE paper_grid_bots SET entry_price = $2, mark_price = $2 WHERE id = $1
+			`, bot.id, price)
 			continue
 		}
 		realized := bot.realized
@@ -1866,14 +2001,21 @@ func databaseTrend(trend string) string {
 	}
 }
 
+// terminalRemoteGridStatus reports whether the remote status is FINAL.
+// Transitional states ("stopping", "canceling", "closing") must stay under
+// supervision until the exchange reports a final reason — a substring match
+// here would finalize a bot whose close is still being worked on, dropping
+// it from management while margin is still locked. Unknown status values
+// fall back to the not-found/already-closed error path on the next cycle.
 func terminalRemoteGridStatus(status string) bool {
-	normalized := strings.ToLower(strings.TrimSpace(status))
-	for _, marker := range []string{"cancel", "closed", "close", "finish", "stopped", "stop", "liquidat", "expired", "inactive", "terminate", "complete", "failed"} {
-		if strings.Contains(normalized, marker) {
-			return true
-		}
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "finished", "canceled", "cancelled", "closed", "stopped",
+		"stop_by_user", "stopped_by_user", "liquidated", "expired",
+		"inactive", "terminated", "completed", "failed":
+		return true
+	default:
+		return false
 	}
-	return false
 }
 
 // terminalOutcome maps the native Pionex reasonBy to our durable lifecycle

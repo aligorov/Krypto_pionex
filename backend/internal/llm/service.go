@@ -71,6 +71,11 @@ func (s *Service) UpdateSettings(ctx context.Context, patch Settings) (*Settings
 	if model == "" {
 		model = current.Model
 	}
+	// Persist gate for the SSRF allowlist (audit SEC-005): a bad base URL
+	// must never reach the stored settings in the first place.
+	if err := ValidateBaseURL(provider, patch.BaseURL); err != nil {
+		return nil, fmt.Errorf("LLM base URL rejected: %w", err)
+	}
 
 	_, err = s.db.Exec(ctx, `
 		UPDATE llm_settings
@@ -142,13 +147,15 @@ func (s *Service) AuditCandidate(
 
 	decision, err := ParseAuditDecision(rawResponse)
 	if err != nil {
-		s.logger.Warn("LLM parse fallback", "symbol", input.Symbol, "error", err, "raw", rawResponse)
-		// Construct basic fallback decision
+		s.logger.Warn("LLM parse failure — failing closed", "symbol", input.Symbol, "error", err, "raw", rawResponse)
+		// A risk gate must fail CLOSED (audit SEC-009): a provider outage,
+		// truncated JSON or injected content must never convert itself into
+		// a trading approval.
 		decision = &AuditDecision{
-			Decision:         "APPROVED",
-			Confidence:       0.70,
+			Decision:         "REJECTED",
+			Confidence:       0.0,
 			Regime:           "UNCERTAIN",
-			ReasoningSummary: "Ответ LLM не соответствовал JSON-схеме; допущено по квант-модели",
+			ReasoningSummary: "Ответ LLM не соответствовал JSON-схеме; кандидат отклонён (fail-closed)",
 		}
 	}
 

@@ -198,18 +198,18 @@ type PnLBreakdown struct {
 // endpoints (spot trading account + futures account), cached briefly so UI
 // polling stays polite.
 type ExchangeSnapshot struct {
-	Connected     bool                     `json:"connected"`
-	AccountName   string                   `json:"accountName,omitempty"`
-	Error         string                   `json:"error,omitempty"`
-	Coins         []pionex.FuturesBalance  `json:"coins"`
-	USDTFree      decimal.Decimal          `json:"usdtFree"`
-	USDTFrozen    decimal.Decimal          `json:"usdtFrozen"`
-	USDTDebts     decimal.Decimal          `json:"usdtDebts"`
-	SpotCoins     []pionex.SpotBalance     `json:"spotCoins"`
-	SpotUSDTFree  decimal.Decimal          `json:"spotUsdtFree"`
+	Connected      bool                    `json:"connected"`
+	AccountName    string                  `json:"accountName,omitempty"`
+	Error          string                  `json:"error,omitempty"`
+	Coins          []pionex.FuturesBalance `json:"coins"`
+	USDTFree       decimal.Decimal         `json:"usdtFree"`
+	USDTFrozen     decimal.Decimal         `json:"usdtFrozen"`
+	USDTDebts      decimal.Decimal         `json:"usdtDebts"`
+	SpotCoins      []pionex.SpotBalance    `json:"spotCoins"`
+	SpotUSDTFree   decimal.Decimal         `json:"spotUsdtFree"`
 	SpotUSDTFrozen decimal.Decimal         `json:"spotUsdtFrozen"`
-	TotalUSDT     decimal.Decimal          `json:"totalUsdt"`
-	UpdatedAt     time.Time                `json:"updatedAt"`
+	TotalUSDT      decimal.Decimal         `json:"totalUsdt"`
+	UpdatedAt      time.Time               `json:"updatedAt"`
 }
 
 type PnLSummary struct {
@@ -229,11 +229,11 @@ type Service struct {
 	db   *pgxpool.Pool
 	risk *risk.Engine
 
-	balanceMu      sync.Mutex
-	balanceCached  *ExchangeSnapshot
-	clientMu       sync.Mutex
-	clientCache    map[string]*clientCacheEntry
-	publicAPI      *pionex.Client
+	balanceMu     sync.Mutex
+	balanceCached *ExchangeSnapshot
+	clientMu      sync.Mutex
+	clientCache   map[string]*clientCacheEntry
+	publicAPI     *pionex.Client
 }
 
 func NewService(db *pgxpool.Pool, riskEngine *risk.Engine) *Service {
@@ -475,11 +475,12 @@ func (s *Service) fetchAndCacheExchangeSnapshot(
 		var name string
 		_ = s.db.QueryRow(ctx, `SELECT name FROM pionex_accounts WHERE id = $1`, *accountID).Scan(&name)
 		snapshot.AccountName = name
-		credentials, credErr := accountService.Credentials(ctx, *accountID, true)
-		if credErr != nil {
-			snapshot.Error = credErr.Error()
+		// Cached per-account client: reuses the shared private rate budget
+		// instead of a fresh token bucket per snapshot (audit M1).
+		client, clientErr := s.PrivateClient(ctx, accountService, *accountID)
+		if clientErr != nil {
+			snapshot.Error = clientErr.Error()
 		} else {
-			client := pionex.NewClient("", credentials.APIKey, credentials.APISecret)
 			balCtx, balCancel := context.WithTimeout(ctx, 2*time.Second)
 			defer balCancel()
 			// Futures wallet: the margin grids trade with.
@@ -1035,7 +1036,7 @@ func (s *Service) listClosedBots(ctx context.Context, settingsID string) ([]Clos
 		SELECT id, COALESCE(bot_number, 0), symbol, direction, quote_investment,
 		       COALESCE(realized_pnl_usdt, 0), closed_reason, status, COALESCE(closed_at, updated_at)
 		FROM grid_bots
-		WHERE (autogrid_settings_id = $1 OR autogrid_settings_id IS NOT NULL)
+		WHERE autogrid_settings_id = $1
 		  AND status IN ('STOPPED', 'CANCELLED', 'COMPLETED', 'LIQUIDATED', 'FAILED')
 		ORDER BY COALESCE(closed_at, updated_at) DESC
 		LIMIT 100
@@ -1061,7 +1062,7 @@ func (s *Service) listClosedBots(ctx context.Context, settingsID string) ([]Clos
 		SELECT id, COALESCE(bot_number, 0), symbol, direction, quote_investment,
 		       COALESCE(realized_pnl_usdt, 0), closed_reason, status, COALESCE(closed_at, updated_at)
 		FROM paper_grid_bots
-		WHERE (settings_id = $1 OR settings_id IS NOT NULL)
+		WHERE settings_id = $1
 		  AND status IN ('STOPPED', 'COMPLETED', 'EMERGENCY_STOPPED')
 		ORDER BY COALESCE(closed_at, updated_at) DESC
 		LIMIT 100
@@ -1555,8 +1556,8 @@ func (s *Service) lastATRPct(ctx context.Context, symbol string) float64 {
 // fields fall back to the latest scanner recommendation for the symbol.
 type ManualDeployInput struct {
 	Symbol      string          `json:"symbol"`
-	Mode        string          `json:"mode"`        // PAPER, REAL or empty (= autopilot mode)
-	Direction   string          `json:"direction"`   // LONG, SHORT, NEUTRAL
+	Mode        string          `json:"mode"`      // PAPER, REAL or empty (= autopilot mode)
+	Direction   string          `json:"direction"` // LONG, SHORT, NEUTRAL
 	Leverage    int             `json:"leverage"`
 	Lower       decimal.Decimal `json:"lower"`
 	Upper       decimal.Decimal `json:"upper"`
@@ -1610,7 +1611,11 @@ func (s *Service) DeployManualBot(
 	}
 	// Fall back to the latest scanner recommendation for missing fields.
 	if !upper.GreaterThan(lower) {
-		var candidate struct{ lower, upper decimal.Decimal; trend string; leverage, row int }
+		var candidate struct {
+			lower, upper  decimal.Decimal
+			trend         string
+			leverage, row int
+		}
 		if err := s.db.QueryRow(ctx, `
 			SELECT COALESCE(lower_price, 0), COALESCE(upper_price, 0),
 			       COALESCE(recommended_trend, 'no_trend'),
@@ -1640,14 +1645,22 @@ func (s *Service) DeployManualBot(
 	}
 	// A grid that does not bracket the live price cannot trade and would be
 	// closed by the management loop as a range break on its first cycle.
-	if price, priceErr := s.perpPrice(ctx, input.Symbol); priceErr == nil &&
-		(price.LessThanOrEqual(lower) || price.GreaterThanOrEqual(upper)) {
+	// The price is also the paper bot's entry price, so fetch it once here.
+	livePrice, livePriceErr := s.perpPrice(ctx, input.Symbol)
+	if livePriceErr == nil &&
+		(livePrice.LessThanOrEqual(lower) || livePrice.GreaterThanOrEqual(upper)) {
 		return nil, "", fmt.Errorf(
 			"range %s–%s does not bracket the live PERP price %s",
-			lower.Round(8), upper.Round(8), price.Round(8))
+			lower.Round(8), upper.Round(8), livePrice.Round(8))
 	}
 
 	if mode == "PAPER" {
+		// A paper grid without a live entry price cannot be simulated: a
+		// zero entry would poison the supervision loop's PnL math.
+		if livePriceErr != nil {
+			return nil, "", fmt.Errorf(
+				"cannot fetch live PERP price for %s: %w", input.Symbol, livePriceErr)
+		}
 		botTarget, botMaxLoss := s.computeManualTargets(ctx, *settings, input.Symbol)
 		var id string
 		if err := s.db.QueryRow(ctx, `
@@ -1668,7 +1681,7 @@ func (s *Service) DeployManualBot(
 			RETURNING id
 		`, settings.ID, input.Symbol, dbDirection(trend), "ARITHMETIC",
 			lower, upper, row, leverage, settings.BudgetUSDT,
-			decimal.Zero, input.RangeSource, settings.PnLTargetMode,
+			livePrice, input.RangeSource, settings.PnLTargetMode,
 			botTarget, botMaxLoss,
 		).Scan(&id); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
@@ -1679,10 +1692,6 @@ func (s *Service) DeployManualBot(
 		}
 		if id == "" {
 			return nil, "", errors.New("a paper bot for this symbol is already RUNNING")
-		}
-		price, priceErr := s.perpPrice(ctx, input.Symbol)
-		if priceErr == nil {
-			_, _ = s.db.Exec(ctx, `UPDATE paper_grid_bots SET entry_price = $2, mark_price = $2 WHERE id = $1`, id, price)
 		}
 		return &ActiveBot{ID: id, Source: "PAPER", Symbol: input.Symbol,
 			Status: "RUNNING", Direction: dbDirection(trend),
@@ -1698,6 +1707,15 @@ func (s *Service) DeployManualBot(
 	accountID, err := s.resolveAccount(ctx)
 	if err != nil {
 		return nil, "", err
+	}
+	// Pin the resolved account so reconcile/stop flows supervise the bots
+	// this deploy creates even when no account was explicitly selected.
+	if settings.AccountID == nil {
+		_, _ = s.db.Exec(ctx, `
+			UPDATE autogrid_settings
+			SET account_id = $2, updated_at = NOW()
+			WHERE id = $1 AND account_id IS NULL
+		`, settings.ID, *accountID)
 	}
 	if err := s.risk.ValidateNewGrid(ctx, *accountID, input.Symbol, leverage, settings.BudgetUSDT); err != nil {
 		return nil, "", err
@@ -1734,12 +1752,18 @@ func (s *Service) DeployManualBot(
 	gridID, createErr := manager.CreateGridBot(ctx, grid.CreateInput{
 		AccountID:          *accountID,
 		AutoGridSettingsID: &settings.ID,
-		IdempotencyKey:     fmt.Sprintf("manual:%s:%d", input.Symbol, time.Now().UnixNano()),
-		Params:             params,
-		PnLTargetUSDT:      botTarget,
-		MaxLossUSDT:        botMaxLoss,
+		// Fresh per request: the transactional duplicate guard in
+		// CreateGridBot is what blocks double-click/retry re-creates.
+		IdempotencyKey: fmt.Sprintf("manual:%s:%d", input.Symbol, time.Now().UnixNano()),
+		Params:         params,
+		PnLTargetUSDT:  botTarget,
+		MaxLossUSDT:    botMaxLoss,
 	})
 	if createErr != nil {
+		if errors.Is(createErr, grid.ErrDuplicateActiveBot) {
+			return nil, "", fmt.Errorf(
+				"an active %s grid bot already exists — close it first on the bots screen", input.Symbol)
+		}
 		return nil, "", createErr
 	}
 	return &ActiveBot{ID: gridID, Source: "REAL", Symbol: input.Symbol,
@@ -1772,9 +1796,9 @@ type AISample struct {
 // distribution across the most liquid pairs. Nothing is applied
 // automatically — the operator reviews and saves.
 type AIFillSuggestion struct {
-	Sampled   []AISample      `json:"sampled"`
-	Suggested map[string]any  `json:"suggested"`
-	Notes     []string        `json:"notes"`
+	Sampled   []AISample     `json:"sampled"`
+	Suggested map[string]any `json:"suggested"`
+	Notes     []string       `json:"notes"`
 }
 
 // deriveAISettings maps the sampled AI Kit distribution onto autopilot

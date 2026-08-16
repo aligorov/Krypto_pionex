@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -533,13 +534,15 @@ func (s *Service) ConfirmCommand(
 	var expiresAt time.Time
 	var actorID string
 	var commandType string
+	var confirmAttempts int
 	var arguments map[string]any
 	err = tx.QueryRow(ctx, `
-		SELECT actor_id, command_type, arguments, confirmation_hash, confirmation_expires_at
+		SELECT actor_id, command_type, arguments, confirmation_hash, confirmation_expires_at,
+		       COALESCE(confirm_attempts, 0)
 		FROM control_commands
 		WHERE id = $1 AND status = 'CONFIRMATION_REQUIRED'
 		FOR UPDATE
-	`, commandID).Scan(&actorID, &commandType, &arguments, &storedHash, &expiresAt)
+	`, commandID).Scan(&actorID, &commandType, &arguments, &storedHash, &expiresAt, &confirmAttempts)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, errors.New("command is not awaiting confirmation")
 	}
@@ -557,7 +560,22 @@ func (s *Service) ConfirmCommand(
 		_ = tx.Commit(ctx)
 		return nil, errors.New("confirmation has expired")
 	}
-	if hashValue(confirmationCode) != storedHash {
+	// Constant-time compare plus a hard attempt budget: a 6-digit code must
+	// not be brute-forceable inside its validity window (audit SEC-008).
+	if subtle.ConstantTimeCompare([]byte(hashValue(confirmationCode)), []byte(storedHash)) != 1 {
+		confirmAttempts++
+		if confirmAttempts >= 5 {
+			_, _ = tx.Exec(ctx, `
+				UPDATE control_commands SET status = 'EXPIRED', confirm_attempts = $2, updated_at = NOW()
+				WHERE id = $1
+			`, commandID, confirmAttempts)
+			_ = tx.Commit(ctx)
+			return nil, errors.New("too many invalid confirmation attempts — command expired")
+		}
+		_, _ = tx.Exec(ctx, `
+			UPDATE control_commands SET confirm_attempts = $2, updated_at = NOW() WHERE id = $1
+		`, commandID, confirmAttempts)
+		_ = tx.Commit(ctx)
 		return nil, errors.New("invalid confirmation code")
 	}
 	if _, err := tx.Exec(ctx, `

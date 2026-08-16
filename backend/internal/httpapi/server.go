@@ -43,6 +43,7 @@ type Server struct {
 	control      *controlplane.Service
 	llm          *llm.Service
 	telegram     *telegram.Service
+	publicPionex *pionex.Client
 	version      string
 	commit       string
 	buildTime    string
@@ -67,9 +68,20 @@ func NewServer(
 		auth: authService, accounts: accountService,
 		autogrid: autoGridService, control: controlService,
 		llm: llmService, telegram: telegramService,
-		version: version, commit: commit, buildTime: buildTime,
+		publicPionex: sharedPublicClient(autoGridService),
+		version:      version, commit: commit, buildTime: buildTime,
 		mcpHandler: mcpHandler, frontendDist: frontendDist, logger: logger,
 	}
+}
+
+// sharedPublicClient reuses the AutoGrid scanner's public Pionex client so
+// every component stays inside one 10 req/s budget instead of bursting past
+// it with a fresh token bucket per request (audit M1).
+func sharedPublicClient(autoGridService *autogrid.Service) *pionex.Client {
+	if autoGridService != nil && autoGridService.PublicAPI() != nil {
+		return autoGridService.PublicAPI()
+	}
+	return pionex.NewClient("", "", "")
 }
 
 func (s *Server) Handler() http.Handler {
@@ -95,7 +107,7 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /api/llm/settings", s.withSession(http.HandlerFunc(s.getLLMSettings)))
 	mux.Handle("PUT /api/llm/settings", s.withRole(auth.RoleAdmin, http.HandlerFunc(s.updateLLMSettings)))
 	mux.Handle("POST /api/llm/test", s.withRole(auth.RoleAdmin, http.HandlerFunc(s.testLLMConnection)))
-	mux.Handle("POST /api/llm/models", s.withSession(http.HandlerFunc(s.listLLMModels)))
+	mux.Handle("POST /api/llm/models", s.withRole(auth.RoleAdmin, http.HandlerFunc(s.listLLMModels)))
 	mux.Handle("GET /api/llm/audits", s.withSession(http.HandlerFunc(s.listLLMAudits)))
 
 	mux.Handle("GET /api/dashboard", s.withSession(http.HandlerFunc(s.dashboard)))
@@ -1120,7 +1132,17 @@ func (s *Server) withSession(next http.Handler) http.Handler {
 		}
 		if mutatingMethod(r.Method) {
 			csrf := r.Header.Get("X-CSRF-Token")
-			if csrf != "" && !s.auth.ValidateCSRF(*principal, csrf) {
+			if csrf == "" {
+				// Cookie sessions carry ambient credentials that a forged
+				// cross-site request can ride on: the CSRF header is
+				// mandatory for them (audit SEC-007). Bearer / X-Session-
+				// Token callers use explicit headers a forged request
+				// cannot set, so they are exempt.
+				if cookieAuthenticated(r) {
+					writeJSON(w, http.StatusForbidden, map[string]string{"error": "missing CSRF token"})
+					return
+				}
+			} else if !s.auth.ValidateCSRF(*principal, csrf) {
 				writeJSON(w, http.StatusForbidden, map[string]string{"error": "invalid CSRF token"})
 				return
 			}
@@ -1145,6 +1167,19 @@ func extractSessionToken(r *http.Request) string {
 		return cookie.Value
 	}
 	return ""
+}
+
+// cookieAuthenticated reports whether the request relies on the ambient
+// session cookie (no explicit token headers) — the CSRF-relevant case.
+func cookieAuthenticated(r *http.Request) bool {
+	if strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") {
+		return false
+	}
+	if strings.TrimSpace(r.Header.Get("X-Session-Token")) != "" {
+		return false
+	}
+	_, err := r.Cookie(auth.SessionCookieName)
+	return err == nil
 }
 
 func (s *Server) requestMiddleware(next http.Handler) http.Handler {
@@ -1335,6 +1370,9 @@ func (s *Server) getLLMSettings(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, err)
 		return
 	}
+	// The raw provider key must never leave the server (audit SEC-004);
+	// the masked value is already part of the payload.
+	settings.APIKey = ""
 	writeJSON(w, http.StatusOK, settings)
 }
 
@@ -1352,6 +1390,7 @@ func (s *Server) updateLLMSettings(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, err)
 		return
 	}
+	settings.APIKey = ""
 	s.auditMutation(r, "llm.settings.update", "llm_settings", "1", map[string]any{
 		"enabled":  settings.Enabled,
 		"provider": settings.Provider,
@@ -1440,7 +1479,7 @@ func (s *Server) getMarketCandles(w http.ResponseWriter, r *http.Request) {
 	}
 
 	pionexSymbol := strings.ReplaceAll(symbol, "/", "_")
-	client := pionex.NewClient("", "", "")
+	client := s.publicPionex
 	klines, err := client.GetKlines(r.Context(), pionexSymbol, interval, limit)
 	if err != nil {
 		altSymbol := strings.TrimSuffix(pionexSymbol, "_PERP")
@@ -1497,6 +1536,8 @@ func (s *Server) getTelegramSettings(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, err)
 		return
 	}
+	// The raw bot token must never leave the server (audit SEC-003).
+	settings.BotToken = telegram.MaskToken(settings.BotToken)
 	writeJSON(w, http.StatusOK, map[string]any{"data": settings})
 }
 
@@ -1526,6 +1567,13 @@ func (s *Server) testTelegramConnection(w http.ResponseWriter, r *http.Request) 
 	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
 		s.fail(w, r, errors.New("invalid JSON payload"))
 		return
+	}
+	// The form shows only a masked token: an empty/masked input means
+	// "test the stored token".
+	if strings.TrimSpace(input.BotToken) == "" || strings.Contains(input.BotToken, "•") {
+		if stored, err := s.telegram.GetSettings(r.Context()); err == nil {
+			input.BotToken = stored.BotToken
+		}
 	}
 	if err := s.telegram.TestConnection(r.Context(), input.BotToken, input.ChatID, input.TopicID); err != nil {
 		s.fail(w, r, err)

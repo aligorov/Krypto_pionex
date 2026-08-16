@@ -25,9 +25,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-var Version = "1.1.0"
-
-const defaultDatabaseURL = "postgres://pionex:pionex_password@localhost:5432/pionex_bot?sslmode=disable"
+var Version = "1.1.1"
 
 func main() {
 	tokenFile := flag.String("token-file", "", "path to a file containing one MCP API token")
@@ -50,7 +48,8 @@ func main() {
 
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {
-		databaseURL = defaultDatabaseURL
+		// No credentials inside the binary (Zero-ENV policy, audit SEC-001).
+		exitError(errors.New("DATABASE_URL is required"))
 	}
 	db, err := pgxpool.New(startupCtx, databaseURL)
 	if err != nil {

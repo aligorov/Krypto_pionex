@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -27,6 +28,49 @@ func NewClient() *Client {
 	}
 }
 
+// ValidateBaseURL enforces that a custom base URL points at the official API
+// host of the provider. Without this gate, a request could point the server
+// at an attacker-controlled host and exfiltrate the stored API key that is
+// attached to every provider call (audit SEC-005).
+func ValidateBaseURL(provider, baseURL string) error {
+	baseURL = strings.TrimSpace(baseURL)
+	if baseURL == "" {
+		return nil
+	}
+	parsed, err := url.Parse(baseURL)
+	if err != nil || parsed.Scheme != "https" || parsed.Host == "" {
+		return errors.New("base URL must be a valid https:// URL")
+	}
+	host := strings.ToLower(parsed.Hostname())
+	var official string
+	switch provider {
+	case ProviderGemini:
+		official = "generativelanguage.googleapis.com"
+	case ProviderAnthropic:
+		official = "api.anthropic.com"
+	case ProviderOpenRouter:
+		official = "openrouter.ai"
+	case ProviderCustom:
+		// Custom providers may use any public https host, but never an
+		// internal address the stored key must not be sent to.
+		if ip := net.ParseIP(host); ip != nil &&
+			(ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast()) {
+			return errors.New("custom base URL must not point at internal addresses")
+		}
+		if host == "localhost" || strings.HasSuffix(host, ".local") ||
+			strings.HasSuffix(host, ".internal") {
+			return errors.New("custom base URL must not point at internal addresses")
+		}
+		return nil
+	default:
+		return fmt.Errorf("unsupported LLM provider: %s", provider)
+	}
+	if host != official {
+		return fmt.Errorf("base URL host must be %s for provider %s", official, provider)
+	}
+	return nil
+}
+
 // ExecutePrompt sends the system instructions and user prompt to the configured LLM provider.
 func (c *Client) ExecutePrompt(
 	ctx context.Context,
@@ -35,6 +79,9 @@ func (c *Client) ExecutePrompt(
 ) (string, int, error) {
 	if strings.TrimSpace(settings.APIKey) == "" {
 		return "", 0, errors.New("LLM API key is not configured")
+	}
+	if err := ValidateBaseURL(settings.Provider, settings.BaseURL); err != nil {
+		return "", 0, fmt.Errorf("LLM base URL rejected: %w", err)
 	}
 
 	start := time.Now()
@@ -73,7 +120,9 @@ func (c *Client) callGemini(
 	if baseURL == "" {
 		baseURL = "https://generativelanguage.googleapis.com/v1beta"
 	}
-	endpoint := fmt.Sprintf("%s/models/%s:generateContent?key=%s", baseURL, url.PathEscape(model), url.QueryEscape(settings.APIKey))
+	// The API key travels in the x-goog-api-key header only: URLs are logged
+	// by proxies and log pipelines, so it must never be a query parameter.
+	endpoint := fmt.Sprintf("%s/models/%s:generateContent", baseURL, url.PathEscape(model))
 
 	type part struct {
 		Text string `json:"text"`
@@ -351,13 +400,16 @@ func (c *Client) callOpenAICompatible(
 
 // ListAvailableModels queries the provider's API for the list of available models.
 func (c *Client) ListAvailableModels(ctx context.Context, settings Settings) ([]string, error) {
+	if err := ValidateBaseURL(settings.Provider, settings.BaseURL); err != nil {
+		return nil, fmt.Errorf("LLM base URL rejected: %w", err)
+	}
 	switch settings.Provider {
 	case ProviderGemini:
 		baseURL := settings.BaseURL
 		if baseURL == "" {
 			baseURL = "https://generativelanguage.googleapis.com/v1beta"
 		}
-		endpoint := fmt.Sprintf("%s/models?key=%s", baseURL, url.QueryEscape(settings.APIKey))
+		endpoint := fmt.Sprintf("%s/models", baseURL)
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 		if err != nil {
 			return nil, err

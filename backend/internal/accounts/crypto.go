@@ -15,11 +15,12 @@ type CryptoManager struct {
 	masterKey []byte
 }
 
-// NewCryptoManager initializes CryptoManager with a 32-byte key.
+// NewCryptoManager initializes CryptoManager with a 32-byte key. An empty
+// key is an error: silently defaulting to a publicly committed key would
+// encrypt every secret with a known key (audit SEC-011).
 func NewCryptoManager(keyHex string) (*CryptoManager, error) {
 	if keyHex == "" {
-		// Default secure 32-byte key for local DB vault
-		keyHex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+		return nil, errors.New("master key is required: provide a 64-character hex string (32 bytes)")
 	}
 	key, err := hex.DecodeString(keyHex)
 	if err != nil || len(key) != 32 {

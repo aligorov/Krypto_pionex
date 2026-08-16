@@ -25,6 +25,10 @@ const (
 	StateFailed            = "FAILED"
 )
 
+// ErrDuplicateActiveBot is returned when the account already has a live grid
+// on this symbol; callers map it to an operator-facing message.
+var ErrDuplicateActiveBot = errors.New("an active grid bot already exists for this account and symbol")
+
 type LifecycleManager struct {
 	db           *pgxpool.Pool
 	pionexClient *pionex.Client
@@ -72,43 +76,85 @@ func (manager *LifecycleManager) CreateGridBot(
 		extraMargin = *input.Params.BUOrderData.ExtraMargin
 	}
 	var gridID string
-	err = manager.db.QueryRow(ctx, `
-		INSERT INTO grid_bots (
-			account_id, autogrid_settings_id, symbol, status, direction,
-			grid_type, lower_price, upper_price, grid_num, leverage,
-			quote_investment, extra_margin, stop_loss, take_profit,
-			request_fingerprint, execution_mode, reconciliation_state,
-			pnl_target_usdt, max_loss_usdt
-		) VALUES (
-			$1, $2, $3, 'PENDING_SUBMISSION', $4, $5, $6, $7, $8, $9,
-			$10, $11, $12, $13, $14, 'REAL', 'PENDING', $15, $16
-		)
-		ON CONFLICT (request_fingerprint) DO NOTHING
-		RETURNING id
-	`, input.AccountID, input.AutoGridSettingsID, symbol,
-		databaseDirection(input.Params.BUOrderData.Trend),
-		strings.ToUpper(input.Params.BUOrderData.GridType),
-		input.Params.BUOrderData.Bottom, input.Params.BUOrderData.Top,
-		input.Params.BUOrderData.Row, input.Params.BUOrderData.Leverage,
-		input.Params.BUOrderData.QuoteInvestment,
-		extraMargin,
-		input.Params.BUOrderData.LossStop,
-		input.Params.BUOrderData.ProfitStop,
-		fingerprint,
-		input.PnLTargetUSDT,
-		input.MaxLossUSDT,
-	).Scan(&gridID)
-	if errors.Is(err, pgx.ErrNoRows) {
-		err = manager.db.QueryRow(ctx, `
-			SELECT id FROM grid_bots WHERE request_fingerprint = $1
-		`, fingerprint).Scan(&gridID)
-		if err != nil {
-			return "", fmt.Errorf("load idempotent grid submission: %w", err)
+	// The duplicate guard and the insert must be serialized per
+	// account+symbol: two overlapping scans (or a double-click) both pass
+	// their EXISTS pre-checks before either row is committed, so the final
+	// gate has to be transactional.
+	idempotentReplay := false
+	err = func() error {
+		tx, txErr := manager.db.Begin(ctx)
+		if txErr != nil {
+			return fmt.Errorf("begin grid create transaction: %w", txErr)
 		}
-		return gridID, nil
-	}
+		defer tx.Rollback(ctx)
+		if _, lockErr := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`,
+			input.AccountID+"\x00"+symbol); lockErr != nil {
+			return fmt.Errorf("acquire grid create lock: %w", lockErr)
+		}
+		var activeID string
+		scanErr := tx.QueryRow(ctx, `
+			SELECT id FROM grid_bots
+			WHERE account_id = $1 AND symbol = $2
+			  AND status IN (
+				'PENDING_SUBMISSION', 'SUBMISSION_UNKNOWN', 'RUNNING',
+				'STOP_REQUESTED', 'STOPPING'
+			  )
+			LIMIT 1
+		`, input.AccountID, symbol).Scan(&activeID)
+		if scanErr == nil {
+			return fmt.Errorf("%w: bot id %s", ErrDuplicateActiveBot, activeID)
+		}
+		if !errors.Is(scanErr, pgx.ErrNoRows) {
+			return fmt.Errorf("check duplicate active grid: %w", scanErr)
+		}
+		insertErr := tx.QueryRow(ctx, `
+			INSERT INTO grid_bots (
+				account_id, autogrid_settings_id, symbol, status, direction,
+				grid_type, lower_price, upper_price, grid_num, leverage,
+				quote_investment, extra_margin, stop_loss, take_profit,
+				request_fingerprint, execution_mode, reconciliation_state,
+				pnl_target_usdt, max_loss_usdt
+			) VALUES (
+				$1, $2, $3, 'PENDING_SUBMISSION', $4, $5, $6, $7, $8, $9,
+				$10, $11, $12, $13, $14, 'REAL', 'PENDING', $15, $16
+			)
+			ON CONFLICT (request_fingerprint) DO NOTHING
+			RETURNING id
+		`, input.AccountID, input.AutoGridSettingsID, symbol,
+			databaseDirection(input.Params.BUOrderData.Trend),
+			strings.ToUpper(input.Params.BUOrderData.GridType),
+			input.Params.BUOrderData.Bottom, input.Params.BUOrderData.Top,
+			input.Params.BUOrderData.Row, input.Params.BUOrderData.Leverage,
+			input.Params.BUOrderData.QuoteInvestment,
+			extraMargin,
+			input.Params.BUOrderData.LossStop,
+			input.Params.BUOrderData.ProfitStop,
+			fingerprint,
+			input.PnLTargetUSDT,
+			input.MaxLossUSDT,
+		).Scan(&gridID)
+		if errors.Is(insertErr, pgx.ErrNoRows) {
+			loadErr := tx.QueryRow(ctx, `
+				SELECT id FROM grid_bots WHERE request_fingerprint = $1
+			`, fingerprint).Scan(&gridID)
+			if loadErr != nil {
+				return fmt.Errorf("load idempotent grid submission: %w", loadErr)
+			}
+			idempotentReplay = true
+			return nil
+		}
+		if insertErr != nil {
+			return fmt.Errorf("record pending grid bot: %w", insertErr)
+		}
+		return tx.Commit(ctx)
+	}()
 	if err != nil {
-		return "", fmt.Errorf("record pending grid bot: %w", err)
+		return "", err
+	}
+	if idempotentReplay {
+		// A previous submission with the same fingerprint already exists;
+		// the remote create must not be repeated.
+		return gridID, nil
 	}
 
 	result, remoteErr := manager.pionexClient.CreateFuturesGridBot(ctx, input.Params)
