@@ -123,13 +123,13 @@ func (worker *Worker) processNext(ctx context.Context) error {
 }
 
 func (worker *Worker) claim(ctx context.Context) (*queuedCommand, error) {
-	// Auto-expire stale commands from crashed processes, old queue items (>5 min), or excessive retries
+	// Auto-expire stale commands from crashed processes, old queue items (>15 min), or excessive retries
 	_, _ = worker.db.Exec(ctx, `
 		UPDATE control_commands
 		SET status = 'EXPIRED', updated_at = NOW()
-		WHERE (status = 'QUEUED' AND created_at < NOW() - INTERVAL '5 minutes')
-		   OR (status = 'EXECUTING' AND (lease_expiry IS NULL OR lease_expiry < NOW()))
-		   OR (attempts >= 3 AND status IN ('QUEUED', 'EXECUTING'))
+		WHERE (status = 'QUEUED' AND created_at < NOW() - INTERVAL '15 minutes')
+		   OR (status = 'EXECUTING' AND lease_expiry IS NOT NULL AND lease_expiry < NOW())
+		   OR (attempts >= 5 AND status IN ('QUEUED', 'EXECUTING'))
 	`)
 	var command queuedCommand
 	err := worker.db.QueryRow(ctx, `
@@ -148,7 +148,7 @@ func (worker *Worker) claim(ctx context.Context) (*queuedCommand, error) {
 		)
 		UPDATE control_commands AS command
 		SET status = 'EXECUTING', lease_owner = $1,
-		    lease_expiry = NOW() + INTERVAL '2 minutes',
+		    lease_expiry = NOW() + INTERVAL '10 minutes',
 		    attempts = attempts + 1, updated_at = NOW()
 		FROM next_command
 		WHERE command.id = next_command.id
@@ -206,7 +206,7 @@ func (worker *Worker) start(ctx context.Context, command *queuedCommand) error {
 	}
 	// Run scan and deploy in background without blocking the state transition
 	go func() {
-		bgCtx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+		bgCtx, cancel := context.WithTimeout(context.Background(), 6*time.Minute)
 		defer cancel()
 		if _, err := worker.scanAndDeploy(bgCtx, command); err != nil {
 			worker.logger.Error("initial AutoGrid scanAndDeploy failed", "component", "autogrid_worker", "error", err)
@@ -713,8 +713,8 @@ func (worker *Worker) deployReal(
 		}
 
 		trend := strings.ToLower(strings.TrimSpace(candidate.RecommendedTrend))
-		if trend == "no_trend" || trend == "" {
-			trend = "neutral"
+		if trend == "neutral" || trend == "" {
+			trend = "no_trend"
 		}
 
 		atrPrice := candidate.CurrentPrice.Mul(decimal.NewFromFloat(atrPct / 100.0))
@@ -774,7 +774,7 @@ func (worker *Worker) deployReal(
 			targetVal := botTarget.Round(2)
 			data.ProfitStopType = "profit_amount"
 			data.ProfitStop = &targetVal
-		} else if settings.SmartPNLEnabled && trend != "neutral" {
+		} else if settings.SmartPNLEnabled && trend != "no_trend" {
 			profit := upperPrice
 			if trend == "short" {
 				profit = lowerPrice

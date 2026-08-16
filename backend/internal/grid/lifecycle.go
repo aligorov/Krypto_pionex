@@ -57,8 +57,8 @@ func (manager *LifecycleManager) CreateGridBot(
 	baseCoin := strings.TrimSuffix(strings.TrimSuffix(input.Params.Base, ".PERP"), "_PERP")
 	symbol := fmt.Sprintf("%s_%s_PERP", baseCoin, input.Params.Quote)
 	input.Params.Base = fmt.Sprintf("%s.PERP", baseCoin)
-	if input.Params.BUOrderData.Trend == "no_trend" || input.Params.BUOrderData.Trend == "" {
-		input.Params.BUOrderData.Trend = "neutral"
+	if input.Params.BUOrderData.Trend == "neutral" || input.Params.BUOrderData.Trend == "" {
+		input.Params.BUOrderData.Trend = "no_trend"
 	}
 	if input.Params.BUOrderData.GridTypeCamel == "" {
 		input.Params.BUOrderData.GridTypeCamel = input.Params.BUOrderData.GridType
