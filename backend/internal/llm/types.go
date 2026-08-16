@@ -27,6 +27,7 @@ type Settings struct {
 	ThinkingEnabled         bool      `json:"thinkingEnabled"`
 	RequireApprovalToDeploy bool      `json:"requireApprovalToDeploy"`
 	RequireAuditForReal     bool      `json:"requireAuditForReal"`
+	GroundingEnabled        bool      `json:"groundingEnabled"`
 	AuditIntervalSeconds    int       `json:"auditIntervalSeconds"`
 	CreatedAt               time.Time `json:"createdAt"`
 	UpdatedAt               time.Time `json:"updatedAt"`
@@ -51,11 +52,11 @@ type AuditRecord struct {
 
 // RecommendedGridParams carries quantitative grid parameters parsed from the LLM.
 type RecommendedGridParams struct {
-	LowerPrice         decimal.Decimal `json:"lower_price"`
-	UpperPrice         decimal.Decimal `json:"upper_price"`
-	GridCount          int             `json:"grid_count"`
-	Leverage           int             `json:"leverage"`
-	StopLoss           decimal.Decimal `json:"stop_loss"`
+	LowerPrice          decimal.Decimal `json:"lower_price"`
+	UpperPrice          decimal.Decimal `json:"upper_price"`
+	GridCount           int             `json:"grid_count"`
+	Leverage            int             `json:"leverage"`
+	StopLoss            decimal.Decimal `json:"stop_loss"`
 	TakeProfitTargetUSD decimal.Decimal `json:"take_profit_target_usd"`
 }
 
@@ -99,21 +100,21 @@ type CandleSummary struct {
 
 // CandidateInput is passed to the LLM evaluator to audit a symbol.
 type CandidateInput struct {
-	Symbol               string          `json:"symbol"`
-	CurrentPrice         float64         `json:"current_price"`
-	Volume24h            float64         `json:"volume_24h_usd"`
-	VolatilityParkinson  float64         `json:"volatility_parkinson_pct"`
-	ATRPct               float64         `json:"atr_pct"`
-	ADX                  float64         `json:"adx"`
-	Choppiness           float64         `json:"choppiness_index"`
-	EMASlopePct          float64         `json:"ema_slope_pct"`
-	IsSqueeze            bool            `json:"is_bbw_squeeze"`
-	Hurst                float64         `json:"hurst_exponent"`
-	ConfluenceVerdict    string          `json:"confluence_verdict"`
-	RecommendedTrend     string          `json:"recommended_trend"`
-	ProposedLowerPrice   float64         `json:"proposed_lower_price"`
-	ProposedUpperPrice   float64         `json:"proposed_upper_price"`
-	ProposedGridCount    int             `json:"proposed_grid_count"`
-	ProposedLeverage     int             `json:"proposed_leverage"`
-	RecentCandles15m     []CandleSummary `json:"recent_candles_15m"`
+	Symbol              string          `json:"symbol"`
+	CurrentPrice        float64         `json:"current_price"`
+	Volume24h           float64         `json:"volume_24h_usd"`
+	VolatilityParkinson float64         `json:"volatility_parkinson_pct"`
+	ATRPct              float64         `json:"atr_pct"`
+	ADX                 float64         `json:"adx"`
+	Choppiness          float64         `json:"choppiness_index"`
+	EMASlopePct         float64         `json:"ema_slope_pct"`
+	IsSqueeze           bool            `json:"is_bbw_squeeze"`
+	Hurst               float64         `json:"hurst_exponent"`
+	ConfluenceVerdict   string          `json:"confluence_verdict"`
+	RecommendedTrend    string          `json:"recommended_trend"`
+	ProposedLowerPrice  float64         `json:"proposed_lower_price"`
+	ProposedUpperPrice  float64         `json:"proposed_upper_price"`
+	ProposedGridCount   int             `json:"proposed_grid_count"`
+	ProposedLeverage    int             `json:"proposed_leverage"`
+	RecentCandles15m    []CandleSummary `json:"recent_candles_15m"`
 }

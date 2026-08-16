@@ -509,6 +509,7 @@ export interface LLMSettings {
   thinkingEnabled: boolean;
   requireApprovalToDeploy: boolean;
   requireAuditForReal?: boolean;
+  groundingEnabled?: boolean;
   auditIntervalSeconds: number;
   updatedAt: string;
 }

@@ -98,6 +98,7 @@ export default function LLMSettings() {
   const [temperature, setTemperature] = useState(0.2);
   const [thinkingEnabled, setThinkingEnabled] = useState(true);
   const [requireAuditForReal, setRequireAuditForReal] = useState(false);
+  const [groundingEnabled, setGroundingEnabled] = useState(true);
   const [availableModels, setAvailableModels] = useState<string[]>([]);
   const [loadingModels, setLoadingModels] = useState(false);
 
@@ -117,6 +118,7 @@ export default function LLMSettings() {
       setTemperature(data.temperature ?? 0.2);
       setThinkingEnabled(data.thinkingEnabled ?? true);
       setRequireAuditForReal(data.requireAuditForReal ?? false);
+      setGroundingEnabled(data.groundingEnabled ?? true);
       setApiKey('');
       setTestResult(null);
       setAvailableModels([]);
@@ -222,6 +224,7 @@ export default function LLMSettings() {
           temperature,
           thinkingEnabled,
           requireAuditForReal,
+          groundingEnabled,
           auditIntervalSeconds: 3600,
         }),
       });
@@ -406,6 +409,16 @@ export default function LLMSettings() {
                   <small className="muted" style={{ display: 'block' }}>Нет ответа LLM = кандидат отклонён. Деплой на реальные деньги только после успешного аудита</small>
                 </span>
                 <input type="checkbox" checked={requireAuditForReal} onChange={(e) => setRequireAuditForReal(e.target.checked)} style={{ transform: 'scale(1.2)', cursor: 'pointer' }} />
+              </label>
+              <label style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '0.75rem' }}>
+                <span>
+                  <strong style={{ fontSize: '0.9rem' }}>Живой поиск новостей (google_search)</strong>
+                  <small className="muted" style={{ display: 'block' }}>
+                    Модель гуглит токен перед вердиктом: анлоки, делисты, эксплойты — по факту, а не по памяти.
+                    Только для Gemini; при сбое инструмента автоматический откат на обычный режим
+                  </small>
+                </span>
+                <input type="checkbox" checked={groundingEnabled} onChange={(e) => setGroundingEnabled(e.target.checked)} style={{ transform: 'scale(1.2)', cursor: 'pointer' }} />
               </label>
               <label style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '0.75rem' }}>
                 <span>

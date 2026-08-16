@@ -136,10 +136,14 @@ func (c *Client) callGemini(
 		ResponseMimeType string         `json:"responseMimeType,omitempty"`
 		ThinkingConfig   map[string]any `json:"thinkingConfig,omitempty"`
 	}
+	type geminiTool struct {
+		GoogleSearch map[string]any `json:"google_search,omitempty"`
+	}
 	type geminiReq struct {
 		SystemInstruction *content          `json:"system_instruction,omitempty"`
 		Contents          []content         `json:"contents"`
 		GenerationConfig  *generationConfig `json:"generationConfig,omitempty"`
+		Tools             []geminiTool      `json:"tools,omitempty"`
 	}
 
 	reqBody := geminiReq{
@@ -150,9 +154,18 @@ func (c *Client) callGemini(
 			},
 		},
 		GenerationConfig: &generationConfig{
-			Temperature:      settings.Temperature,
-			ResponseMimeType: "application/json",
+			Temperature: settings.Temperature,
 		},
+	}
+	// google_search grounding turns the catalyst investigation from
+	// memory-recall into a live web lookup. JSON response mode is mutually
+	// exclusive with tools on this API, so with grounding enabled the mime
+	// type is dropped and the strict prompt + CleanJSONResponse take over.
+	grounded := settings.GroundingEnabled
+	if grounded {
+		reqBody.Tools = []geminiTool{{GoogleSearch: map[string]any{}}}
+	} else {
+		reqBody.GenerationConfig.ResponseMimeType = "application/json"
 	}
 	if systemPrompt != "" {
 		reqBody.SystemInstruction = &content{
@@ -165,31 +178,46 @@ func (c *Client) callGemini(
 		}
 	}
 
-	jsonBytes, err := json.Marshal(reqBody)
-	if err != nil {
-		return "", fmt.Errorf("marshal gemini request: %w", err)
+	sendGemini := func(body geminiReq) ([]byte, int, error) {
+		jsonBytes, marshalErr := json.Marshal(body)
+		if marshalErr != nil {
+			return nil, 0, fmt.Errorf("marshal gemini request: %w", marshalErr)
+		}
+		req, reqErr := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(jsonBytes))
+		if reqErr != nil {
+			return nil, 0, reqErr
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("x-goog-api-key", strings.TrimSpace(settings.APIKey))
+		resp, doErr := c.httpClient.Do(req)
+		if doErr != nil {
+			return nil, 0, fmt.Errorf("gemini network error: %w", doErr)
+		}
+		defer resp.Body.Close()
+		respBytes, readErr := io.ReadAll(resp.Body)
+		if readErr != nil {
+			return nil, resp.StatusCode, fmt.Errorf("read gemini response: %w", readErr)
+		}
+		return respBytes, resp.StatusCode, nil
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(jsonBytes))
+	respBytes, statusCode, err := sendGemini(reqBody)
 	if err != nil {
 		return "", err
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("x-goog-api-key", strings.TrimSpace(settings.APIKey))
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("gemini network error: %w", err)
-	}
-	defer resp.Body.Close()
-
-	respBytes, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", fmt.Errorf("read gemini response: %w", err)
+	// Some API revisions reject the google_search tool combination: retry
+	// once without grounding (JSON mode restored) before surfacing errors.
+	if grounded && statusCode >= 400 {
+		fallbackBody := reqBody
+		fallbackBody.Tools = nil
+		fallbackBody.GenerationConfig.ResponseMimeType = "application/json"
+		if retryBytes, retryStatus, retryErr := sendGemini(fallbackBody); retryErr == nil && retryStatus < 400 {
+			respBytes, statusCode = retryBytes, retryStatus
+		}
 	}
 
-	if resp.StatusCode >= 400 {
-		return "", fmt.Errorf("gemini API error [%d]: %s", resp.StatusCode, string(respBytes))
+	if statusCode >= 400 {
+		return "", fmt.Errorf("gemini API error [%d]: %s", statusCode, string(respBytes))
 	}
 
 	var geminiResp struct {
@@ -329,9 +357,9 @@ func (c *Client) callOpenAICompatible(
 		Content string `json:"content"`
 	}
 	type openAIReq struct {
-		Model          string  `json:"model"`
-		Messages       []msg   `json:"messages"`
-		Temperature    float64 `json:"temperature"`
+		Model          string            `json:"model"`
+		Messages       []msg             `json:"messages"`
+		Temperature    float64           `json:"temperature"`
 		ResponseFormat map[string]string `json:"response_format,omitempty"`
 	}
 

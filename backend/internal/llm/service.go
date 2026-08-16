@@ -36,13 +36,14 @@ func (s *Service) GetSettings(ctx context.Context) (*Settings, error) {
 	err := s.db.QueryRow(ctx, `
 		SELECT id, enabled, provider, api_key, model, base_url,
 		       temperature, thinking_enabled, require_approval_to_deploy,
-		       require_audit_for_real,
+		       require_audit_for_real, grounding_enabled,
 		       audit_interval_seconds, created_at, updated_at
 		FROM llm_settings WHERE id = 1
 	`).Scan(
 		&item.ID, &item.Enabled, &item.Provider, &item.APIKey, &item.Model,
 		&item.BaseURL, &item.Temperature, &item.ThinkingEnabled,
 		&item.RequireApprovalToDeploy, &item.RequireAuditForReal,
+		&item.GroundingEnabled,
 		&item.AuditIntervalSeconds,
 		&item.CreatedAt, &item.UpdatedAt,
 	)
@@ -90,12 +91,14 @@ func (s *Service) UpdateSettings(ctx context.Context, patch Settings) (*Settings
 		    thinking_enabled = $7,
 		    require_approval_to_deploy = $8,
 		    require_audit_for_real = $10,
+		    grounding_enabled = $11,
 		    audit_interval_seconds = $9,
 		    updated_at = NOW()
 		WHERE id = 1
 	`, patch.Enabled, provider, apiKey, model,
 		strings.TrimSpace(patch.BaseURL), patch.Temperature, patch.ThinkingEnabled,
-		patch.RequireApprovalToDeploy, patch.AuditIntervalSeconds, patch.RequireAuditForReal)
+		patch.RequireApprovalToDeploy, patch.AuditIntervalSeconds, patch.RequireAuditForReal,
+		patch.GroundingEnabled)
 	if err != nil {
 		return nil, fmt.Errorf("update llm settings: %w", err)
 	}

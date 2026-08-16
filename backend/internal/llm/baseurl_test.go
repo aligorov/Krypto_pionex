@@ -22,12 +22,12 @@ func TestValidateBaseURL(t *testing.T) {
 		// Key exfiltration: official provider with attacker host.
 		{ProviderGemini, "https://attacker.example"},
 		{ProviderAnthropic, "https://api.anthropic.com.evil.io"},
-		{ProviderOpenRouter, "http://openrouter.ai"},          // not https
-		{ProviderGemini, "https://198.51.100.1"},              // arbitrary IP
-		{ProviderCustom, "https://localhost:8080"},            // internal
-		{ProviderCustom, "https://10.0.0.5/v1"},               // private range
-		{ProviderCustom, "https://192.168.1.10/v1"},           // private range
-		{ProviderGemini, "not a url at all"},                  // unparseable
+		{ProviderOpenRouter, "http://openrouter.ai"}, // not https
+		{ProviderGemini, "https://198.51.100.1"},     // arbitrary IP
+		{ProviderCustom, "https://localhost:8080"},   // internal
+		{ProviderCustom, "https://10.0.0.5/v1"},      // private range
+		{ProviderCustom, "https://192.168.1.10/v1"},  // private range
+		{ProviderGemini, "not a url at all"},         // unparseable
 	}
 	for _, item := range rejected {
 		if err := ValidateBaseURL(item.provider, item.baseURL); err == nil {

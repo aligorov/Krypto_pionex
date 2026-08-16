@@ -24,13 +24,21 @@ export default function Candidates({ canOperate: _canOperate }: Props) {
   const [sortKey, setSortKey] = useState<SortKey>('createdAt');
   const [sortOrder, setSortOrder] = useState<SortOrder>('desc');
   const [selectedForChart, setSelectedForChart] = useState<AutoGridCandidate | null>(null);
+  const [lastSyncAt, setLastSyncAt] = useState<Date | null>(null);
+  const [syncError, setSyncError] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     try {
       const result = await api<AutoGridState>('/api/autogrid');
       setState(result);
       setCachedAutoGrid(result);
+      setLastSyncAt(new Date());
+      setSyncError(null);
     } catch (loadError) {
+      // Silent cache fallback must stay VISIBLE: a frozen table with no
+      // warning reads as "no new candidates" while the truth is "data not
+      // refreshing".
+      setSyncError(describeError(loadError));
       if (!getCachedAutoGrid()) {
         setError(describeError(loadError));
       }
@@ -156,11 +164,28 @@ export default function Candidates({ canOperate: _canOperate }: Props) {
         </div>
       )}
 
+      {syncError && (
+        <div className="banner error" style={{ marginBottom: '0.75rem' }}>
+          ⚠ Данные не обновляются{lastSyncAt ? ` (последняя успешная загрузка ${lastSyncAt.toLocaleTimeString()})` : ''}: {syncError}
+        </div>
+      )}
+      {lastSyncAt && !syncError && new Date().getTime() - lastSyncAt.getTime() > 60000 && (
+        <div className="banner error" style={{ marginBottom: '0.75rem' }}>
+          ⚠ Экран давно не обновлялся ({lastSyncAt.toLocaleTimeString()}) — обнови страницу (Ctrl+Shift+R)
+        </div>
+      )}
+
       <div className="panel">
         <div className="panel-heading" style={{ flexWrap: 'wrap', gap: '1rem' }}>
           <div>
             <span className="eyebrow">LAST SCAN</span>
             <h3>Кандидаты последнего скана ({accepted.length})</h3>
+            <small className="muted" style={{ display: 'block', marginTop: '2px' }}>
+              {state?.lastScan?.completedAt
+                ? `Скан завершён ${new Date(state.lastScan.completedAt).toLocaleTimeString()}`
+                : 'Скан ещё не завершался'}
+              {lastSyncAt ? ` · экран обновлён ${lastSyncAt.toLocaleTimeString()}` : ''}
+            </small>
           </div>
 
           <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', flexWrap: 'wrap' }}>
