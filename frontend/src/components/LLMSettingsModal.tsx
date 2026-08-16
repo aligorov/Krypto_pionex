@@ -113,7 +113,7 @@ export function LLMSettingsModal({ onClose, onSaved }: Props) {
         method: 'POST',
         body: JSON.stringify({
           provider,
-          apiKey: apiKey.trim() || settings?.apiKeyMasked,
+          apiKey: apiKey.trim() || undefined,
           baseUrl,
         }),
       });
@@ -139,7 +139,7 @@ export function LLMSettingsModal({ onClose, onSaved }: Props) {
         method: 'POST',
         body: JSON.stringify({
           provider,
-          apiKey: apiKey.trim() || settings?.apiKeyMasked,
+          apiKey: apiKey.trim() || undefined,
           model,
           baseUrl,
           temperature,
