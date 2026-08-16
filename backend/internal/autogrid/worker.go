@@ -486,9 +486,12 @@ func (worker *Worker) deployPaper(
 			candidate.CurrentPrice, atrPrice, 1.5,
 		)
 
-		dynLev := ComputeDynamicLeverage(
-			candidate.CurrentPrice, antiHuntStop, atrPct, 0.85, settings.Leverage,
-		)
+		botLev := settings.Leverage
+		if settings.AdaptiveLeverageEnabled {
+			botLev = ComputeDynamicLeverage(
+				candidate.CurrentPrice, antiHuntStop, atrPct, 0.85, settings.Leverage,
+			)
+		}
 
 		confluence := EvaluateConfluence(candidate, nil, nil)
 
@@ -552,7 +555,7 @@ func (worker *Worker) deployPaper(
 		`, settings.ID, candidate.ID, candidate.Symbol,
 			databaseTrend(candidate.RecommendedTrend), gridType,
 			mesh.LowerPrice, mesh.UpperPrice, mesh.GridNum,
-			dynLev, settings.BudgetUSDT,
+			botLev, settings.BudgetUSDT,
 			candidate.CurrentPrice, settings.PnLTargetMode, target, maxLoss,
 			confluence.Status, mesh.GridStepPct, confluence.Score, antiHuntStop)
 		if err != nil {
@@ -668,13 +671,16 @@ func (worker *Worker) deployReal(
 			candidate.CurrentPrice, atrPrice, 1.5,
 		)
 
-		realLev := ComputeDynamicLeverage(
-			candidate.CurrentPrice, antiHuntStop, atrPct, 0.85, settings.Leverage,
-		)
+		botLev := settings.Leverage
+		if settings.AdaptiveLeverageEnabled {
+			botLev = ComputeDynamicLeverage(
+				candidate.CurrentPrice, antiHuntStop, atrPct, 0.85, settings.Leverage,
+			)
+		}
 
 		if err := worker.risk.ValidateNewGrid(
 			ctx, *settings.AccountID, candidate.Symbol,
-			realLev, settings.BudgetUSDT,
+			botLev, settings.BudgetUSDT,
 		); err != nil {
 			deployErrors = append(deployErrors, fmt.Sprintf("%s: risk gate: %v", candidate.Symbol, err))
 			continue
@@ -688,7 +694,7 @@ func (worker *Worker) deployReal(
 			Top: mesh.UpperPrice, Bottom: mesh.LowerPrice,
 			Row: mesh.GridNum, GridType: mapGridType(settings.DensityGridEnabled),
 			Trend:           candidate.RecommendedTrend,
-			Leverage:        realLev,
+			Leverage:        botLev,
 			QuoteInvestment: settings.BudgetUSDT,
 			InvestCoin:      "USDT", InvestmentFrom: "USER",
 		}
