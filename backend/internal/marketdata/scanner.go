@@ -143,10 +143,22 @@ func (s *Scanner) ScanMarkets(
 		return ranked[i].amount.GreaterThan(ranked[j].amount)
 	})
 
-	// Scan 100% of all available trading PERP pairs across Pionex (no cap)
+	// L1→top-K pipeline: the ticker-only prefilter above has already ranked
+	// every PERP by 24h turnover and dropped pump/dump anomalies. Fetching
+	// klines for all ~400 pairs at 10 req/s took 6-10 minutes; taking only
+	// the top-K by L1 ranking (3× the MaxSymbols the operator wants to keep)
+	// cuts the scan to ~1 minute while preserving the candidates that matter
+	// — illiquid tail symbols were rejected downstream anyway.
+	scanCap := config.MaxSymbols * 3
+	if scanCap < 30 {
+		scanCap = 30
+	}
+	if scanCap > 150 {
+		scanCap = 150
+	}
 	activeRanked := ranked
-	if len(activeRanked) == 0 {
-		activeRanked = ranked
+	if len(activeRanked) > scanCap {
+		activeRanked = ranked[:scanCap]
 	}
 
 	// L2 Concurrent Worker Pool for Deep Kline Analysis across all Pionex pairs
