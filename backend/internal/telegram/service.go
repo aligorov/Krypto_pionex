@@ -110,7 +110,7 @@ func (s *Service) UpdateSettings(ctx context.Context, item Settings) (*Settings,
 		    template_range_adjust = $16,
 		    template_digest = $17,
 		    updated_at = NOW()
-		WHERE id = 1
+		WHERE id = $1
 	`,
 		item.ID, item.Enabled, token, item.ChatID, item.TopicID,
 		item.NotifyBotCreated, item.NotifyTakeProfit, item.NotifyStopLoss,
