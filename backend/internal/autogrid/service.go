@@ -659,6 +659,46 @@ func (s *Service) SetStatus(
 	if err != nil {
 		return fmt.Errorf("set AutoGrid status: %w", err)
 	}
+	if status == "STOPPED" || status == "EMERGENCY_STOPPED" {
+		_ = s.CloseAllActiveBots(ctx, status)
+	}
+	return nil
+}
+
+// CloseAllActiveBots immediately closes all running paper bots and queues stop for real bots.
+func (s *Service) CloseAllActiveBots(ctx context.Context, reason string) error {
+	settings, err := s.GetSettings(ctx)
+	if err != nil {
+		return err
+	}
+	if reason == "" {
+		reason = "AUTOGRID_STOP"
+	}
+	// 1. Close all running paper bots immediately
+	_, err = s.db.Exec(ctx, `
+		UPDATE paper_grid_bots
+		SET status = 'COMPLETED',
+		    closed_reason = $2,
+		    closed_at = NOW(),
+		    updated_at = NOW()
+		WHERE settings_id = $1 AND status = 'RUNNING'
+	`, settings.ID, reason)
+	if err != nil {
+		return fmt.Errorf("close all paper bots: %w", err)
+	}
+
+	// 2. Request stop for all real bots
+	_, err = s.db.Exec(ctx, `
+		UPDATE grid_bots
+		SET status = 'STOP_REQUESTED',
+		    closed_reason = COALESCE(closed_reason, $2),
+		    updated_at = NOW()
+		WHERE autogrid_settings_id = $1
+		  AND status IN ('PENDING_SUBMISSION', 'SUBMISSION_UNKNOWN', 'RUNNING')
+	`, settings.ID, reason)
+	if err != nil {
+		return fmt.Errorf("request stop for real bots: %w", err)
+	}
 	return nil
 }
 

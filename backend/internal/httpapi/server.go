@@ -726,9 +726,12 @@ func (s *Server) autoGridAction(w http.ResponseWriter, r *http.Request) {
 			s.fail(w, r, err)
 			return
 		}
+		if err := s.autogrid.CloseAllActiveBots(r.Context(), "AUTOGRID_STOP"); err != nil {
+			s.logger.Warn("Failed to close active bots on stop", "error", err)
+		}
 		s.auditMutation(r, "autogrid.stop", "autogrid", "1", map[string]any{"status": "STOPPED"})
 		writeJSON(w, http.StatusOK, map[string]any{
-			"success": true, "status": "STOPPED", "message": "Автопилот остановлен",
+			"success": true, "status": "STOPPED", "message": "Автопилот остановлен, все боты закрыты",
 		})
 		return
 
@@ -755,9 +758,12 @@ func (s *Server) autoGridAction(w http.ResponseWriter, r *http.Request) {
 			current.KillSwitchEnabled = true
 			_, _ = s.control.UpdateRiskSettings(r.Context(), principal, *current)
 		}
-		_ = s.autogrid.SetStatus(r.Context(), "STOPPED", errors.New("emergency stop engaged"))
+		_ = s.autogrid.SetStatus(r.Context(), "EMERGENCY_STOPPED", errors.New("emergency stop engaged"))
+		if err := s.autogrid.CloseAllActiveBots(r.Context(), "EMERGENCY_STOP"); err != nil {
+			s.logger.Warn("Failed to close active bots on emergency stop", "error", err)
+		}
 		writeJSON(w, http.StatusOK, map[string]any{
-			"success": true, "status": "EMERGENCY_STOPPED", "message": "Emergency Stop активирован",
+			"success": true, "status": "EMERGENCY_STOPPED", "message": "Emergency Stop активирован, все боты закрыты",
 		})
 		return
 
