@@ -143,6 +143,10 @@ type BUOrderDataResponse struct {
 	PositionOpenPriceRaw json.RawMessage `json:"positionOpenPrice"`
 	ProfitWithdrawnRaw   json.RawMessage `json:"profitWithdrawn"`
 	TotalProfitRaw       json.RawMessage `json:"totalProfit"`
+	ProfitRaw            json.RawMessage `json:"profit"`
+	PnlRaw               json.RawMessage `json:"pnl"`
+	RealizedProfitRaw    json.RawMessage `json:"realizedProfit"`
+	GridProfitRaw        json.RawMessage `json:"gridProfit"`
 	RiskStatus           string          `json:"riskStatus"`
 	LiquidationPriceRaw  json.RawMessage `json:"liquidationPrice"`
 
@@ -152,6 +156,7 @@ type BUOrderDataResponse struct {
 	Position          decimal.Decimal `json:"-"`
 	PositionOpenPrice decimal.Decimal `json:"-"`
 	ProfitWithdrawn   decimal.Decimal `json:"-"`
+	TotalProfit       decimal.Decimal `json:"-"`
 	LiquidationPrice  decimal.Decimal `json:"-"`
 }
 
@@ -183,8 +188,18 @@ func (b *BUOrderDataResponse) UnmarshalJSON(data []byte) error {
 	b.Position = parseDecimalRaw(b.PositionRaw)
 	b.PositionOpenPrice = parseDecimalRaw(b.PositionOpenPriceRaw)
 	b.ProfitWithdrawn = parseDecimalRaw(b.ProfitWithdrawnRaw)
-	if b.ProfitWithdrawn.IsZero() {
-		b.ProfitWithdrawn = parseDecimalRaw(b.TotalProfitRaw)
+	b.TotalProfit = parseDecimalRaw(b.TotalProfitRaw)
+	if b.TotalProfit.IsZero() {
+		b.TotalProfit = parseDecimalRaw(b.ProfitRaw)
+	}
+	if b.TotalProfit.IsZero() {
+		b.TotalProfit = parseDecimalRaw(b.PnlRaw)
+	}
+	if b.TotalProfit.IsZero() {
+		b.TotalProfit = parseDecimalRaw(b.RealizedProfitRaw)
+	}
+	if b.ProfitWithdrawn.IsZero() && !b.TotalProfit.IsZero() {
+		b.ProfitWithdrawn = b.TotalProfit
 	}
 	b.LiquidationPrice = parseDecimalRaw(b.LiquidationPriceRaw)
 	return nil

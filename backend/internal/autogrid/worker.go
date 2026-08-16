@@ -1296,6 +1296,47 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 			}
 		}
 	}
+
+	// Synchronize closed bots with exchange history to fill accurate realized PnL
+	closedRows, err := worker.db.Query(ctx, `
+		SELECT id, bu_order_id
+		FROM grid_bots
+		WHERE autogrid_settings_id = $1
+		  AND status IN ('STOPPED', 'COMPLETED', 'CANCELLED', 'LIQUIDATED')
+		  AND bu_order_id IS NOT NULL
+		  AND (realized_pnl_usdt IS NULL OR realized_pnl_usdt = 0)
+		ORDER BY created_at DESC
+		LIMIT 10
+	`, settings.ID)
+	if err == nil {
+		type closedBotItem struct {
+			id, remoteID string
+		}
+		var unSynced []closedBotItem
+		for closedRows.Next() {
+			var item closedBotItem
+			if err := closedRows.Scan(&item.id, &item.remoteID); err == nil {
+				unSynced = append(unSynced, item)
+			}
+		}
+		closedRows.Close()
+		for _, item := range unSynced {
+			if remote, err := client.GetFuturesGridBot(ctx, item.remoteID); err == nil && remote != nil {
+				profit := remote.BUOrderData.ProfitWithdrawn
+				if profit.IsZero() {
+					profit = remote.BUOrderData.TotalProfit
+				}
+				if !profit.IsZero() {
+					_, _ = worker.db.Exec(ctx, `
+						UPDATE grid_bots
+						SET realized_pnl_usdt = $2, updated_at = NOW()
+						WHERE id = $1
+					`, item.id, profit)
+				}
+			}
+		}
+	}
+
 	return clampInterval(settings.ManageIntervalSeconds), nil
 }
 
