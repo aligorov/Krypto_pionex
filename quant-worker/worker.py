@@ -52,13 +52,13 @@ def fetch_klines(symbol, interval, limit):
         raise ValueError(f"no klines returned for {symbol}")
     candles = []
     for row in data["klines"]:
-        # Pionex returns [start_ts, open, high, low, close, volume]
+        # Pionex returns kline OBJECTS with string-typed numbers.
         candles.append({
-            "open": float(row[1]),
-            "high": float(row[2]),
-            "low": float(row[3]),
-            "close": float(row[4]),
-            "volume": float(row[5]),
+            "open": float(row["open"]),
+            "high": float(row["high"]),
+            "low": float(row["low"]),
+            "close": float(row["close"]),
+            "volume": float(row["volume"]),
         })
     return candles
 
