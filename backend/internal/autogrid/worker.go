@@ -736,6 +736,7 @@ func (worker *Worker) deployReal(
 		return nil
 	}
 	deployErrors := make([]string, 0)
+	backtestGateOn := worker.backtestGateEnabled(ctx)
 	for _, candidate := range candidates {
 		if candidate.Decision != "ACCEPTED" || activeCount >= settings.MaxActiveBots {
 			continue
@@ -747,6 +748,32 @@ func (worker *Worker) deployReal(
 			worker.logger.Info("skip real deploy after fresh trend revalidation",
 				"component", "autogrid_worker", "symbol", candidate.Symbol, "reason", reason)
 			continue
+		}
+		// Walk-forward backtest gate: the traded TF must have earned a fresh
+		// non-negative OOS verdict with bounded drawdown, and no neighbor TF
+		// may be catastrophic. Missing jobs are auto-enqueued; the candidate
+		// is reconsidered on the next scan once results arrive.
+		if backtestGateOn {
+			verdict := worker.backtestGate(ctx, settings, candidate.Symbol)
+			if verdict.Pending {
+				worker.logger.Info("backtest gate: awaiting walk-forward results",
+					"component", "autogrid_worker", "symbol", candidate.Symbol)
+				continue
+			}
+			if !verdict.Allowed {
+				worker.rejectCandidate(ctx, candidate, verdict.Reason, map[string]any{
+					"backtestGate": map[string]any{
+						"allowed": verdict.Allowed, "reason": verdict.Reason,
+						"traded": verdict.Traded, "neighbors": verdict.Neighbors,
+					},
+				})
+				worker.logger.Info("backtest gate rejected candidate",
+					"component", "autogrid_worker", "symbol", candidate.Symbol, "reason", verdict.Reason)
+				continue
+			}
+			worker.logger.Info("backtest gate passed",
+				"component", "autogrid_worker", "symbol", candidate.Symbol,
+				"reason", verdict.Reason, "potential_pct", verdict.PotentialPct)
 		}
 		var exists bool
 		if err := worker.db.QueryRow(ctx, `
@@ -1148,6 +1175,19 @@ func (worker *Worker) autotuneIfDue(ctx context.Context, settings Settings) {
 		worker.logger.Info("AI autotune adjusted settings",
 			"component", "autogrid_worker", "changes", strings.Join(changes, "; "))
 	}
+}
+
+// rejectCandidate records a late-stage rejection so the UI shows WHY a
+// previously accepted candidate never deployed.
+func (worker *Worker) rejectCandidate(
+	ctx context.Context, candidate Candidate, reason string, assumptions map[string]any,
+) {
+	_, _ = worker.db.Exec(ctx, `
+		UPDATE autogrid_candidates
+		SET decision = 'REJECTED', rejection_reason = $2,
+		    model_assumptions = model_assumptions || $3::jsonb
+		WHERE id = $1
+	`, candidate.ID, reason, assumptions)
 }
 
 // deployStructContext snapshots the market thesis a bot is opened under:
