@@ -54,7 +54,9 @@ func (manager *LifecycleManager) CreateGridBot(
 	if err := validateCreateInput(input); err != nil {
 		return "", err
 	}
-	symbol := fmt.Sprintf("%s_%s_PERP", input.Params.Base, input.Params.Quote)
+	baseCoin := strings.TrimSuffix(strings.TrimSuffix(input.Params.Base, ".PERP"), "_PERP")
+	symbol := fmt.Sprintf("%s_%s_PERP", baseCoin, input.Params.Quote)
+	input.Params.Base = fmt.Sprintf("%s.PERP", baseCoin)
 	if err := manager.validatePionexSymbol(ctx, symbol); err != nil {
 		return "", err
 	}

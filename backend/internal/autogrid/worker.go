@@ -781,8 +781,12 @@ func (worker *Worker) deployReal(
 			data.ProfitStopType = "price"
 			data.ProfitStop = &profit
 		}
+		futuresBase := base
+		if !strings.HasSuffix(futuresBase, ".PERP") && !strings.HasSuffix(futuresBase, "_PERP") {
+			futuresBase = fmt.Sprintf("%s.PERP", base)
+		}
 		params := pionex.NativeFuturesGridCreateParams{
-			Base: base, Quote: quote, BUOrderData: data,
+			Base: futuresBase, Quote: quote, BUOrderData: data,
 		}
 		// Native pre-flight validation: Pionex itself confirms the parameters
 		// and minimum investment before any capital is committed.

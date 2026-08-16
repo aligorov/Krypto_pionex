@@ -1686,13 +1686,16 @@ func (s *Service) DeployManualBot(
 		return nil, "", err
 	}
 	base, quote, _ := SplitPionexPerp(input.Symbol)
+	futuresBase := base
+	if !strings.HasSuffix(futuresBase, ".PERP") && !strings.HasSuffix(futuresBase, "_PERP") {
+		futuresBase = fmt.Sprintf("%s.PERP", base)
+	}
 	params := pionex.NativeFuturesGridCreateParams{
-		Base: base, Quote: quote,
+		Base: futuresBase, Quote: quote,
 		BUOrderData: pionex.BUOrderData{
 			Top: upper, Bottom: lower, Row: row,
-			GridType: "arithmetic", Trend: trend,
+			GridType: "arithmetic", GridTypeCamel: "arithmetic", Trend: trend,
 			Leverage: leverage, QuoteInvestment: settings.BudgetUSDT,
-			InvestCoin: "USDT", InvestmentFrom: "USER",
 		},
 	}
 	botTarget, botMaxLoss := s.computeManualTargets(ctx, *settings, input.Symbol)
