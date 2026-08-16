@@ -30,7 +30,7 @@ services:
     ports:
       - "127.0.0.1:8080:8080"
     environment:
-      DATABASE_URL: postgres://pionex:pionex_password@pionex_postgres:5432/pionex_bot?sslmode=disable
+      DATABASE_URL: postgres://pionex:pionex_password@postgres:5432/pionex_bot?sslmode=disable
     depends_on:
       postgres:
         condition: service_healthy
@@ -51,7 +51,7 @@ services:
     container_name: pionex_quant
     restart: unless-stopped
     environment:
-      DATABASE_URL: postgres://pionex:pionex_password@pionex_postgres:5432/pionex_bot?sslmode=disable
+      DATABASE_URL: postgres://pionex:pionex_password@postgres:5432/pionex_bot?sslmode=disable
     depends_on:
       postgres:
         condition: service_healthy
