@@ -174,8 +174,9 @@ func neutralGridPaperPNL(
 	}
 	crossingProfit = perLevelCapital.Mul(stepPct.Sub(feePct)).Mul(decimal.NewFromInt(int64(crossings))).Div(decimal.NewFromInt(2))
 
-	// Inventory model: below the midpoint the grid holds long inventory
-	// bought across the lower half of the range.
+	// Inventory model:
+	// Below the midpoint, the grid accumulates long inventory bought on dips.
+	// Above the midpoint, the grid accumulates short inventory sold on rallies.
 	position := price.Sub(mid).Div(width.Div(decimal.NewFromInt(2)))
 	if position.GreaterThan(decimal.NewFromInt(1)) {
 		position = decimal.NewFromInt(1)
@@ -183,12 +184,19 @@ func neutralGridPaperPNL(
 	if position.LessThan(decimal.NewFromInt(-1)) {
 		position = decimal.NewFromInt(-1)
 	}
-	if !position.IsNegative() {
-		return crossingProfit, decimal.Zero
+	if position.IsNegative() {
+		inventory := investment.Mul(position.Neg())
+		entry := mid.Add(position.Mul(width.Div(decimal.NewFromInt(4))))
+		if entry.GreaterThan(decimal.Zero) {
+			unrealized = inventory.Mul(price.Sub(entry).Div(entry))
+		}
+	} else if position.IsPositive() {
+		inventory := investment.Mul(position)
+		entry := mid.Add(position.Mul(width.Div(decimal.NewFromInt(4))))
+		if entry.GreaterThan(decimal.Zero) {
+			unrealized = inventory.Mul(entry.Sub(price).Div(entry))
+		}
 	}
-	inventory := investment.Mul(position.Neg())
-	entry := mid.Add(position.Mul(width.Div(decimal.NewFromInt(4))))
-	unrealized = inventory.Mul(price.Sub(entry).Div(entry))
 	return crossingProfit, unrealized
 }
 

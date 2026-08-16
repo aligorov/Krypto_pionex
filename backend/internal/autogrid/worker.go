@@ -1279,7 +1279,14 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 		if remote.BUOrderData.ReasonBy != "" {
 			reasonBy = remote.BUOrderData.ReasonBy
 		}
-		price := priceBySymbol[bot.symbol]
+		price, ok := priceBySymbol[bot.symbol]
+		if !ok || price.IsZero() {
+			trimmed := strings.TrimSuffix(strings.TrimSuffix(strings.ToUpper(bot.symbol), "_PERP"), ".PERP")
+			price, ok = priceBySymbol[trimmed]
+			if !ok || price.IsZero() {
+				price = priceBySymbol[trimmed+"_PERP"]
+			}
+		}
 		realized := remote.BUOrderData.ProfitWithdrawn
 		unrealized := decimal.Zero
 		if !remote.BUOrderData.Position.IsZero() && price.GreaterThan(decimal.Zero) {
@@ -1708,6 +1715,13 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 	for _, bot := range bots {
 		price, ok := priceBySymbol[bot.symbol]
 		if !ok || price.IsZero() {
+			trimmed := strings.TrimSuffix(strings.TrimSuffix(strings.ToUpper(bot.symbol), "_PERP"), ".PERP")
+			price, ok = priceBySymbol[trimmed]
+			if !ok || price.IsZero() {
+				price, ok = priceBySymbol[trimmed+"_PERP"]
+			}
+		}
+		if !ok || price.IsZero() {
 			continue
 		}
 		// A zero entry price cannot be divided against; repair it from the
@@ -1867,10 +1881,15 @@ func (worker *Worker) priceMap(ctx context.Context) (map[string]decimal.Decimal,
 	if err != nil {
 		return nil, err
 	}
-	prices := make(map[string]decimal.Decimal, len(tickers))
+	prices := make(map[string]decimal.Decimal, len(tickers)*4)
 	for _, ticker := range tickers {
 		if ticker.Close.GreaterThan(decimal.Zero) {
-			prices[ticker.Symbol] = ticker.Close
+			sym := strings.ToUpper(strings.TrimSpace(ticker.Symbol))
+			prices[sym] = ticker.Close
+			trimmed := strings.TrimSuffix(strings.TrimSuffix(sym, "_PERP"), ".PERP")
+			prices[trimmed] = ticker.Close
+			prices[trimmed+"_PERP"] = ticker.Close
+			prices[trimmed+".PERP"] = ticker.Close
 		}
 	}
 	return prices, nil
