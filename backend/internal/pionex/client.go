@@ -134,10 +134,10 @@ type BUOrderDataResponse struct {
 	ReasonBy             string          `json:"reasonBy"`
 	TopRaw               json.RawMessage `json:"top"`
 	BottomRaw            json.RawMessage `json:"bottom"`
-	Row                  int             `json:"row"`
+	RowRaw               json.RawMessage `json:"row"`
 	GridType             string          `json:"gridType"`
 	Trend                string          `json:"trend"`
-	Leverage             int             `json:"leverage"`
+	LeverageRaw          json.RawMessage `json:"leverage"`
 	OpenPriceRaw         json.RawMessage `json:"openPrice"`
 	PositionRaw          json.RawMessage `json:"position"`
 	PositionOpenPriceRaw json.RawMessage `json:"positionOpenPrice"`
@@ -152,6 +152,8 @@ type BUOrderDataResponse struct {
 
 	Top               decimal.Decimal `json:"-"`
 	Bottom            decimal.Decimal `json:"-"`
+	Row               int             `json:"-"`
+	Leverage          int             `json:"-"`
 	OpenPrice         decimal.Decimal `json:"-"`
 	Position          decimal.Decimal `json:"-"`
 	PositionOpenPrice decimal.Decimal `json:"-"`
@@ -175,6 +177,23 @@ func parseDecimalRaw(raw json.RawMessage) decimal.Decimal {
 	return d
 }
 
+func parseIntRaw(raw json.RawMessage) int {
+	if len(raw) == 0 {
+		return 0
+	}
+	s := strings.Trim(string(raw), "\" \t\n\r")
+	if s == "" || s == "null" {
+		return 0
+	}
+	if n, err := strconv.Atoi(s); err == nil {
+		return n
+	}
+	if f, err := strconv.ParseFloat(s, 64); err == nil {
+		return int(f)
+	}
+	return 0
+}
+
 func (b *BUOrderDataResponse) UnmarshalJSON(data []byte) error {
 	type Alias BUOrderDataResponse
 	var aux Alias
@@ -184,6 +203,8 @@ func (b *BUOrderDataResponse) UnmarshalJSON(data []byte) error {
 	*b = BUOrderDataResponse(aux)
 	b.Top = parseDecimalRaw(b.TopRaw)
 	b.Bottom = parseDecimalRaw(b.BottomRaw)
+	b.Row = parseIntRaw(b.RowRaw)
+	b.Leverage = parseIntRaw(b.LeverageRaw)
 	b.OpenPrice = parseDecimalRaw(b.OpenPriceRaw)
 	b.Position = parseDecimalRaw(b.PositionRaw)
 	b.PositionOpenPrice = parseDecimalRaw(b.PositionOpenPriceRaw)
