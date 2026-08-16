@@ -60,9 +60,6 @@ func (manager *LifecycleManager) CreateGridBot(
 	if input.Params.BUOrderData.Trend == "neutral" || input.Params.BUOrderData.Trend == "" {
 		input.Params.BUOrderData.Trend = "no_trend"
 	}
-	if input.Params.BUOrderData.GridTypeCamel == "" {
-		input.Params.BUOrderData.GridTypeCamel = input.Params.BUOrderData.GridType
-	}
 	if err := manager.validatePionexSymbol(ctx, symbol); err != nil {
 		return "", err
 	}

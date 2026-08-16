@@ -96,13 +96,11 @@ type BUOrderData struct {
 	Bottom              decimal.Decimal  `json:"bottom"`
 	Row                 int              `json:"row"`
 	GridType            string           `json:"grid_type"`
-	GridTypeCamel       string           `json:"gridType,omitempty"`
 	Trend               string           `json:"trend"`
 	Leverage            int              `json:"leverage"`
-	ExtraMargin         decimal.Decimal  `json:"extraMargin,omitempty"`
-	QuoteInvestment      decimal.Decimal  `json:"quoteInvestment"`
-	QuoteInvestmentSnake decimal.Decimal  `json:"quote_investment,omitempty"`
-	LossStopType         string           `json:"lossStopType,omitempty"`
+	ExtraMargin         *decimal.Decimal `json:"extraMargin,omitempty"`
+	QuoteInvestment     decimal.Decimal  `json:"quoteInvestment"`
+	LossStopType        string           `json:"lossStopType,omitempty"`
 	LossStop            *decimal.Decimal `json:"lossStop,omitempty"`
 	ProfitStopType      string           `json:"profitStopType,omitempty"`
 	ProfitStop          *decimal.Decimal `json:"profitStop,omitempty"`

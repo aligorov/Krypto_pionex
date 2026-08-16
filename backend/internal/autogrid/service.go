@@ -1695,7 +1695,7 @@ func (s *Service) DeployManualBot(
 		Base: futuresBase, Quote: quote,
 		BUOrderData: pionex.BUOrderData{
 			Top: upper, Bottom: lower, Row: row,
-			GridType: "arithmetic", GridTypeCamel: "arithmetic", Trend: trend,
+			GridType: "arithmetic", Trend: trend,
 			Leverage: leverage, QuoteInvestment: settings.BudgetUSDT,
 		},
 	}

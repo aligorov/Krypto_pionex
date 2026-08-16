@@ -78,7 +78,7 @@ func TestCheckFuturesGridParamsContract(t *testing.T) {
 	result, err := client.CheckFuturesGridParams(context.Background(), NativeFuturesGridCreateParams{
 		Base: "BTC.PERP", Quote: "USDT",
 		BUOrderData: BUOrderData{
-			GridType: "arithmetic", GridTypeCamel: "arithmetic", Trend: "no_trend",
+			GridType: "arithmetic", Trend: "no_trend",
 			Bottom: decimal.NewFromInt(55000), Top: decimal.NewFromInt(65000),
 			Row: 20, Leverage: 3, QuoteInvestment: decimal.NewFromInt(100),
 		},

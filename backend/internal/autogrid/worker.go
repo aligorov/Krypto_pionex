@@ -756,7 +756,7 @@ func (worker *Worker) deployReal(
 		gridTypeStr := mapGridType(settings.DensityGridEnabled)
 		data := pionex.BUOrderData{
 			Top: upperPrice, Bottom: lowerPrice,
-			Row: mesh.GridNum, GridType: gridTypeStr, GridTypeCamel: gridTypeStr,
+			Row: mesh.GridNum, GridType: gridTypeStr,
 			Trend:           trend,
 			Leverage:        botLev,
 			QuoteInvestment: settings.BudgetUSDT.Round(2),
@@ -829,6 +829,8 @@ func (worker *Worker) deployReal(
 			"leverage": botLev, "lower_price": lowerPrice, "upper_price": upperPrice,
 			"grid_num": mesh.GridNum, "quote_investment": settings.BudgetUSDT, "source": "REAL",
 		})
+		// Rate limit protection: 1.2s delay between bot creations
+		time.Sleep(1200 * time.Millisecond)
 	}
 	if len(deployErrors) > 0 {
 		worker.logger.Warn(

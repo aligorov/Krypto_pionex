@@ -59,7 +59,6 @@ func TestCreateFuturesGridBotOfficialContract(t *testing.T) {
 			Row:             10,
 			Leverage:        5,
 			QuoteInvestment: decimal.NewFromInt(100),
-			ExtraMargin:     decimal.Zero,
 		},
 	}
 
