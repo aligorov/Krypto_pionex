@@ -183,22 +183,38 @@ func (c *Client) callGemini(
 		if marshalErr != nil {
 			return nil, 0, fmt.Errorf("marshal gemini request: %w", marshalErr)
 		}
-		req, reqErr := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(jsonBytes))
-		if reqErr != nil {
-			return nil, 0, reqErr
+		// Free-tier rate limit is ~15 RPM; grounded requests hit it fast.
+		// Retry 429s with exponential backoff (1s, 3s, 7s).
+		for attempt := 0; attempt < 3; attempt++ {
+			req, reqErr := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(jsonBytes))
+			if reqErr != nil {
+				return nil, 0, reqErr
+			}
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("x-goog-api-key", strings.TrimSpace(settings.APIKey))
+			resp, doErr := c.httpClient.Do(req)
+			if doErr != nil {
+				return nil, 0, fmt.Errorf("gemini network error: %w", doErr)
+			}
+			respBytes, readErr := io.ReadAll(resp.Body)
+			if readErr != nil {
+				resp.Body.Close()
+				return nil, resp.StatusCode, fmt.Errorf("read gemini response: %w", readErr)
+			}
+			if resp.StatusCode == 429 && attempt < 2 {
+				resp.Body.Close()
+				backoff := time.Duration(1<<attempt) * 3 * time.Second / 2 // 1.5s, 3s
+				select {
+				case <-ctx.Done():
+					return nil, 429, ctx.Err()
+				case <-time.After(backoff):
+				}
+				continue
+			}
+			resp.Body.Close()
+			return respBytes, resp.StatusCode, nil
 		}
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("x-goog-api-key", strings.TrimSpace(settings.APIKey))
-		resp, doErr := c.httpClient.Do(req)
-		if doErr != nil {
-			return nil, 0, fmt.Errorf("gemini network error: %w", doErr)
-		}
-		defer resp.Body.Close()
-		respBytes, readErr := io.ReadAll(resp.Body)
-		if readErr != nil {
-			return nil, resp.StatusCode, fmt.Errorf("read gemini response: %w", readErr)
-		}
-		return respBytes, resp.StatusCode, nil
+		return nil, 0, fmt.Errorf("gemini rate limit: exhausted retries")
 	}
 
 	respBytes, statusCode, err := sendGemini(reqBody)
