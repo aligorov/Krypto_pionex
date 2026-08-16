@@ -213,6 +213,7 @@ export default function Candidates({ canOperate: _canOperate }: Props) {
                   </th>
                   <th>Режим рынка</th>
                   <th>Позиция в диапазоне</th>
+                  <th>Радар входа (Снайпер)</th>
                   <th onClick={() => handleSort('volatilityPct')} style={{ cursor: 'pointer', whiteSpace: 'nowrap' }}>
                     Волатильность {sortKey === 'volatilityPct' ? (sortOrder === 'desc' ? '↓' : '↑') : ''}
                   </th>
@@ -349,6 +350,33 @@ function CandidateRow({
         <span className={`badge ${regimeBadge(regime)}`}>{regime}</span>
       </td>
       <td>{formatNumber(rangePosition)}%</td>
+      <td>
+        {candidate.recommendedTrend === 'long' ? (
+          Number(rangePosition) > 40 ? (
+            <span className="badge" style={{ background: 'rgba(239, 68, 68, 0.15)', color: '#f87171', border: '1px solid rgba(239, 68, 68, 0.3)' }}>
+              🚫 НА ХАЯХ
+            </span>
+          ) : (
+            <span className="badge" style={{ background: 'rgba(16, 185, 129, 0.15)', color: '#34d399', border: '1px solid rgba(16, 185, 129, 0.3)' }}>
+              🎯 ВХОД (Дно {formatNumber(rangePosition)}%)
+            </span>
+          )
+        ) : candidate.recommendedTrend === 'short' ? (
+          Number(rangePosition) < 60 ? (
+            <span className="badge" style={{ background: 'rgba(239, 68, 68, 0.15)', color: '#f87171', border: '1px solid rgba(239, 68, 68, 0.3)' }}>
+              🚫 НА ДНЕ
+            </span>
+          ) : (
+            <span className="badge" style={{ background: 'rgba(16, 185, 129, 0.15)', color: '#34d399', border: '1px solid rgba(16, 185, 129, 0.3)' }}>
+              🎯 ВХОД (Пик {formatNumber(rangePosition)}%)
+            </span>
+          )
+        ) : (
+          <span className="badge" style={{ background: 'rgba(56, 189, 248, 0.15)', color: '#38bdf8', border: '1px solid rgba(56, 189, 248, 0.3)' }}>
+            🟢 Ядро канала ({formatNumber(rangePosition)}%)
+          </span>
+        )}
+      </td>
       <td>{Number(candidate.volatilityPct).toFixed(2)}%</td>
       <td>{formatNumber(adx)}</td>
       <td>

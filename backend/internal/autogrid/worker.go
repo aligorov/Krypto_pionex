@@ -448,10 +448,34 @@ func (worker *Worker) deployPaper(
 		if !isEntryTimingFavorable(candidate) {
 			continue
 		}
-		gridType := "ARITHMETIC"
-		if settings.DensityGridEnabled {
-			gridType = "GEOMETRIC"
+		atrPct := 2.0
+		if val, ok := candidate.ModelAssumptions["atrPct"].(float64); ok && val > 0 {
+			atrPct = val
 		}
+		regime := "RANGE"
+		if val, ok := candidate.ModelAssumptions["regime"].(string); ok && val != "" {
+			regime = val
+		}
+
+		mesh := ComputeAdaptiveMesh(
+			candidate.LowerPrice, candidate.UpperPrice, candidate.CurrentPrice,
+			atrPct, regime, settings.BudgetUSDT, settings.Leverage, 0.30,
+		)
+
+		atrPrice := candidate.CurrentPrice.Mul(decimal.NewFromFloat(atrPct / 100.0))
+		antiHuntStop := ComputeAntiHuntStop(
+			candidate.RecommendedTrend, mesh.LowerPrice, mesh.UpperPrice,
+			candidate.CurrentPrice, atrPrice, 1.5,
+		)
+
+		dynLev := ComputeDynamicLeverage(
+			candidate.CurrentPrice, antiHuntStop, atrPct, 0.85, settings.Leverage,
+		)
+
+		confluence := EvaluateConfluence(candidate, nil, nil)
+
+		gridType := mesh.GridType
+
 		tag, err := worker.db.Exec(ctx, `
 			UPDATE paper_grid_bots
 			SET candidate_id = $3, mark_price = $4,
@@ -485,33 +509,34 @@ func (worker *Worker) deployPaper(
 			continue
 		}
 		target, maxLoss := computeBotTargets(settings, candidate)
-		lev := candidate.RecommendedLeverage
-		if lev < 2 && settings.Leverage >= 2 {
-			lev = 2
-		}
+
 		tag, err = worker.db.Exec(ctx, `
 			INSERT INTO paper_grid_bots (
 				settings_id, candidate_id, symbol, status, direction, grid_type,
 				lower_price, upper_price, grid_num, leverage, quote_investment,
 				entry_price, mark_price, model_state,
-				pnl_target_usdt, max_loss_usdt
+				pnl_target_usdt, max_loss_usdt,
+				grid_step_pct, confluence_score, anti_hunt_stop_price
 			) VALUES (
 				$1, $2, $3, 'RUNNING', $4, $5, $6, $7, $8, $9, $10, $11, $11,
 				jsonb_build_object(
-					'model', 'mark_to_market_directional_proxy_v1',
+					'model', 'adaptive_confluence_mesh_v2',
 					'gridFillsSimulated', false,
 					'pnlTargetSource', $12::TEXT,
+					'confluenceStatus', $15::TEXT,
 					'warning', 'paper PnL is not a native Pionex grid backtest'
 				),
-				$13, $14
+				$13, $14,
+				$16, $17, $18
 			)
 			ON CONFLICT (settings_id, symbol) WHERE status = 'RUNNING'
 			DO NOTHING
 		`, settings.ID, candidate.ID, candidate.Symbol,
 			databaseTrend(candidate.RecommendedTrend), gridType,
-			candidate.LowerPrice, candidate.UpperPrice, candidate.GridNum,
-			lev, settings.BudgetUSDT,
-			candidate.CurrentPrice, settings.PnLTargetMode, target, maxLoss)
+			mesh.LowerPrice, mesh.UpperPrice, mesh.GridNum,
+			dynLev, settings.BudgetUSDT,
+			candidate.CurrentPrice, settings.PnLTargetMode, target, maxLoss,
+			confluence.Status, mesh.GridStepPct, confluence.Score, antiHuntStop)
 		if err != nil {
 			return fmt.Errorf("deploy paper grid %s: %w", candidate.Symbol, err)
 		}
@@ -605,10 +630,30 @@ func (worker *Worker) deployReal(
 		`, *settings.AccountID, candidate.Symbol).Scan(&recentlyStoppedReal); err == nil && recentlyStoppedReal {
 			continue
 		}
-		realLev := candidate.RecommendedLeverage
-		if realLev < 2 && settings.Leverage >= 2 {
-			realLev = 2
+		atrPct := 2.0
+		if val, ok := candidate.ModelAssumptions["atrPct"].(float64); ok && val > 0 {
+			atrPct = val
 		}
+		regime := "RANGE"
+		if val, ok := candidate.ModelAssumptions["regime"].(string); ok && val != "" {
+			regime = val
+		}
+
+		mesh := ComputeAdaptiveMesh(
+			candidate.LowerPrice, candidate.UpperPrice, candidate.CurrentPrice,
+			atrPct, regime, settings.BudgetUSDT, settings.Leverage, 0.30,
+		)
+
+		atrPrice := candidate.CurrentPrice.Mul(decimal.NewFromFloat(atrPct / 100.0))
+		antiHuntStop := ComputeAntiHuntStop(
+			candidate.RecommendedTrend, mesh.LowerPrice, mesh.UpperPrice,
+			candidate.CurrentPrice, atrPrice, 1.5,
+		)
+
+		realLev := ComputeDynamicLeverage(
+			candidate.CurrentPrice, antiHuntStop, atrPct, 0.85, settings.Leverage,
+		)
+
 		if err := worker.risk.ValidateNewGrid(
 			ctx, *settings.AccountID, candidate.Symbol,
 			realLev, settings.BudgetUSDT,
@@ -622,26 +667,16 @@ func (worker *Worker) deployReal(
 			continue
 		}
 		data := pionex.BUOrderData{
-			Top: candidate.UpperPrice, Bottom: candidate.LowerPrice,
-			Row: candidate.GridNum, GridType: mapGridType(settings.DensityGridEnabled),
+			Top: mesh.UpperPrice, Bottom: mesh.LowerPrice,
+			Row: mesh.GridNum, GridType: mapGridType(settings.DensityGridEnabled),
 			Trend:           candidate.RecommendedTrend,
 			Leverage:        realLev,
 			QuoteInvestment: settings.BudgetUSDT,
 			InvestCoin:      "USDT", InvestmentFrom: "USER",
 		}
 		if settings.StopLossMode == "ADAPTIVE_ATR" {
-			bufferPct := settings.RangeBreakBufferPct
-			if bufferPct.LessThanOrEqual(decimal.Zero) {
-				bufferPct = decimal.NewFromFloat(2.0)
-			}
-			bufferMultiplier := decimal.NewFromInt(1).Sub(bufferPct.Div(decimal.NewFromInt(100)))
-			stop := candidate.LowerPrice.Mul(bufferMultiplier)
-			if candidate.RecommendedTrend == "short" {
-				shortMultiplier := decimal.NewFromInt(1).Add(bufferPct.Div(decimal.NewFromInt(100)))
-				stop = candidate.UpperPrice.Mul(shortMultiplier)
-			}
 			data.LossStopType = "price"
-			data.LossStop = &stop
+			data.LossStop = &antiHuntStop
 		}
 		// Native exchange-side take-profit: the per-bot target (dynamic from
 		// AI Kit/scanner readings, or the operator's fixed amount) is enforced

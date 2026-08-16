@@ -81,19 +81,16 @@ func TestParseAuditDecision(t *testing.T) {
 		t.Errorf("expected grid count 28, got %d", decision.GridParams.GridCount)
 	}
 }
-
 func TestParseAuditDecisionRejection(t *testing.T) {
-	raw := `
-	```json
-	{
+	raw := "```json\n" +
+		`{
 	  "decision": "REJECTED",
 	  "confidence": 0.95,
 	  "regime": "STRONG_TREND_DOWN",
 	  "reasoning_summary": "Падающий нож с высоким объемом",
 	  "rejection_reason": "EMA slope -7.5% confirms ongoing dump"
-	}
-	```
-	`
+	}` +
+		"\n```"
 
 	decision, err := ParseAuditDecision(raw)
 	if err != nil {

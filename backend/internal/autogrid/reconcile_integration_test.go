@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/aligorov/pionex-bot/backend/internal/accounts"
+	"github.com/aligorov/pionex-bot/backend/internal/llm"
 	"github.com/aligorov/pionex-bot/backend/internal/pionex"
 	"github.com/aligorov/pionex-bot/backend/internal/risk"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -188,6 +189,7 @@ func TestReconcileAndManageIntegration(t *testing.T) {
 	}
 
 	worker := NewWorker(pool, service, accountService, riskEngine,
+		llm.NewService(pool, slog.New(slog.DiscardHandler)),
 		slog.New(slog.DiscardHandler))
 
 	// Round 1: the durable stop intent must submit the native cancel.
