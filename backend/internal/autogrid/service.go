@@ -1282,10 +1282,10 @@ func (s *Service) AdjustBot(
 			if !input.QuoteInvestment.GreaterThan(decimal.Zero) {
 				return "", errors.New("invest_in requires a positive quoteInvestment")
 			}
-			params.QuoteInvestment = input.QuoteInvestment
+			params.QuoteInvestment = &input.QuoteInvestment
 		} else {
-			params.Bottom = input.Lower
-			params.Top = input.Upper
+			params.Bottom = &input.Lower
+			params.Top = &input.Upper
 			params.Row = input.Row
 			if input.Row <= 0 {
 				params.Row = currentRow

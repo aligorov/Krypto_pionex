@@ -97,12 +97,12 @@ func (c *Client) CheckFuturesGridParams(
 // POST /api/v1/bot/orders/futuresGrid/adjustParams. Type is "invest_in"
 // (add quoteInvestment) or "adjust_params" (move bottom/top/row).
 type AdjustFuturesGridParams struct {
-	BUOrderID       string          `json:"buOrderId"`
-	Type            string          `json:"type"`
-	Bottom          decimal.Decimal `json:"bottom,omitempty"`
-	Top             decimal.Decimal `json:"top,omitempty"`
-	Row             int             `json:"row,omitempty"`
-	QuoteInvestment decimal.Decimal `json:"quoteInvestment,omitempty"`
+	BUOrderID       string           `json:"buOrderId"`
+	Type            string           `json:"type"`
+	Bottom          *decimal.Decimal `json:"bottom,omitempty"`
+	Top             *decimal.Decimal `json:"top,omitempty"`
+	Row             int              `json:"row,omitempty"`
+	QuoteInvestment *decimal.Decimal `json:"quoteInvestment,omitempty"`
 }
 
 func (c *Client) AdjustFuturesGridBot(

@@ -109,9 +109,11 @@ func TestAdjustFuturesGridBotContract(t *testing.T) {
 	defer server.Close()
 
 	client := NewClient(server.URL, "testKey", "testSecret")
+	bottom := decimal.NewFromInt(100)
+	top := decimal.NewFromInt(120)
 	err := client.AdjustFuturesGridBot(context.Background(), AdjustFuturesGridParams{
 		BUOrderID: "GRID_1", Type: "adjust_params",
-		Bottom: decimal.NewFromInt(100), Top: decimal.NewFromInt(120), Row: 20,
+		Bottom: &bottom, Top: &top, Row: 20,
 	})
 	if err != nil {
 		t.Fatalf("AdjustFuturesGridBot failed: %v", err)

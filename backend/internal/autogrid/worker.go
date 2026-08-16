@@ -1229,7 +1229,7 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 		case ActionAdjustUp, ActionAdjustDown:
 			if err := client.AdjustFuturesGridBot(ctx, pionex.AdjustFuturesGridParams{
 				BUOrderID: bot.remoteID, Type: "adjust_params",
-				Bottom: decision.NewLower, Top: decision.NewUpper, Row: bot.rowNum,
+				Bottom: &decision.NewLower, Top: &decision.NewUpper, Row: bot.rowNum,
 			}); err != nil {
 				worker.logger.Error("adjust native grid range",
 					"component", "autogrid_worker", "bot_id", bot.id, "error", err)
