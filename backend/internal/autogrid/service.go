@@ -69,6 +69,7 @@ type Settings struct {
 type UpdateSettingsInput struct {
 	AccountID               *string         `json:"accountId"`
 	ExecutionMode           string          `json:"executionMode"`
+	ScanMode                string          `json:"scanMode"`
 	BudgetUSDT              decimal.Decimal `json:"budgetUsdt"`
 	MaxActiveBots           int             `json:"maxActiveBots"`
 	Leverage                int             `json:"leverage"`
@@ -321,6 +322,9 @@ func (s *Service) UpdateSettings(
 			input.AIAutotuneInterval = 3600
 		}
 	}
+	if input.ScanMode != "FULL" && input.ScanMode != "TOP_K" {
+		input.ScanMode = "TOP_K"
+	}
 	if err := s.validateSettings(ctx, input); err != nil {
 		return nil, err
 	}
@@ -334,7 +338,7 @@ func (s *Service) UpdateSettings(
 		    max_active_bots = $5, leverage = $6, min_sharpe = $7,
 		    min_ev_pct = $8, stop_loss_mode = $9, smart_pnl_enabled = $10,
 		    adaptive_leverage_enabled = $11, density_grid_enabled = $12,
-		    candle_interval = $13, lookback_candles = $14,
+		    candle_interval = $13, scan_mode = $33, lookback_candles = $14,
 		    max_symbols_per_scan = $15, scan_interval_seconds = $16,
 		    min_volume_24h = $17, min_volatility_pct = $18,
 		    max_volatility_pct = $19, max_drawdown_pct = $20,
@@ -355,7 +359,7 @@ func (s *Service) UpdateSettings(
 		input.FeeBps, input.SlippageBps, input.PnLTargetMode,
 		input.PnLTargetUSDT, input.MaxLossUSDT, input.ManageIntervalSeconds,
 		input.RangeBreakBufferPct, input.MaxAdjustmentsPerBot, input.AIKitEnabled,
-		input.AIAutotuneEnabled, input.AIAutotuneInterval)
+		input.AIAutotuneEnabled, input.AIAutotuneInterval, input.ScanMode)
 	if err != nil {
 		return nil, fmt.Errorf("update AutoGrid settings: %w", err)
 	}

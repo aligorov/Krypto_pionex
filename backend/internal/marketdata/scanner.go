@@ -53,6 +53,7 @@ type ScannerCandidate struct {
 
 type ScanConfig struct {
 	Interval            string
+	ScanMode            string // TOP_K (fast, default) or FULL (all pairs)
 	LookbackCandles     int
 	MaxSymbols          int
 	MinVolume24h        decimal.Decimal
@@ -149,7 +150,10 @@ func (s *Scanner) ScanMarkets(
 	// the top-K by L1 ranking (3× the MaxSymbols the operator wants to keep)
 	// cuts the scan to ~1 minute while preserving the candidates that matter
 	// — illiquid tail symbols were rejected downstream anyway.
-	scanCap := config.MaxSymbols * 3
+	scanCap := 10000 // FULL mode: effectively no cap
+	if config.ScanMode != "FULL" {
+		scanCap = config.MaxSymbols * 3
+	}
 	if scanCap < 30 {
 		scanCap = 30
 	}
@@ -612,6 +616,9 @@ func validateConfig(config ScanConfig) error {
 	}
 	if config.LookbackCandles < 30 || config.LookbackCandles > 500 {
 		return errors.New("lookback candles must be between 30 and 500")
+	}
+	if config.ScanMode == "" {
+		config.ScanMode = "TOP_K"
 	}
 	if config.MaxSymbols < 1 || config.MaxSymbols > 500 {
 		return errors.New("max symbols per scan must be between 1 and 500")

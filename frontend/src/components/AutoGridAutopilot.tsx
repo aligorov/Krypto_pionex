@@ -565,6 +565,7 @@ function SettingsForm({
           rangeBreakBufferPct: dec(form.rangeBreakBufferPct),
           stopLossMode: form.stopLossMode,
           candleInterval: form.candleInterval,
+          scanMode: form.scanMode || 'TOP_K',
           pnlTargetMode: form.pnlTargetMode,
           smartPnlEnabled: !!form.smartPnlEnabled,
           adaptiveLeverageEnabled: !!form.adaptiveLeverageEnabled,
@@ -704,6 +705,13 @@ function SettingsForm({
         <label>
           Интервал скана, сек
           <input {...field('scanIntervalSeconds')} inputMode="numeric" />
+        </label>
+        <label>
+          Режим скана
+          <select {...field('scanMode')}>
+            <option value="TOP_K">⚡ Быстрый (топ по обороту, ~1 мин)</option>
+            <option value="FULL">🔍 Полный (все пары, ~6-10 мин)</option>
+          </select>
         </label>
         <label>
           Волатильность мин, %

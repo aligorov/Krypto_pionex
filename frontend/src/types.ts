@@ -293,6 +293,7 @@ export interface AutoGridSettings {
   adaptiveLeverageEnabled: boolean;
   densityGridEnabled: boolean;
   candleInterval: string;
+  scanMode?: string;
   lookbackCandles: number;
   maxSymbolsPerScan: number;
   scanIntervalSeconds: number;
