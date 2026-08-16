@@ -143,6 +143,16 @@ export default function AutoGridAutopilot({ canOperate, accountsHref }: Props) {
         method: 'POST',
         body: JSON.stringify({ idempotencyKey: `ui-${action}-${Date.now()}` }),
       });
+      if (state && state.settings) {
+        let newStatus = state.settings.status;
+        if (action === 'start') newStatus = 'RUNNING';
+        if (action === 'stop') newStatus = 'STOPPED';
+        if (action === 'emergency-stop') newStatus = 'EMERGENCY_STOPPED';
+        setState({
+          ...state,
+          settings: { ...state.settings, status: newStatus, lastError: null },
+        });
+      }
       const code = res.confirmationCode;
       setMessage({
         kind: 'success',
@@ -190,7 +200,9 @@ export default function AutoGridAutopilot({ canOperate, accountsHref }: Props) {
       <div className={`kill-panel ${settings.status === 'RUNNING' ? '' : 'active'}`}>
         <div>
           <span className="eyebrow">AUTOGRID AUTOPILOT</span>
-          <h2>{statusTitle(settings.status)}</h2>
+          <h2>
+            {statusTitle(settings.status)} {settings.status === 'RUNNING' ? '🟢' : '⚪️'}
+          </h2>
           <p>
             {settings.executionMode === 'REAL'
               ? 'РЕАЛЬНЫЙ режим: нативные futures-гриды Pionex, take-profit исполняет биржа.'
