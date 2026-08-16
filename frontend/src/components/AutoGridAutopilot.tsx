@@ -1,5 +1,5 @@
 import { FormEvent, useCallback, useEffect, useMemo, useState } from 'react';
-import { api, ApiError } from '../api';
+import { api, ApiError, getCachedAutoGrid, setCachedAutoGrid } from '../api';
 import type { Account, AutoGridPreset, AutoGridSettings, AutoGridState } from '../types';
 
 interface Props {
@@ -28,7 +28,7 @@ export function describeError(error: unknown): string {
 }
 
 export default function AutoGridAutopilot({ canOperate, accountsHref }: Props) {
-  const [state, setState] = useState<AutoGridState | null>(null);
+  const [state, setState] = useState<AutoGridState | null>(() => getCachedAutoGrid<AutoGridState>());
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [message, setMessage] = useState<Message>(null);
   const [busy, setBusy] = useState<string | null>(null);
@@ -82,14 +82,17 @@ export default function AutoGridAutopilot({ canOperate, accountsHref }: Props) {
     try {
       const result = await api<AutoGridState>('/api/autogrid');
       setState(result);
+      setCachedAutoGrid(result);
     } catch (error) {
-      setMessage({ kind: 'danger', text: describeError(error) });
+      if (!getCachedAutoGrid()) {
+        setMessage({ kind: 'danger', text: describeError(error) });
+      }
     }
   }, []);
 
   useEffect(() => {
     void load();
-    const timer = window.setInterval(() => void load(), 3000);
+    const timer = window.setInterval(() => void load(), 5000);
     return () => window.clearInterval(timer);
   }, [load]);
 

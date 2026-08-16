@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { api } from '../api';
+import { api, getCachedAutoGrid, setCachedAutoGrid } from '../api';
 import { describeError } from './AutoGridAutopilot';
 import { CandlestickChart } from './CandlestickChart';
 import type { AIKitResponse, AutoGridCandidate, AutoGridState } from '../types';
@@ -18,7 +18,7 @@ type SortKey = 'createdAt' | 'score' | 'volatilityPct' | 'expectedValuePct' | 's
 type SortOrder = 'asc' | 'desc';
 
 export default function Candidates({ canOperate: _canOperate }: Props) {
-  const [state, setState] = useState<AutoGridState | null>(null);
+  const [state, setState] = useState<AutoGridState | null>(() => getCachedAutoGrid<AutoGridState>());
   const [error, setError] = useState<string | null>(null);
   const [aiKit, setAiKit] = useState<Record<string, AIKitState>>({});
   const [sortKey, setSortKey] = useState<SortKey>('createdAt');
@@ -27,15 +27,19 @@ export default function Candidates({ canOperate: _canOperate }: Props) {
 
   const load = useCallback(async () => {
     try {
-      setState(await api<AutoGridState>('/api/autogrid'));
+      const result = await api<AutoGridState>('/api/autogrid');
+      setState(result);
+      setCachedAutoGrid(result);
     } catch (loadError) {
-      setError(describeError(loadError));
+      if (!getCachedAutoGrid()) {
+        setError(describeError(loadError));
+      }
     }
   }, []);
 
   useEffect(() => {
     void load();
-    const timer = window.setInterval(() => void load(), 30000);
+    const timer = window.setInterval(() => void load(), 15000);
     return () => window.clearInterval(timer);
   }, [load]);
 

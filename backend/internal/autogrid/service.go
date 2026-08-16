@@ -432,22 +432,35 @@ func (s *Service) State(ctx context.Context) (*State, error) {
 }
 
 // ExchangeSnapshotWith fetches the live exchange wallet through the resolved
-// account (30s cache); without an account it reports connected=false instead
-// of failing the whole state.
+// account (asynchronous non-blocking refresh); without an account it reports
+// connected=false instead of failing the whole state.
 func (s *Service) ExchangeSnapshotWith(
 	ctx context.Context,
 	accountService *accounts.Service,
 ) *ExchangeSnapshot {
 	s.balanceMu.Lock()
-	if s.balanceCached != nil && time.Since(s.balanceCached.UpdatedAt) < 30*time.Second {
+	if s.balanceCached != nil {
 		cached := *s.balanceCached
+		isStale := time.Since(s.balanceCached.UpdatedAt) > 15*time.Second
 		s.balanceMu.Unlock()
+		if isStale {
+			go func() {
+				bgCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				s.fetchAndCacheExchangeSnapshot(bgCtx, accountService)
+			}()
+		}
 		return &cached
 	}
 	s.balanceMu.Unlock()
 
-	// Non-nil slices so the JSON never carries null arrays the UI would
-	// have to defend against.
+	return s.fetchAndCacheExchangeSnapshot(ctx, accountService)
+}
+
+func (s *Service) fetchAndCacheExchangeSnapshot(
+	ctx context.Context,
+	accountService *accounts.Service,
+) *ExchangeSnapshot {
 	snapshot := &ExchangeSnapshot{
 		UpdatedAt: time.Now(),
 		Coins:     []pionex.FuturesBalance{},
@@ -467,7 +480,7 @@ func (s *Service) ExchangeSnapshotWith(
 			snapshot.Error = credErr.Error()
 		} else {
 			client := pionex.NewClient("", credentials.APIKey, credentials.APISecret)
-			balCtx, balCancel := context.WithTimeout(ctx, 3*time.Second)
+			balCtx, balCancel := context.WithTimeout(ctx, 2*time.Second)
 			defer balCancel()
 			// Futures wallet: the margin grids trade with.
 			if balances, balanceErr := client.GetFuturesBalances(balCtx); balanceErr != nil {

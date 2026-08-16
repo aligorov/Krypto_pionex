@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { api } from '../api';
+import { api, getCachedAutoGrid, setCachedAutoGrid } from '../api';
 import type { AutoGridState, Dashboard } from '../types';
 
 interface Props {
@@ -8,11 +8,16 @@ interface Props {
 
 export default function Overview({ onRefresh }: Props) {
   const [dashboard, setDashboard] = useState<Dashboard | null>(null);
-  const [state, setState] = useState<AutoGridState | null>(null);
+  const [state, setState] = useState<AutoGridState | null>(() => getCachedAutoGrid<AutoGridState>());
 
   useEffect(() => {
     api<Dashboard>('/api/dashboard').then(setDashboard).catch(() => setDashboard(null));
-    api<AutoGridState>('/api/autogrid').then(setState).catch(() => setState(null));
+    api<AutoGridState>('/api/autogrid')
+      .then((res) => {
+        setState(res);
+        setCachedAutoGrid(res);
+      })
+      .catch(() => {});
     const timer = window.setInterval(onRefresh, 15000);
     return () => window.clearInterval(timer);
   }, [onRefresh]);

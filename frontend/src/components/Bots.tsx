@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
-import { api, describeError } from '../api';
+import { api, describeError, getCachedAutoGrid, setCachedAutoGrid } from '../api';
 import { CandlestickChart } from './CandlestickChart';
 import type { AIKitResponse, AutoGridClosedBot, AutoGridBot, AutoGridState, BotExecutionEvent } from '../types';
 
@@ -10,22 +10,26 @@ interface Props {
 const closableStatuses = ['RUNNING', 'PENDING_SUBMISSION', 'SUBMISSION_UNKNOWN', 'STOP_REQUESTED'];
 
 export default function Bots({ canOperate }: Props) {
-  const [state, setState] = useState<AutoGridState | null>(null);
+  const [state, setState] = useState<AutoGridState | null>(() => getCachedAutoGrid<AutoGridState>());
   const [error, setError] = useState<string | null>(null);
   const [selectedBotForChart, setSelectedBotForChart] = useState<AutoGridBot | null>(null);
   const [selectedBotForHistory, setSelectedBotForHistory] = useState<{ id: string; symbol: string; botNumber?: number } | null>(null);
 
   const load = useCallback(async () => {
     try {
-      setState(await api<AutoGridState>('/api/autogrid'));
+      const result = await api<AutoGridState>('/api/autogrid');
+      setState(result);
+      setCachedAutoGrid(result);
     } catch (loadError) {
-      setError(describeError(loadError));
+      if (!getCachedAutoGrid()) {
+        setError(describeError(loadError));
+      }
     }
   }, []);
 
   useEffect(() => {
     void load();
-    const timer = window.setInterval(() => void load(), 3000);
+    const timer = window.setInterval(() => void load(), 5000);
     return () => window.clearInterval(timer);
   }, [load]);
 

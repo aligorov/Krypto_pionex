@@ -63,3 +63,14 @@ export function describeError(err: unknown): string {
   return String(err);
 }
 
+let autoGridCache: any = null;
+
+export function getCachedAutoGrid<T = any>(): T | null {
+  return autoGridCache as T | null;
+}
+
+export function setCachedAutoGrid(data: any) {
+  autoGridCache = data;
+}
+
+
