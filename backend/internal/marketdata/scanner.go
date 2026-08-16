@@ -137,17 +137,9 @@ func (s *Scanner) ScanMarkets(
 		return ranked[i].amount.GreaterThan(ranked[j].amount)
 	})
 
-	// Scan all available trading PERP pairs across Pionex (no artificial cap)
-	// Filter out only zero-volume / dead markets
-	activeRanked := make([]rankedSymbol, 0, len(ranked))
-	for _, r := range ranked {
-		if r.amount.GreaterThan(decimal.NewFromInt(10000)) { // Min 10k USD 24h turnover to avoid completely dead books
-			activeRanked = append(activeRanked, r)
-		}
-	}
-	if len(activeRanked) > 50 {
-		activeRanked = activeRanked[:50]
-	} else if len(activeRanked) == 0 {
+	// Scan 100% of all available trading PERP pairs across Pionex (no cap)
+	activeRanked := ranked
+	if len(activeRanked) == 0 {
 		activeRanked = ranked
 	}
 
@@ -159,7 +151,7 @@ func (s *Scanner) ScanMarkets(
 		candidate ScannerCandidate
 	}
 
-	workerCount := 16
+	workerCount := 24
 	if len(activeRanked) < workerCount {
 		workerCount = len(activeRanked)
 	}

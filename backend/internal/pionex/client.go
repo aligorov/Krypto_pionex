@@ -48,8 +48,8 @@ func NewClientWithHTTPClient(baseURL, apiKey, apiSecret string, httpClient *http
 		baseURL:        strings.TrimRight(baseURL, "/"),
 		signer:         NewSigner(apiKey, apiSecret),
 		httpClient:     httpClient,
-		publicLimiter:  NewRateLimiter(9, 9),
-		privateLimiter: NewRateLimiter(9, 9),
+		publicLimiter:  NewRateLimiter(20, 20),
+		privateLimiter: NewRateLimiter(10, 10),
 		now:            time.Now,
 	}
 }

@@ -93,7 +93,7 @@ func (worker *Worker) processNext(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	executionCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	executionCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 	defer cancel()
 	result := map[string]any{}
 	switch command.CommandType {
