@@ -376,7 +376,11 @@ func (s *Service) ValidateSession(ctx context.Context, token string) (*Principal
 		return nil, fmt.Errorf("validate session: %w", err)
 	}
 	principal.ActorType = "USER"
-	_, _ = s.db.Exec(ctx, "UPDATE user_sessions SET last_seen_at = NOW() WHERE id = $1", principal.SessionID)
+	go func(sessionID string) {
+		bgCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_, _ = s.db.Exec(bgCtx, "UPDATE user_sessions SET last_seen_at = NOW() WHERE id = $1", sessionID)
+	}(principal.SessionID)
 	return &principal, nil
 }
 

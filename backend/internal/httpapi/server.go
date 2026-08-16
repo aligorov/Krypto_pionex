@@ -1064,7 +1064,6 @@ func (s *Server) withSession(next http.Handler) http.Handler {
 		}
 		principal, err := s.auth.ValidateSession(r.Context(), token)
 		if err != nil {
-			clearAuthCookies(w, requestSecure(r))
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": auth.ErrUnauthorized.Error()})
 			return
 		}
