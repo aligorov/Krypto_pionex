@@ -2264,6 +2264,14 @@ func (worker *Worker) enrichAndAuditCandidatesWithLLM(
 					input.ConfluenceVerdict = verdict
 				}
 			}
+			// Pass the operator's scanner floors so the LLM doesn't
+			// re-reject what already passed them.
+			input.ScannerFloor = llm.ScannerFloor{
+				MinVolume24hUSD:  settings.MinVolume24h.InexactFloat64(),
+				MinVolatilityPct: settings.MinVolatilityPct.InexactFloat64(),
+				MaxVolatilityPct: settings.MaxVolatilityPct.InexactFloat64(),
+				MinSharpe:        settings.MinSharpe.InexactFloat64(),
+			}
 		}
 
 		// Grounded audits run a live google_search before answering and

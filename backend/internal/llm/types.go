@@ -100,21 +100,35 @@ type CandleSummary struct {
 
 // CandidateInput is passed to the LLM evaluator to audit a symbol.
 type CandidateInput struct {
-	Symbol              string          `json:"symbol"`
-	CurrentPrice        float64         `json:"current_price"`
-	Volume24h           float64         `json:"volume_24h_usd"`
-	VolatilityParkinson float64         `json:"volatility_parkinson_pct"`
-	ATRPct              float64         `json:"atr_pct"`
-	ADX                 float64         `json:"adx"`
-	Choppiness          float64         `json:"choppiness_index"`
-	EMASlopePct         float64         `json:"ema_slope_pct"`
-	IsSqueeze           bool            `json:"is_bbw_squeeze"`
-	Hurst               float64         `json:"hurst_exponent"`
-	ConfluenceVerdict   string          `json:"confluence_verdict"`
-	RecommendedTrend    string          `json:"recommended_trend"`
-	ProposedLowerPrice  float64         `json:"proposed_lower_price"`
-	ProposedUpperPrice  float64         `json:"proposed_upper_price"`
-	ProposedGridCount   int             `json:"proposed_grid_count"`
-	ProposedLeverage    int             `json:"proposed_leverage"`
-	RecentCandles15m    []CandleSummary `json:"recent_candles_15m"`
+	Symbol              string  `json:"symbol"`
+	CurrentPrice        float64 `json:"current_price"`
+	Volume24h           float64 `json:"volume_24h_usd"`
+	VolatilityParkinson float64 `json:"volatility_parkinson_pct"`
+	ATRPct              float64 `json:"atr_pct"`
+	ADX                 float64 `json:"adx"`
+	Choppiness          float64 `json:"choppiness_index"`
+	EMASlopePct         float64 `json:"ema_slope_pct"`
+	IsSqueeze           bool    `json:"is_bbw_squeeze"`
+	Hurst               float64 `json:"hurst_exponent"`
+	ConfluenceVerdict   string  `json:"confluence_verdict"`
+	RecommendedTrend    string  `json:"recommended_trend"`
+	// ScannerFloor tells the LLM what quantitative gates the operator has
+	// already applied, so the audit doesn't re-reject what passed them.
+	ScannerFloor       ScannerFloor    `json:"scanner_floor"`
+	ProposedLowerPrice float64         `json:"proposed_lower_price"`
+	ProposedUpperPrice float64         `json:"proposed_upper_price"`
+	ProposedGridCount  int             `json:"proposed_grid_count"`
+	ProposedLeverage   int             `json:"proposed_leverage"`
+	RecentCandles15m   []CandleSummary `json:"recent_candles_15m"`
+}
+
+// ScannerFloor carries the operator's quantitative scanner settings into
+// the LLM prompt as CONTEXT — the audit should not re-reject candidates
+// that already passed these thresholds, but may still flag qualitative
+// concerns (wash trading, spoofing, catalyst risks) independent of them.
+type ScannerFloor struct {
+	MinVolume24hUSD  float64 `json:"min_volume_24h_usd"`
+	MinVolatilityPct float64 `json:"min_volatility_pct"`
+	MaxVolatilityPct float64 `json:"max_volatility_pct"`
+	MinSharpe        float64 `json:"min_sharpe"`
 }

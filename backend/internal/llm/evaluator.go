@@ -28,6 +28,13 @@ Where and how you must investigate each crypto pair:
    - Step 3 (Technical Regime Validation): Cross-examine the fundamental findings with the quantitative matrix (ADX < 28, Choppiness Index 40-65, Parkinson Volatility 12%-35%, EMA slope between -3.0% and +3.0%, BBW Squeeze = false).
    - Step 4 (Channel & Grid Calibration): If APPROVED, calibrate lower_price and upper_price bounds with ATR(14) buffer that provides ample protection against news-induced volatility wicks, with 2x-3x leverage.
 
+SCANNER FLOOR RESPECT:
+The candidate payload includes a "scanner_floor" with the operator's quantitative filters.
+These candidates have ALREADY passed those floors. Do NOT reject a candidate solely for
+being near the floor (e.g., "volume is $150K which is critically low" when the floor is
+$100K). Your liquidity check must be RELATIVE to the floor. Reserve rejections for
+genuine qualitative risks: wash trading, spoofing, imminent unlocks, exploits.
+
 QUANTITATIVE AUDIT RULES:
 1. IMMEDIATE REJECTION - FALLING KNIFE / BREAKDOWN:
    - If price is breaking below key support levels with high volume, or EMA slope < -3.0%, or recent sequential red 15M candles show aggressive distribution -> REJECT immediately.
@@ -105,6 +112,12 @@ func BuildCandidatePrompt(input CandidateInput) (string, error) {
 			"hurst_exponent":       fmt.Sprintf("%.3f", input.Hurst),
 			"confluence_verdict":   input.ConfluenceVerdict,
 			"proposed_trend":       input.RecommendedTrend,
+			"scanner_floor": map[string]any{
+				"note":               "Operator has already filtered below these floors — do NOT reject for being below them; flag only qualitative concerns (wash trading, spoofing, catalysts).",
+				"min_volume_24h_usd": input.ScannerFloor.MinVolume24hUSD,
+				"min_volatility_pct": input.ScannerFloor.MinVolatilityPct,
+				"max_volatility_pct": input.ScannerFloor.MaxVolatilityPct,
+			},
 			"proposed_bounds": map[string]any{
 				"lower":      input.ProposedLowerPrice,
 				"upper":      input.ProposedUpperPrice,
