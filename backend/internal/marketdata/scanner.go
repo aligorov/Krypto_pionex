@@ -435,15 +435,15 @@ func scoreCandidate(
 		if regime.RSI > 58.0 {
 			reasons = append(reasons, fmt.Sprintf("Anti-FOMO: RSI (%.1f) > 58 - пара перекуплена, вход в LONG на локальном хае заблокирован", regime.RSI))
 		}
-		if regime.RangePositionPct > 65.0 {
-			reasons = append(reasons, fmt.Sprintf("Anti-FOMO: положение в канале (%.1f%%) > 65%% - вход в LONG на верхней границе заблокирован", regime.RangePositionPct))
+		if regime.RangePositionPct > 40.0 {
+			reasons = append(reasons, fmt.Sprintf("Anti-FOMO: положение в канале (%.1f%%) > 40%% - вход в LONG выше середины заблокирован", regime.RangePositionPct))
 		}
 	} else if recommendedTrend == "short" {
 		if regime.RSI < 42.0 {
 			reasons = append(reasons, fmt.Sprintf("Anti-FOMO: RSI (%.1f) < 42 - пара перепродана, вход в SHORT на локальном дне заблокирован", regime.RSI))
 		}
-		if regime.RangePositionPct < 35.0 {
-			reasons = append(reasons, fmt.Sprintf("Anti-FOMO: положение в канале (%.1f%%) < 35%% - вход в SHORT на нижней границе заблокирован", regime.RangePositionPct))
+		if regime.RangePositionPct < 60.0 {
+			reasons = append(reasons, fmt.Sprintf("Anti-FOMO: положение в канале (%.1f%%) < 60%% - вход в SHORT ниже середины заблокирован", regime.RangePositionPct))
 		}
 	} else {
 		// NEUTRAL grid
@@ -514,9 +514,9 @@ func scoreCandidate(
 	entryFit := 1.0
 	switch recommendedTrend {
 	case "long":
-		entryFit = clamp((70-regime.RangePositionPct)/45, 0, 1)
+		entryFit = clamp((40-regime.RangePositionPct)/40, 0, 1)
 	case "short":
-		entryFit = clamp((regime.RangePositionPct-30)/45, 0, 1)
+		entryFit = clamp((regime.RangePositionPct-60)/40, 0, 1)
 	default:
 		entryFit = clamp(1.0-math.Abs(regime.RangePositionPct-50)/50, 0, 1)
 	}
