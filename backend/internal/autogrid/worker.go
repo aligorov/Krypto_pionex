@@ -141,7 +141,7 @@ func (worker *Worker) processNext(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	executionCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+	executionCtx, cancel := context.WithTimeout(ctx, 15*time.Minute)
 	defer cancel()
 	result := map[string]any{}
 	worker.logger.Info("Executing AutoGrid command", "component", "autogrid_worker", "command_type", command.CommandType, "command_id", command.ID)
@@ -196,7 +196,7 @@ func (worker *Worker) claim(ctx context.Context) (*queuedCommand, error) {
 		)
 		UPDATE control_commands AS command
 		SET status = 'EXECUTING', lease_owner = $1,
-		    lease_expiry = NOW() + INTERVAL '10 minutes',
+		    lease_expiry = NOW() + INTERVAL '15 minutes',
 		    attempts = attempts + 1, updated_at = NOW()
 		FROM next_command
 		WHERE command.id = next_command.id
@@ -2265,7 +2265,10 @@ func (worker *Worker) enrichAndAuditCandidatesWithLLM(
 			}
 		}
 
-		auditCtx, auditCancel := context.WithTimeout(ctx, 15*time.Second)
+		// Grounded audits run a live google_search before answering and
+		// routinely exceed 15s; cutting them mid-flight used to fail-close
+		// candidates that would have passed (prod: TUT, context deadline).
+		auditCtx, auditCancel := context.WithTimeout(ctx, 45*time.Second)
 		decision, record, err := worker.llm.AuditCandidate(auditCtx, &candidate.ID, input)
 		auditCancel()
 		if err != nil {
