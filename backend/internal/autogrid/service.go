@@ -137,6 +137,7 @@ type Candidate struct {
 
 type ActiveBot struct {
 	ID                  string           `json:"id"`
+	BotNumber           int              `json:"botNumber"`
 	Source              string           `json:"source"`
 	AccountID           *string          `json:"accountId"`
 	BUOrderID           *string          `json:"buOrderId"`
@@ -163,6 +164,7 @@ type ActiveBot struct {
 
 type ClosedBot struct {
 	ID              string           `json:"id"`
+	BotNumber       int              `json:"botNumber"`
 	Source          string           `json:"source"`
 	Symbol          string           `json:"symbol"`
 	Direction       string           `json:"direction"`
@@ -674,6 +676,26 @@ func (s *Service) CloseAllActiveBots(ctx context.Context, reason string) error {
 	if reason == "" {
 		reason = "AUTOGRID_STOP"
 	}
+
+	// Record close events for active paper bots
+	rows, err := s.db.Query(ctx, `
+		SELECT id, COALESCE(bot_number, 0), symbol, mark_price, realized_pnl_usdt + unrealized_pnl_usdt
+		FROM paper_grid_bots
+		WHERE settings_id = $1 AND status = 'RUNNING'
+	`, settings.ID)
+	if err == nil {
+		for rows.Next() {
+			var bID string
+			var bNum int
+			var sym string
+			var mPrice, pnl decimal.Decimal
+			if err := rows.Scan(&bID, &bNum, &sym, &mPrice, &pnl); err == nil {
+				_ = LogBotEvent(ctx, s.db, bID, bNum, "PAPER", sym, "MANUAL_STOP", &mPrice, &pnl, map[string]any{"reason": reason})
+			}
+		}
+		rows.Close()
+	}
+
 	// 1. Close all running paper bots immediately
 	_, err = s.db.Exec(ctx, `
 		UPDATE paper_grid_bots
@@ -881,7 +903,7 @@ func (s *Service) listCandidates(ctx context.Context, scanID string) ([]Candidat
 func (s *Service) listActiveBots(ctx context.Context, settingsID string) ([]ActiveBot, error) {
 	items := make([]ActiveBot, 0)
 	rows, err := s.db.Query(ctx, `
-		SELECT id, account_id, bu_order_id, symbol, status, direction, grid_type,
+		SELECT id, COALESCE(bot_number, 0), account_id, bu_order_id, symbol, status, direction, grid_type,
 		       lower_price, upper_price, grid_num, leverage, quote_investment,
 		       reconciliation_state, adjustments_count,
 		       pnl_target_usdt, max_loss_usdt,
@@ -898,7 +920,7 @@ func (s *Service) listActiveBots(ctx context.Context, settingsID string) ([]Acti
 		var item ActiveBot
 		item.Source = "REAL"
 		if err := rows.Scan(
-			&item.ID, &item.AccountID, &item.BUOrderID, &item.Symbol,
+			&item.ID, &item.BotNumber, &item.AccountID, &item.BUOrderID, &item.Symbol,
 			&item.Status, &item.Direction, &item.GridType, &item.LowerPrice,
 			&item.UpperPrice, &item.GridNum, &item.Leverage,
 			&item.QuoteInvestment, &item.ReconciliationState,
@@ -917,7 +939,7 @@ func (s *Service) listActiveBots(ctx context.Context, settingsID string) ([]Acti
 	rows.Close()
 
 	rows, err = s.db.Query(ctx, `
-		SELECT id, symbol, status, direction, grid_type, lower_price,
+		SELECT id, COALESCE(bot_number, 0), symbol, status, direction, grid_type, lower_price,
 		       upper_price, grid_num, leverage, quote_investment,
 		       realized_pnl_usdt, unrealized_pnl_usdt,
 		       pnl_target_usdt, max_loss_usdt, updated_at,
@@ -936,7 +958,7 @@ func (s *Service) listActiveBots(ctx context.Context, settingsID string) ([]Acti
 		item.ReconciliationState = "SIMULATION"
 		var rawModelState any
 		if err := rows.Scan(
-			&item.ID, &item.Symbol, &item.Status, &item.Direction,
+			&item.ID, &item.BotNumber, &item.Symbol, &item.Status, &item.Direction,
 			&item.GridType, &item.LowerPrice, &item.UpperPrice,
 			&item.GridNum, &item.Leverage, &item.QuoteInvestment,
 			&item.RealizedPNLUSDT, &item.UnrealizedPNLUSDT,
@@ -997,7 +1019,7 @@ func mapGridType(density bool) string {
 func (s *Service) listClosedBots(ctx context.Context, settingsID string) ([]ClosedBot, error) {
 	items := make([]ClosedBot, 0)
 	rows, err := s.db.Query(ctx, `
-		SELECT id, symbol, direction, quote_investment,
+		SELECT id, COALESCE(bot_number, 0), symbol, direction, quote_investment,
 		       realized_pnl_usdt, closed_reason, status, COALESCE(closed_at, updated_at)
 		FROM grid_bots
 		WHERE (autogrid_settings_id = $1 OR autogrid_settings_id IS NOT NULL)
@@ -1012,7 +1034,7 @@ func (s *Service) listClosedBots(ctx context.Context, settingsID string) ([]Clos
 		var item ClosedBot
 		item.Source = "REAL"
 		if err := rows.Scan(
-			&item.ID, &item.Symbol, &item.Direction, &item.QuoteInvestment,
+			&item.ID, &item.BotNumber, &item.Symbol, &item.Direction, &item.QuoteInvestment,
 			&item.RealizedPNLUSDT, &item.ClosedReason, &item.Status, &item.ClosedAt,
 		); err != nil {
 			rows.Close()
@@ -1023,7 +1045,7 @@ func (s *Service) listClosedBots(ctx context.Context, settingsID string) ([]Clos
 	rows.Close()
 
 	rows, err = s.db.Query(ctx, `
-		SELECT id, symbol, direction, quote_investment,
+		SELECT id, COALESCE(bot_number, 0), symbol, direction, quote_investment,
 		       realized_pnl_usdt, closed_reason, status, COALESCE(closed_at, updated_at)
 		FROM paper_grid_bots
 		WHERE (settings_id = $1 OR settings_id IS NOT NULL)
@@ -1039,7 +1061,7 @@ func (s *Service) listClosedBots(ctx context.Context, settingsID string) ([]Clos
 		var item ClosedBot
 		item.Source = "PAPER"
 		if err := rows.Scan(
-			&item.ID, &item.Symbol, &item.Direction, &item.QuoteInvestment,
+			&item.ID, &item.BotNumber, &item.Symbol, &item.Direction, &item.QuoteInvestment,
 			&item.RealizedPNLUSDT, &item.ClosedReason, &item.Status, &item.ClosedAt,
 		); err != nil {
 			return nil, fmt.Errorf("scan closed paper AutoGrid bot: %w", err)
@@ -1065,6 +1087,15 @@ func (s *Service) RequestBotClose(ctx context.Context, settingsID, botID, reason
 	if tag.RowsAffected() == 1 {
 		return "REAL", nil
 	}
+
+	var bNum int
+	var sym string
+	var mPrice, pnl decimal.Decimal
+	_ = s.db.QueryRow(ctx, `
+		SELECT COALESCE(bot_number, 0), symbol, mark_price, realized_pnl_usdt + unrealized_pnl_usdt
+		FROM paper_grid_bots WHERE id = $1
+	`, botID).Scan(&bNum, &sym, &mPrice, &pnl)
+
 	tag, err = s.db.Exec(ctx, `
 		UPDATE paper_grid_bots
 		SET status = 'COMPLETED', closed_reason = $3,
@@ -1075,6 +1106,7 @@ func (s *Service) RequestBotClose(ctx context.Context, settingsID, botID, reason
 		return "", fmt.Errorf("close paper bot: %w", err)
 	}
 	if tag.RowsAffected() == 1 {
+		_ = LogBotEvent(ctx, s.db, botID, bNum, "PAPER", sym, "MANUAL_STOP", &mPrice, &pnl, map[string]any{"reason": reason})
 		return "PAPER", nil
 	}
 	return "", errors.New("bot not found or already terminal")

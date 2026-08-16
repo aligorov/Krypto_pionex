@@ -1,8 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
-import { api } from '../api';
-import { describeError } from './AutoGridAutopilot';
+import { api, describeError } from '../api';
 import { CandlestickChart } from './CandlestickChart';
-import type { AIKitResponse, AutoGridClosedBot, AutoGridBot, AutoGridState } from '../types';
+import type { AIKitResponse, AutoGridClosedBot, AutoGridBot, AutoGridState, BotExecutionEvent } from '../types';
 
 interface Props {
   canOperate: boolean;
@@ -14,6 +13,7 @@ export default function Bots({ canOperate }: Props) {
   const [state, setState] = useState<AutoGridState | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [selectedBotForChart, setSelectedBotForChart] = useState<AutoGridBot | null>(null);
+  const [selectedBotForHistory, setSelectedBotForHistory] = useState<{ id: string; symbol: string; botNumber?: number } | null>(null);
 
   const load = useCallback(async () => {
     try {
@@ -80,6 +80,13 @@ export default function Bots({ canOperate }: Props) {
         </div>
       )}
 
+      {selectedBotForHistory && (
+        <BotHistoryModal
+          bot={selectedBotForHistory}
+          onClose={() => setSelectedBotForHistory(null)}
+        />
+      )}
+
       {canOperate && <ManualDeployPanel onDeployed={load} state={state} />}
 
       <div className="panel">
@@ -102,7 +109,7 @@ export default function Bots({ canOperate }: Props) {
             <table>
               <thead>
                 <tr>
-                  <th>Символ</th>
+                  <th>Бот / Символ</th>
                   <th>Источник</th>
                   <th>Статус</th>
                   <th>Направление</th>
@@ -112,9 +119,8 @@ export default function Bots({ canOperate }: Props) {
                   <th>Реализ. PnL</th>
                   <th>Нереализ. PnL</th>
                   <th>Всего</th>
-                  <th>Цель / стоп</th>
                   <th>Сдвиги</th>
-                  {canOperate && <th></th>}
+                  <th>Действия</th>
                 </tr>
               </thead>
               <tbody>
@@ -125,6 +131,7 @@ export default function Bots({ canOperate }: Props) {
                     canOperate={canOperate}
                     onClosed={load}
                     onOpenChart={() => setSelectedBotForChart(bot)}
+                    onOpenHistory={() => setSelectedBotForHistory({ id: bot.id, symbol: bot.symbol, botNumber: bot.botNumber })}
                   />
                 ))}
               </tbody>
@@ -160,18 +167,23 @@ export default function Bots({ canOperate }: Props) {
             <table>
               <thead>
                 <tr>
-                  <th>Символ</th>
+                  <th>Бот / Символ</th>
                   <th>Источник</th>
                   <th>Причина закрытия</th>
                   <th>Направление</th>
                   <th>Инвест.</th>
                   <th>Итоговый PnL</th>
                   <th>Закрыт</th>
+                  <th>История</th>
                 </tr>
               </thead>
               <tbody>
                 {state.closedBots.map((bot) => (
-                  <ClosedBotRow key={`${bot.source}-${bot.id}`} bot={bot} />
+                  <ClosedBotRow
+                    key={`${bot.source}-${bot.id}`}
+                    bot={bot}
+                    onOpenHistory={() => setSelectedBotForHistory({ id: bot.id, symbol: bot.symbol, botNumber: bot.botNumber })}
+                  />
                 ))}
               </tbody>
             </table>
@@ -187,11 +199,13 @@ function BotRow({
   canOperate,
   onClosed,
   onOpenChart,
+  onOpenHistory,
 }: {
   bot: AutoGridBot;
   canOperate: boolean;
   onClosed: () => Promise<void>;
   onOpenChart: () => void;
+  onOpenHistory: () => void;
 }) {
   const [closing, setClosing] = useState(false);
   const [adjusting, setAdjusting] = useState(false);
@@ -209,7 +223,7 @@ function BotRow({
   async function close() {
     if (
       !window.confirm(
-        `Закрыть бот ${bot.symbol} (${bot.source})? Реальный бот будет отменён нативным API Pionex, позиция закроется в USDT.`,
+        `Закрыть бот #${bot.botNumber || ''} ${bot.symbol} (${bot.source})? Позиция будет зафиксирована.`,
       )
     ) {
       return;
@@ -252,13 +266,20 @@ function BotRow({
     <>
       <tr>
         <td>
-          <strong
-            style={{ cursor: 'pointer', color: '#38bdf8' }}
-            onClick={onOpenChart}
-            title="Открыть интерактивный график"
-          >
-            {bot.symbol}
-          </strong>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+            {bot.botNumber ? (
+              <span className="badge neutral" style={{ fontWeight: 700, padding: '2px 6px', fontSize: '0.75rem' }}>
+                #{bot.botNumber}
+              </span>
+            ) : null}
+            <strong
+              style={{ cursor: 'pointer', color: '#38bdf8' }}
+              onClick={onOpenChart}
+              title="Открыть интерактивный график"
+            >
+              {bot.symbol}
+            </strong>
+          </div>
         </td>
         <td><span className={`badge ${bot.source === 'REAL' ? 'danger' : 'neutral'}`}>{bot.source}</span></td>
         <td>
@@ -292,33 +313,42 @@ function BotRow({
         <td className={pnlClass(unrealized)}>{bot.unrealizedPnlUsdt ?? '—'}</td>
         <td className={pnlClass(total)}><strong>{total.toFixed(4)}</strong></td>
         <td>{bot.adjustmentsCount}</td>
-        {canOperate && (
-          <td>
-            <div className="row-actions">
-              <button
-                className="button small"
-                onClick={onOpenChart}
-                title="Посмотреть свечной график"
-              >
-                📊
-              </button>
-              <button
-                className="button small"
-                disabled={adjusting || bot.status !== 'RUNNING'}
-                onClick={() => setAdjusting((value) => !value)}
-              >
-                Вести
-              </button>
-              <button
-                className="button small danger"
-                disabled={closing || !closableStatuses.includes(bot.status)}
-                onClick={() => void close()}
-              >
-                {closing ? '…' : 'Закрыть'}
-              </button>
-            </div>
-          </td>
-        )}
+        <td>
+          <div className="row-actions" style={{ display: 'flex', gap: '4px', alignItems: 'center' }}>
+            <button
+              className="button small"
+              onClick={onOpenChart}
+              title="Посмотреть свечной график"
+            >
+              📊
+            </button>
+            <button
+              className="button small"
+              onClick={onOpenHistory}
+              title="История событий и лог бота"
+            >
+              📜
+            </button>
+            {canOperate && (
+              <>
+                <button
+                  className="button small"
+                  disabled={adjusting || bot.status !== 'RUNNING'}
+                  onClick={() => setAdjusting((value) => !value)}
+                >
+                  Вести
+                </button>
+                <button
+                  className="button small danger"
+                  disabled={closing || !closableStatuses.includes(bot.status)}
+                  onClick={() => void close()}
+                >
+                  {closing ? '…' : 'Закрыть'}
+                </button>
+              </>
+            )}
+          </div>
+        </td>
       </tr>
       {adjusting && (
         <tr>
@@ -376,11 +406,26 @@ function BotRow({
   );
 }
 
-function ClosedBotRow({ bot }: { bot: AutoGridClosedBot }) {
+function ClosedBotRow({
+  bot,
+  onOpenHistory,
+}: {
+  bot: AutoGridClosedBot;
+  onOpenHistory: () => void;
+}) {
   const pnl = Number(bot.realizedPnlUsdt) || 0;
   return (
     <tr>
-      <td><strong>{bot.symbol}</strong></td>
+      <td>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+          {bot.botNumber ? (
+            <span className="badge neutral" style={{ fontWeight: 700, padding: '2px 6px', fontSize: '0.75rem' }}>
+              #{bot.botNumber}
+            </span>
+          ) : null}
+          <strong>{bot.symbol}</strong>
+        </div>
+      </td>
       <td><span className={`badge ${bot.source === 'REAL' ? 'danger' : 'neutral'}`}>{bot.source}</span></td>
       <td>
         <span className={`badge ${reasonBadge(bot.closedReason)}`}>{bot.closedReason ?? bot.status}</span>
@@ -391,7 +436,142 @@ function ClosedBotRow({ bot }: { bot: AutoGridClosedBot }) {
         <strong>{bot.realizedPnlUsdt ?? '—'}</strong>
       </td>
       <td>{bot.closedAt ? new Date(bot.closedAt).toLocaleString() : '—'}</td>
+      <td>
+        <button
+          className="button small"
+          onClick={onOpenHistory}
+          title="История событий бота"
+        >
+          📜 Лог
+        </button>
+      </td>
     </tr>
+  );
+}
+
+function BotHistoryModal({
+  bot,
+  onClose,
+}: {
+  bot: { id: string; symbol: string; botNumber?: number };
+  onClose: () => void;
+}) {
+  const [events, setEvents] = useState<BotExecutionEvent[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    async function fetchEvents() {
+      try {
+        setLoading(true);
+        const res = await api<{ data: BotExecutionEvent[] }>(`/api/bots/${bot.id}/history`);
+        setEvents(res.data || []);
+      } catch (err) {
+        setError(describeError(err));
+      } finally {
+        setLoading(false);
+      }
+    }
+    void fetchEvents();
+  }, [bot.id]);
+
+  const eventBadge = (type: string) => {
+    switch (type) {
+      case 'CREATED': return <span className="badge success">🚀 ЗАПУСК</span>;
+      case 'TAKE_PROFIT': return <span className="badge success">🎯 ТЕЙК-ПРОФИТ</span>;
+      case 'STOP_LOSS': return <span className="badge danger">🛡️ СТОП-ЛОСС</span>;
+      case 'ADJUST_RANGE': return <span className="badge warning">🔄 СДВИГ</span>;
+      case 'GRID_FILL': return <span className="badge neutral">⚡ ИСПОЛНЕНИЕ</span>;
+      case 'MANUAL_STOP': return <span className="badge warning">⏹️ ОСТАНОВКА</span>;
+      default: return <span className="badge neutral">{type}</span>;
+    }
+  };
+
+  return (
+    <div
+      style={{
+        position: 'fixed',
+        inset: 0,
+        backgroundColor: 'rgba(0, 0, 0, 0.75)',
+        zIndex: 1100,
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        padding: '1rem',
+      }}
+      onClick={onClose}
+    >
+      <div
+        className="card"
+        style={{
+          width: '700px',
+          maxWidth: '95vw',
+          maxHeight: '85vh',
+          display: 'flex',
+          flexDirection: 'column',
+          overflow: 'hidden',
+          padding: '1.5rem',
+        }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderBottom: '1px solid var(--border-color)', paddingBottom: '1rem', marginBottom: '1rem' }}>
+          <div>
+            <h3 style={{ margin: 0, fontSize: '1.2rem' }}>
+              📜 История событий: {bot.botNumber ? `#${bot.botNumber} ` : ''}{bot.symbol}
+            </h3>
+            <span style={{ fontSize: '0.78rem', color: 'var(--text-secondary)' }}>ID: {bot.id}</span>
+          </div>
+          <button className="button ghost" onClick={onClose} style={{ fontSize: '1.2rem', padding: '0.2rem 0.6rem' }}>×</button>
+        </div>
+
+        <div style={{ flex: 1, overflowY: 'auto', paddingRight: '0.5rem' }}>
+          {loading && <div style={{ textAlign: 'center', padding: '2rem' }}>Загрузка истории...</div>}
+          {error && <div className="banner error">{error}</div>}
+          {!loading && !error && events.length === 0 && (
+            <div className="empty-state">Событий по данному боту пока не зафиксировано.</div>
+          )}
+          {!loading && !error && events.length > 0 && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
+              {events.map((ev) => (
+                <div
+                  key={ev.id}
+                  style={{
+                    padding: '0.75rem 1rem',
+                    borderRadius: '6px',
+                    background: 'var(--surface-color, rgba(255,255,255,0.03))',
+                    border: '1px solid var(--border-color)',
+                  }}
+                >
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.35rem' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                      {eventBadge(ev.eventType)}
+                      {ev.pnlUsdt && (
+                        <strong className={Number(ev.pnlUsdt) > 0 ? 'positive' : Number(ev.pnlUsdt) < 0 ? 'negative' : ''}>
+                          {Number(ev.pnlUsdt) > 0 ? `+${ev.pnlUsdt}` : ev.pnlUsdt} USDT
+                        </strong>
+                      )}
+                    </div>
+                    <span style={{ fontSize: '0.75rem', color: 'var(--text-secondary)' }}>
+                      {new Date(ev.createdAt).toLocaleString()}
+                    </span>
+                  </div>
+                  {ev.price && (
+                    <div style={{ fontSize: '0.8rem', color: 'var(--text-secondary)' }}>
+                      Цена события: <code>{ev.price}</code>
+                    </div>
+                  )}
+                  {ev.details && Object.keys(ev.details).length > 0 && (
+                    <div style={{ fontSize: '0.78rem', marginTop: '0.3rem', color: 'var(--text-secondary)', background: 'rgba(0,0,0,0.2)', padding: '0.4rem', borderRadius: '4px' }}>
+                      {JSON.stringify(ev.details)}
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
   );
 }
 

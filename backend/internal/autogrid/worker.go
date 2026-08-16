@@ -534,7 +534,9 @@ func (worker *Worker) deployPaper(
 		}
 		target, maxLoss := computeBotTargets(settings, candidate)
 
-		tag, err = worker.db.Exec(ctx, `
+		var botID string
+		var botNumber int
+		err = worker.db.QueryRow(ctx, `
 			INSERT INTO paper_grid_bots (
 				settings_id, candidate_id, symbol, status, direction, grid_type,
 				lower_price, upper_price, grid_num, leverage, quote_investment,
@@ -558,19 +560,30 @@ func (worker *Worker) deployPaper(
 			)
 			ON CONFLICT (settings_id, symbol) WHERE status = 'RUNNING'
 			DO NOTHING
+			RETURNING id, bot_number
 		`, settings.ID, candidate.ID, candidate.Symbol,
 			databaseTrend(candidate.RecommendedTrend), gridType,
 			mesh.LowerPrice, mesh.UpperPrice, mesh.GridNum,
 			botLev, settings.BudgetUSDT,
 			candidate.CurrentPrice, settings.PnLTargetMode, target, maxLoss,
 			confluence.Status, mesh.GridStepPct, confluence.Score, antiHuntStop,
-			levReason, levMode, settings.Leverage)
+			levReason, levMode, settings.Leverage).Scan(&botID, &botNumber)
 		if err != nil {
+			if err.Error() == "no rows in result set" {
+				continue
+			}
 			return fmt.Errorf("deploy paper grid %s: %w", candidate.Symbol, err)
 		}
-		if tag.RowsAffected() > 0 {
-			activeCount++
-		}
+		activeCount++
+
+		_ = LogBotEvent(ctx, worker.db, botID, botNumber, "PAPER", candidate.Symbol, "CREATED", &candidate.CurrentPrice, nil, map[string]any{
+			"leverage": botLev, "gridNum": mesh.GridNum, "lowerPrice": mesh.LowerPrice, "upperPrice": mesh.UpperPrice, "budget": settings.BudgetUSDT,
+		})
+		_ = QueueTelegramEvent(ctx, worker.db, "BOT_CREATED", map[string]any{
+			"bot_number": botNumber, "symbol": candidate.Symbol, "direction": databaseTrend(candidate.RecommendedTrend),
+			"leverage": botLev, "lower_price": mesh.LowerPrice, "upper_price": mesh.UpperPrice,
+			"grid_num": mesh.GridNum, "quote_investment": settings.BudgetUSDT,
+		})
 	}
 	return nil
 }
@@ -1167,7 +1180,7 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 		return err
 	}
 	rows, err := worker.db.Query(ctx, `
-		SELECT id, symbol, direction, entry_price, leverage, quote_investment,
+		SELECT id, COALESCE(bot_number, 0), symbol, direction, entry_price, leverage, quote_investment,
 		       lower_price, upper_price, pnl_target_usdt, max_loss_usdt,
 		       grid_num, last_grid_level, realized_pnl_usdt
 		FROM paper_grid_bots
@@ -1177,7 +1190,9 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 		return err
 	}
 	type paperBot struct {
-		id, symbol, direction        string
+		id                           string
+		botNumber                    int
+		symbol, direction            string
 		entry                        decimal.Decimal
 		leverage                     int
 		investment, lower, upper     decimal.Decimal
@@ -1190,7 +1205,7 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 	for rows.Next() {
 		var item paperBot
 		if err := rows.Scan(
-			&item.id, &item.symbol, &item.direction, &item.entry,
+			&item.id, &item.botNumber, &item.symbol, &item.direction, &item.entry,
 			&item.leverage, &item.investment, &item.lower, &item.upper,
 			&item.pnlTarget, &item.maxLoss, &item.gridNum, &item.lastLevel,
 			&item.realized,
@@ -1279,6 +1294,24 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 			worker.logger.Info("paper bot closed by management",
 				"component", "autogrid_worker", "symbol", bot.symbol,
 				"reason", decision.Reason, "pnl", total.String())
+
+			eventType := "STOP_LOSS"
+			if decision.Action == ActionCloseTakeProfit {
+				eventType = "TAKE_PROFIT"
+			}
+			pnlPct := decimal.Zero
+			if !bot.investment.IsZero() {
+				pnlPct = total.Div(bot.investment).Mul(decimal.NewFromInt(100)).Round(2)
+			}
+
+			_ = LogBotEvent(ctx, worker.db, bot.id, bot.botNumber, "PAPER", bot.symbol, eventType, &price, &total, map[string]any{
+				"reason": decision.Reason, "pnlPct": pnlPct,
+			})
+			_ = QueueTelegramEvent(ctx, worker.db, eventType, map[string]any{
+				"bot_number": bot.botNumber, "symbol": bot.symbol,
+				"pnl_usdt": total.StringFixed(4), "pnl_pct": pnlPct.StringFixed(2),
+				"reason": decision.Reason,
+			})
 			continue
 		}
 		_, _ = worker.db.Exec(ctx, `

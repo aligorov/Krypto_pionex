@@ -11,8 +11,9 @@ import AuditLogs from './components/AuditLogs';
 import MCPServer from './components/MCPServer';
 import SecurityModal from './components/SecurityModal';
 import { LLMSettingsModal } from './components/LLMSettingsModal';
+import { TelegramSettings } from './components/TelegramSettings';
 
-type Tab = 'overview' | 'autogrid' | 'candidates' | 'bots' | 'accounts' | 'risk' | 'audit' | 'mcp';
+type Tab = 'overview' | 'autogrid' | 'candidates' | 'bots' | 'accounts' | 'risk' | 'telegram' | 'audit' | 'mcp';
 
 const canOperate = (role: Role): boolean => role === 'OPERATOR' || role === 'ADMIN';
 const canManage = (role: Role): boolean => role === 'ADMIN';
@@ -30,6 +31,7 @@ export default function App() {
   const [overview, setOverview] = useState<Dashboard | null>(null);
 
   const [activeTab, setActiveTab] = useState<Tab>('overview');
+  const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [showSecurityModal, setShowSecurityModal] = useState(false);
   const [showLLMModal, setShowLLMModal] = useState(false);
   const [securityTab, setSecurityTab] = useState<'password' | '2fa' | 'ip'>('password');
@@ -240,13 +242,14 @@ export default function App() {
     );
   }
 
-  const sidebarLinks: { id: Tab; label: string }[] = [
+  const sidebarLinks: { id: Tab; label: string; icon?: string }[] = [
     { id: 'overview', label: 'Обзор' },
     { id: 'autogrid', label: 'Автопилот' },
     { id: 'candidates', label: 'Кандидаты' },
     { id: 'bots', label: 'Боты · PnL' },
     { id: 'accounts', label: 'Pionex API' },
     { id: 'risk', label: 'Риск' },
+    { id: 'telegram', label: 'Telegram' },
     { id: 'audit', label: 'Аудит' },
     { id: 'mcp', label: 'MCP' },
   ];
@@ -255,21 +258,39 @@ export default function App() {
 
   return (
     <div className="app-shell">
-      <aside className="sidebar">
+      {/* Mobile Drawer Backdrop */}
+      <div
+        className={`mobile-overlay ${mobileMenuOpen ? 'visible' : ''}`}
+        onClick={() => setMobileMenuOpen(false)}
+      />
+
+      <aside className={`sidebar ${mobileMenuOpen ? 'open' : ''}`}>
         <div>
-          <div className="brand">
-            <span className="brand-mark">PX</span>
-            <div>
-              <div className="brand-title">Pionex Control</div>
-              <div className="muted">Pionex-only · native bots</div>
+          <div className="brand" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+              <span className="brand-mark">PX</span>
+              <div>
+                <div className="brand-title">Pionex Control</div>
+                <div className="muted">Pionex-only · native bots</div>
+              </div>
             </div>
+            <button
+              className="button ghost"
+              onClick={() => setMobileMenuOpen(false)}
+              style={{ display: mobileMenuOpen ? 'block' : 'none', fontSize: '1.2rem', padding: '4px 8px' }}
+            >
+              ×
+            </button>
           </div>
 
           <nav className="nav">
             {sidebarLinks.map((item) => (
               <button
                 key={item.id}
-                onClick={() => setActiveTab(item.id)}
+                onClick={() => {
+                  setActiveTab(item.id);
+                  setMobileMenuOpen(false);
+                }}
                 className={`nav-item ${activeTab === item.id ? 'active' : ''}`}
               >
                 <span>{item.label}</span>
@@ -293,7 +314,10 @@ export default function App() {
           <div style={{ display: 'flex', gap: 6, marginBottom: 6 }}>
             <button
               className="button small"
-              onClick={() => setShowLLMModal(true)}
+              onClick={() => {
+                setShowLLMModal(true);
+                setMobileMenuOpen(false);
+              }}
               title="Настройка AI Мозга (Gemini / Claude / OpenRouter)"
               style={{ flex: 1, borderColor: '#3b82f6', color: '#60a5fa' }}
             >
@@ -304,6 +328,7 @@ export default function App() {
               onClick={() => {
                 setSecurityTab('password');
                 setShowSecurityModal(true);
+                setMobileMenuOpen(false);
               }}
               title="Сменить пароль или настроить 2FA"
               style={{ flex: 1 }}
@@ -319,13 +344,22 @@ export default function App() {
 
       <main>
         <div className="topbar">
-          <div>
-            <h1 className="page-title">
-              {sidebarLinks.find((item) => item.id === activeTab)?.label}
-            </h1>
-            <p className="muted">
-              Конфигурация и credentials из PostgreSQL · нативные грид-боты Pionex
-            </p>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+            <button
+              className="hamburger-btn"
+              onClick={() => setMobileMenuOpen(true)}
+              aria-label="Открыть меню"
+            >
+              ☰
+            </button>
+            <div>
+              <h1 className="page-title">
+                {sidebarLinks.find((item) => item.id === activeTab)?.label}
+              </h1>
+              <p className="muted">
+                Конфигурация и credentials из PostgreSQL · нативные грид-боты Pionex
+              </p>
+            </div>
           </div>
           <div className="topbar-actions">
             <span className={`badge ${killSwitchOn ? 'badge-danger' : 'badge-ok'}`}>
@@ -348,6 +382,7 @@ export default function App() {
         {activeTab === 'bots' && <Bots canOperate={canOperate(user.role)} />}
         {activeTab === 'accounts' && <PionexAccounts canManage={canManage(user.role)} />}
         {activeTab === 'risk' && <RiskSettings canManage={canManage(user.role)} />}
+        {activeTab === 'telegram' && <TelegramSettings />}
         {activeTab === 'audit' && <AuditLogs />}
         {activeTab === 'mcp' && <MCPServer canManage={canManage(user.role)} />}
       </main>

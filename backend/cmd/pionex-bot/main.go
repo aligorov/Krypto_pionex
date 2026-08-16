@@ -110,6 +110,7 @@ func main() {
 		logStore := observability.NewStore(dbPool)
 
 		controlService := controlplane.NewService(dbPool, riskEngine, auditStore, logStore, Version, GitCommit, BuildTime)
+		telegramService := telegram.NewService(dbPool, logger)
 
 		// The MCP streamable HTTP endpoint is mounted at /mcp and authenticated
 		// with scoped Bearer API tokens (same tokens as the stdio binary).
@@ -127,6 +128,7 @@ func main() {
 			autoService,
 			controlService,
 			llmService,
+			telegramService,
 			Version,
 			GitCommit,
 			BuildTime,

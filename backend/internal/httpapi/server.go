@@ -25,6 +25,7 @@ import (
 	"github.com/aligorov/pionex-bot/backend/internal/observability"
 	"github.com/aligorov/pionex-bot/backend/internal/pionex"
 	"github.com/aligorov/pionex-bot/backend/internal/risk"
+	"github.com/aligorov/pionex-bot/backend/internal/telegram"
 )
 
 type contextKey string
@@ -41,6 +42,7 @@ type Server struct {
 	autogrid     *autogrid.Service
 	control      *controlplane.Service
 	llm          *llm.Service
+	telegram     *telegram.Service
 	version      string
 	commit       string
 	buildTime    string
@@ -55,6 +57,7 @@ func NewServer(
 	autoGridService *autogrid.Service,
 	controlService *controlplane.Service,
 	llmService *llm.Service,
+	telegramService *telegram.Service,
 	version, commit, buildTime string,
 	mcpHandler http.Handler,
 	frontendDist string,
@@ -63,7 +66,7 @@ func NewServer(
 	return &Server{
 		auth: authService, accounts: accountService,
 		autogrid: autoGridService, control: controlService,
-		llm: llmService,
+		llm: llmService, telegram: telegramService,
 		version: version, commit: commit, buildTime: buildTime,
 		mcpHandler: mcpHandler, frontendDist: frontendDist, logger: logger,
 	}
@@ -138,6 +141,11 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /api/mcp/tokens", s.withSession(http.HandlerFunc(s.listTokens)))
 	mux.Handle("POST /api/mcp/tokens", s.withSession(http.HandlerFunc(s.createToken)))
 	mux.Handle("DELETE /api/mcp/tokens/{id}", s.withSession(http.HandlerFunc(s.revokeToken)))
+
+	mux.Handle("GET /api/telegram/settings", s.withSession(http.HandlerFunc(s.getTelegramSettings)))
+	mux.Handle("PUT /api/telegram/settings", s.withRole(auth.RoleAdmin, http.HandlerFunc(s.updateTelegramSettings)))
+	mux.Handle("POST /api/telegram/test", s.withRole(auth.RoleAdmin, http.HandlerFunc(s.testTelegramConnection)))
+	mux.Handle("GET /api/bots/{id}/history", s.withSession(http.HandlerFunc(s.getBotHistory)))
 	mux.Handle("GET /api/control/commands", s.withSession(http.HandlerFunc(s.listCommands)))
 	mux.Handle("POST /api/control/commands", s.withRole(auth.RoleOperator, http.HandlerFunc(s.prepareCommand)))
 	mux.Handle("POST /api/control/commands/{id}/confirm", s.withRole(auth.RoleOperator, http.HandlerFunc(s.confirmCommand)))
@@ -1482,4 +1490,62 @@ func (s *Server) getMarketCandles(w http.ResponseWriter, r *http.Request) {
 		"candles":  out,
 	})
 }
+
+func (s *Server) getTelegramSettings(w http.ResponseWriter, r *http.Request) {
+	settings, err := s.telegram.GetSettings(r.Context())
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"data": settings})
+}
+
+func (s *Server) updateTelegramSettings(w http.ResponseWriter, r *http.Request) {
+	var input telegram.Settings
+	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+		s.fail(w, r, errors.New("invalid JSON payload"))
+		return
+	}
+	updated, err := s.telegram.UpdateSettings(r.Context(), input)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	s.auditMutation(r, "telegram.settings.update", "telegram", "1", map[string]any{
+		"enabled": updated.Enabled,
+	})
+	writeJSON(w, http.StatusOK, map[string]any{"data": updated, "message": "Настройки Telegram успешно сохранены"})
+}
+
+func (s *Server) testTelegramConnection(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		BotToken string `json:"botToken"`
+		ChatID   string `json:"chatID"`
+		TopicID  string `json:"topicID"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+		s.fail(w, r, errors.New("invalid JSON payload"))
+		return
+	}
+	if err := s.telegram.TestConnection(r.Context(), input.BotToken, input.ChatID, input.TopicID); err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"success": true, "message": "Тестовое сообщение успешно отправлено в Telegram"})
+}
+
+func (s *Server) getBotHistory(w http.ResponseWriter, r *http.Request) {
+	botID := r.PathValue("id")
+	if strings.TrimSpace(botID) == "" {
+		s.fail(w, r, errors.New("bot id required"))
+		return
+	}
+	events, err := s.autogrid.GetBotExecutionEvents(r.Context(), botID)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"data": events})
+}
+
 

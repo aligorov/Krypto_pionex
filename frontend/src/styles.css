@@ -484,19 +484,218 @@ input:disabled, select:disabled { opacity: .65; }
   gap: 8px;
 }
 
-.empty-state-box {
-  padding: 20px;
-  text-align: center;
-  background: var(--surface-soft);
-  border: 1px dashed var(--border);
-  border-radius: 8px;
-  color: var(--muted);
-  font-size: 0.85rem;
-}
-
 .whitelist-add-form {
   display: flex;
   gap: 8px;
   align-items: center;
   flex-wrap: wrap;
 }
+
+/* ==========================================================================
+   Mobile-First Responsive Layout & Touch Adaptations
+   ========================================================================== */
+
+.hamburger-btn {
+  display: none;
+  background: var(--surface-soft);
+  border: 1px solid var(--border);
+  color: var(--text);
+  font-size: 1.25rem;
+  padding: 6px 12px;
+  border-radius: 8px;
+  cursor: pointer;
+  line-height: 1;
+}
+
+.mobile-overlay {
+  display: none;
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.65);
+  backdrop-filter: blur(4px);
+  z-index: 998;
+}
+
+@media (max-width: 900px) {
+  .metric-grid {
+    grid-template-columns: repeat(3, 1fr) !important;
+  }
+}
+
+@media (max-width: 768px) {
+  .app-shell {
+    grid-template-columns: 1fr !important;
+    display: flex !important;
+    flex-direction: column !important;
+    min-height: 100vh;
+  }
+
+  .hamburger-btn {
+    display: inline-flex !important;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .mobile-overlay.visible {
+    display: block !important;
+  }
+
+  .sidebar {
+    position: fixed !important;
+    top: 0 !important;
+    left: 0 !important;
+    bottom: 0 !important;
+    width: 280px !important;
+    max-width: 85vw !important;
+    height: 100vh !important;
+    z-index: 999 !important;
+    background: #081814 !important;
+    box-shadow: 5px 0 25px rgba(0, 0, 0, 0.7) !important;
+    transform: translateX(-100%);
+    transition: transform 0.25s cubic-bezier(0.4, 0, 0.2, 1) !important;
+    display: flex !important;
+    flex-direction: column !important;
+  }
+
+  .sidebar.open {
+    transform: translateX(0) !important;
+  }
+
+  .topbar {
+    padding: 12px 16px !important;
+    min-height: auto !important;
+    gap: 12px !important;
+    flex-wrap: wrap !important;
+  }
+
+  .topbar h1 {
+    font-size: 1.15rem !important;
+  }
+
+  .topbar p {
+    display: none !important;
+  }
+
+  .topbar-actions {
+    gap: 6px !important;
+    flex-wrap: wrap !important;
+  }
+
+  .topbar-actions .badge {
+    font-size: 9px !important;
+    padding: 2px 6px !important;
+  }
+
+  main {
+    padding: 14px 12px 60px !important;
+    max-width: 100% !important;
+  }
+
+  .panel {
+    padding: 14px 10px !important;
+    border-radius: 10px !important;
+    margin-bottom: 12px !important;
+  }
+
+  .panel-heading {
+    flex-direction: column !important;
+    align-items: flex-start !important;
+    gap: 8px !important;
+    margin-bottom: 14px !important;
+  }
+
+  .metric-grid {
+    grid-template-columns: repeat(2, 1fr) !important;
+    gap: 8px !important;
+  }
+
+  .metric-card {
+    padding: 12px 10px !important;
+    gap: 6px !important;
+  }
+
+  .metric-card strong {
+    font-size: 1.3rem !important;
+  }
+
+  .two-column {
+    grid-template-columns: 1fr !important;
+    gap: 12px !important;
+  }
+
+  .form-grid {
+    grid-template-columns: 1fr !important;
+    gap: 10px !important;
+  }
+
+  .inline-form {
+    grid-template-columns: 1fr !important;
+    gap: 8px !important;
+  }
+
+  .kill-panel {
+    flex-direction: column !important;
+    align-items: flex-start !important;
+    padding: 16px !important;
+    gap: 12px !important;
+  }
+
+  .kill-panel h2 {
+    font-size: 1.3rem !important;
+  }
+
+  .login-page {
+    grid-template-columns: 1fr !important;
+  }
+
+  .login-hero {
+    display: none !important;
+  }
+
+  .login-card {
+    padding: 2rem 1.5rem !important;
+    max-width: 100% !important;
+    margin: auto !important;
+  }
+
+  .table-wrap {
+    margin: 0 -10px -14px !important;
+    padding-bottom: 8px !important;
+    -webkit-overflow-scrolling: touch !important;
+  }
+
+  table {
+    font-size: 11.5px !important;
+    min-width: 600px;
+  }
+
+  th, td {
+    padding: 8px 10px !important;
+  }
+
+  .row-actions {
+    flex-wrap: wrap !important;
+    gap: 4px !important;
+  }
+
+  .button {
+    padding: 8px 12px !important;
+    font-size: 13px !important;
+  }
+
+  .button.small {
+    padding: 4px 8px !important;
+    font-size: 11px !important;
+  }
+}
+
+@media (max-width: 480px) {
+  .metric-grid {
+    grid-template-columns: 1fr 1fr !important;
+  }
+
+  .topbar {
+    padding: 10px 12px !important;
+  }
+}
+

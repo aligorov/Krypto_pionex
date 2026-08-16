@@ -185,6 +185,41 @@ export interface AuditEvent {
   createdAt: string;
 }
 
+export interface TelegramSettings {
+  id: number;
+  enabled: boolean;
+  botToken: string;
+  chatID: string;
+  topicID: string;
+  notifyBotCreated: boolean;
+  notifyTakeProfit: boolean;
+  notifyStopLoss: boolean;
+  notifyRangeAdjust: boolean;
+  notifyDigest: boolean;
+  notifyEmergency: boolean;
+  digestIntervalMinutes: number;
+  templateBotCreated: string;
+  templateTakeProfit: string;
+  templateStopLoss: string;
+  templateRangeAdjust: string;
+  templateDigest: string;
+  lastDigestAt: string | null;
+  updatedAt: string;
+}
+
+export interface BotExecutionEvent {
+  id: string;
+  botId: string;
+  botNumber: number;
+  botSource: string;
+  symbol: string;
+  eventType: string;
+  price: string | null;
+  pnlUsdt: string | null;
+  details: Record<string, unknown>;
+  createdAt: string;
+}
+
 export interface APIToken {
   id: string;
   name: string;
@@ -227,6 +262,7 @@ export type Tab =
   | 'autogrid'
   | 'grids'
   | 'risk'
+  | 'telegram'
   | 'settings'
   | 'audit';
 
@@ -322,6 +358,7 @@ export interface AutoGridCandidate {
 
 export interface AutoGridBot {
   id: string;
+  botNumber?: number;
   source: 'PAPER' | 'REAL';
   accountId: string | null;
   buOrderId: string | null;
@@ -348,6 +385,7 @@ export interface AutoGridBot {
 
 export interface AutoGridClosedBot {
   id: string;
+  botNumber?: number;
   source: 'PAPER' | 'REAL';
   symbol: string;
   direction: string;

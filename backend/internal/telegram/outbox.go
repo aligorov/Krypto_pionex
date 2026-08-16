@@ -25,28 +25,43 @@ type InlineKeyboardMarkup struct {
 }
 
 type OutboxDispatcher struct {
-	db          *pgxpool.Pool
-	botToken    string
-	chatID      string
-	httpClient  *http.Client
-	logger      *slog.Logger
+	db           *pgxpool.Pool
+	defaultToken string
+	defaultChat  string
+	httpClient   *http.Client
+	logger       *slog.Logger
 	lastUpdateID int64
+	service      *Service
 }
 
-func NewOutboxDispatcher(db *pgxpool.Pool, botToken, chatID string) *OutboxDispatcher {
+func NewOutboxDispatcher(db *pgxpool.Pool, defaultToken, defaultChat string) *OutboxDispatcher {
 	return &OutboxDispatcher{
-		db:       db,
-		botToken: botToken,
-		chatID:   chatID,
+		db:           db,
+		defaultToken: defaultToken,
+		defaultChat:  defaultChat,
 		httpClient: &http.Client{
 			Timeout: 25 * time.Second,
 		},
-		logger: slog.Default(),
+		logger:  slog.Default(),
+		service: NewService(db, slog.Default()),
 	}
 }
 
+func (d *OutboxDispatcher) getActiveCredentials(ctx context.Context) (token, chatID, topicID string, enabled bool) {
+	if settings, err := d.service.GetSettings(ctx); err == nil && settings != nil {
+		if settings.Enabled && strings.TrimSpace(settings.BotToken) != "" && strings.TrimSpace(settings.ChatID) != "" {
+			return strings.TrimSpace(settings.BotToken), strings.TrimSpace(settings.ChatID), strings.TrimSpace(settings.TopicID), true
+		}
+	}
+	if strings.TrimSpace(d.defaultToken) != "" && strings.TrimSpace(d.defaultChat) != "" {
+		return strings.TrimSpace(d.defaultToken), strings.TrimSpace(d.defaultChat), "", true
+	}
+	return "", "", "", false
+}
+
 func (d *OutboxDispatcher) DispatchPending(ctx context.Context) error {
-	if d.botToken == "" || d.chatID == "" {
+	token, chatID, topicID, enabled := d.getActiveCredentials(ctx)
+	if !enabled || token == "" || chatID == "" {
 		return nil
 	}
 
@@ -69,11 +84,20 @@ func (d *OutboxDispatcher) DispatchPending(ctx context.Context) error {
 	}
 
 	for _, item := range items {
-		url := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", d.botToken)
-		
+		// Extract text if payload is JSON with {"text": "..."}
+		msgText := item.payload
+		var parsed map[string]any
+		if err := json.Unmarshal([]byte(item.payload), &parsed); err == nil {
+			if t, ok := parsed["text"].(string); ok && strings.TrimSpace(t) != "" {
+				msgText = t
+			}
+		}
+
+		url := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", token)
+
 		var replyMarkup *InlineKeyboardMarkup
-		// If payload is a critical alert, attach action buttons
-		if strings.Contains(item.payload, "ALERT") || strings.Contains(item.payload, "CANDIDATE") || strings.Contains(item.payload, "STOP") {
+		// If payload is a critical alert, candidate, or stop, attach quick action buttons
+		if strings.Contains(msgText, "ALERT") || strings.Contains(msgText, "STOP") || strings.Contains(msgText, "Kill Switch") {
 			replyMarkup = &InlineKeyboardMarkup{
 				InlineKeyboard: [][]InlineKeyboardButton{
 					{
@@ -85,9 +109,12 @@ func (d *OutboxDispatcher) DispatchPending(ctx context.Context) error {
 		}
 
 		bodyData := map[string]any{
-			"chat_id":    d.chatID,
-			"text":       item.payload,
+			"chat_id":    chatID,
+			"text":       msgText,
 			"parse_mode": "HTML",
+		}
+		if topicID != "" {
+			bodyData["message_thread_id"] = topicID
 		}
 		if replyMarkup != nil {
 			bodyData["reply_markup"] = replyMarkup
@@ -119,10 +146,6 @@ func (d *OutboxDispatcher) DispatchPending(ctx context.Context) error {
 
 // StartInboundListener starts the long-polling loop for 2-way Telegram commands
 func (d *OutboxDispatcher) StartInboundListener(ctx context.Context) {
-	if d.botToken == "" || d.chatID == "" {
-		return
-	}
-
 	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
 
@@ -137,7 +160,12 @@ func (d *OutboxDispatcher) StartInboundListener(ctx context.Context) {
 }
 
 func (d *OutboxDispatcher) pollUpdates(ctx context.Context) {
-	url := fmt.Sprintf("https://api.telegram.org/bot%s/getUpdates?offset=%d&timeout=2", d.botToken, d.lastUpdateID+1)
+	token, chatID, _, enabled := d.getActiveCredentials(ctx)
+	if !enabled || token == "" || chatID == "" {
+		return
+	}
+
+	url := fmt.Sprintf("https://api.telegram.org/bot%s/getUpdates?offset=%d&timeout=2", token, d.lastUpdateID+1)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return
@@ -189,73 +217,74 @@ func (d *OutboxDispatcher) pollUpdates(ctx context.Context) {
 		// Security: verify authorized chat ID
 		if u.Message != nil {
 			senderID := strconv.FormatInt(u.Message.Chat.ID, 10)
-			if senderID == d.chatID {
-				d.handleCommand(ctx, u.Message.Text)
+			if senderID == chatID {
+				d.handleCommand(ctx, token, chatID, u.Message.Text)
 			}
 		}
 
 		if u.CallbackQuery != nil {
 			senderID := strconv.FormatInt(u.CallbackQuery.From.ID, 10)
-			if senderID == d.chatID {
-				d.handleCallback(ctx, u.CallbackQuery.ID, u.CallbackQuery.Data)
+			if senderID == chatID {
+				d.handleCallback(ctx, token, chatID, u.CallbackQuery.ID, u.CallbackQuery.Data)
 			}
 		}
 	}
 }
 
-func (d *OutboxDispatcher) handleCommand(ctx context.Context, text string) {
+func (d *OutboxDispatcher) handleCommand(ctx context.Context, token, chatID, text string) {
 	text = strings.TrimSpace(text)
 	switch {
 	case strings.HasPrefix(text, "/status") || text == "Статус":
-		d.sendStatusReport(ctx)
+		d.sendStatusReport(ctx, token, chatID)
 	case strings.HasPrefix(text, "/kill") || text == "🚨 EMERGENCY KILL SWITCH":
-		d.triggerKillSwitch(ctx)
+		d.triggerKillSwitch(ctx, token, chatID)
 	case strings.HasPrefix(text, "/start"):
-		d.sendMessage(ctx, "🤖 <b>Pionex Grid Bot Controller</b>\n\nКоманды:\n/status — Текущее состояние ботов и PnL\n/kill — Экстренная остановка (Kill Switch)")
+		d.sendMessage(ctx, token, chatID, "🤖 <b>Pionex Grid Bot Controller</b>\n\nКоманды:\n/status — Текущее состояние ботов и PnL\n/kill — Экстренная остановка (Kill Switch)")
 	}
 }
 
-func (d *OutboxDispatcher) handleCallback(ctx context.Context, queryID, action string) {
+func (d *OutboxDispatcher) handleCallback(ctx context.Context, token, chatID, queryID, action string) {
 	// Acknowledge callback query
-	ackURL := fmt.Sprintf("https://api.telegram.org/bot%s/answerCallbackQuery", d.botToken)
+	ackURL := fmt.Sprintf("https://api.telegram.org/bot%s/answerCallbackQuery", token)
 	ackBody, _ := json.Marshal(map[string]string{"callback_query_id": queryID})
 	_, _ = d.httpClient.Post(ackURL, "application/json", bytes.NewReader(ackBody))
 
 	switch action {
 	case "cmd_status":
-		d.sendStatusReport(ctx)
+		d.sendStatusReport(ctx, token, chatID)
 	case "cmd_kill_switch":
-		d.triggerKillSwitch(ctx)
+		d.triggerKillSwitch(ctx, token, chatID)
 	}
 }
 
-func (d *OutboxDispatcher) sendStatusReport(ctx context.Context) {
-	var count int
-	_ = d.db.QueryRow(ctx, "SELECT COUNT(*) FROM grid_bots WHERE status = 'RUNNING'").Scan(&count)
+func (d *OutboxDispatcher) sendStatusReport(ctx context.Context, token, chatID string) {
+	var paperCount, realCount int
+	_ = d.db.QueryRow(ctx, "SELECT COUNT(*) FROM paper_grid_bots WHERE status = 'RUNNING'").Scan(&paperCount)
+	_ = d.db.QueryRow(ctx, "SELECT COUNT(*) FROM grid_bots WHERE status = 'RUNNING'").Scan(&realCount)
 
 	var totalPnL float64
-	_ = d.db.QueryRow(ctx, "SELECT COALESCE(SUM(realized_pnl_usdt), 0) FROM grid_bots WHERE status = 'STOPPED'").Scan(&totalPnL)
+	_ = d.db.QueryRow(ctx, "SELECT COALESCE(SUM(realized_pnl_usdt), 0) FROM paper_grid_bots WHERE status IN ('STOPPED', 'COMPLETED')").Scan(&totalPnL)
 
 	msg := fmt.Sprintf(
-		"📊 <b>Pionex Bot Status</b>\n\n🟢 Активных ботов: <b>%d</b>\n💰 Зафиксированный PnL: <b>%.4f USDT</b>\n⏱ Время: %s",
-		count, totalPnL, time.Now().Format("15:04:05 MSK"),
+		"📊 <b>Pionex Bot Status</b>\n\n🟢 Активных симуляций: <b>%d</b>\n🟢 Реальных ботов: <b>%d</b>\n💰 Зафиксированный PnL: <b>%+.4f USDT</b>\n⏱ Время: %s",
+		paperCount, realCount, totalPnL, time.Now().Format("15:04:05 MSK"),
 	)
-	d.sendMessage(ctx, msg)
+	d.sendMessage(ctx, token, chatID, msg)
 }
 
-func (d *OutboxDispatcher) triggerKillSwitch(ctx context.Context) {
+func (d *OutboxDispatcher) triggerKillSwitch(ctx context.Context, token, chatID string) {
 	_, err := d.db.Exec(ctx, "UPDATE risk_settings SET kill_switch_enabled = true WHERE id = 1")
 	if err != nil {
-		d.sendMessage(ctx, fmt.Sprintf("❌ Ошибка включения Kill Switch: %v", err))
+		d.sendMessage(ctx, token, chatID, fmt.Sprintf("❌ Ошибка включения Kill Switch: %v", err))
 		return
 	}
-	d.sendMessage(ctx, "🚨 <b>KILL SWITCH АКТИВИРОВАН!</b>\nВсе новые запуски ботов заблокированы.")
+	d.sendMessage(ctx, token, chatID, "🚨 <b>KILL SWITCH АКТИВИРОВАН!</b>\nВсе новые запуски ботов заблокированы.")
 }
 
-func (d *OutboxDispatcher) sendMessage(ctx context.Context, text string) {
-	url := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", d.botToken)
+func (d *OutboxDispatcher) sendMessage(ctx context.Context, token, chatID, text string) {
+	url := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", token)
 	bodyData := map[string]any{
-		"chat_id":    d.chatID,
+		"chat_id":    chatID,
 		"text":       text,
 		"parse_mode": "HTML",
 	}
