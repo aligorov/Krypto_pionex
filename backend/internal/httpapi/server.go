@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"compress/gzip"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -732,9 +733,9 @@ func (s *Server) autoGridAction(w http.ResponseWriter, r *http.Request) {
 		go func() {
 			_, _ = s.control.PrepareCommand(
 				context.Background(), principal, controlplane.PrepareCommandInput{
-					CommandType:  "autogrid.scan",
-					ResourceType: "autogrid",
-					ResourceID:   "1",
+					CommandType:    "autogrid.scan",
+					ResourceType:   "autogrid",
+					ResourceID:     "1",
 					IdempotencyKey: fmt.Sprintf("direct-start-scan-%d", time.Now().UnixNano()),
 				},
 			)
@@ -761,9 +762,9 @@ func (s *Server) autoGridAction(w http.ResponseWriter, r *http.Request) {
 	case "scan":
 		prepared, err := s.control.PrepareCommand(
 			r.Context(), principal, controlplane.PrepareCommandInput{
-				CommandType:  "autogrid.scan",
-				ResourceType: "autogrid",
-				ResourceID:   "1",
+				CommandType:    "autogrid.scan",
+				ResourceType:   "autogrid",
+				ResourceID:     "1",
 				IdempotencyKey: fmt.Sprintf("direct-scan-%d", time.Now().UnixNano()),
 			},
 		)
@@ -876,7 +877,7 @@ func (s *Server) autoGridAIStrategy(w http.ResponseWriter, r *http.Request) {
 		"advisory": map[string]any{
 			"boundary": "Pionex AI Kit parameters are Spot-only; the futures proposal adapts the AI width to the live PERP price and stays operator-confirmable",
 		},
-		"strategy":     strategy,
+		"strategy": strategy,
 		"futuresAdapted": map[string]any{
 			"lower":     lower,
 			"upper":     upper,
@@ -906,11 +907,11 @@ func (s *Server) applyAutoGridPreset(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.auditMutation(r, "autogrid.preset.apply", "autogrid", settings.ID, map[string]any{
-		"preset":      preset.ID,
-		"title":       preset.Title,
-		"leverage":    settings.Leverage,
-		"pnlTarget":   settings.PnLTargetUSDT,
-		"maxLoss":     settings.MaxLossUSDT,
+		"preset":    preset.ID,
+		"title":     preset.Title,
+		"leverage":  settings.Leverage,
+		"pnlTarget": settings.PnLTargetUSDT,
+		"maxLoss":   settings.MaxLossUSDT,
 	})
 	writeJSON(w, http.StatusOK, map[string]any{"settings": settings, "preset": preset})
 }
@@ -1185,8 +1186,34 @@ func cookieAuthenticated(r *http.Request) bool {
 	return err == nil
 }
 
-func (s *Server) requestMiddleware(next http.Handler) http.Handler {
+// gzipResponseWriter compresses JSON payloads on the fly: the autogrid
+// state alone is ~440KB uncompressed and is polled every 15s by the SPA —
+// uncompressed it stalls behind slow proxies and browser connections.
+type gzipResponseWriter struct {
+	http.ResponseWriter
+	gz *gzip.Writer
+}
+
+func (g *gzipResponseWriter) Write(b []byte) (int, error) {
+	return g.gz.Write(b)
+}
+
+func gzipMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+			next.ServeHTTP(w, r)
+			return
+		}
+		gz := gzip.NewWriter(w)
+		defer gz.Close()
+		w.Header().Set("Content-Encoding", "gzip")
+		w.Header().Del("Content-Length")
+		next.ServeHTTP(&gzipResponseWriter{ResponseWriter: w, gz: gz}, r)
+	})
+}
+
+func (s *Server) requestMiddleware(next http.Handler) http.Handler {
+	return gzipMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		started := time.Now()
 		requestID := strings.TrimSpace(r.Header.Get("X-Request-ID"))
 		if requestID == "" || len(requestID) > 64 {
@@ -1202,7 +1229,7 @@ func (s *Server) requestMiddleware(next http.Handler) http.Handler {
 			"component", "http", "request_id", requestID, "method", r.Method,
 			"path", r.URL.Path, "duration_ms", time.Since(started).Milliseconds(),
 		)
-	})
+	}))
 }
 
 func (s *Server) spaHandler() http.Handler {
@@ -1633,5 +1660,3 @@ func (s *Server) getBotHistory(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"data": events})
 }
-
-
