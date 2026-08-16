@@ -10,16 +10,17 @@ import (
 // grids harvest oscillation, so RANGE markets get neutral grids while
 // confirmed trends get one-directional grids in the trend direction.
 type RegimeResult struct {
-	Regime           string  `json:"regime"`           // RANGE, TREND_UP, TREND_DOWN
-	ADX              float64 `json:"adx"`              // Wilder ADX(14), trend strength
-	Choppiness       float64 `json:"choppiness"`       // Dreiss Choppiness Index (14), 0..100 (>61.8 range, <38.2 trend)
-	BBWPct           float64 `json:"bbwPct"`           // Bollinger Band Width %
-	IsSqueeze        bool    `json:"isSqueeze"`        // Volatility squeeze detected (breakout risk)
-	EMAFast          float64 `json:"emaFast"`          // EMA(20) of closes
-	EMASlow          float64 `json:"emaSlow"`          // EMA(50) of closes
-	EMASlopePct      float64 `json:"emaSlopePct"`      // EMA20 slope over ~10 candles, %
-	RangePositionPct float64 `json:"rangePositionPct"` // 0 = at window low, 100 = at window high
-	ATRPct           float64 `json:"atrPct"`           // ATR(14) / price * 100
+	Regime              string  `json:"regime"`              // RANGE, TREND_UP, TREND_DOWN
+	ADX                 float64 `json:"adx"`                 // Wilder ADX(14), trend strength
+	RSI                 float64 `json:"rsi"`                 // Wilder RSI(14), momentum oscillator 0..100
+	Choppiness          float64 `json:"choppiness"`          // Dreiss Choppiness Index (14), 0..100 (>61.8 range, <38.2 trend)
+	BBWPct              float64 `json:"bbwPct"`              // Bollinger Band Width %
+	IsSqueeze           bool    `json:"isSqueeze"`           // Volatility squeeze detected (breakout risk)
+	EMAFast             float64 `json:"emaFast"`             // EMA(20) of closes
+	EMASlow             float64 `json:"emaSlow"`             // EMA(50) of closes
+	EMASlopePct         float64 `json:"emaSlopePct"`         // EMA20 slope over ~10 candles, %
+	RangePositionPct    float64 `json:"rangePositionPct"`    // 0 = at window low, 100 = at window high
+	ATRPct              float64 `json:"atrPct"`              // ATR(14) / price * 100
 	ParkinsonVolatility float64 `json:"parkinsonVolatility"` // Parkinson intra-candle volatility %
 }
 
@@ -35,7 +36,7 @@ const (
 
 // DetectRegime computes trend/range classification from OHLCV candles.
 func DetectRegime(candles []pionex.KlineCandle) RegimeResult {
-	result := RegimeResult{Regime: "RANGE", Choppiness: 50.0}
+	result := RegimeResult{Regime: "RANGE", Choppiness: 50.0, RSI: 50.0}
 	if len(candles) < 30 {
 		return result
 	}
@@ -52,6 +53,7 @@ func DetectRegime(candles []pionex.KlineCandle) RegimeResult {
 	result.EMAFast = ema(closes, emaFastPeriod)
 	result.EMASlow = ema(closes, emaSlowPeriod)
 	result.ADX = adx(candles, adxPeriod)
+	result.RSI = CalculateRSI(candles, 14)
 	result.Choppiness = ChoppinessIndex(candles, adxPeriod)
 	result.BBWPct, result.IsSqueeze = BollingerBandWidth(candles, bbPeriod, 2.0)
 	result.ATRPct = atrPercent(candles, adxPeriod)
@@ -358,4 +360,54 @@ func supportResistanceRange(
 		return volLower, volUpper
 	}
 	return lower, upper
+}
+
+// CalculateRSI calculates the Relative Strength Index over closes using Wilder's smoothing.
+func CalculateRSI(candles []pionex.KlineCandle, period int) float64 {
+	if len(candles) < period+1 || period <= 0 {
+		return 50.0
+	}
+	closes := make([]float64, 0, len(candles))
+	for _, c := range candles {
+		v, _ := c.Close.Float64()
+		if v > 0 {
+			closes = append(closes, v)
+		}
+	}
+	if len(closes) < period+1 {
+		return 50.0
+	}
+
+	var gains, losses float64
+	for i := 1; i <= period; i++ {
+		change := closes[i] - closes[i-1]
+		if change > 0 {
+			gains += change
+		} else {
+			losses -= change
+		}
+	}
+	avgGain := gains / float64(period)
+	avgLoss := losses / float64(period)
+
+	for i := period + 1; i < len(closes); i++ {
+		change := closes[i] - closes[i-1]
+		var gain, loss float64
+		if change > 0 {
+			gain = change
+		} else {
+			loss = -change
+		}
+		avgGain = (avgGain*float64(period-1) + gain) / float64(period)
+		avgLoss = (avgLoss*float64(period-1) + loss) / float64(period)
+	}
+
+	if avgLoss == 0 {
+		if avgGain == 0 {
+			return 50.0
+		}
+		return 100.0
+	}
+	rs := avgGain / avgLoss
+	return 100.0 - (100.0 / (1.0 + rs))
 }

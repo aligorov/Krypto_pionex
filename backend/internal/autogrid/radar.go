@@ -1,6 +1,7 @@
 package autogrid
 
 import (
+	"fmt"
 	"math"
 
 	"github.com/aligorov/pionex-bot/backend/internal/pionex"
@@ -122,7 +123,19 @@ func EvaluateConfluence(
 		eval.RejectionReasons = append(eval.RejectionReasons, "ADX > 35: слишком сильный тренд для сетки")
 	}
 
-	// RSI / Choppiness proxy
+	// RSI / Choppiness evaluation
+	var rsi float64 = 50.0
+	if v, ok := candidate.ModelAssumptions["rsi"].(float64); ok {
+		rsi = v
+	}
+	if direction == "long" && rsi > 58.0 {
+		eval.RejectionReasons = append(eval.RejectionReasons, fmt.Sprintf("Anti-FOMO: RSI (%.1f) > 58 - вход в LONG на перекупленности запрещен", rsi))
+	} else if direction == "short" && rsi < 42.0 {
+		eval.RejectionReasons = append(eval.RejectionReasons, fmt.Sprintf("Anti-FOMO: RSI (%.1f) < 42 - вход в SHORT на перепроданности запрещен", rsi))
+	} else if direction == "neutral" && (rsi > 60.0 || rsi < 40.0) {
+		eval.RejectionReasons = append(eval.RejectionReasons, fmt.Sprintf("Anti-FOMO: RSI (%.1f) смещен от центра (40..60) - вход в нейтральную сетку запрещен", rsi))
+	}
+
 	var chop float64 = 50.0
 	if v, ok := candidate.ModelAssumptions["choppiness"].(float64); ok {
 		chop = v

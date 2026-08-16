@@ -378,6 +378,34 @@ func scoreCandidate(
 	if recommendedTrend == "no_trend" && (regime.ADX > 32.0 || math.Abs(regime.EMASlopePct) > 3.0) {
 		reasons = append(reasons, fmt.Sprintf("trend too strong for neutral grid (ADX: %.1f, EMA slope: %.2f%%)", regime.ADX, regime.EMASlopePct))
 	}
+
+	// Anti-FOMO Overbought / Oversold protection:
+	if recommendedTrend == "long" {
+		if regime.RSI > 58.0 {
+			reasons = append(reasons, fmt.Sprintf("Anti-FOMO: RSI (%.1f) > 58 - пара перекуплена, вход в LONG на локальном хае заблокирован", regime.RSI))
+		}
+		if regime.RangePositionPct > 65.0 {
+			reasons = append(reasons, fmt.Sprintf("Anti-FOMO: положение в канале (%.1f%%) > 65%% - вход в LONG на верхней границе заблокирован", regime.RangePositionPct))
+		}
+	} else if recommendedTrend == "short" {
+		if regime.RSI < 42.0 {
+			reasons = append(reasons, fmt.Sprintf("Anti-FOMO: RSI (%.1f) < 42 - пара перепродана, вход в SHORT на локальном дне заблокирован", regime.RSI))
+		}
+		if regime.RangePositionPct < 35.0 {
+			reasons = append(reasons, fmt.Sprintf("Anti-FOMO: положение в канале (%.1f%%) < 35%% - вход в SHORT на нижней границе заблокирован", regime.RangePositionPct))
+		}
+	} else {
+		// NEUTRAL grid
+		if regime.RSI > 60.0 {
+			reasons = append(reasons, fmt.Sprintf("Anti-FOMO: RSI (%.1f) > 60 - пара перекуплена на хаях, вход в нейтральную сетку заблокирован", regime.RSI))
+		} else if regime.RSI < 40.0 {
+			reasons = append(reasons, fmt.Sprintf("Anti-FOMO: RSI (%.1f) < 40 - пара перепродана на лоях, вход в нейтральную сетку заблокирован", regime.RSI))
+		}
+		if regime.RangePositionPct > 70.0 || regime.RangePositionPct < 30.0 {
+			reasons = append(reasons, fmt.Sprintf("Anti-FOMO: положение в канале (%.1f%%) на экстремуме - вход в нейтральную сетку заблокирован", regime.RangePositionPct))
+		}
+	}
+
 	if len(sorted) >= 3 {
 		for i := len(sorted) - 3; i < len(sorted); i++ {
 			cOpen, _ := sorted[i].Open.Float64()
@@ -438,6 +466,7 @@ func scoreCandidate(
 			"recommendedTrend":   recommendedTrend,
 			"regime":             regime.Regime,
 			"adx":                regime.ADX,
+			"rsi":                regime.RSI,
 			"choppiness":         regime.Choppiness,
 			"isSqueeze":          regime.IsSqueeze,
 			"emaSlopePct":        regime.EMASlopePct,
