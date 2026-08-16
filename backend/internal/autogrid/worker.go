@@ -122,6 +122,12 @@ func (worker *Worker) processNext(ctx context.Context) error {
 }
 
 func (worker *Worker) claim(ctx context.Context) (*queuedCommand, error) {
+	// Auto-expire stale commands with expired lease from crashed/restarted processes
+	_, _ = worker.db.Exec(ctx, `
+		UPDATE control_commands
+		SET status = 'EXPIRED', updated_at = NOW()
+		WHERE status = 'EXECUTING' AND lease_expiry < NOW() - INTERVAL '30 seconds'
+	`)
 	var command queuedCommand
 	err := worker.db.QueryRow(ctx, `
 		WITH next_command AS (

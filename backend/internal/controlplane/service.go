@@ -166,7 +166,13 @@ func (s *Service) Dashboard(ctx context.Context) (*Dashboard, error) {
 	if !dashboard.DatabaseHealthy {
 		return dashboard, nil
 	}
-
+	// Auto-expire stale commands so ghost commands never pollute the queue count
+	_, _ = s.db.Exec(ctx, `
+		UPDATE control_commands
+		SET status = 'EXPIRED', updated_at = NOW()
+		WHERE (status = 'CONFIRMATION_REQUIRED' AND confirmation_expires_at < NOW())
+		   OR (status = 'EXECUTING' AND lease_expiry < NOW() - INTERVAL '30 seconds')
+	`)
 	err := s.db.QueryRow(ctx, `
 		SELECT
 			(SELECT kill_switch_enabled FROM risk_settings WHERE id = 1),
@@ -174,7 +180,7 @@ func (s *Service) Dashboard(ctx context.Context) (*Dashboard, error) {
 			(SELECT COUNT(*) FROM grid_bots WHERE status IN ('RUNNING', 'ADJUSTING', 'REDUCING', 'STOPPING')),
 			(SELECT COUNT(*) FROM pattern_orders WHERE status IN ('CREATED', 'SUBMITTING', 'SUBMITTED', 'PARTIALLY_FILLED', 'CANCEL_REQUESTED')),
 			(SELECT COUNT(*) FROM system_incidents WHERE status IN ('OPEN', 'ACKNOWLEDGED')),
-			(SELECT COUNT(*) FROM control_commands WHERE status IN ('PREPARED', 'CONFIRMATION_REQUIRED', 'QUEUED', 'EXECUTING')),
+			(SELECT COUNT(*) FROM control_commands WHERE status IN ('QUEUED', 'EXECUTING') AND (lease_expiry IS NULL OR lease_expiry >= NOW())),
 			COALESCE((SELECT (value #>> '{}')::BOOLEAN FROM app_config WHERE key = 'mcp_write_enabled'), false),
 			COALESCE((SELECT (value #>> '{}')::BOOLEAN FROM app_config WHERE key = 'real_grid_execution_enabled'), false),
 			COALESCE((SELECT (value #>> '{}')::BOOLEAN FROM app_config WHERE key = 'real_pattern_execution_enabled'), false)
