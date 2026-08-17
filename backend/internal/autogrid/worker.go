@@ -1332,8 +1332,8 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 		if err := rows.Scan(
 			&item.id, &item.accountID, &item.remoteID, &item.localStatus, &item.symbol,
 			&item.direction, &item.lower, &item.upper, &item.rowNum,
-			&item.adjustments, &item.pnlTarget, &item.maxLoss, &item.antiHuntStop,
-			&item.investment, &item.botNumber,
+			&item.adjustments, &item.pnlTarget, &item.maxLoss, &item.investment,
+			&item.antiHuntStop, &item.botNumber,
 		); err != nil {
 			rows.Close()
 			return clampInterval(settings.ManageIntervalSeconds), err
@@ -1837,8 +1837,8 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 		if err := rows.Scan(
 			&item.id, &item.botNumber, &item.symbol, &item.direction, &item.entry,
 			&item.leverage, &item.investment, &item.lower, &item.upper,
-			&item.pnlTarget, &item.maxLoss, &item.antiHuntStop, &item.gridNum,
-			&item.lastLevel, &item.realized, &item.adjustmentsCount,
+			&item.pnlTarget, &item.maxLoss, &item.gridNum, &item.lastLevel,
+			&item.realized, &item.adjustmentsCount, &item.antiHuntStop,
 		); err != nil {
 			rows.Close()
 			return err
