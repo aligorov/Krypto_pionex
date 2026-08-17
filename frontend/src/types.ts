@@ -537,7 +537,18 @@ export interface LLMAuditRecord {
   confidence: string;
   regime: string;
   reasoning: string;
-  recommendedParams?: Record<string, any>;
+  recommendedParams?: {
+    news_catalyst?: {
+      detected: boolean;
+      type: string;
+      severity: string;
+      summary: string;
+      eta_hours: number;
+    };
+    rejection_reason?: string;
+    [key: string]: unknown;
+  };
+  rawResponse?: string;
   latencyMs: number;
   createdAt: string;
 }

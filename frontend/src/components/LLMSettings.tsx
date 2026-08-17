@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { Fragment, useCallback, useEffect, useMemo, useState } from 'react';
 import { api, describeError } from '../api';
 import type { LLMSettings, LLMAuditRecord } from '../types';
 
@@ -47,7 +47,7 @@ const PROVIDERS: ProviderProfile[] = [
     title: 'OpenRouter',
     tagline: 'Любая модель из каталога одним ключом',
     keyPrefix: 'sk-or-v1-',
-    keyHint: 'Ключ openrouter.ai, начинается с sk-or-v1-… (~73 символа)',
+    keyHint: 'Ключ openrouter.ai, начинается с sk-or-v1-… (~73 символов)',
     keyUrl: 'https://openrouter.ai/settings/keys',
     keyUrlLabel: 'openrouter.ai/settings/keys',
     note: 'Ошибка «User not found» = ключ от другого сервиса или скопирован не целиком.',
@@ -80,6 +80,24 @@ function keyLooksValid(provider: Provider, key: string): 'empty' | 'ok' | 'warn'
   return trimmed.startsWith(profile.keyPrefix) ? 'ok' : 'warn';
 }
 
+function catalystOf(audit: LLMAuditRecord) {
+  const catalyst = audit.recommendedParams?.news_catalyst;
+  if (!catalyst || (!catalyst.detected && (catalyst.type ?? 'NONE').toUpperCase() === 'NONE')) return null;
+  return catalyst;
+}
+
+function severityClass(severity: string): string {
+  switch ((severity ?? '').toUpperCase()) {
+    case 'CRITICAL':
+    case 'HIGH':
+      return 'danger';
+    case 'MEDIUM':
+      return 'warning';
+    default:
+      return 'neutral';
+  }
+}
+
 export default function LLMSettings() {
   const [view, setView] = useState<'config' | 'audits'>('config');
   const [settings, setSettings] = useState<LLMSettings | null>(null);
@@ -87,7 +105,7 @@ export default function LLMSettings() {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
-  const [testResult, setTestResult] = useState<{ ok: boolean; message: string; latency?: number } | null>(null);
+  const [testResult, setTestResult] = useState<{ ok: boolean; message: string; latency?: number; response?: string } | null>(null);
   const [notice, setNotice] = useState<{ kind: 'success' | 'danger'; text: string } | null>(null);
 
   const [enabled, setEnabled] = useState(false);
@@ -102,11 +120,18 @@ export default function LLMSettings() {
   const [availableModels, setAvailableModels] = useState<string[]>([]);
   const [loadingModels, setLoadingModels] = useState(false);
 
-  useEffect(() => {
-    loadSettings();
-  }, []);
+  // Hidden-but-preserved settings: the backend PUT replaces the whole row, so
+  // fields the form does not edit must be echoed back verbatim or every save
+  // silently resets them.
+  const [requireApprovalToDeploy, setRequireApprovalToDeploy] = useState(false);
+  const [auditIntervalSeconds, setAuditIntervalSeconds] = useState(3600);
 
-  async function loadSettings() {
+  const [auditSymbolFilter, setAuditSymbolFilter] = useState('');
+  const [auditVerdictFilter, setAuditVerdictFilter] = useState<'ALL' | 'APPROVED' | 'REJECTED'>('ALL');
+  const [catalystOnly, setCatalystOnly] = useState(false);
+  const [expandedAudit, setExpandedAudit] = useState<string | null>(null);
+
+  const loadSettings = useCallback(async () => {
     setLoading(true);
     try {
       const data = await api<LLMSettings>('/api/llm/settings');
@@ -119,6 +144,8 @@ export default function LLMSettings() {
       setThinkingEnabled(data.thinkingEnabled ?? true);
       setRequireAuditForReal(data.requireAuditForReal ?? false);
       setGroundingEnabled(data.groundingEnabled ?? true);
+      setRequireApprovalToDeploy(data.requireApprovalToDeploy ?? false);
+      setAuditIntervalSeconds(data.auditIntervalSeconds || 3600);
       setApiKey('');
       setTestResult(null);
       setAvailableModels([]);
@@ -127,22 +154,29 @@ export default function LLMSettings() {
     } finally {
       setLoading(false);
     }
-  }
+  }, []);
 
-  async function loadAudits() {
+  const loadAudits = useCallback(async () => {
     try {
       const data = await api<LLMAuditRecord[]>('/api/llm/audits');
       setAudits(data);
     } catch {
-      setAudits([]);
+      /* keep previous list; the refresh button retries */
     }
-  }
+  }, []);
 
   useEffect(() => {
-    if (view === 'audits') {
-      void loadAudits();
-    }
-  }, [view]);
+    void loadSettings();
+  }, [loadSettings]);
+
+  // Audits stream in during every scan — keep the history live while the tab
+  // is open instead of freezing at first visit.
+  useEffect(() => {
+    if (view !== 'audits') return;
+    void loadAudits();
+    const timer = window.setInterval(() => void loadAudits(), 10000);
+    return () => window.clearInterval(timer);
+  }, [view, loadAudits]);
 
   function handleProviderChange(next: Provider) {
     setProvider(next);
@@ -200,6 +234,7 @@ export default function LLMSettings() {
           ? `Подключение успешно! ${res.latencyMs} мс`
           : `Ошибка API: ${res.error || 'неизвестная'}`,
         latency: res.latencyMs,
+        response: res.response,
       });
     } catch (err) {
       setTestResult({ ok: false, message: `Сбой запроса: ${describeError(err)}` });
@@ -223,9 +258,10 @@ export default function LLMSettings() {
           baseUrl: provider === 'custom' ? baseUrl : '',
           temperature,
           thinkingEnabled,
+          groundingEnabled: provider === 'gemini' ? groundingEnabled : false,
           requireAuditForReal,
-          groundingEnabled,
-          auditIntervalSeconds: 3600,
+          requireApprovalToDeploy,
+          auditIntervalSeconds,
         }),
       });
       setSettings(updated);
@@ -238,9 +274,29 @@ export default function LLMSettings() {
     }
   }
 
+  const filteredAudits = useMemo(
+    () =>
+      audits.filter((audit) => {
+        if (auditVerdictFilter !== 'ALL' && audit.decision !== auditVerdictFilter) return false;
+        if (catalystOnly && !catalystOf(audit)) return false;
+        const needle = auditSymbolFilter.trim().toUpperCase();
+        return needle === '' || audit.symbol.toUpperCase().includes(needle);
+      }),
+    [audits, auditVerdictFilter, catalystOnly, auditSymbolFilter],
+  );
+  const auditStats = useMemo(
+    () => ({
+      approved: audits.filter((item) => item.decision === 'APPROVED').length,
+      rejected: audits.filter((item) => item.decision === 'REJECTED').length,
+      catalysts: audits.filter((item) => catalystOf(item)).length,
+    }),
+    [audits],
+  );
+
   const profile = PROVIDERS.find((item) => item.id === provider)!;
   const keyState = keyLooksValid(provider, apiKey);
   const modelOptions = Array.from(new Set([...MODEL_PRESETS[provider], ...availableModels]));
+  const groundingAvailable = provider === 'gemini';
 
   if (loading) {
     return (
@@ -252,7 +308,7 @@ export default function LLMSettings() {
   }
 
   return (
-    <div style={{ maxWidth: '980px', margin: '0 auto' }}>
+    <div style={{ maxWidth: '1080px', margin: '0 auto' }}>
       <div className="section-header" style={{ marginBottom: '1.5rem' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
           <span style={{ fontSize: '1.75rem' }}>🧠</span>
@@ -263,13 +319,18 @@ export default function LLMSettings() {
             </p>
           </div>
         </div>
-        <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
+        <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center', flexWrap: 'wrap' }}>
           {settings && (
             <span className={`badge ${settings.enabled ? 'success' : 'neutral'}`}>
               {settings.enabled ? '🟢 Включён' : '⚪ Выключен'}
             </span>
           )}
           {settings?.apiKeyMasked && <span className="badge neutral">Ключ: {settings.apiKeyMasked}</span>}
+          {settings && (
+            <span className="badge neutral" title={new Date(settings.updatedAt).toLocaleString()}>
+              {settings.provider} · {settings.model}
+            </span>
+          )}
         </div>
       </div>
 
@@ -410,15 +471,31 @@ export default function LLMSettings() {
                 </span>
                 <input type="checkbox" checked={requireAuditForReal} onChange={(e) => setRequireAuditForReal(e.target.checked)} style={{ transform: 'scale(1.2)', cursor: 'pointer' }} />
               </label>
-              <label style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '0.75rem' }}>
+              <label
+                style={{
+                  display: 'flex',
+                  justifyContent: 'space-between',
+                  alignItems: 'center',
+                  gap: '0.75rem',
+                  opacity: groundingAvailable ? 1 : 0.5,
+                }}
+                title={groundingAvailable ? undefined : 'Живой поиск доступен только для Gemini'}
+              >
                 <span>
                   <strong style={{ fontSize: '0.9rem' }}>Живой поиск новостей (google_search)</strong>
                   <small className="muted" style={{ display: 'block' }}>
-                    Модель гуглит токен перед вердиктом: анлоки, делисты, эксплойты — по факту, а не по памяти.
-                    Только для Gemini; при сбое инструмента автоматический откат на обычный режим
+                    {groundingAvailable
+                      ? 'Модель гуглит токен перед вердиктом: анлоки, делисты, эксплойты — по факту, а не по памяти. При сбое инструмента автоматический откат на обычный режим'
+                      : 'Недоступно для этого провайдера — переключись на Gemini'}
                   </small>
                 </span>
-                <input type="checkbox" checked={groundingEnabled} onChange={(e) => setGroundingEnabled(e.target.checked)} style={{ transform: 'scale(1.2)', cursor: 'pointer' }} />
+                <input
+                  type="checkbox"
+                  checked={groundingEnabled && groundingAvailable}
+                  disabled={!groundingAvailable}
+                  onChange={(e) => setGroundingEnabled(e.target.checked)}
+                  style={{ transform: 'scale(1.2)', cursor: groundingAvailable ? 'pointer' : 'not-allowed' }}
+                />
               </label>
               <label style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '0.75rem' }}>
                 <span>
@@ -453,14 +530,24 @@ export default function LLMSettings() {
             <button className="btn" onClick={() => void handleTest()} disabled={testing}>
               {testing ? 'Проверка…' : '🔌 Проверить подключение'}
             </button>
+            <button className="btn" onClick={() => void loadSettings()} disabled={loading}>
+              ↺ Перезагрузить
+            </button>
             <small className="muted">Тест с пустым полем ключа проверяет сохранённый ключ</small>
           </div>
 
           {testResult && (
             <div className={`banner ${testResult.ok ? 'success' : 'error'}`} style={{ marginTop: '1rem' }}>
-              {testResult.message}
-              {testResult.latency !== undefined && (
-                <span style={{ marginLeft: '0.5rem', opacity: 0.8 }}>Скорость отклика: {testResult.latency} мс</span>
+              <div>
+                {testResult.message}
+                {testResult.latency !== undefined && (
+                  <span style={{ marginLeft: '0.5rem', opacity: 0.8 }}>Скорость отклика: {testResult.latency} мс</span>
+                )}
+              </div>
+              {testResult.response && (
+                <div style={{ marginTop: '0.5rem', fontSize: '0.8rem', opacity: 0.85, whiteSpace: 'pre-wrap' }}>
+                  Ответ модели: {testResult.response}
+                </div>
               )}
             </div>
           )}
@@ -472,51 +559,166 @@ export default function LLMSettings() {
           <div className="panel-heading">
             <div>
               <span className="eyebrow">ИСТОРИЯ</span>
-              <h3>Последние аудиты ({audits.length})</h3>
+              <h3>Последние аудиты ({filteredAudits.length}{filteredAudits.length !== audits.length ? ` из ${audits.length}` : ''})</h3>
+            </div>
+            <div style={{ display: 'flex', gap: '0.75rem', alignItems: 'center' }}>
+              <small className="muted">
+                ✅ {auditStats.approved} · ⛔ {auditStats.rejected} · 📰 вето {auditStats.catalysts}
+              </small>
+              <button className="button secondary" style={{ padding: '4px 10px' }} onClick={() => void loadAudits()}>
+                🔄 Обновить
+              </button>
             </div>
           </div>
-          <div style={{ overflowX: 'auto' }}>
-            <table className="table">
-              <thead>
-                <tr>
-                  <th>Время</th>
-                  <th>Символ</th>
-                  <th>Вердикт</th>
-                  <th>Уверенность</th>
-                  <th>Режим</th>
-                  <th>Обоснование</th>
-                </tr>
-              </thead>
-              <tbody>
-                {audits.length === 0 && (
+
+          <form className="inline-form" style={{ marginBottom: 12, flexWrap: 'wrap' }} onSubmit={(event) => event.preventDefault()}>
+            <input
+              placeholder="Символ"
+              value={auditSymbolFilter}
+              onChange={(event) => setAuditSymbolFilter(event.target.value)}
+              style={{ maxWidth: 180 }}
+            />
+            <select
+              value={auditVerdictFilter}
+              onChange={(event) => setAuditVerdictFilter(event.target.value as 'ALL' | 'APPROVED' | 'REJECTED')}
+              style={{ maxWidth: 150 }}
+            >
+              <option value="ALL">Все вердикты</option>
+              <option value="APPROVED">APPROVED</option>
+              <option value="REJECTED">REJECTED</option>
+            </select>
+            <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: '0.85rem' }}>
+              <input type="checkbox" checked={catalystOnly} onChange={(event) => setCatalystOnly(event.target.checked)} />
+              только с катализатором
+            </label>
+            {(auditSymbolFilter !== '' || auditVerdictFilter !== 'ALL' || catalystOnly) && (
+              <button
+                type="button"
+                className="button ghost"
+                onClick={() => {
+                  setAuditSymbolFilter('');
+                  setAuditVerdictFilter('ALL');
+                  setCatalystOnly(false);
+                }}
+              >
+                Сбросить
+              </button>
+            )}
+            <span className="muted compact">Обновляется каждые 10 с · клик по строке — детали</span>
+          </form>
+
+          {audits.length === 0 ? (
+            <div className="empty-state">Аудитов пока нет — включи AI Мозг и дождись скана</div>
+          ) : filteredAudits.length === 0 ? (
+            <div className="empty-state">По фильтрам ничего не найдено.</div>
+          ) : (
+            <div className="table-wrap">
+              <table>
+                <thead>
                   <tr>
-                    <td colSpan={6} style={{ textAlign: 'center', padding: '1.5rem', color: 'var(--text-secondary)' }}>
-                      Аудитов пока нет — включи AI Мозг и дождись скана
-                    </td>
+                    <th>Время</th>
+                    <th>Символ</th>
+                    <th>Вердикт</th>
+                    <th>Катализатор</th>
+                    <th>Модель</th>
+                    <th>Обоснование</th>
                   </tr>
-                )}
-                {audits.map((audit) => (
-                  <tr key={audit.id}>
-                    <td><span className="badge neutral">{new Date(audit.createdAt).toLocaleString()}</span></td>
-                    <td><strong>{audit.symbol}</strong></td>
-                    <td>
-                      <span
-                        className="badge"
-                        style={{
-                          background: audit.decision === 'APPROVED' ? 'rgba(16, 185, 129, 0.15)' : 'rgba(239, 68, 68, 0.15)',
-                          color: audit.decision === 'APPROVED' ? '#34d399' : '#f87171',
-                        }}
-                      >
-                        {audit.decision}
-                      </span>
-                    </td>
-                    <td>{Math.round(Number(audit.confidence) * 100)}%</td>
-                    <td><small>{audit.regime}</small></td>
-                    <td style={{ maxWidth: '380px' }}><small className="muted">{audit.reasoning}</small></td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+                </thead>
+                <tbody>
+                  {filteredAudits.map((audit) => {
+                    const catalyst = catalystOf(audit);
+                    const confidence = Number(audit.confidence);
+                    const expanded = expandedAudit === audit.id;
+                    return (
+                      <Fragment key={audit.id}>
+                        <tr
+                          style={{ cursor: 'pointer' }}
+                          onClick={() => setExpandedAudit(expanded ? null : audit.id)}
+                          title="Показать детали аудита"
+                        >
+                          <td><small>{new Date(audit.createdAt).toLocaleString()}</small></td>
+                          <td><strong>{audit.symbol}</strong></td>
+                          <td>
+                            <span
+                              className={`badge ${audit.decision === 'APPROVED' ? 'success' : 'danger'}`}
+                            >
+                              {audit.decision}
+                            </span>
+                            <small className="muted" style={{ display: 'block' }}>
+                              {Number.isFinite(confidence) ? `${Math.round(confidence * 100)}%` : '—'}
+                            </small>
+                          </td>
+                          <td>
+                            {catalyst ? (
+                              <span
+                                className={`badge ${severityClass(catalyst.severity)}`}
+                                title={`${catalyst.summary || 'без описания'}${catalyst.eta_hours ? ` · ETA ~${catalyst.eta_hours}ч` : ''}`}
+                              >
+                                📰 {catalyst.type} · {catalyst.severity}
+                              </span>
+                            ) : (
+                              <small className="muted">—</small>
+                            )}
+                          </td>
+                          <td>
+                            <small>{audit.model}</small>
+                            <small className="muted" style={{ display: 'block' }}>{audit.latencyMs} мс</small>
+                          </td>
+                          <td style={{ maxWidth: '420px' }}>
+                            <small className="muted">
+                              {audit.recommendedParams?.rejection_reason
+                                ? audit.recommendedParams.rejection_reason
+                                : audit.reasoning}
+                            </small>
+                          </td>
+                        </tr>
+                        {expanded && (
+                          <tr>
+                            <td colSpan={6}>
+                              <div style={{ background: 'rgba(0,0,0,0.2)', borderRadius: 6, padding: '0.75rem', fontSize: '0.8rem' }}>
+                                <div style={{ marginBottom: '0.4rem' }}>
+                                  <strong>Обоснование модели:</strong> {audit.reasoning || '—'}
+                                </div>
+                                {audit.recommendedParams?.rejection_reason && (
+                                  <div style={{ marginBottom: '0.4rem' }}>
+                                    <strong>Причина отклонения:</strong> {audit.recommendedParams.rejection_reason}
+                                  </div>
+                                )}
+                                {catalyst && (
+                                  <div style={{ marginBottom: '0.4rem' }}>
+                                    <strong>Катализатор:</strong> {catalyst.type} / {catalyst.severity}
+                                    {catalyst.eta_hours ? ` · ETA ~${catalyst.eta_hours} ч` : ''} — {catalyst.summary || 'без описания'}
+                                  </div>
+                                )}
+                                {audit.recommendedParams && Object.keys(audit.recommendedParams).filter((key) => !['news_catalyst', 'rejection_reason'].includes(key)).length > 0 && (
+                                  <div style={{ marginBottom: '0.4rem' }}>
+                                    <strong>Параметры от модели:</strong>{' '}
+                                    <code>{JSON.stringify(
+                                      Object.fromEntries(
+                                        Object.entries(audit.recommendedParams).filter(([key]) => !['news_catalyst', 'rejection_reason'].includes(key)),
+                                      ),
+                                    )}</code>
+                                  </div>
+                                )}
+                                <div className="muted">
+                                  Провайдер: {audit.provider} · латентность {audit.latencyMs} мс · режим {audit.regime}
+                                  {audit.candidateId ? ` · кандидат ${audit.candidateId.slice(0, 8)}…` : ''}
+                                </div>
+                              </div>
+                            </td>
+                          </tr>
+                        )}
+                      </Fragment>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+          <div className="panel-actions">
+            <span className="muted compact">
+              Бэкенд хранит последние записи аудита: вердикт, уверенность, катализатор, параметры и сырой ответ модели.
+            </span>
           </div>
         </div>
       )}

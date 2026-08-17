@@ -165,18 +165,6 @@ func (s *Service) AuditCandidate(
 		}
 	}
 
-	var recParams map[string]any
-	if decision.GridParams != nil {
-		recParams = map[string]any{
-			"lower_price":            decision.GridParams.LowerPrice.String(),
-			"upper_price":            decision.GridParams.UpperPrice.String(),
-			"grid_count":             decision.GridParams.GridCount,
-			"leverage":               decision.GridParams.Leverage,
-			"stop_loss":              decision.GridParams.StopLoss.String(),
-			"take_profit_target_usd": decision.GridParams.TakeProfitTargetUSD.String(),
-		}
-	}
-
 	record := &AuditRecord{
 		ID:                newUUID(),
 		CandidateID:       candidateID,
@@ -187,7 +175,7 @@ func (s *Service) AuditCandidate(
 		Confidence:        decimal.NewFromFloat(decision.Confidence),
 		Regime:            decision.Regime,
 		Reasoning:         decision.ReasoningSummary,
-		RecommendedParams: recParams,
+		RecommendedParams: auditExtrasParams(decision),
 		RawResponse:       rawResponse,
 		LatencyMs:         latencyMs,
 		CreatedAt:         time.Now().UTC(),
@@ -280,4 +268,36 @@ func (s *Service) ListModels(ctx context.Context, settings Settings) ([]string, 
 		return nil, errors.New("API-ключ не заполнен")
 	}
 	return s.client.ListAvailableModels(ctx, settings)
+}
+
+// auditExtrasParams builds the recommended_params JSONB payload: grid params
+// when the model proposed them, plus the structured news catalyst and
+// rejection reason. The audit UI renders the catalyst (the news-veto core)
+// from here — dropping it made every audit look catalyst-free.
+func auditExtrasParams(decision *AuditDecision) map[string]any {
+	params := map[string]any{}
+	if decision.GridParams != nil {
+		params["lower_price"] = decision.GridParams.LowerPrice.String()
+		params["upper_price"] = decision.GridParams.UpperPrice.String()
+		params["grid_count"] = decision.GridParams.GridCount
+		params["leverage"] = decision.GridParams.Leverage
+		params["stop_loss"] = decision.GridParams.StopLoss.String()
+		params["take_profit_target_usd"] = decision.GridParams.TakeProfitTargetUSD.String()
+	}
+	if decision.NewsCatalyst != nil {
+		params["news_catalyst"] = map[string]any{
+			"detected":  decision.NewsCatalyst.Detected,
+			"type":      decision.NewsCatalyst.Type,
+			"severity":  decision.NewsCatalyst.Severity,
+			"summary":   decision.NewsCatalyst.Summary,
+			"eta_hours": decision.NewsCatalyst.ETAHours,
+		}
+	}
+	if decision.RejectionReason != nil && strings.TrimSpace(*decision.RejectionReason) != "" {
+		params["rejection_reason"] = *decision.RejectionReason
+	}
+	if len(params) == 0 {
+		return nil
+	}
+	return params
 }
