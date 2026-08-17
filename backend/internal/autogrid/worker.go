@@ -489,19 +489,24 @@ func (worker *Worker) deployPaper(
 	`, settings.ID).Scan(&activeCount); err != nil {
 		return fmt.Errorf("count active paper grids: %w", err)
 	}
-	// Portfolio Circuit Breaker: if >= 3 stop-losses in the last 1 hour, pause new bot deployments
+	// Portfolio Circuit Breaker: >= 3 protective closes in the last 1 hour
+	// pauses new deployments. Every loss exit counts — stop-loss, structural
+	// invalidation, range break, liquidation; only profit takes and
+	// operator/exchange-driven closes are excluded.
 	var recentStopLossCount int
 	if err := worker.db.QueryRow(ctx, `
 		SELECT COUNT(*) FROM (
 			SELECT 1 FROM paper_grid_bots
 			WHERE settings_id = $1
 			  AND status = 'COMPLETED'
-			  AND closed_reason IN ('STOP_LOSS', 'STOP_LOSS_NATIVE')
+			  AND COALESCE(closed_reason, '') NOT IN ('TAKE_PROFIT', 'TRAILING_TAKE_PROFIT', 'BREAKEVEN_LOCK')
 			  AND closed_at > NOW() - INTERVAL '1 hour'
 			UNION ALL
 			SELECT 1 FROM grid_bots
-			WHERE status = 'STOPPED'
-			  AND closed_reason IN ('STOP_LOSS', 'STOP_LOSS_NATIVE', 'loss_stop')
+			WHERE status IN ('STOPPED', 'LIQUIDATED')
+			  AND COALESCE(closed_reason, '') NOT IN (
+			      'TAKE_PROFIT', 'TAKE_PROFIT_NATIVE', 'TRAILING_TAKE_PROFIT', 'BREAKEVEN_LOCK',
+			      'USER_CANCEL', 'ALREADY_CLOSED', 'EXTERNAL_CLOSE', 'REMOTE_FAILED')
 			  AND COALESCE(closed_at, updated_at) > NOW() - INTERVAL '1 hour'
 		) recent_stops
 	`, settings.ID).Scan(&recentStopLossCount); err == nil && recentStopLossCount >= 3 {
@@ -572,14 +577,16 @@ func (worker *Worker) deployPaper(
 		if tag.RowsAffected() > 0 || activeCount >= settings.MaxActiveBots {
 			continue
 		}
-		// Cooldown check: do not reopen a symbol if it stopped out within 2 hours
+		// Cooldown: do not reopen a symbol within 2 hours of ANY protective
+		// close (stop-loss, structural invalidation, range break) — only
+		// take-profit exits may redeploy immediately.
 		var recentlyStopped bool
 		if err := worker.db.QueryRow(ctx, `
 			SELECT EXISTS (
 				SELECT 1 FROM paper_grid_bots
 				WHERE settings_id = $1 AND symbol = $2
 				  AND status = 'COMPLETED'
-				  AND closed_reason IN ('STOP_LOSS', 'STOP_LOSS_NATIVE')
+				  AND COALESCE(closed_reason, '') NOT IN ('TAKE_PROFIT', 'TRAILING_TAKE_PROFIT', 'BREAKEVEN_LOCK')
 				  AND closed_at > NOW() - INTERVAL '2 hours'
 			)
 		`, settings.ID, candidate.Symbol).Scan(&recentlyStopped); err == nil && recentlyStopped {
@@ -807,14 +814,18 @@ func (worker *Worker) deployReal(
 		if exists {
 			continue
 		}
-		// Cooldown check: do not reopen a symbol if it stopped out within 2 hours
+		// Cooldown: do not reopen a symbol within 2 hours of ANY protective
+		// close (stop-loss, structural invalidation, range break, liquidation);
+		// profit takes and operator/exchange-driven closes are exempt.
 		var recentlyStoppedReal bool
 		if err := worker.db.QueryRow(ctx, `
 			SELECT EXISTS (
 				SELECT 1 FROM grid_bots
 				WHERE account_id = $1 AND symbol = $2
-				  AND status = 'STOPPED'
-				  AND closed_reason IN ('STOP_LOSS', 'STOP_LOSS_NATIVE', 'loss_stop')
+				  AND status IN ('STOPPED', 'LIQUIDATED')
+				  AND COALESCE(closed_reason, '') NOT IN (
+				      'TAKE_PROFIT', 'TAKE_PROFIT_NATIVE', 'TRAILING_TAKE_PROFIT', 'BREAKEVEN_LOCK',
+				      'USER_CANCEL', 'ALREADY_CLOSED', 'EXTERNAL_CLOSE', 'REMOTE_FAILED')
 				  AND COALESCE(closed_at, updated_at) > NOW() - INTERVAL '2 hours'
 			)
 		`, *settings.AccountID, candidate.Symbol).Scan(&recentlyStoppedReal); err == nil && recentlyStoppedReal {
@@ -1588,7 +1599,7 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 				_ = QueueTelegramEvent(ctx, worker.db, "ADJUST_RANGE", map[string]any{
 					"bot_number": bot.botNumber, "symbol": bot.symbol,
 					"lower_price": decision.NewLower.StringFixed(6), "upper_price": decision.NewUpper.StringFixed(6),
-					"reason": decision.Reason,
+					"reason": decision.Reason, "adjustments_count": bot.adjustments + 1,
 				})
 			}
 		}
@@ -2001,7 +2012,7 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 			_ = QueueTelegramEvent(ctx, worker.db, "ADJUST_RANGE", map[string]any{
 				"bot_number": bot.botNumber, "symbol": bot.symbol,
 				"lower_price": decision.NewLower.StringFixed(6), "upper_price": decision.NewUpper.StringFixed(6),
-				"reason": decision.Reason,
+				"reason": decision.Reason, "adjustments_count": bot.adjustmentsCount + 1,
 			})
 			continue
 		}

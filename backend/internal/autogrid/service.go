@@ -959,6 +959,7 @@ func (s *Service) listActiveBots(ctx context.Context, settingsID string) ([]Acti
 	rows, err = s.db.Query(ctx, `
 		SELECT id, COALESCE(bot_number, 0), symbol, status, direction, grid_type, lower_price,
 		       upper_price, grid_num, leverage, quote_investment,
+		       COALESCE(adjustments_count, 0),
 		       realized_pnl_usdt, unrealized_pnl_usdt,
 		       pnl_target_usdt, max_loss_usdt, updated_at,
 		       model_state
@@ -979,6 +980,7 @@ func (s *Service) listActiveBots(ctx context.Context, settingsID string) ([]Acti
 			&item.ID, &item.BotNumber, &item.Symbol, &item.Status, &item.Direction,
 			&item.GridType, &item.LowerPrice, &item.UpperPrice,
 			&item.GridNum, &item.Leverage, &item.QuoteInvestment,
+			&item.AdjustmentsCount,
 			&item.RealizedPNLUSDT, &item.UnrealizedPNLUSDT,
 			&item.PnLTargetUSDT, &item.MaxLossUSDT, &item.UpdatedAt,
 			&rawModelState,
