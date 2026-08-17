@@ -1088,7 +1088,28 @@ func (s *Service) listClosedBots(ctx context.Context, settingsID string) ([]Clos
 		}
 		items = append(items, item)
 	}
-	return items, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	sortClosedBots(items)
+	return items, nil
+}
+
+// sortClosedBots merges the REAL and PAPER histories into one newest-first
+// timeline. Each source query is already ordered, but appending one block
+// after the other made the combined table look unordered by time.
+func sortClosedBots(items []ClosedBot) {
+	sort.SliceStable(items, func(i, j int) bool {
+		a, b := items[i].ClosedAt, items[j].ClosedAt
+		switch {
+		case a == nil:
+			return false // unknown close time sinks to the end
+		case b == nil:
+			return true
+		default:
+			return a.After(*b)
+		}
+	})
 }
 
 // RequestBotClose durably records a close intent. Real bots transition to

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { api, describeError, getCachedAutoGrid, setCachedAutoGrid } from '../api';
 import { CandlestickChart } from './CandlestickChart';
 import type { AIKitResponse, AutoGridClosedBot, AutoGridBot, AutoGridState, BotExecutionEvent } from '../types';
@@ -14,6 +14,9 @@ export default function Bots({ canOperate }: Props) {
   const [error, setError] = useState<string | null>(null);
   const [selectedBotForChart, setSelectedBotForChart] = useState<AutoGridBot | null>(null);
   const [selectedBotForHistory, setSelectedBotForHistory] = useState<{ id: string; symbol: string; botNumber?: number } | null>(null);
+  const [closedSymbolFilter, setClosedSymbolFilter] = useState('');
+  const [closedSourceFilter, setClosedSourceFilter] = useState<'ALL' | 'PAPER' | 'REAL'>('ALL');
+  const [closedReasonFilter, setClosedReasonFilter] = useState('ALL');
 
   const load = useCallback(async () => {
     try {
@@ -32,6 +35,25 @@ export default function Bots({ canOperate }: Props) {
     const timer = window.setInterval(() => void load(), 5000);
     return () => window.clearInterval(timer);
   }, [load]);
+
+  const closedReasons = useMemo(
+    () =>
+      Array.from(new Set((state?.closedBots ?? []).map((bot) => bot.closedReason ?? bot.status))).sort(),
+    [state],
+  );
+  const filteredClosedBots = useMemo(
+    () =>
+      (state?.closedBots ?? [])
+        .filter((bot) => closedSourceFilter === 'ALL' || bot.source === closedSourceFilter)
+        .filter((bot) => closedReasonFilter === 'ALL' || (bot.closedReason ?? bot.status) === closedReasonFilter)
+        .filter((bot) => {
+          const needle = closedSymbolFilter.trim().toUpperCase().replace('#', '');
+          return needle === '' || bot.symbol.toUpperCase().includes(needle) || String(bot.botNumber ?? '') === needle;
+        })
+        .slice()
+        .sort((a, b) => (Date.parse(b.closedAt ?? '') || 0) - (Date.parse(a.closedAt ?? '') || 0)),
+    [state, closedSourceFilter, closedReasonFilter, closedSymbolFilter],
+  );
 
   if (!state) {
     return <div className="empty-state">{error ?? 'Загрузка ботов…'}</div>;
@@ -156,7 +178,11 @@ export default function Bots({ canOperate }: Props) {
         <div className="panel-heading">
           <div>
             <span className="eyebrow">CLOSED BOTS</span>
-            <h3>Закрытые боты ({state.closedBots.length})</h3>
+            <h3>
+              Закрытые боты (
+              {filteredClosedBots.length}
+              {filteredClosedBots.length !== state.closedBots.length ? ` из ${state.closedBots.length}` : ''})
+            </h3>
           </div>
           <span className="muted">
             PAPER: {state.pnl.paper.closedBots} закр. / {state.pnl.paper.realizedUsdt} USDT · REAL:{' '}
@@ -167,31 +193,84 @@ export default function Bots({ canOperate }: Props) {
         {state.closedBots.length === 0 ? (
           <div className="empty-state">Закрытых ботов пока нет.</div>
         ) : (
-          <div className="table-wrap">
-            <table>
-              <thead>
-                <tr>
-                  <th>Бот / Символ</th>
-                  <th>Источник</th>
-                  <th>Причина закрытия</th>
-                  <th>Направление</th>
-                  <th>Инвест.</th>
-                  <th>Итоговый PnL</th>
-                  <th>Закрыт</th>
-                  <th>История</th>
-                </tr>
-              </thead>
-              <tbody>
-                {state.closedBots.map((bot) => (
-                  <ClosedBotRow
-                    key={`${bot.source}-${bot.id}`}
-                    bot={bot}
-                    onOpenHistory={() => setSelectedBotForHistory({ id: bot.id, symbol: bot.symbol, botNumber: bot.botNumber })}
-                  />
+          <>
+            <form
+              className="inline-form"
+              style={{ marginBottom: 12, flexWrap: 'wrap' }}
+              onSubmit={(event) => event.preventDefault()}
+            >
+              <input
+                placeholder="Символ или № бота"
+                value={closedSymbolFilter}
+                onChange={(event) => setClosedSymbolFilter(event.target.value)}
+                style={{ maxWidth: 200 }}
+              />
+              <select
+                value={closedSourceFilter}
+                onChange={(event) => setClosedSourceFilter(event.target.value as 'ALL' | 'PAPER' | 'REAL')}
+                style={{ maxWidth: 140 }}
+              >
+                <option value="ALL">Все источники</option>
+                <option value="PAPER">PAPER</option>
+                <option value="REAL">REAL</option>
+              </select>
+              <select
+                value={closedReasonFilter}
+                onChange={(event) => setClosedReasonFilter(event.target.value)}
+                style={{ maxWidth: 260 }}
+              >
+                <option value="ALL">Все причины</option>
+                {closedReasons.map((reason) => (
+                  <option key={reason} value={reason}>
+                    {reason}
+                  </option>
                 ))}
-              </tbody>
-            </table>
-          </div>
+              </select>
+              {(closedSymbolFilter !== '' || closedSourceFilter !== 'ALL' || closedReasonFilter !== 'ALL') && (
+                <button
+                  type="button"
+                  className="button ghost"
+                  onClick={() => {
+                    setClosedSymbolFilter('');
+                    setClosedSourceFilter('ALL');
+                    setClosedReasonFilter('ALL');
+                  }}
+                >
+                  Сбросить
+                </button>
+              )}
+              <span className="muted compact">Сортировка: время закрытия ↓</span>
+            </form>
+            {filteredClosedBots.length === 0 ? (
+              <div className="empty-state">По фильтрам ничего не найдено.</div>
+            ) : (
+              <div className="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Бот / Символ</th>
+                      <th>Источник</th>
+                      <th>Причина закрытия</th>
+                      <th>Направление</th>
+                      <th>Инвест.</th>
+                      <th>Итоговый PnL</th>
+                      <th>Закрыт ↓</th>
+                      <th>История</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {filteredClosedBots.map((bot) => (
+                      <ClosedBotRow
+                        key={`${bot.source}-${bot.id}`}
+                        bot={bot}
+                        onOpenHistory={() => setSelectedBotForHistory({ id: bot.id, symbol: bot.symbol, botNumber: bot.botNumber })}
+                      />
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </>
         )}
       </div>
     </div>
