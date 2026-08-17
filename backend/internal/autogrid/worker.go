@@ -760,11 +760,19 @@ func (worker *Worker) deployReal(
 		return fmt.Errorf("count active real grids: %w", err)
 	}
 	// Portfolio Circuit Breaker: if >= 3 stop-losses in the last 1 hour, pause new bot deployments
+	// Portfolio Circuit Breaker (REAL): >= 3 protective closes in the last
+	// hour pauses deployments. Counts every loss exit — stop-loss, structural
+	// invalidation, range break, liquidation (the manage loop writes decision
+	// reasons as closed_reason, so an IN-list silently missed them; the paper
+	// breaker was fixed in v1.3.16, this one lagged). Profit takes and
+	// operator/exchange-driven closes are exempt.
 	var recentStopLossCountReal int
 	if err := worker.db.QueryRow(ctx, `
 		SELECT COUNT(*) FROM grid_bots
 		WHERE status IN ('STOPPED', 'LIQUIDATED')
-		  AND closed_reason IN ('STOP_LOSS', 'STOP_LOSS_NATIVE', 'LIQUIDATION', 'loss_stop')
+		  AND COALESCE(closed_reason, '') NOT IN (
+		      'TAKE_PROFIT', 'TAKE_PROFIT_NATIVE', 'TRAILING_TAKE_PROFIT', 'BREAKEVEN_LOCK',
+		      'USER_CANCEL', 'ALREADY_CLOSED', 'EXTERNAL_CLOSE', 'REMOTE_FAILED')
 		  AND COALESCE(closed_at, updated_at) > NOW() - INTERVAL '1 hour'
 	`).Scan(&recentStopLossCountReal); err == nil && recentStopLossCountReal >= 3 {
 		worker.logger.Warn("Portfolio circuit breaker: recent real stop-losses holding new deployments", "recentStopLossCountReal", recentStopLossCountReal)
