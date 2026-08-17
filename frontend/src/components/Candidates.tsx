@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { api, getCachedAutoGrid, setCachedAutoGrid } from '../api';
-import { describeError } from './AutoGridAutopilot';
+import { api, describeError, getCachedAutoGrid, setCachedAutoGrid } from '../api';
+
 import { CandlestickChart } from './CandlestickChart';
 import type { AIKitResponse, AutoGridCandidate, AutoGridState } from '../types';
 
@@ -165,12 +165,12 @@ export default function Candidates({ canOperate: _canOperate }: Props) {
       )}
 
       {syncError && (
-        <div className="banner error" style={{ marginBottom: '0.75rem' }}>
+        <div className="alert danger" style={{ marginBottom: '0.75rem' }}>
           ⚠ Данные не обновляются{lastSyncAt ? ` (последняя успешная загрузка ${lastSyncAt.toLocaleTimeString()})` : ''}: {syncError}
         </div>
       )}
       {lastSyncAt && !syncError && new Date().getTime() - lastSyncAt.getTime() > 60000 && (
-        <div className="banner error" style={{ marginBottom: '0.75rem' }}>
+        <div className="alert danger" style={{ marginBottom: '0.75rem' }}>
           ⚠ Экран давно не обновлялся ({lastSyncAt.toLocaleTimeString()}) — обнови страницу (Ctrl+Shift+R)
         </div>
       )}
@@ -370,7 +370,7 @@ function CandidateRow({
               style={{ background: 'rgba(59, 130, 246, 0.15)', color: '#60a5fa', border: '1px solid rgba(59, 130, 246, 0.3)', fontSize: '10px', padding: '1px 5px', cursor: 'help' }}
               title={`🧠 AI Мозг (${assumptions['llmRegime'] || 'Аудит'}): ${assumptions['llmReasoning'] || ''}`}
             >
-              🧠 AI {Math.round(Number(assumptions['llmConfidence']) * 100)}%
+              🧠 AI {(() => { const conf = Number(assumptions['llmConfidence']); return Number.isFinite(conf) ? `${Math.round(conf * 100)}%` : '—'; })()}
             </span>
           </div>
         )}

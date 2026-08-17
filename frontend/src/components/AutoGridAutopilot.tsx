@@ -1,5 +1,5 @@
 import { FormEvent, useCallback, useEffect, useMemo, useState } from 'react';
-import { api, ApiError, getCachedAutoGrid, setCachedAutoGrid } from '../api';
+import { api, describeError, getCachedAutoGrid, setCachedAutoGrid } from '../api';
 import type { Account, AutoGridPreset, AutoGridSettings, AutoGridState } from '../types';
 
 interface Props {
@@ -21,11 +21,7 @@ const numberField = (value: string, fallback: number): number => {
   return Number.isFinite(parsed) ? parsed : fallback;
 };
 
-export function describeError(error: unknown): string {
-  if (error instanceof ApiError) return error.message;
-  if (error instanceof Error) return error.message;
-  return 'Неизвестная ошибка';
-}
+export { describeError };
 
 export default function AutoGridAutopilot({ canOperate, accountsHref }: Props) {
   const [state, setState] = useState<AutoGridState | null>(() => getCachedAutoGrid<AutoGridState>());
@@ -265,9 +261,9 @@ export default function AutoGridAutopilot({ canOperate, accountsHref }: Props) {
           action={
             <button
               type="button"
-              className="btn btn-secondary btn-small"
+              className="button secondary small"
               style={{ padding: '2px 8px', fontSize: '11px', lineHeight: '1.2' }}
-              disabled={clearingPaper}
+              disabled={clearingPaper || !canOperate}
               onClick={handleClearPaper}
               title="Очистить историю симуляции и обнулить PnL"
             >
@@ -356,7 +352,10 @@ export default function AutoGridAutopilot({ canOperate, accountsHref }: Props) {
                 <strong>Когда: </strong>{preset.whenToUse}
               </p>
               <p className="compact" style={{ margin: 0 }}>
-                Плечо {preset.patch.leverage}x · цель +{preset.patch.pnlTargetUsdt} / стоп −{preset.patch.maxLossUsdt} USDT ·{' '}
+                Плечо {preset.patch.leverage}x ·{' '}
+                {preset.patch.pnlTargetUsdt !== undefined && preset.patch.maxLossUsdt !== undefined
+                  ? `цель +${preset.patch.pnlTargetUsdt} / стоп −${preset.patch.maxLossUsdt} USDT · `
+                  : 'динамические цели · '}
                 вола {preset.patch.minVolatilityPct}–{preset.patch.maxVolatilityPct}% ·{' '}
                 {preset.patch.maxAdjustmentsPerBot} сдвига
               </p>

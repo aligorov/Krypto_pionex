@@ -38,6 +38,7 @@ type Settings struct {
 	AdaptiveLeverageEnabled bool            `json:"adaptiveLeverageEnabled"`
 	DensityGridEnabled      bool            `json:"densityGridEnabled"`
 	CandleInterval          string          `json:"candleInterval"`
+	ScanMode                string          `json:"scanMode"` // TOP_K (fast) or FULL (all pairs)
 	LookbackCandles         int             `json:"lookbackCandles"`
 	MaxSymbolsPerScan       int             `json:"maxSymbolsPerScan"`
 	ScanIntervalSeconds     int             `json:"scanIntervalSeconds"`
@@ -287,7 +288,7 @@ func (s *Service) GetSettings(ctx context.Context) (*Settings, error) {
 		SELECT id, account_id, status, execution_mode, budget_usdt,
 		       max_active_bots, leverage, min_sharpe, min_ev_pct,
 		       stop_loss_mode, smart_pnl_enabled, adaptive_leverage_enabled,
-		       density_grid_enabled, candle_interval, lookback_candles,
+		       density_grid_enabled, candle_interval, scan_mode, lookback_candles,
 		       max_symbols_per_scan, scan_interval_seconds, min_volume_24h,
 		       min_volatility_pct, max_volatility_pct, max_drawdown_pct,
 		       min_profit_factor, fee_bps, slippage_bps,
@@ -745,6 +746,7 @@ func (s *Service) CloseAllActiveBots(ctx context.Context, reason string) error {
 func (s *Service) scannerConfig(settings Settings) marketdata.ScanConfig {
 	return marketdata.ScanConfig{
 		Interval:            settings.CandleInterval,
+		ScanMode:            settings.ScanMode,
 		LookbackCandles:     settings.LookbackCandles,
 		MaxSymbols:          settings.MaxSymbolsPerScan,
 		MinVolume24h:        settings.MinVolume24h,
@@ -1009,7 +1011,7 @@ func settingsScanTargets(item *Settings) []any {
 		&item.BudgetUSDT, &item.MaxActiveBots, &item.Leverage,
 		&item.MinSharpe, &item.MinEVPct, &item.StopLossMode,
 		&item.SmartPNLEnabled, &item.AdaptiveLeverageEnabled,
-		&item.DensityGridEnabled, &item.CandleInterval,
+		&item.DensityGridEnabled, &item.CandleInterval, &item.ScanMode,
 		&item.LookbackCandles, &item.MaxSymbolsPerScan,
 		&item.ScanIntervalSeconds, &item.MinVolume24h,
 		&item.MinVolatilityPct, &item.MaxVolatilityPct,

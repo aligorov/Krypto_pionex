@@ -1,6 +1,5 @@
 import { FormEvent, useEffect, useState } from 'react';
-import { api } from '../api';
-import { describeError } from './AutoGridAutopilot';
+import { api, describeError } from '../api';
 import type { RiskSettings as RiskSettingsModel } from '../types';
 
 interface Props {
@@ -45,13 +44,15 @@ export default function RiskSettings({ canManage }: Props) {
   }
 
   async function toggleKillSwitch() {
-    if (!settings) return;
+    if (!settings || !form) return;
     setBusy(true);
     setError(null);
     try {
+      // Send the form's values: toggling the switch mid-edit must not
+      // silently revert the admin's unsaved limit changes.
       const updated = await api<RiskSettingsModel>('/api/risk/settings', {
         method: 'PUT',
-        body: JSON.stringify({ ...settings, killSwitchEnabled: !settings.killSwitchEnabled }),
+        body: JSON.stringify({ ...form, killSwitchEnabled: !settings.killSwitchEnabled }),
       });
       setSettings(updated);
       setForm({ ...updated });

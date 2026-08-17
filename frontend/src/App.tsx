@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
-import { api, ApiError } from './api';
+import { api, ApiError, clearCachedAutoGrid } from './api';
 import type { Dashboard, LoginResponse, Role, User } from './types';
 import PionexAccounts from './components/PionexAccounts';
 import AutoGridAutopilot from './components/AutoGridAutopilot';
@@ -63,6 +63,7 @@ export default function App() {
     const handleUnauthorized = () => {
       setUser(null);
       setOverview(null);
+      clearCachedAutoGrid();
     };
     window.addEventListener('auth:unauthorized', handleUnauthorized);
     return () => {
@@ -125,6 +126,7 @@ export default function App() {
       /* the session cookie is being dropped either way */
     }
     localStorage.removeItem('pionex_session_token');
+    clearCachedAutoGrid();
     setUser(null);
     setOverview(null);
     setRequires2FA(false);
@@ -364,7 +366,7 @@ export default function App() {
             </div>
           </div>
           <div className="topbar-actions">
-            <span className={`badge ${killSwitchOn ? 'badge-danger' : 'badge-ok'}`}>
+            <span className={`badge ${killSwitchOn ? 'danger' : 'success'}`}>
               KILL SWITCH {killSwitchOn ? 'ON' : 'OFF'}
             </span>
             {overview && (
@@ -376,7 +378,7 @@ export default function App() {
           </div>
         </div>
 
-        {user && activeTab === 'overview' && <Overview onRefresh={loadOverview} />}
+        {user && activeTab === 'overview' && <Overview onRefresh={loadOverview} canOperate={canOperate(user.role)} />}
         {activeTab === 'autogrid' && (
           <AutoGridAutopilot canOperate={canOperate(user.role)} accountsHref={() => setActiveTab('accounts')} />
         )}
@@ -385,8 +387,8 @@ export default function App() {
         {activeTab === 'backtest' && <BacktestLab canOperate={canOperate(user.role)} />}
         {activeTab === 'accounts' && <PionexAccounts canManage={canManage(user.role)} />}
         {activeTab === 'risk' && <RiskSettings canManage={canManage(user.role)} />}
-        {activeTab === 'llm' && <LLMSettings />}
-        {activeTab === 'telegram' && <TelegramSettings />}
+        {activeTab === 'llm' && <LLMSettings canManage={canManage(user.role)} />}
+        {activeTab === 'telegram' && <TelegramSettings canManage={canManage(user.role)} />}
         {activeTab === 'audit' && <AuditLogs />}
         {activeTab === 'mcp' && <MCPServer canManage={canManage(user.role)} />}
       </main>

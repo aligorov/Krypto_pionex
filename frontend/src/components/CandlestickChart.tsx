@@ -266,7 +266,7 @@ export const CandlestickChart: React.FC<CandlestickChartProps> = ({
 
         <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
           <div style={{ display: 'flex', backgroundColor: '#1e293b', borderRadius: '4px', padding: '2px' }}>
-            {['1M', '5M', '15M', '1H', '4H', '1D'].map((tf) => (
+            {['1M', '5M', '15M', '60M', '4H', '1D'].map((tf) => (
               <button
                 key={tf}
                 onClick={() => setInterval(tf)}

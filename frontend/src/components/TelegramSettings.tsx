@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { api, describeError } from '../api';
 import { TelegramSettings as TelegramSettingsType } from '../types';
 
-export const TelegramSettings: React.FC = () => {
+export const TelegramSettings: React.FC<{ canManage: boolean }> = ({ canManage }) => {
   const [settings, setSettings] = useState<TelegramSettingsType | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -76,7 +76,7 @@ export const TelegramSettings: React.FC = () => {
     return (
       <div className="section" style={{ textAlign: 'center', padding: '3rem' }}>
         <div className="loading-spinner" />
-        <p style={{ marginTop: '1rem', color: 'var(--text-secondary)' }}>Загрузка настроек Telegram...</p>
+        <p style={{ marginTop: '1rem', color: 'var(--muted)' }}>Загрузка настроек Telegram...</p>
       </div>
     );
   }
@@ -84,7 +84,7 @@ export const TelegramSettings: React.FC = () => {
   if (!settings) {
     return (
       <div className="section">
-        <div className="banner error">Не удалось загрузить настройки Telegram</div>
+        <div className="alert danger">Не удалось загрузить настройки Telegram</div>
       </div>
     );
   }
@@ -97,27 +97,27 @@ export const TelegramSettings: React.FC = () => {
           <span style={{ fontSize: '1.75rem' }}>✈️</span>
           <div>
             <h2 style={{ margin: 0, fontSize: '1.4rem', fontWeight: 700 }}>Telegram Уведомления</h2>
-            <p style={{ margin: '0.2rem 0 0', color: 'var(--text-secondary)', fontSize: '0.85rem' }}>
+            <p style={{ margin: '0.2rem 0 0', color: 'var(--muted)', fontSize: '0.85rem' }}>
               Мгновенные оповещения об операциях ботов, настраиваемые шаблоны и команды управления
             </p>
           </div>
         </div>
       </div>
 
-      {error && <div className="banner error" style={{ marginBottom: '1rem' }}>{error}</div>}
-      {saveSuccess && <div className="banner success" style={{ marginBottom: '1rem' }}>{saveSuccess}</div>}
+      {error && <div className="alert danger" style={{ marginBottom: '1rem' }}>{error}</div>}
+      {saveSuccess && <div className="alert success" style={{ marginBottom: '1rem' }}>{saveSuccess}</div>}
       {testResult && (
-        <div className={`banner ${testResult.success ? 'success' : 'error'}`} style={{ marginBottom: '1rem' }}>
+        <div className={`alert ${testResult.success ? 'success' : 'danger'}`} style={{ marginBottom: '1rem' }}>
           {testResult.message}
         </div>
       )}
 
       {/* Main Settings Card */}
       <div className="card" style={{ padding: '1.5rem', marginBottom: '1.5rem' }}>
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderBottom: '1px solid var(--border-color)', paddingBottom: '1rem', marginBottom: '1.25rem' }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderBottom: '1px solid var(--border)', paddingBottom: '1rem', marginBottom: '1.25rem' }}>
           <div>
             <h3 style={{ margin: 0, fontSize: '1.1rem' }}>Статус подключения</h3>
-            <span style={{ fontSize: '0.8rem', color: 'var(--text-secondary)' }}>
+            <span style={{ fontSize: '0.8rem', color: 'var(--muted)' }}>
               Zero-ENV: данные хранятся защищенно в PostgreSQL
             </span>
           </div>
@@ -126,12 +126,12 @@ export const TelegramSettings: React.FC = () => {
               type="checkbox"
               checked={settings.enabled}
               onChange={(e) => setSettings({ ...settings, enabled: e.target.checked })}
-              style={{ width: '18px', height: '18px', accentColor: 'var(--primary-color)' }}
+              style={{ width: '18px', height: '18px', accentColor: 'var(--accent)' }}
             />
             {settings.enabled ? (
               <span style={{ color: 'var(--success-color, #10b981)' }}>🟢 Включено</span>
             ) : (
-              <span style={{ color: 'var(--text-secondary)' }}>⚪ Отключено</span>
+              <span style={{ color: 'var(--muted)' }}>⚪ Отключено</span>
             )}
           </label>
         </div>
@@ -145,7 +145,7 @@ export const TelegramSettings: React.FC = () => {
               <div style={{ position: 'relative' }}>
                 <input
                   type={showToken ? 'text' : 'password'}
-                  className="input"
+                  
                   placeholder="123456789:ABCdefGHIjklMNOpqrSTUvwxYZ"
                   value={settings.botToken}
                   onChange={(e) => setSettings({ ...settings, botToken: e.target.value })}
@@ -163,14 +163,14 @@ export const TelegramSettings: React.FC = () => {
                     border: 'none',
                     cursor: 'pointer',
                     fontSize: '0.9rem',
-                    color: 'var(--text-secondary)',
+                    color: 'var(--muted)',
                   }}
                   title={showToken ? 'Скрыть токен' : 'Показать токен'}
                 >
                   {showToken ? '🙈' : '👁️'}
                 </button>
               </div>
-              <small style={{ color: 'var(--text-secondary)', fontSize: '0.75rem' }}>
+              <small style={{ color: 'var(--muted)', fontSize: '0.75rem' }}>
                 Получите у <code>@BotFather</code> в Telegram
               </small>
             </div>
@@ -181,13 +181,13 @@ export const TelegramSettings: React.FC = () => {
               </label>
               <input
                 type="text"
-                className="input"
+                
                 placeholder="123456789 или -100123456789"
                 value={settings.chatID}
                 onChange={(e) => setSettings({ ...settings, chatID: e.target.value })}
                 style={{ width: '100%' }}
               />
-              <small style={{ color: 'var(--text-secondary)', fontSize: '0.75rem' }}>
+              <small style={{ color: 'var(--muted)', fontSize: '0.75rem' }}>
                 Ваш личный ID или ID группы (узнать в <code>@userinfobot</code>)
               </small>
             </div>
@@ -198,13 +198,13 @@ export const TelegramSettings: React.FC = () => {
               </label>
               <input
                 type="text"
-                className="input"
+                
                 placeholder="Например: 12"
                 value={settings.topicID}
                 onChange={(e) => setSettings({ ...settings, topicID: e.target.value })}
                 style={{ width: '100%' }}
               />
-              <small style={{ color: 'var(--text-secondary)', fontSize: '0.75rem' }}>
+              <small style={{ color: 'var(--muted)', fontSize: '0.75rem' }}>
                 Для супергрупп с включенными темами (форумами)
               </small>
             </div>
@@ -214,7 +214,7 @@ export const TelegramSettings: React.FC = () => {
                 Интервал сводки (PnL Digest)
               </label>
               <select
-                className="input"
+                
                 value={settings.digestIntervalMinutes}
                 onChange={(e) => setSettings({ ...settings, digestIntervalMinutes: Number(e.target.value) })}
                 style={{ width: '100%' }}
@@ -226,7 +226,7 @@ export const TelegramSettings: React.FC = () => {
                 <option value={240}>Каждые 4 часа</option>
                 <option value={720}>Каждые 12 часов</option>
               </select>
-              <small style={{ color: 'var(--text-secondary)', fontSize: '0.75rem' }}>
+              <small style={{ color: 'var(--muted)', fontSize: '0.75rem' }}>
                 Периодичность отправки текущего PnL и статуса ботов
               </small>
             </div>
@@ -237,7 +237,7 @@ export const TelegramSettings: React.FC = () => {
               type="button"
               className="button secondary"
               onClick={handleTest}
-              disabled={testing || !settings.botToken || !settings.chatID}
+              disabled={testing || !canManage || !settings.botToken || !settings.chatID}
               style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}
             >
               {testing ? '⏳ Отправка...' : '🧪 Отправить тестовое сообщение'}
@@ -245,7 +245,7 @@ export const TelegramSettings: React.FC = () => {
             <button
               type="submit"
               className="button primary"
-              disabled={saving}
+              disabled={saving || !canManage}
               style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', marginLeft: 'auto' }}
             >
               {saving ? '⏳ Сохранение...' : '💾 Сохранить настройки'}
@@ -256,7 +256,7 @@ export const TelegramSettings: React.FC = () => {
 
       {/* Event Filters */}
       <div className="card" style={{ padding: '1.5rem', marginBottom: '1.5rem' }}>
-        <h3 style={{ margin: '0 0 1rem', fontSize: '1.1rem', borderBottom: '1px solid var(--border-color)', paddingBottom: '0.75rem' }}>
+        <h3 style={{ margin: '0 0 1rem', fontSize: '1.1rem', borderBottom: '1px solid var(--border)', paddingBottom: '0.75rem' }}>
           🔔 События для отправки уведомлений
         </h3>
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))', gap: '1rem' }}>
@@ -269,7 +269,7 @@ export const TelegramSettings: React.FC = () => {
             />
             <div>
               <div style={{ fontWeight: 600, fontSize: '0.9rem' }}>🚀 Запуск бота</div>
-              <div style={{ fontSize: '0.75rem', color: 'var(--text-secondary)' }}>
+              <div style={{ fontSize: '0.75rem', color: 'var(--muted)' }}>
                 Оповещение при открытии новой сетки автопилотом
               </div>
             </div>
@@ -284,7 +284,7 @@ export const TelegramSettings: React.FC = () => {
             />
             <div>
               <div style={{ fontWeight: 600, fontSize: '0.9rem' }}>🎯 Тейк-профит (PnL Target)</div>
-              <div style={{ fontSize: '0.75rem', color: 'var(--text-secondary)' }}>
+              <div style={{ fontSize: '0.75rem', color: 'var(--muted)' }}>
                 Закрытие бота с прибылью при достижении цели
               </div>
             </div>
@@ -299,7 +299,7 @@ export const TelegramSettings: React.FC = () => {
             />
             <div>
               <div style={{ fontWeight: 600, fontSize: '0.9rem' }}>🛡️ Стоп-лосс / Защита</div>
-              <div style={{ fontSize: '0.75rem', color: 'var(--text-secondary)' }}>
+              <div style={{ fontSize: '0.75rem', color: 'var(--muted)' }}>
                 Фиксация убытка или срабатывание защитного стопа
               </div>
             </div>
@@ -314,7 +314,7 @@ export const TelegramSettings: React.FC = () => {
             />
             <div>
               <div style={{ fontWeight: 600, fontSize: '0.9rem' }}>🔄 Сдвиг диапазона (Adjust)</div>
-              <div style={{ fontSize: '0.75rem', color: 'var(--text-secondary)' }}>
+              <div style={{ fontSize: '0.75rem', color: 'var(--muted)' }}>
                 Автоматическая подтяжка сетки за ушедшим рынком
               </div>
             </div>
@@ -329,7 +329,7 @@ export const TelegramSettings: React.FC = () => {
             />
             <div>
               <div style={{ fontWeight: 600, fontSize: '0.9rem' }}>📊 Периодическая сводка</div>
-              <div style={{ fontSize: '0.75rem', color: 'var(--text-secondary)' }}>
+              <div style={{ fontSize: '0.75rem', color: 'var(--muted)' }}>
                 Регулярный отчет по активным ботам и суммарному PnL
               </div>
             </div>
@@ -344,7 +344,7 @@ export const TelegramSettings: React.FC = () => {
             />
             <div>
               <div style={{ fontWeight: 600, fontSize: '0.9rem' }}>🚨 Аварийный стоп / Kill Switch</div>
-              <div style={{ fontSize: '0.75rem', color: 'var(--text-secondary)' }}>
+              <div style={{ fontSize: '0.75rem', color: 'var(--muted)' }}>
                 Критические алерты безопасности и ручные экстренные остановки
               </div>
             </div>
@@ -355,7 +355,7 @@ export const TelegramSettings: React.FC = () => {
       {/* Templates Editor */}
       <div className="card" style={{ padding: '1.5rem', marginBottom: '1.5rem' }}>
         <h3 style={{ margin: '0 0 0.5rem', fontSize: '1.1rem' }}>📝 Шаблоны сообщений (HTML)</h3>
-        <p style={{ margin: '0 0 1.25rem', fontSize: '0.8rem', color: 'var(--text-secondary)' }}>
+        <p style={{ margin: '0 0 1.25rem', fontSize: '0.8rem', color: 'var(--muted)' }}>
           Используйте переменные <code>{'{{bot_number}}'}</code>, <code>{'{{symbol}}'}</code>, <code>{'{{pnl_usdt}}'}</code>, <code>{'{{direction}}'}</code>, <code>{'{{leverage}}'}</code>, <code>{'{{reason}}'}</code>. Поддерживается HTML-разметка Telegram (<code>&lt;b&gt;</code>, <code>&lt;code&gt;</code>, <code>&lt;i&gt;</code>).
         </p>
 
@@ -365,7 +365,7 @@ export const TelegramSettings: React.FC = () => {
               🚀 Шаблон: Запуск бота
             </label>
             <textarea
-              className="input"
+              
               rows={4}
               value={settings.templateBotCreated}
               onChange={(e) => setSettings({ ...settings, templateBotCreated: e.target.value })}
@@ -378,7 +378,7 @@ export const TelegramSettings: React.FC = () => {
               🎯 Шаблон: Тейк-профит (Take-Profit)
             </label>
             <textarea
-              className="input"
+              
               rows={3}
               value={settings.templateTakeProfit}
               onChange={(e) => setSettings({ ...settings, templateTakeProfit: e.target.value })}
@@ -391,7 +391,7 @@ export const TelegramSettings: React.FC = () => {
               🛡️ Шаблон: Стоп-лосс (Stop-Loss)
             </label>
             <textarea
-              className="input"
+              
               rows={3}
               value={settings.templateStopLoss}
               onChange={(e) => setSettings({ ...settings, templateStopLoss: e.target.value })}
@@ -404,7 +404,7 @@ export const TelegramSettings: React.FC = () => {
               🔄 Шаблон: Сдвиг диапазона (Adjust)
             </label>
             <textarea
-              className="input"
+              
               rows={3}
               value={settings.templateRangeAdjust}
               onChange={(e) => setSettings({ ...settings, templateRangeAdjust: e.target.value })}
@@ -417,7 +417,7 @@ export const TelegramSettings: React.FC = () => {
               📊 Шаблон: Периодическая сводка PnL (Digest)
             </label>
             <textarea
-              className="input"
+              
               rows={4}
               value={settings.templateDigest}
               onChange={(e) => setSettings({ ...settings, templateDigest: e.target.value })}
@@ -431,7 +431,7 @@ export const TelegramSettings: React.FC = () => {
             type="button"
             className="button primary"
             onClick={() => handleSave()}
-            disabled={saving}
+            disabled={saving || !canManage}
           >
             {saving ? '⏳ Сохранение...' : '💾 Сохранить шаблоны'}
           </button>
@@ -441,10 +441,10 @@ export const TelegramSettings: React.FC = () => {
       {/* Bot Commands Help */}
       <div className="card" style={{ padding: '1.25rem', background: 'var(--surface-color-subtle, rgba(255,255,255,0.02))' }}>
         <h4 style={{ margin: '0 0 0.5rem', fontSize: '0.95rem' }}>🎮 Интерактивные команды в Telegram боте</h4>
-        <p style={{ margin: '0 0 0.75rem', fontSize: '0.8rem', color: 'var(--text-secondary)' }}>
+        <p style={{ margin: '0 0 0.75rem', fontSize: '0.8rem', color: 'var(--muted)' }}>
           Вы можете отправлять боту команды прямо в чат Telegram:
         </p>
-        <ul style={{ margin: 0, paddingLeft: '1.25rem', fontSize: '0.82rem', color: 'var(--text-secondary)' }}>
+        <ul style={{ margin: 0, paddingLeft: '1.25rem', fontSize: '0.82rem', color: 'var(--muted)' }}>
           <li><code>/status</code> — Мгновенный отчет по количеству активных ботов и зафиксированному PnL</li>
           <li><code>/kill</code> — Экстренная активация Kill Switch (блокирует запуск новых позиций)</li>
         </ul>

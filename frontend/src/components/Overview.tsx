@@ -1,44 +1,56 @@
-import { useEffect, useState } from 'react';
-import { api, getCachedAutoGrid, setCachedAutoGrid } from '../api';
+import { useCallback, useEffect, useState } from 'react';
+import { api, describeError, getCachedAutoGrid, setCachedAutoGrid } from '../api';
 import type { AutoGridState, Dashboard } from '../types';
 
 interface Props {
   onRefresh: () => void;
+  canOperate: boolean;
 }
 
-export default function Overview({ onRefresh }: Props) {
+export default function Overview({ onRefresh, canOperate }: Props) {
   const [dashboard, setDashboard] = useState<Dashboard | null>(null);
   const [state, setState] = useState<AutoGridState | null>(() => getCachedAutoGrid<AutoGridState>());
+  const [clearError, setClearError] = useState<string | null>(null);
+  const [clearingPaper, setClearingPaper] = useState(false);
 
-  useEffect(() => {
-    api<Dashboard>('/api/dashboard').then(setDashboard).catch(() => setDashboard(null));
+  // The gates panel and PnL live HERE: this tab must poll into its own
+  // state, not kick App's topbar refresh.
+  const refresh = useCallback(() => {
+    api<Dashboard>('/api/dashboard').then(setDashboard).catch(() => {});
     api<AutoGridState>('/api/autogrid')
       .then((res) => {
         setState(res);
         setCachedAutoGrid(res);
       })
       .catch(() => {});
-    const timer = window.setInterval(onRefresh, 15000);
+  }, []);
+
+  useEffect(() => {
+    refresh();
+    const timer = window.setInterval(refresh, 15000);
     return () => window.clearInterval(timer);
-  }, [onRefresh]);
+  }, [refresh]);
 
   const pnl = state?.pnl;
   const exchange = state?.exchange;
-  const [clearingPaper, setClearingPaper] = useState(false);
 
   async function handleClearPaper() {
     if (!window.confirm('Сбросить историю и накопленный PnL симуляции (PAPER)? Завершенные боты будут удалены.')) {
       return;
     }
     setClearingPaper(true);
+    setClearError(null);
     try {
-      await api<{ success: boolean; deletedCount: number }>('/api/autogrid/paper/clear', {
+      const res = await api<{ success: boolean; deletedCount: number }>('/api/autogrid/paper/clear', {
         method: 'POST',
         body: JSON.stringify({ includeRunning: false }),
       });
-      onRefresh();
-    } catch {
-      // ignore
+      setClearError(null);
+      void refresh();
+      void onRefresh();
+      window.setTimeout(() => window.alert(`История симуляции очищена (${res.deletedCount} ботов удалено).`), 0);
+    } catch (error) {
+      setClearError(describeError(error));
     } finally {
       setClearingPaper(false);
     }
@@ -46,6 +58,7 @@ export default function Overview({ onRefresh }: Props) {
 
   return (
     <div className="section-stack">
+      {clearError && <div className="alert danger"><span>Очистка не удалась: {clearError}</span></div>}
       <div className="metric-grid">
         <Metric label="Автопилот" value={state?.settings.status ?? '—'} />
         <Metric label="Активных ботов" value={String(state?.activeBots.length ?? 0)} />
@@ -56,9 +69,9 @@ export default function Overview({ onRefresh }: Props) {
           action={
             <button
               type="button"
-              className="btn btn-secondary btn-small"
+              className="button secondary small"
               style={{ padding: '2px 8px', fontSize: '11px', lineHeight: '1.2' }}
-              disabled={clearingPaper}
+              disabled={clearingPaper || !canOperate}
               onClick={handleClearPaper}
               title="Очистить историю симуляции и обнулить PnL"
             >

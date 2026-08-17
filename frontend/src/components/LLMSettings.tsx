@@ -98,7 +98,7 @@ function severityClass(severity: string): string {
   }
 }
 
-export default function LLMSettings() {
+export default function LLMSettings({ canManage }: { canManage: boolean }) {
   const [view, setView] = useState<'config' | 'audits'>('config');
   const [settings, setSettings] = useState<LLMSettings | null>(null);
   const [audits, setAudits] = useState<LLMAuditRecord[]>([]);
@@ -302,7 +302,7 @@ export default function LLMSettings() {
     return (
       <div className="section" style={{ textAlign: 'center', padding: '3rem' }}>
         <div className="loading-spinner" />
-        <p style={{ marginTop: '1rem', color: 'var(--text-secondary)' }}>Загрузка настроек AI…</p>
+        <p style={{ marginTop: '1rem', color: 'var(--muted)' }}>Загрузка настроек AI…</p>
       </div>
     );
   }
@@ -314,7 +314,7 @@ export default function LLMSettings() {
           <span style={{ fontSize: '1.75rem' }}>🧠</span>
           <div>
             <h2 style={{ margin: 0, fontSize: '1.4rem', fontWeight: 700 }}>AI Мозг — аудит кандидатов</h2>
-            <p style={{ margin: '0.2rem 0 0', color: 'var(--text-secondary)', fontSize: '0.85rem' }}>
+            <p style={{ margin: '0.2rem 0 0', color: 'var(--muted)', fontSize: '0.85rem' }}>
               Перед REAL-деплоем каждый кандидат проходит LLM-аудит с новостным вето (UNLOCK / DELIST / EXPLOIT)
             </p>
           </div>
@@ -338,7 +338,7 @@ export default function LLMSettings() {
         {(['config', 'audits'] as const).map((item) => (
           <button
             key={item}
-            className={`btn btn-sm ${view === item ? 'btn-primary' : ''}`}
+            className={`button small ${view === item ? 'primary' : 'secondary'}`}
             onClick={() => setView(item)}
           >
             {item === 'config' ? 'Настройки' : `Аудиты (${audits.length})`}
@@ -358,7 +358,7 @@ export default function LLMSettings() {
                   key={item.id}
                   onClick={() => handleProviderChange(item.id)}
                   style={{
-                    border: `1px solid ${provider === item.id ? 'var(--primary-color)' : 'var(--border-color)'}`,
+                    border: `1px solid ${provider === item.id ? 'var(--accent)' : 'var(--border)'}`,
                     borderRadius: '8px',
                     padding: '0.85rem',
                     cursor: 'pointer',
@@ -373,7 +373,7 @@ export default function LLMSettings() {
                       </span>
                     )}
                   </div>
-                  <small style={{ color: 'var(--text-secondary)', display: 'block', marginTop: '0.3rem' }}>{item.tagline}</small>
+                  <small style={{ color: 'var(--muted)', display: 'block', marginTop: '0.3rem' }}>{item.tagline}</small>
                 </div>
               ))}
             </div>
@@ -387,7 +387,7 @@ export default function LLMSettings() {
             </label>
             <div style={{ display: 'flex', gap: '0.75rem', alignItems: 'center' }}>
               <input
-                className="input"
+                
                 type="password"
                 value={apiKey}
                 onChange={(e) => setApiKey(e.target.value)}
@@ -417,7 +417,7 @@ export default function LLMSettings() {
             <h3 style={{ margin: '0 0 0.75rem', fontSize: '1.05rem' }}>3. Модель</h3>
             <div style={{ display: 'flex', gap: '0.75rem', flexWrap: 'wrap' }}>
               <input
-                className="input"
+                
                 list="llm-model-options"
                 value={model}
                 onChange={(e) => setModel(e.target.value)}
@@ -429,7 +429,7 @@ export default function LLMSettings() {
                   <option key={item} value={item} />
                 ))}
               </datalist>
-              <button className="btn" onClick={() => void handleFetchModels()} disabled={loadingModels}>
+              <button className="button secondary" onClick={() => void handleFetchModels()} disabled={loadingModels}>
                 {loadingModels ? 'Загрузка…' : '📥 Получить модели'}
               </button>
             </div>
@@ -443,7 +443,7 @@ export default function LLMSettings() {
             <div className="card" style={{ padding: '1.25rem', marginBottom: '1.25rem' }}>
               <h3 style={{ margin: '0 0 0.75rem', fontSize: '1.05rem' }}>Base URL</h3>
               <input
-                className="input"
+                
                 value={baseUrl}
                 onChange={(e) => setBaseUrl(e.target.value)}
                 placeholder="https://your-llm.example.com/v1/chat/completions"
@@ -524,16 +524,19 @@ export default function LLMSettings() {
           </div>
 
           <div style={{ display: 'flex', gap: '0.75rem', flexWrap: 'wrap', alignItems: 'center' }}>
-            <button className="btn btn-primary" onClick={() => void handleSave()} disabled={saving}>
+            <button className="button primary" onClick={() => void handleSave()} disabled={saving || !canManage}>
               {saving ? 'Сохранение…' : '💾 Сохранить'}
             </button>
-            <button className="btn" onClick={() => void handleTest()} disabled={testing}>
+            <button className="button secondary" onClick={() => void handleTest()} disabled={testing || !canManage}>
               {testing ? 'Проверка…' : '🔌 Проверить подключение'}
             </button>
-            <button className="btn" onClick={() => void loadSettings()} disabled={loading}>
+            <button className="button secondary" onClick={() => void loadSettings()} disabled={loading}>
               ↺ Перезагрузить
             </button>
-            <small className="muted">Тест с пустым полем ключа проверяет сохранённый ключ</small>
+            <small className="muted">
+              Тест с пустым полем ключа проверяет сохранённый ключ
+              {canManage ? '' : ' · изменение настроек доступно только администратору'}
+            </small>
           </div>
 
           {testResult && (

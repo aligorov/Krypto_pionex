@@ -718,7 +718,9 @@ func (s *Server) autoGridAction(w http.ResponseWriter, r *http.Request) {
 		IdempotencyKey string `json:"idempotencyKey"`
 	}
 	if r.Body != nil && r.ContentLength > 0 {
-		_ = decodeJSON(w, r, &input)
+		if !decodeJSON(w, r, &input) {
+			return
+		}
 	}
 	action := r.PathValue("action")
 	principal := principalFromContext(r.Context())
@@ -1446,7 +1448,9 @@ func (s *Server) testLLMConnection(w http.ResponseWriter, r *http.Request) {
 	}
 	var input llm.Settings
 	if r.Body != nil && r.ContentLength > 0 {
-		_ = decodeJSON(w, r, &input)
+		if !decodeJSON(w, r, &input) {
+			return
+		}
 	}
 	resp, latencyMs, err := s.llm.TestConnection(r.Context(), input)
 	if err != nil {
@@ -1471,7 +1475,9 @@ func (s *Server) listLLMModels(w http.ResponseWriter, r *http.Request) {
 	}
 	var input llm.Settings
 	if r.Body != nil && r.ContentLength > 0 {
-		_ = decodeJSON(w, r, &input)
+		if !decodeJSON(w, r, &input) {
+			return
+		}
 	}
 	models, err := s.llm.ListModels(r.Context(), input)
 	if err != nil {

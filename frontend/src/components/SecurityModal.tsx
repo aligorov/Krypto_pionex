@@ -293,7 +293,7 @@ export default function SecurityModal({
               >
                 🚫 IP-защита & Whitelist
                 {bans.length > 0 && (
-                  <span className="badge badge-danger" style={{ marginLeft: 8 }}>
+                  <span className="badge danger" style={{ marginLeft: 8 }}>
                     {bans.length} бан
                   </span>
                 )}
@@ -607,7 +607,7 @@ export default function SecurityModal({
                   </div>
                 ) : (
                   <div className="table-wrapper">
-                    <table className="table">
+                    <table >
                       <thead>
                         <tr>
                           <th>IP адрес</th>
@@ -621,7 +621,7 @@ export default function SecurityModal({
                         {bans.map((b) => (
                           <tr key={b.ip}>
                             <td><code>{b.ip}</code></td>
-                            <td><span className="badge badge-danger">{b.failedAttempts}</span></td>
+                            <td><span className="badge danger">{b.failedAttempts}</span></td>
                             <td className="muted" style={{ fontSize: '0.8rem' }}>
                               {new Date(b.lastFailedAt).toLocaleTimeString()}
                             </td>
@@ -677,7 +677,7 @@ export default function SecurityModal({
                 </form>
 
                 <div className="table-wrapper" style={{ marginTop: 12 }}>
-                  <table className="table">
+                  <table >
                     <thead>
                       <tr>
                         <th>IP / CIDR</th>

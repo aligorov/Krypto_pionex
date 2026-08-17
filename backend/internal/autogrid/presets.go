@@ -205,6 +205,7 @@ func mergePreset(current Settings, preset Preset) UpdateSettingsInput {
 		AdaptiveLeverageEnabled: current.AdaptiveLeverageEnabled,
 		DensityGridEnabled:      current.DensityGridEnabled,
 		CandleInterval:          current.CandleInterval,
+		ScanMode:                current.ScanMode,
 		LookbackCandles:         current.LookbackCandles,
 		MaxSymbolsPerScan:       current.MaxSymbolsPerScan,
 		ScanIntervalSeconds:     current.ScanIntervalSeconds,

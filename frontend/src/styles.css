@@ -699,3 +699,10 @@ input:disabled, select:disabled { opacity: .65; }
   }
 }
 
+
+/* Shared blocks referenced by settings/history screens */
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: 14px; box-shadow: var(--shadow); padding: 18px; }
+.loading-spinner { width: 34px; height: 34px; margin: 0 auto; border: 3px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: spin 0.9s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+.alert.warning { color: var(--warning); border-color: rgba(255, 200, 87, .35); background: rgba(255, 200, 87, .08); }
+.alert.info { color: var(--blue); border-color: rgba(112, 168, 255, .35); background: rgba(112, 168, 255, .08); }

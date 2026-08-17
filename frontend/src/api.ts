@@ -63,14 +63,21 @@ export function describeError(err: unknown): string {
   return String(err);
 }
 
-let autoGridCache: any = null;
+let autoGridCache: unknown = null;
 
-export function getCachedAutoGrid<T = any>(): T | null {
-  return autoGridCache as T | null;
+export function getCachedAutoGrid<T>(): T | null {
+  return (autoGridCache as T | null) ?? null;
 }
 
-export function setCachedAutoGrid(data: any) {
+export function setCachedAutoGrid(data: unknown) {
   autoGridCache = data;
+}
+
+// The cached snapshot is per-session: a logout or a 401 must drop it, or the
+// next sign-in on the same browser renders the previous user's bots/PnL
+// with fetch errors suppressed (all consumers gate errors on the cache).
+export function clearCachedAutoGrid() {
+  autoGridCache = null;
 }
 
 

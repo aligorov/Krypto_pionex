@@ -1,6 +1,6 @@
 import { FormEvent, useCallback, useEffect, useState } from 'react';
 import { api } from '../api';
-import { describeError } from './AutoGridAutopilot';
+import { describeError } from '../api';
 import type { APIToken } from '../types';
 
 interface Props {
@@ -153,9 +153,11 @@ export default function MCPServer({ canManage }: Props) {
                     <td>{token.expiresAt ? new Date(token.expiresAt).toLocaleString() : 'никогда'}</td>
                     <td>{new Date(token.createdAt).toLocaleString()}</td>
                     <td>
-                      <button className="button small danger" disabled={busy} onClick={() => void revoke(token.id)}>
-                        Отозвать
-                      </button>
+                      {canManage && (
+                        <button className="button small danger" disabled={busy} onClick={() => void revoke(token.id)}>
+                          Отозвать
+                        </button>
+                      )}
                     </td>
                   </tr>
                 ))}

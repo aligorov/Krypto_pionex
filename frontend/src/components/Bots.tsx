@@ -312,11 +312,12 @@ function BotRow({
       return;
     }
     setClosing(true);
+    setAdjustError(null);
     try {
       await api(`/api/autogrid/bots/${bot.id}/close`, { method: 'POST' });
       await onClosed();
-    } catch {
-      /* surfaced by the parent reload */
+    } catch (error) {
+      setAdjustError(describeError(error));
     } finally {
       setClosing(false);
     }
@@ -597,19 +598,19 @@ function BotHistoryModal({
         }}
         onClick={(e) => e.stopPropagation()}
       >
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderBottom: '1px solid var(--border-color)', paddingBottom: '1rem', marginBottom: '1rem' }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderBottom: '1px solid var(--border)', paddingBottom: '1rem', marginBottom: '1rem' }}>
           <div>
             <h3 style={{ margin: 0, fontSize: '1.2rem' }}>
               📜 История событий: {bot.botNumber ? `#${bot.botNumber} ` : ''}{bot.symbol}
             </h3>
-            <span style={{ fontSize: '0.78rem', color: 'var(--text-secondary)' }}>ID: {bot.id}</span>
+            <span style={{ fontSize: '0.78rem', color: 'var(--muted)' }}>ID: {bot.id}</span>
           </div>
           <button className="button ghost" onClick={onClose} style={{ fontSize: '1.2rem', padding: '0.2rem 0.6rem' }}>×</button>
         </div>
 
         <div style={{ flex: 1, overflowY: 'auto', paddingRight: '0.5rem' }}>
           {loading && <div style={{ textAlign: 'center', padding: '2rem' }}>Загрузка истории...</div>}
-          {error && <div className="banner error">{error}</div>}
+          {error && <div className="alert danger">{error}</div>}
           {!loading && !error && events.length === 0 && (
             <div className="empty-state">Событий по данному боту пока не зафиксировано.</div>
           )}
@@ -622,7 +623,7 @@ function BotHistoryModal({
                     padding: '0.75rem 1rem',
                     borderRadius: '6px',
                     background: 'var(--surface-color, rgba(255,255,255,0.03))',
-                    border: '1px solid var(--border-color)',
+                    border: '1px solid var(--border)',
                   }}
                 >
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.35rem' }}>
@@ -634,17 +635,17 @@ function BotHistoryModal({
                         </strong>
                       )}
                     </div>
-                    <span style={{ fontSize: '0.75rem', color: 'var(--text-secondary)' }}>
+                    <span style={{ fontSize: '0.75rem', color: 'var(--muted)' }}>
                       {new Date(ev.createdAt).toLocaleString()}
                     </span>
                   </div>
                   {ev.price && (
-                    <div style={{ fontSize: '0.8rem', color: 'var(--text-secondary)' }}>
+                    <div style={{ fontSize: '0.8rem', color: 'var(--muted)' }}>
                       Цена события: <code>{ev.price}</code>
                     </div>
                   )}
                   {ev.details && Object.keys(ev.details).length > 0 && (
-                    <div style={{ fontSize: '0.78rem', marginTop: '0.3rem', color: 'var(--text-secondary)', background: 'rgba(0,0,0,0.2)', padding: '0.4rem', borderRadius: '4px' }}>
+                    <div style={{ fontSize: '0.78rem', marginTop: '0.3rem', color: 'var(--muted)', background: 'rgba(0,0,0,0.2)', padding: '0.4rem', borderRadius: '4px' }}>
                       {JSON.stringify(ev.details)}
                     </div>
                   )}
@@ -660,8 +661,15 @@ function BotHistoryModal({
 
 function reasonBadge(reason: string | null): string {
   if (!reason) return 'neutral';
-  if (reason.startsWith('TAKE_PROFIT')) return 'success';
-  if (reason.startsWith('STOP_LOSS') || reason.startsWith('RANGE_BREAK') || reason.startsWith('LIQUID')) {
+  if (reason.startsWith('TAKE_PROFIT') || reason.startsWith('TRAILING_TAKE_PROFIT') || reason.startsWith('BREAKEVEN_LOCK')) {
+    return 'success';
+  }
+  if (
+    reason.startsWith('STOP_LOSS') ||
+    reason.startsWith('STRUCT_INVALID') ||
+    reason.startsWith('RANGE_BREAK') ||
+    reason.startsWith('LIQUID')
+  ) {
     return 'danger';
   }
   return 'warning';

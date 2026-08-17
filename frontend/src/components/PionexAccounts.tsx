@@ -1,5 +1,5 @@
 import { FormEvent, useCallback, useEffect, useState } from 'react';
-import { api, ApiError } from '../api';
+import { api, describeError } from '../api';
 import type { Account } from '../types';
 
 interface Props {
@@ -307,9 +307,4 @@ function Capability({ ok, label }: { ok: boolean; label: string }) {
 
 function formatDate(value: string | null): string {
   return value ? new Date(value).toLocaleString('ru-RU') : 'не проверялся';
-}
-
-function describeError(error: unknown): string {
-  if (error instanceof ApiError || error instanceof Error) return error.message;
-  return 'Неизвестная ошибка';
 }

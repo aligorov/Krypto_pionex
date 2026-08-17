@@ -6,7 +6,7 @@ interface Props {
   canOperate: boolean;
 }
 
-const INTERVALS = ['15M', '30M', '60M', '1H', '4H', '1D'];
+const INTERVALS = ['15M', '30M', '60M', '4H', '1D'];
 
 const STATUS_BADGES: Record<string, string> = {
   QUEUED: 'badge neutral',
@@ -68,7 +68,7 @@ export default function BacktestLab({ canOperate }: Props) {
           <span style={{ fontSize: '1.75rem' }}>🔬</span>
           <div>
             <h2 style={{ margin: 0, fontSize: '1.4rem', fontWeight: 700 }}>Бэктест-лаборатория</h2>
-            <p style={{ margin: '0.2rem 0 0', color: 'var(--text-secondary)', fontSize: '0.85rem' }}>
+            <p style={{ margin: '0.2rem 0 0', color: 'var(--muted)', fontSize: '0.85rem' }}>
               Purged walk-forward симуляция сетки на истории Pionex: параметры подбираются на train-окне,
               результат считается строго out-of-sample
             </p>
@@ -76,15 +76,15 @@ export default function BacktestLab({ canOperate }: Props) {
         </div>
       </div>
 
-      {error && <div className="banner error" style={{ marginBottom: '1rem' }}>{error}</div>}
-      {notice && <div className="banner success" style={{ marginBottom: '1rem' }}>{notice}</div>}
+      {error && <div className="alert danger" style={{ marginBottom: '1rem' }}>{error}</div>}
+      {notice && <div className="alert success" style={{ marginBottom: '1rem' }}>{notice}</div>}
 
       <div className="card" style={{ padding: '1.25rem', marginBottom: '1.25rem' }}>
         <div style={{ display: 'flex', gap: '1rem', flexWrap: 'wrap', alignItems: 'flex-end' }}>
           <div>
             <label style={{ display: 'block', fontSize: '0.8rem', fontWeight: 600, marginBottom: '0.3rem' }}>Символ</label>
             <input
-              className="input"
+              
               value={symbol}
               onChange={(e) => setSymbol(e.target.value)}
               placeholder="BTC_USDT_PERP"
@@ -93,7 +93,7 @@ export default function BacktestLab({ canOperate }: Props) {
           </div>
           <div>
             <label style={{ display: 'block', fontSize: '0.8rem', fontWeight: 600, marginBottom: '0.3rem' }}>Таймфрейм</label>
-            <select className="input" value={tf} onChange={(e) => setTf(e.target.value)} style={{ width: '110px' }}>
+            <select  value={tf} onChange={(e) => setTf(e.target.value)} style={{ width: '110px' }}>
               {INTERVALS.map((item) => (
                 <option key={item} value={item}>{item}</option>
               ))}
@@ -104,7 +104,7 @@ export default function BacktestLab({ canOperate }: Props) {
               Стоп-лосс, % (за нижней границей)
             </label>
             <input
-              className="input"
+              
               type="number"
               min={1}
               max={30}
@@ -115,7 +115,7 @@ export default function BacktestLab({ canOperate }: Props) {
             />
           </div>
           <button
-            className="btn btn-primary"
+            className="button primary"
             onClick={() => void submit()}
             disabled={submitting || !canOperate || symbol.trim() === ''}
             title={canOperate ? '' : 'Требуется роль OPERATOR'}
@@ -137,7 +137,7 @@ export default function BacktestLab({ canOperate }: Props) {
           </div>
         </div>
         <div style={{ overflowX: 'auto' }}>
-          <table className="table">
+          <table >
             <thead>
               <tr>
                 <th>Создана</th>
@@ -155,7 +155,7 @@ export default function BacktestLab({ canOperate }: Props) {
             <tbody>
               {jobs.length === 0 && (
                 <tr>
-                  <td colSpan={10} style={{ textAlign: 'center', padding: '1.5rem', color: 'var(--text-secondary)' }}>
+                  <td colSpan={10} style={{ textAlign: 'center', padding: '1.5rem', color: 'var(--muted)' }}>
                     Задач пока нет — запусти первый бэктест выше
                   </td>
                 </tr>

@@ -1,6 +1,5 @@
-import { useCallback, useEffect, useState } from 'react';
-import { api } from '../api';
-import { describeError } from './AutoGridAutopilot';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { api, describeError } from '../api';
 import type { AuditEvent } from '../types';
 
 export default function AuditLogs() {
@@ -9,21 +8,28 @@ export default function AuditLogs() {
   const [action, setAction] = useState('');
   const [outcome, setOutcome] = useState('');
 
+  const latest = useRef(0);
   const load = useCallback(async () => {
+    const requestId = ++latest.current;
     const params = new URLSearchParams();
     if (action) params.set('action', action);
     if (outcome) params.set('outcome', outcome);
     params.set('limit', '200');
     try {
-      setEvents(await api<AuditEvent[]>(`/api/audit?${params.toString()}`));
-      setError(null);
+      const result = await api<AuditEvent[]>(`/api/audit?${params.toString()}`);
+      if (requestId === latest.current) {
+        setEvents(result);
+        setError(null);
+      }
     } catch (loadError) {
-      setError(describeError(loadError));
+      if (requestId === latest.current) setError(describeError(loadError));
     }
   }, [action, outcome]);
 
+  // Debounce the text filters; the sequence guard above keeps responses in order.
   useEffect(() => {
-    void load();
+    const handle = window.setTimeout(() => void load(), 300);
+    return () => window.clearTimeout(handle);
   }, [load]);
 
   return (
