@@ -513,6 +513,7 @@ func (worker *Worker) deployPaper(
 		worker.logger.Warn("Portfolio circuit breaker: recent stop-losses holding new deployments", "recentStopLossCount", recentStopLossCount)
 		return nil
 	}
+	backtestGateOn := worker.backtestGateEnabled(ctx)
 	for _, candidate := range candidates {
 		if candidate.Decision != "ACCEPTED" {
 			continue
@@ -591,6 +592,31 @@ func (worker *Worker) deployPaper(
 			)
 		`, settings.ID, candidate.Symbol).Scan(&recentlyStopped); err == nil && recentlyStopped {
 			continue
+		}
+		// Walk-forward backtest gate — PAPER runs the same exam as REAL
+		// capital: otherwise paper statistics prove a pipeline that REAL
+		// would have gated (prod: TUT walked into paper while its 30M
+		// walk-forward showed OOS −24.5% / DD 81%). Missing jobs are
+		// auto-enqueued and awaited in-cycle; the candidate is reconsidered
+		// on the next scan if results are still missing.
+		if backtestGateOn {
+			verdict := worker.backtestGate(ctx, settings, candidate.Symbol)
+			if verdict.Pending {
+				worker.logger.Info("backtest gate: awaiting walk-forward results",
+					"component", "autogrid_worker", "symbol", candidate.Symbol)
+				continue
+			}
+			if !verdict.Allowed {
+				worker.rejectCandidate(ctx, candidate, verdict.Reason, map[string]any{
+					"backtestGate": map[string]any{
+						"allowed": verdict.Allowed, "reason": verdict.Reason,
+						"traded": verdict.Traded, "neighbors": verdict.Neighbors,
+					},
+				})
+				worker.logger.Info("backtest gate rejected candidate",
+					"component", "autogrid_worker", "symbol", candidate.Symbol, "reason", verdict.Reason)
+				continue
+			}
 		}
 		target, maxLoss := computeBotTargets(settings, candidate)
 

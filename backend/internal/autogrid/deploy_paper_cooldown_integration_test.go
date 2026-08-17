@@ -51,6 +51,24 @@ func TestDeployPaperCooldownAfterProtectiveClose(t *testing.T) {
 	worker, _, settings := newCooldownTestWorker(t, pool)
 
 	const symbol = "COOLDOWN_USDT_PERP"
+	// Passing walk-forward verdicts so the backtest gate (applied to paper
+	// since this release) never interferes with the cooldown assertions.
+	tradedTF := normalizeBacktestTF(settings.CandleInterval)
+	for _, tf := range append([]string{tradedTF}, neighborBacktestTFs(tradedTF)...) {
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO backtest_jobs (symbol, interval, status, result, finished_at)
+			VALUES ($1, $2, 'DONE',
+			        '{"folds": 4, "oos_return_pct": 1.2, "oos_max_drawdown": 0.05, "round_trips": 100, "stop_hits": 0}'::jsonb,
+			        NOW())
+		`, symbol, tf); err != nil {
+			t.Fatalf("seed backtest job %s: %v", tf, err)
+		}
+	}
+	t.Cleanup(func() {
+		if _, err := pool.Exec(ctx, `DELETE FROM backtest_jobs WHERE symbol = $1`, symbol); err != nil {
+			t.Errorf("cleanup backtest jobs: %v", err)
+		}
+	})
 	if _, err := pool.Exec(ctx, `
 		INSERT INTO paper_grid_bots (
 			settings_id, symbol, status, direction, grid_type,
@@ -260,5 +278,143 @@ func TestPaperAdjustPersistsCountAndNotifies(t *testing.T) {
 	}
 	if !strings.Contains(payload, "Сдвигов: 1") {
 		t.Fatalf("telegram notification must carry the new shift count, got: %s", payload)
+	}
+}
+
+// TestPaperDeployRunsBacktestGate pins PAPER deployments to the same
+// walk-forward exam REAL capital pays: a symbol without a verdict stays
+// undeployed while jobs pend, a catastrophic traded-TF verdict rejects the
+// candidate (prod: TUT walked into paper with 30M OOS −24.5% / DD 81%), and
+// a passing verdict deploys. Pending neighbors never block.
+func TestPaperDeployRunsBacktestGate(t *testing.T) {
+	dbURL := integrationDatabaseURL(t)
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, dbURL)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	t.Cleanup(pool.Close)
+
+	worker, _, settings := newCooldownTestWorker(t, pool)
+	tradedTF := normalizeBacktestTF(settings.CandleInterval)
+	allTFs := append([]string{tradedTF}, neighborBacktestTFs(tradedTF)...)
+
+	const symbol = "BTGATE_USDT_PERP"
+	for _, tf := range allTFs {
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO backtest_jobs (symbol, interval, status, params)
+			VALUES ($1, $2, 'QUEUED', '{}'::jsonb)
+		`, symbol, tf); err != nil {
+			t.Fatalf("seed queued job %s: %v", tf, err)
+		}
+	}
+	t.Cleanup(func() {
+		if _, err := pool.Exec(ctx, `DELETE FROM backtest_jobs WHERE symbol = $1`, symbol); err != nil {
+			t.Errorf("cleanup backtest jobs: %v", err)
+		}
+		if _, err := pool.Exec(ctx, `DELETE FROM paper_grid_bots WHERE symbol = $1`, symbol); err != nil {
+			t.Errorf("cleanup paper bot: %v", err)
+		}
+	})
+
+	var scanID string
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO autogrid_scan_runs (status) VALUES ('SUCCEEDED') RETURNING id
+	`).Scan(&scanID); err != nil {
+		t.Fatalf("insert scan run: %v", err)
+	}
+	t.Cleanup(func() {
+		if _, err := pool.Exec(ctx, `DELETE FROM autogrid_scan_runs WHERE id = $1`, scanID); err != nil {
+			t.Errorf("cleanup scan run: %v", err)
+		}
+	})
+	var candidateID string
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO autogrid_candidates (
+			scan_id, symbol, decision, current_price, lower_price, upper_price,
+			grid_num, recommended_trend, model_assumptions
+		) VALUES (
+			$1, $2, 'ACCEPTED', 100, 90, 110,
+			10, 'no_trend', '{"atrPct": 1.0, "regime": "RANGE"}'::jsonb
+		)
+		RETURNING id
+	`, scanID, symbol).Scan(&candidateID); err != nil {
+		t.Fatalf("insert candidate: %v", err)
+	}
+
+	runningBots := func() int {
+		var count int
+		if err := pool.QueryRow(ctx, `
+			SELECT COUNT(*) FROM paper_grid_bots WHERE symbol = $1 AND status = 'RUNNING'
+		`, symbol).Scan(&count); err != nil {
+			t.Fatalf("count running: %v", err)
+		}
+		return count
+	}
+
+	// Round 1: every TF still QUEUED — deployment must wait, not jump the gate.
+	if err := worker.deployPaper(ctx, settings, scanID); err != nil {
+		t.Fatalf("deployPaper round 1: %v", err)
+	}
+	if got := runningBots(); got != 0 {
+		t.Fatalf("pending backtest must block paper deploy, got %d bots", got)
+	}
+	for _, tf := range allTFs {
+		var count int
+		if err := pool.QueryRow(ctx, `
+			SELECT COUNT(*) FROM backtest_jobs WHERE symbol = $1 AND interval = $2
+		`, symbol, tf).Scan(&count); err != nil {
+			t.Fatalf("count jobs: %v", err)
+		}
+		if count != 1 {
+			t.Fatalf("QUEUED job for %s must be reused, not duplicated (%d rows)", tf, count)
+		}
+	}
+
+	// Round 2: catastrophic traded-TF verdict (the TUT numbers) — candidate
+	// rejected, no bot.
+	if _, err := pool.Exec(ctx, `
+		UPDATE backtest_jobs
+		SET status = 'DONE', finished_at = NOW(),
+		    result = '{"folds": 4, "oos_return_pct": -24.52, "oos_max_drawdown": 0.8106, "round_trips": 4356, "stop_hits": 2}'::jsonb
+		WHERE symbol = $1 AND interval = $2
+	`, symbol, tradedTF); err != nil {
+		t.Fatalf("finish traded job: %v", err)
+	}
+	if err := worker.deployPaper(ctx, settings, scanID); err != nil {
+		t.Fatalf("deployPaper round 2: %v", err)
+	}
+	if got := runningBots(); got != 0 {
+		t.Fatalf("catastrophic backtest must reject paper deploy, got %d bots", got)
+	}
+	var decision, rejection string
+	if err := pool.QueryRow(ctx, `
+		SELECT decision, COALESCE(rejection_reason, '') FROM autogrid_candidates WHERE id = $1
+	`, candidateID).Scan(&decision, &rejection); err != nil {
+		t.Fatalf("load candidate: %v", err)
+	}
+	if decision != "REJECTED" || !strings.Contains(rejection, "backtest gate") {
+		t.Fatalf("candidate must be rejected by the gate, got %s / %q", decision, rejection)
+	}
+
+	// Round 3: passing traded-TF verdict — deploys even with pending neighbors.
+	if _, err := pool.Exec(ctx, `
+		UPDATE autogrid_candidates
+		SET decision = 'ACCEPTED', rejection_reason = NULL WHERE id = $1
+	`, candidateID); err != nil {
+		t.Fatalf("reset candidate: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		UPDATE backtest_jobs
+		SET result = '{"folds": 4, "oos_return_pct": 1.56, "oos_max_drawdown": 0.0183, "round_trips": 397, "stop_hits": 0}'::jsonb
+		WHERE symbol = $1 AND interval = $2
+	`, symbol, tradedTF); err != nil {
+		t.Fatalf("pass traded job: %v", err)
+	}
+	if err := worker.deployPaper(ctx, settings, scanID); err != nil {
+		t.Fatalf("deployPaper round 3: %v", err)
+	}
+	if got := runningBots(); got != 1 {
+		t.Fatalf("passing backtest must allow paper deploy, got %d bots", got)
 	}
 }
