@@ -127,6 +127,19 @@ func decideBotAction(input botActionInput) manageDecision {
 	adverseUp := input.Regime == "TREND_UP" || input.Regime == ""
 
 	if input.CurrentPrice.LessThan(breakDown) {
+		// v2.0 DGT reset: instead of closing on range break, try rebuilding
+		// the grid around the new price. Falls back to close when no
+		// adjustments remain or when the regime is adverse.
+		// DGT reset: only when the regime doesn't contradict the direction
+		if reset := ShouldResetGrid(input.Direction, input.Lower, input.Upper,
+			input.CurrentPrice, input.RangeBreakBuffer, input.AdjustmentsLeft); reset != nil && !adverseDown {
+			return manageDecision{
+				Action:   ActionAdjustDown,
+				Reason:   reset.Reason,
+				NewLower: reset.NewLower,
+				NewUpper: reset.NewUpper,
+			}
+		}
 		switch input.Direction {
 		case "SHORT":
 			return adjustDecision(input, ActionAdjustDown, "RANGE_SHIFT_DOWN")
@@ -143,6 +156,15 @@ func decideBotAction(input botActionInput) manageDecision {
 		}
 	}
 	if input.CurrentPrice.GreaterThan(breakUp) {
+		if reset := ShouldResetGrid(input.Direction, input.Lower, input.Upper,
+			input.CurrentPrice, input.RangeBreakBuffer, input.AdjustmentsLeft); reset != nil && !adverseUp {
+			return manageDecision{
+				Action:   ActionAdjustUp,
+				Reason:   reset.Reason,
+				NewLower: reset.NewLower,
+				NewUpper: reset.NewUpper,
+			}
+		}
 		switch input.Direction {
 		case "LONG":
 			return adjustDecision(input, ActionAdjustUp, "RANGE_SHIFT_UP")

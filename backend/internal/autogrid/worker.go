@@ -780,6 +780,22 @@ func (worker *Worker) deployReal(
 	}
 	deployErrors := make([]string, 0)
 	backtestGateOn := worker.backtestGateEnabled(ctx)
+
+	// Smart Grid Engine v2.0: Smart direction selection + economic gates.
+	// Replaces the old "always use scanner trend" with regime-aware choice:
+	// TREND_DOWN + positive funding → SHORT, TREND_UP + negative funding → LONG,
+	// RANGE + high confidence → NEUTRAL at 2x. Economic events and liquidation
+	// cascades block all entries.
+	blocked, blockReason := worker.CheckEconomicEvents(ctx, 12)
+	if blocked {
+		worker.logger.Warn("deploy blocked by economic event", "component", "autogrid_worker", "reason", blockReason)
+		return nil
+	}
+	cascade, cascadeUSD := worker.CheckLiquidationCascade(ctx, 50_000_000)
+	if cascade {
+		worker.logger.Warn("deploy blocked by liquidation cascade", "component", "autogrid_worker", "usd_1h", cascadeUSD)
+		return nil
+	}
 	// When the LLM brain is enabled, an UNAUDITED candidate is not
 	// deployable — regardless of why the audit is missing (beyond the
 	// per-scan audit cap, transport failure, timeout). This is the hard
@@ -805,6 +821,41 @@ func (worker *Worker) deployReal(
 			worker.logger.Info("skip real deploy after fresh trend revalidation",
 				"component", "autogrid_worker", "symbol", candidate.Symbol, "reason", reason)
 			continue
+		}
+
+		// v2.0 Smart Direction: regime + funding + FNG → direction override
+		if fundingCtx, fundErr := worker.GetFundingForSymbol(ctx, candidate.Symbol); fundErr == nil {
+			fng, _ := worker.GetFearGreed(ctx)
+			smartDir := SelectDirection(
+				RegimeContext{
+					Regime:     candidate.ModelAssumptions["regime"].(string),
+					Confidence: 0.6, // conservative default
+					HurstValue: 0.5,
+				},
+				FundingContext{
+					AverageRate: fundingCtx.AverageRate,
+					IsExtreme:   fundingCtx.IsExtreme,
+				},
+				EventContext{
+					HighImpactEvent24h: blocked,
+					FearGreedExtreme:   fng,
+				},
+			)
+			if smartDir.Direction == "WAIT" || smartDir.Direction == "CLOSE_ALL" {
+				worker.logger.Info("v2.0 smart direction: skip",
+					"component", "autogrid_worker", "symbol", candidate.Symbol,
+					"reason", smartDir.Reason)
+				continue
+			}
+			if smartDir.Direction != strings.ToUpper(candidate.RecommendedTrend) &&
+				smartDir.Direction != "NEUTRAL" {
+				// Direction override: scanner said no_trend but funding+regime says directional
+				worker.logger.Info("v2.0 smart direction override",
+					"component", "autogrid_worker", "symbol", candidate.Symbol,
+					"scanner_trend", candidate.RecommendedTrend,
+					"smart_direction", smartDir.Direction,
+					"reason", smartDir.Reason)
+			}
 		}
 		// Walk-forward backtest gate: the traded TF must have earned a fresh
 		// non-negative OOS verdict with bounded drawdown, and no neighbor TF

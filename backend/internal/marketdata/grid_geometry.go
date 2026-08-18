@@ -1,0 +1,84 @@
+package marketdata
+
+import "math"
+
+// GridGeometry is the translation of a HAR volatility forecast into futures
+// grid parameters. Higher forecast volatility widens the range and de-gears
+// leverage; the step floor keeps every grid round trip profitable after
+// fees. Confidence carries the HAR R² so downstream sizing can discount a
+// weak fit.
+type GridGeometry struct {
+	RangePct   float64 // total grid range as % of price
+	GridCount  int     // number of grid levels
+	StepPct    float64 // step between adjacent levels in %
+	Leverage   int     // recommended leverage (1-3)
+	StopPct    float64 // stop-loss distance below the range in %
+	Confidence float64 // HAR model R² (quality of the forecast)
+}
+
+// ComputeGridGeometry converts a HAR volatility forecast into grid parameters.
+//
+//	forecastVolPct: annualized daily volatility in % (e.g. 45 = 45% a year)
+//	harR2:          in-sample R² of the HAR fit, stored verbatim as Confidence
+//	feeBps:         one-way taker fee in basis points (e.g. 5 = 0.05%)
+//
+// Mapping rationale:
+//   - range  = 2.5 × daily volatility (covers roughly ±1.25σ of the next
+//     day's move, so the grid is neither instantly escaped nor idle),
+//   - step   ≥ 3 × fee (a round trip pays the fee twice; the third multiple
+//     is the safety buffer),
+//   - leverage falls as volatility rises: 3x only in calm regimes, 1x once
+//     daily moves exceed 5%.
+func ComputeGridGeometry(forecastVolPct float64, harR2 float64, feeBps float64) GridGeometry {
+	// Annualized % → daily %: σ_daily = σ_annual / √365 (crypto trades 24/7).
+	dailyVolPct := forecastVolPct / math.Sqrt(365)
+
+	// Grid range = 2.5 × daily volatility.
+	rangePct := dailyVolPct * 2.5
+	if rangePct < 3.0 {
+		rangePct = 3.0 // structural floor: below 3% a range grid barely spreads
+	}
+	if rangePct > 25.0 {
+		rangePct = 25.0 // ceiling: beyond this a grid stops being a grid
+	}
+
+	// Step must clear fees: 2× for the round trip + 1× buffer.
+	// feeBps/100 converts basis points to percent.
+	minStepPct := feeBps * 3.0 / 100.0
+	if minStepPct < 0.15 {
+		minStepPct = 0.15 // absolute minimum step, keeps level counts sane on cheap fees
+	}
+
+	// Number of fee-viable steps that fit in the range. floor(range/step)
+	// guarantees the realized step (= range/count) never drops below
+	// minStepPct unless the count floor below kicks in.
+	gridCount := int(rangePct / minStepPct)
+	if gridCount < 8 {
+		gridCount = 8 // fewer levels fragments capital and misses fills
+	}
+	if gridCount > 100 {
+		gridCount = 100 // practical ceiling for futures grids
+	}
+
+	// Leverage inversely proportional to volatility.
+	leverage := 2
+	if dailyVolPct > 5.0 {
+		leverage = 1 // very high vol → 1x
+	}
+	if dailyVolPct < 1.0 {
+		leverage = 3 // very low vol → 3x max
+	}
+
+	// Stop at half the range below the lower bound: outside normal grid
+	// oscillation, close enough to cut a regime break early.
+	stopPct := rangePct * 0.5
+
+	return GridGeometry{
+		RangePct:   rangePct,
+		GridCount:  gridCount,
+		StepPct:    rangePct / float64(gridCount),
+		Leverage:   leverage,
+		StopPct:    stopPct,
+		Confidence: harR2,
+	}
+}

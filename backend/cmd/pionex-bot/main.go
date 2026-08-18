@@ -17,6 +17,7 @@ import (
 	"github.com/aligorov/pionex-bot/backend/internal/database"
 	"github.com/aligorov/pionex-bot/backend/internal/httpapi"
 	"github.com/aligorov/pionex-bot/backend/internal/llm"
+	"github.com/aligorov/pionex-bot/backend/internal/marketdata"
 	"github.com/aligorov/pionex-bot/backend/internal/mcpserver"
 	"github.com/aligorov/pionex-bot/backend/internal/observability"
 	"github.com/aligorov/pionex-bot/backend/internal/risk"
@@ -88,6 +89,15 @@ func main() {
 
 		autoWorker := autogrid.NewWorker(dbPool, autoService, accountService, riskEngine, llmService, logger)
 		go autoWorker.Run(ctx)
+
+		// Smart Grid Engine v2.0: cross-exchange data collector
+		// (funding×3, OI, Fear&Greed, economic calendar → PostgreSQL)
+		dataService := marketdata.NewService(dbPool)
+		dataCollector := marketdata.NewCollector(dbPool, []string{
+			"BTC_USDT_PERP", "ETH_USDT_PERP", "SOL_USDT_PERP",
+		})
+		_ = dataService // available for future query integration
+		go dataCollector.Run(ctx)
 
 		// Start Telegram Outbox Dispatcher Loop. Credentials come from the
 		// telegram_settings table only — Zero-ENV policy, no fallbacks.
