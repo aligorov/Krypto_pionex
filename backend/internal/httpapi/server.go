@@ -54,6 +54,15 @@ type Server struct {
 	logger       *slog.Logger
 }
 
+type candleOut struct {
+	Time   int64   `json:"time"`
+	Open   float64 `json:"open"`
+	High   float64 `json:"high"`
+	Low    float64 `json:"low"`
+	Close  float64 `json:"close"`
+	Volume float64 `json:"volume"`
+}
+
 type cachedCandles struct {
 	data      []candleOut
 	fetchedAt time.Time
@@ -1555,14 +1564,6 @@ func (s *Server) getMarketCandles(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	type candleOut struct {
-		Time   int64   `json:"time"`
-		Open   float64 `json:"open"`
-		High   float64 `json:"high"`
-		Low    float64 `json:"low"`
-		Close  float64 `json:"close"`
-		Volume float64 `json:"volume"`
-	}
 	out := make([]candleOut, len(klines))
 	for i, k := range klines {
 		o, _ := k.Open.Float64()
