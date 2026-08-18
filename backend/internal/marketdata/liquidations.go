@@ -163,6 +163,14 @@ func (l *LiquidationListener) flush(ctx context.Context) {
 		key := liquidationRecord{Symbol: r.Symbol, Side: r.Side}
 		aggregated[key] += r.ValueUSD
 	}
+	// Transactional flush: a partial batch failure must not leave half the
+	// rows inserted — the retry would re-insert them and inflate the cascade
+	// sum. Rollback puts the whole batch back into the buffer.
+	tx, err := l.db.Begin(ctx)
+	if err != nil {
+		l.rebuffer(pending)
+		return
+	}
 	batch := &pgx.Batch{}
 	for key, usd := range aggregated {
 		batch.Queue(
@@ -170,11 +178,20 @@ func (l *LiquidationListener) flush(ctx context.Context) {
 			key.Symbol, key.Side, usd,
 		)
 	}
-	if err := l.db.SendBatch(ctx, batch).Close(); err != nil {
-		slog.Warn("liquidation listener: flush failed", "events", len(aggregated), "error", err)
-		// Re-buffer on failure so a transient DB hiccup cannot drop events.
-		l.mu.Lock()
-		l.buffer = append(pending, l.buffer...)
-		l.mu.Unlock()
+	if err := tx.SendBatch(ctx, batch).Close(); err != nil {
+		_ = tx.Rollback(ctx)
+		l.rebuffer(pending)
+		return
 	}
+	if err := tx.Commit(ctx); err != nil {
+		l.rebuffer(pending)
+		return
+	}
+}
+
+// rebuffer puts un-flushed events back ahead of anything ingested meanwhile.
+func (l *LiquidationListener) rebuffer(pending []liquidationRecord) {
+	l.mu.Lock()
+	l.buffer = append(pending, l.buffer...)
+	l.mu.Unlock()
 }

@@ -41,6 +41,12 @@ func SelectDirection(regime RegimeContext, funding FundingContext, events EventC
 	if events.LiquidationCascade {
 		return DirectionDecision{Direction: "WAIT", Reason: "liquidation cascade in progress"}
 	}
+	// Sentiment paralysis zones (wired in v2.0.8 — the field was fetched but
+	// never read): crowd euphoria (>=85) and panic (1..15) are the worst
+	// entry windows for ANY direction. 0 is the zero-value/no-signal case.
+	if events.FearGreedExtreme >= 85 || (events.FearGreedExtreme >= 1 && events.FearGreedExtreme <= 15) {
+		return DirectionDecision{Direction: "WAIT", Reason: fmt.Sprintf("Fear&Greed extreme %d — paralysis zone", events.FearGreedExtreme)}
+	}
 
 	// 2. REGIME-BASED DIRECTION
 	switch regime.Regime {

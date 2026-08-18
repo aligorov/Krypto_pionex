@@ -7,16 +7,18 @@ import (
 )
 
 // CheckEconomicEvents queries the economic_events table for high-impact
-// events in the next N hours. Only USD macro (FOMC, Fed decisions, US CPI/
-// NFP) blocks entries: those reliably move crypto. Non-USD releases (GBP
-// CPI, AUD employment, ...) stay informational — the original any-country
-// gate once blocked deployments for ~29 consecutive hours on a UK CPI the
-// market barely noticed.
+// events around NOW: blocked window is [event − hoursAhead, event + 1 hour].
+// Since v2.0.8 the lookahead is 2h (was 12h — with 2-4 USD High events a
+// week that froze deployments 15-30% of wall clock) and the block now covers
+// the release itself plus the first hour after — previously it lifted at the
+// exact minute the print dropped, i.e. right into peak volatility. Only USD
+// macro (FOMC, Fed decisions, US CPI/NFP) blocks entries; non-USD releases
+// stay informational (v2.07).
 func (worker *Worker) CheckEconomicEvents(ctx context.Context, hoursAhead int) (bool, string) {
 	const whereClause = `
         WHERE impact = 'High'
           AND (country = 'USD' OR country IS NULL OR country = '')
-          AND event_time BETWEEN NOW() AND NOW() + ($1 || ' hours')::interval
+          AND event_time BETWEEN NOW() - INTERVAL '1 hour' AND NOW() + ($1 || ' hours')::interval
     `
 	var count int
 	err := worker.db.QueryRow(ctx, `
@@ -30,7 +32,7 @@ func (worker *Worker) CheckEconomicEvents(ctx context.Context, hoursAhead int) (
 	var title string
 	_ = worker.db.QueryRow(ctx, `
         SELECT title FROM economic_events`+whereClause+`
-        ORDER BY event_time LIMIT 1`,
+        ORDER BY ABS(EXTRACT(EPOCH FROM (event_time - NOW()))) LIMIT 1`,
 		fmt.Sprintf("%d", hoursAhead)).Scan(&title)
 
 	return true, title

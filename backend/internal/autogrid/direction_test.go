@@ -175,6 +175,34 @@ func TestSelectDirectionBlockingGates(t *testing.T) {
 		t.Errorf("expected WAIT with all gates triggered, got %s (reason: %s)", decision.Direction, decision.Reason)
 	}
 
+	// Fear&Greed extremes alone block any direction (wired v2.0.8; was a
+	// dead input). Euphoria >= 85 and panic 1..15 are paralysis zones; the
+	// zero value 0 is no-signal and must NOT block.
+	decision = SelectDirection(
+		RegimeContext{Regime: "TREND_UP", Confidence: 0.9, HurstValue: 0.7},
+		FundingContext{AverageRate: -0.0005},
+		EventContext{FearGreedExtreme: 88},
+	)
+	if decision.Direction != "WAIT" {
+		t.Errorf("expected WAIT on extreme greed, got %s (reason: %s)", decision.Direction, decision.Reason)
+	}
+	decision = SelectDirection(
+		RegimeContext{Regime: "TREND_DOWN", Confidence: 0.9, HurstValue: 0.7},
+		FundingContext{AverageRate: 0.0005},
+		EventContext{FearGreedExtreme: 12},
+	)
+	if decision.Direction != "WAIT" {
+		t.Errorf("expected WAIT on extreme fear, got %s (reason: %s)", decision.Direction, decision.Reason)
+	}
+	decision = SelectDirection(
+		RegimeContext{Regime: "TREND_UP", Confidence: 0.9, HurstValue: 0.7},
+		FundingContext{AverageRate: -0.0005},
+		EventContext{FearGreedExtreme: 0},
+	)
+	if decision.Direction != "LONG" {
+		t.Errorf("FNG zero-value must be no-signal, got %s (reason: %s)", decision.Direction, decision.Reason)
+	}
+
 	// Unknown regime -> WAIT
 	decision = SelectDirection(
 		RegimeContext{Regime: "CHAOS", Confidence: 0.9, HurstValue: 0.4},

@@ -365,6 +365,17 @@ func (worker *Worker) hydrateCandidatesFunding(ctx context.Context, candidates [
 	}
 }
 
+// noteDeployBlock persists a deployment-freeze reason into
+// autogrid_settings.last_error so a silent gate (economic event, cascade,
+// circuit breaker) is visible in the UI instead of living only in docker
+// logs — the GBP-CPI incident class froze deployments for hours with no
+// durable trace.
+func (worker *Worker) noteDeployBlock(ctx context.Context, reason string) {
+	_, _ = worker.db.Exec(ctx, `
+		UPDATE autogrid_settings SET last_error = $1, updated_at = NOW()
+	`, reason)
+}
+
 // confluenceConfidence maps the confluence engine's strength (0..1) onto a
 // 0.5..1.0 confidence scale for the direction selector; absent confluence
 // data degrades to the conservative 0.6 default.
@@ -574,7 +585,9 @@ func (worker *Worker) deployPaper(
 			SELECT 1 FROM paper_grid_bots
 			WHERE settings_id = $1
 			  AND status = 'COMPLETED'
-			  AND COALESCE(closed_reason, '') NOT IN ('TAKE_PROFIT', 'TRAILING_TAKE_PROFIT', 'BREAKEVEN_LOCK')
+			  AND COALESCE(closed_reason, '') NOT IN (
+			      'TAKE_PROFIT', 'TRAILING_TAKE_PROFIT', 'BREAKEVEN_LOCK',
+			      'MANUAL_CLOSE', 'USER_CANCEL', 'ALREADY_CLOSED', 'EXTERNAL_CLOSE', 'REMOTE_FAILED')
 			  AND closed_at > NOW() - INTERVAL '1 hour'
 			UNION ALL
 			SELECT 1 FROM grid_bots
@@ -586,21 +599,24 @@ func (worker *Worker) deployPaper(
 		) recent_stops
 	`, settings.ID).Scan(&recentStopLossCount); err == nil && recentStopLossCount >= 3 {
 		worker.logger.Warn("Portfolio circuit breaker: recent stop-losses holding new deployments", "recentStopLossCount", recentStopLossCount)
+		worker.noteDeployBlock(ctx, fmt.Sprintf("circuit breaker: %d защитных закрытий за последний час — новые деплои на паузе", recentStopLossCount))
 		return nil
 	}
 	// Smart Grid Engine v2.0 macro gates — PAPER runs the same exam as REAL
 	// capital, otherwise paper statistics prove a pipeline REAL would have
 	// blocked. High-impact economic events ahead or an ongoing liquidation
 	// cascade pause all entries.
-	blocked, blockReason := worker.CheckEconomicEvents(ctx, 12)
+	blocked, blockReason := worker.CheckEconomicEvents(ctx, 2)
 	if blocked {
 		worker.logger.Warn("paper deploy blocked by economic event",
 			"component", "autogrid_worker", "reason", blockReason)
+		worker.noteDeployBlock(ctx, "деплой заблокирован: макро-событие USD «"+blockReason+"» (окно T−2ч…T+1ч)")
 		return nil
 	}
 	if cascade, cascadeUSD := worker.CheckLiquidationCascade(ctx, 50_000_000); cascade {
 		worker.logger.Warn("paper deploy blocked by liquidation cascade",
 			"component", "autogrid_worker", "usd_1h", cascadeUSD)
+		worker.noteDeployBlock(ctx, fmt.Sprintf("деплой заблокирован: каскад ликвидаций $%.0fM/час", cascadeUSD/1_000_000))
 		return nil
 	}
 	fng, _ := worker.GetFearGreed(ctx)
@@ -681,7 +697,9 @@ func (worker *Worker) deployPaper(
 				SELECT 1 FROM paper_grid_bots
 				WHERE settings_id = $1 AND symbol = $2
 				  AND status = 'COMPLETED'
-				  AND COALESCE(closed_reason, '') NOT IN ('TAKE_PROFIT', 'TRAILING_TAKE_PROFIT', 'BREAKEVEN_LOCK')
+				  AND COALESCE(closed_reason, '') NOT IN (
+				      'TAKE_PROFIT', 'TRAILING_TAKE_PROFIT', 'BREAKEVEN_LOCK',
+				      'MANUAL_CLOSE', 'USER_CANCEL', 'ALREADY_CLOSED', 'EXTERNAL_CLOSE', 'REMOTE_FAILED')
 				  AND closed_at > NOW() - INTERVAL '2 hours'
 			)
 		`, settings.ID, candidate.Symbol).Scan(&recentlyStopped); err == nil && recentlyStopped {
@@ -744,13 +762,38 @@ func (worker *Worker) deployPaper(
 			candidate.CurrentPrice, atrPrice, 1.5,
 		)
 
+		// Pre-deploy distance check — same exam as REAL (v2.0.8 parity fix):
+		// deploying with price hugging the anti-hunt stop means an instant
+		// STRUCT_INVALID close, whose protective close then feeds the circuit
+		// breaker and cooldowns — paper used to manufacture its own
+		// deployment freezes (prod: ENSO same-second exit, REAL-side fix
+		// v1.3.14; paper lagged).
+		if trend != "short" {
+			if candidate.CurrentPrice.Sub(antiHuntStop).LessThan(atrPrice.Mul(decimal.NewFromFloat(1.5))) {
+				worker.logger.Info("skip paper deploy: price too close to anti-hunt stop",
+					"component", "autogrid_worker", "symbol", candidate.Symbol,
+					"price", candidate.CurrentPrice.String(), "stop", antiHuntStop.String())
+				continue
+			}
+		} else {
+			if antiHuntStop.Sub(candidate.CurrentPrice).LessThan(atrPrice.Mul(decimal.NewFromFloat(1.5))) {
+				worker.logger.Info("skip paper deploy: price too close to anti-hunt stop",
+					"component", "autogrid_worker", "symbol", candidate.Symbol,
+					"price", candidate.CurrentPrice.String(), "stop", antiHuntStop.String())
+				continue
+			}
+		}
+
 		// Leverage precedence: HAR vol-inverse cap, then Smart Direction's
 		// conservative cap — either may only scale DOWN from the operator's
 		// setting. Without HAR/smart inputs the ATR adaptive ladder applies.
 		botLev := settings.Leverage
 		levReason := fmt.Sprintf("Фиксированное (%dx)", settings.Leverage)
 		levMode := "FIXED"
-		if harGeo != nil {
+		if harGeo != nil && harGeo.geo.Leverage < botLev {
+			// HAR may only scale DOWN from the operator's setting (same rule
+			// as deployReal; v2.0.8 fix — it used to REPLACE the setting,
+			// letting paper run 3x where REAL would cap to the operator's 2x).
 			botLev = harGeo.geo.Leverage
 			levReason = fmt.Sprintf("HAR σ=%.0f%%/год R²=%.2f (%dx)",
 				harGeo.forecastPct, harGeo.geo.Confidence, botLev)
@@ -808,7 +851,7 @@ func (worker *Worker) deployPaper(
 			confluence.Status, mesh.GridStepPct, confluence.Score, antiHuntStop,
 			levReason, levMode, settings.Leverage).Scan(&botID, &botNumber)
 		if err != nil {
-			if err.Error() == "no rows in result set" {
+			if errors.Is(err, pgx.ErrNoRows) {
 				continue
 			}
 			return fmt.Errorf("deploy paper grid %s: %w", candidate.Symbol, err)
@@ -929,6 +972,7 @@ func (worker *Worker) deployReal(
 		  AND COALESCE(closed_at, updated_at) > NOW() - INTERVAL '1 hour'
 	`).Scan(&recentStopLossCountReal); err == nil && recentStopLossCountReal >= 3 {
 		worker.logger.Warn("Portfolio circuit breaker: recent real stop-losses holding new deployments", "recentStopLossCountReal", recentStopLossCountReal)
+		worker.noteDeployBlock(ctx, fmt.Sprintf("REAL circuit breaker: %d защитных закрытий за последний час — деплои на паузе", recentStopLossCountReal))
 		return nil
 	}
 	deployErrors := make([]string, 0)
@@ -939,14 +983,16 @@ func (worker *Worker) deployReal(
 	// TREND_DOWN + positive funding → SHORT, TREND_UP + negative funding → LONG,
 	// RANGE + high confidence → NEUTRAL at 2x. Economic events and liquidation
 	// cascades block all entries.
-	blocked, blockReason := worker.CheckEconomicEvents(ctx, 12)
+	blocked, blockReason := worker.CheckEconomicEvents(ctx, 2)
 	if blocked {
 		worker.logger.Warn("deploy blocked by economic event", "component", "autogrid_worker", "reason", blockReason)
+		worker.noteDeployBlock(ctx, "REAL деплой заблокирован: макро-событие USD «"+blockReason+"» (окно T−2ч…T+1ч)")
 		return nil
 	}
 	cascade, cascadeUSD := worker.CheckLiquidationCascade(ctx, 50_000_000)
 	if cascade {
 		worker.logger.Warn("deploy blocked by liquidation cascade", "component", "autogrid_worker", "usd_1h", cascadeUSD)
+		worker.noteDeployBlock(ctx, fmt.Sprintf("REAL деплой заблокирован: каскад ликвидаций $%.0fM/час", cascadeUSD/1_000_000))
 		return nil
 	}
 	// When the LLM brain is enabled, an UNAUDITED candidate is not
