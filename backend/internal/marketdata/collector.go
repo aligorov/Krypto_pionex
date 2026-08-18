@@ -984,12 +984,17 @@ func (c *Collector) insertSentiment(ctx context.Context, value float64, classifi
 
 // insertEconomicEvent stores a High-impact event, de-duplicating on
 // (title, event_time). It reports whether a new row was written.
+// Explicit ::VARCHAR/::TIMESTAMPTZ casts are required: the parameters appear
+// both as bare SELECT items (unknown type) and inside the NOT EXISTS
+// comparison, which PostgreSQL rejects with SQLSTATE 42P08 "inconsistent
+// types deduced for parameter" when left to inference.
 func (c *Collector) insertEconomicEvent(ctx context.Context, title string, eventTime time.Time, country string) (bool, error) {
 	tag, err := c.db.Exec(ctx, `
 		INSERT INTO economic_events (title, event_time, impact, country)
-		SELECT $1, $2, 'High', NULLIF($3, '')
+		SELECT $1::VARCHAR(255), $2::TIMESTAMPTZ, 'High', NULLIF($3::VARCHAR(8), '')
 		WHERE NOT EXISTS (
-			SELECT 1 FROM economic_events WHERE title = $1 AND event_time = $2
+			SELECT 1 FROM economic_events
+			WHERE title = $1::VARCHAR(255) AND event_time = $2::TIMESTAMPTZ
 		)
 	`, title, eventTime, country)
 	if err != nil {
