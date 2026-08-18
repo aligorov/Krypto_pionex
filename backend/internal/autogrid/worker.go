@@ -2133,6 +2133,25 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 	effectiveFeeBps := settings.FeeBps.Add(settings.SlippageBps)
 	feeRate := effectiveFeeBps.Div(decimal.NewFromInt(10000))
 
+	// Real cross-exchange funding (v2.0.6): per-symbol signed 8h rate from
+	// the collector replaces the flat PaperFundingRateBps default whenever
+	// the symbol has coverage — negative rates credit long inventories
+	// exactly like the exchanges do.
+	fundingRateBySymbol := map[string]decimal.Decimal{}
+	if len(bots) > 0 && worker.market != nil {
+		symbols := make([]string, 0, len(bots))
+		for _, bot := range bots {
+			symbols = append(symbols, bot.symbol)
+		}
+		if rates, err := worker.market.GetCurrentFundingBatch(ctx, symbols); err == nil {
+			for symbol, info := range rates {
+				if info != nil {
+					fundingRateBySymbol[symbol] = decimal.NewFromFloat(info.AverageRate).Mul(decimal.NewFromInt(10000))
+				}
+			}
+		}
+	}
+
 	for _, bot := range bots {
 		price, ok := priceBySymbol[bot.symbol]
 		if !ok || price.IsZero() {
@@ -2163,6 +2182,11 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 		// the standard perpetual convention Pionex applies every 8 hours.
 		fundingExposure := decimal.Zero
 		fundingPays := true
+		// Notional a real close would have to sell/buy back — taker fee +
+		// slippage apply on it (v2.0.6 honesty fix: crystallized marks must
+		// be net of the exit cost, otherwise every protective close slightly
+		// overstates PnL).
+		exitNotional := decimal.Zero
 		if bot.direction == "NEUTRAL" {
 			// Native-grid simulation (v1.3.22): realized profit accrues only
 			// on crossings that close previously accumulated inventory
@@ -2182,11 +2206,13 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 			realized = realized.Add(pairProfit)
 			fundingExposure = inventoryNotional
 			fundingPays = price.LessThan(bot.lower.Add(bot.upper).Div(decimal.NewFromInt(2)))
+			exitNotional = inventoryNotional
 		} else {
 			// Directional grid: account for entry taker fee and slippage
 			entryCost := bot.investment.Mul(decimal.NewFromInt(int64(bot.leverage))).Mul(feeRate)
 			fundingExposure = bot.investment.Mul(decimal.NewFromInt(int64(bot.leverage)))
 			fundingPays = bot.direction == "LONG"
+			exitNotional = fundingExposure
 			switch bot.direction {
 			case "LONG":
 				gross := bot.investment.Mul(decimal.NewFromInt(int64(bot.leverage))).Mul(price.Div(bot.entry).Sub(decimal.NewFromInt(1)))
@@ -2196,8 +2222,18 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 				unrealized = gross.Sub(entryCost)
 			}
 		}
+		// Exit-fee honesty: the mark a close could crystallize is net of the
+		// taker fee + slippage a real close pays on the open notional. Applied
+		// before decisions so stop/target thresholds see the true close value.
+		if exitNotional.IsPositive() {
+			unrealized = unrealized.Sub(exitNotional.Mul(feeRate))
+		}
+		botFundingRateBps := settings.PaperFundingRateBps
+		if realRate, hasRate := fundingRateBySymbol[bot.symbol]; hasRate {
+			botFundingRateBps = realRate
+		}
 		if fundingDelta, nextFundingAt := fundingAccrual(
-			fundingExposure, settings.PaperFundingRateBps,
+			fundingExposure, botFundingRateBps,
 			bot.openedAt, bot.lastFundingAt, time.Now(),
 		); fundingDelta != nil {
 			if fundingPays {

@@ -389,11 +389,17 @@ func TestFundingAccrual(t *testing.T) {
 		t.Fatalf("one boundary since the newer anchor must accrue 0.4, got %v", delta2)
 	}
 	// Zero exposure or zero rate → nothing to settle.
-	if delta3, _ := fundingAccrual(decimal.Zero, rate, now.Add(-20*time.Hour), nil, now); delta3 != nil {
+	if delta3, _ := fundingAccrual(exposure, decimal.Zero, now.Add(-20*time.Hour), nil, now); delta3 != nil {
 		t.Fatalf("zero exposure must not accrue, got %s", delta3)
 	}
 	if delta4, _ := fundingAccrual(exposure, decimal.Zero, now.Add(-20*time.Hour), nil, now); delta4 != nil {
 		t.Fatalf("zero rate must not accrue, got %s", delta4)
+	}
+	// Negative rate (v2.0.6): longs RECEIVE — the accrual is signed and the
+	// caller's pay/receive flip turns it into income for paying positions.
+	neg, _ := fundingAccrual(exposure, mustDecimal("-5"), now.Add(-17*time.Hour), nil, now)
+	if neg == nil || neg.Cmp(mustDecimal("-0.4")) != 0 {
+		t.Fatalf("negative rate must accrue -0.4 over 2 boundaries, got %v", neg)
 	}
 }
 

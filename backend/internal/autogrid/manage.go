@@ -299,6 +299,12 @@ func gridLevelForPrice(lower, upper decimal.Decimal, gridNum int, price decimal.
 // boundary has been crossed yet. Pionex settles perpetual funding every 8
 // hours and reflects it in the position's floating PnL; the paper simulator
 // books it into realized so stop/target decisions see it immediately.
+//
+// Since v2.0.6 rateBps is SIGNED and usually the real cross-exchange rate
+// from funding_snapshots: positive = longs pay shorts (the classic drag on
+// dip inventories), negative = longs RECEIVE (short squeezes paying carry
+// to the grid). The caller's pay/receive flip turns the signed magnitude
+// into the correct cash flow either way.
 func fundingAccrual(
 	exposure decimal.Decimal,
 	rateBps decimal.Decimal,
@@ -306,7 +312,7 @@ func fundingAccrual(
 	lastFundingAt *time.Time,
 	now time.Time,
 ) (*decimal.Decimal, *time.Time) {
-	if !exposure.IsPositive() || rateBps.IsNegative() || !rateBps.IsPositive() {
+	if !exposure.IsPositive() || rateBps.IsZero() {
 		return nil, nil
 	}
 	anchor := openedAt
