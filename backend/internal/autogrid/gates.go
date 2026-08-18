@@ -7,14 +7,21 @@ import (
 )
 
 // CheckEconomicEvents queries the economic_events table for high-impact
-// events in the next N hours.
+// events in the next N hours. Only USD macro (FOMC, Fed decisions, US CPI/
+// NFP) blocks entries: those reliably move crypto. Non-USD releases (GBP
+// CPI, AUD employment, ...) stay informational — the original any-country
+// gate once blocked deployments for ~29 consecutive hours on a UK CPI the
+// market barely noticed.
 func (worker *Worker) CheckEconomicEvents(ctx context.Context, hoursAhead int) (bool, string) {
+	const whereClause = `
+        WHERE impact = 'High'
+          AND (country = 'USD' OR country IS NULL OR country = '')
+          AND event_time BETWEEN NOW() AND NOW() + ($1 || ' hours')::interval
+    `
 	var count int
 	err := worker.db.QueryRow(ctx, `
-        SELECT COUNT(*) FROM economic_events
-        WHERE impact = 'High'
-          AND event_time BETWEEN NOW() AND NOW() + ($1 || ' hours')::interval
-    `, fmt.Sprintf("%d", hoursAhead)).Scan(&count)
+        SELECT COUNT(*) FROM economic_events`+whereClause,
+		fmt.Sprintf("%d", hoursAhead)).Scan(&count)
 	if err != nil || count == 0 {
 		return false, ""
 	}
@@ -22,11 +29,9 @@ func (worker *Worker) CheckEconomicEvents(ctx context.Context, hoursAhead int) (
 	// Get the event title
 	var title string
 	_ = worker.db.QueryRow(ctx, `
-        SELECT title FROM economic_events
-        WHERE impact = 'High'
-          AND event_time BETWEEN NOW() AND NOW() + ($1 || ' hours')::interval
-        ORDER BY event_time LIMIT 1
-    `, fmt.Sprintf("%d", hoursAhead)).Scan(&title)
+        SELECT title FROM economic_events`+whereClause+`
+        ORDER BY event_time LIMIT 1`,
+		fmt.Sprintf("%d", hoursAhead)).Scan(&title)
 
 	return true, title
 }
