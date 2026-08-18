@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { api, describeError, getCachedAutoGrid, setCachedAutoGrid } from '../api';
 import type { AutoGridState, Dashboard } from '../types';
+import { SmartDataBadge } from './SmartDataBadge';
 
 interface Props {
   onRefresh: () => void;
@@ -59,6 +60,7 @@ export default function Overview({ onRefresh, canOperate }: Props) {
   return (
     <div className="section-stack">
       {clearError && <div className="alert danger"><span>Очистка не удалась: {clearError}</span></div>}
+      <SmartDataBadge />
       <div className="metric-grid">
         <Metric label="Автопилот" value={state?.settings.status ?? '—'} />
         <Metric label="Активных ботов" value={String(state?.activeBots.length ?? 0)} />

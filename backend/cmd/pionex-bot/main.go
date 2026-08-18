@@ -60,6 +60,7 @@ func main() {
 		riskEngine     *risk.Engine
 		autoService    *autogrid.Service
 		llmService     *llm.Service
+		dataService    *marketdata.Service
 	)
 
 	dbPool, err := pgxpool.New(ctx, dbURL)
@@ -92,11 +93,10 @@ func main() {
 
 		// Smart Grid Engine v2.0: cross-exchange data collector
 		// (funding×3, OI, Fear&Greed, economic calendar → PostgreSQL)
-		dataService := marketdata.NewService(dbPool)
+		dataService = marketdata.NewService(dbPool)
 		dataCollector := marketdata.NewCollector(dbPool, []string{
 			"BTC_USDT_PERP", "ETH_USDT_PERP", "SOL_USDT_PERP",
 		})
-		_ = dataService // available for future query integration
 		go dataCollector.Run(ctx)
 
 		// Start Telegram Outbox Dispatcher Loop. Credentials come from the
@@ -148,6 +148,7 @@ func main() {
 			controlService,
 			llmService,
 			telegramService,
+			dataService,
 			Version,
 			GitCommit,
 			BuildTime,

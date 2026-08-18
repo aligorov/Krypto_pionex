@@ -23,6 +23,7 @@ import (
 	"github.com/aligorov/pionex-bot/backend/internal/autogrid"
 	"github.com/aligorov/pionex-bot/backend/internal/controlplane"
 	"github.com/aligorov/pionex-bot/backend/internal/llm"
+	"github.com/aligorov/pionex-bot/backend/internal/marketdata"
 	"github.com/aligorov/pionex-bot/backend/internal/observability"
 	"github.com/aligorov/pionex-bot/backend/internal/pionex"
 	"github.com/aligorov/pionex-bot/backend/internal/risk"
@@ -45,6 +46,7 @@ type Server struct {
 	control      *controlplane.Service
 	llm          *llm.Service
 	telegram     *telegram.Service
+	market       *marketdata.Service
 	publicPionex *pionex.Client
 	version      string
 	commit       string
@@ -75,6 +77,7 @@ func NewServer(
 	controlService *controlplane.Service,
 	llmService *llm.Service,
 	telegramService *telegram.Service,
+	marketService *marketdata.Service,
 	version, commit, buildTime string,
 	mcpHandler http.Handler,
 	frontendDist string,
@@ -85,6 +88,7 @@ func NewServer(
 		auth:        authService, accounts: accountService,
 		autogrid: autoGridService, control: controlService,
 		llm: llmService, telegram: telegramService,
+		market:       marketService,
 		publicPionex: sharedPublicClient(autoGridService),
 		version:      version, commit: commit, buildTime: buildTime,
 		mcpHandler: mcpHandler, frontendDist: frontendDist, logger: logger,
@@ -166,6 +170,10 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /api/logs", s.withSession(http.HandlerFunc(s.listLogs)))
 	mux.Handle("GET /api/audit", s.withSession(http.HandlerFunc(s.listAudit)))
 	mux.Handle("GET /api/market/candles", s.withSession(http.HandlerFunc(s.getMarketCandles)))
+	mux.Handle("GET /api/market/funding", s.withSession(http.HandlerFunc(s.getCurrentFunding)))
+	mux.Handle("GET /api/market/events", s.withSession(http.HandlerFunc(s.getEconomicEvents)))
+	mux.Handle("GET /api/market/fng", s.withSession(http.HandlerFunc(s.getFearGreed)))
+	mux.Handle("GET /api/market/liquidations", s.withSession(http.HandlerFunc(s.getLiquidationSummary)))
 
 	mux.Handle("GET /api/mcp/tokens", s.withSession(http.HandlerFunc(s.listTokens)))
 	mux.Handle("POST /api/mcp/tokens", s.withSession(http.HandlerFunc(s.createToken)))
@@ -1593,6 +1601,87 @@ func (s *Server) getMarketCandles(w http.ResponseWriter, r *http.Request) {
 		"interval": interval,
 		"candles":  out,
 	})
+}
+
+// normalizeFundingSymbol maps the symbol formats used across the UI
+// ("BTC/USDT Perp", "BTC/USDT:USDT", "btc_usdt_perp") to the canonical
+// PERP form stored by the market data collector ("BTC_USDT_PERP").
+func normalizeFundingSymbol(raw string) string {
+	symbol := strings.ToUpper(strings.TrimSpace(raw))
+	symbol = strings.ReplaceAll(symbol, " ", "")
+	symbol = strings.ReplaceAll(symbol, "/", "_")
+	symbol = strings.TrimSuffix(symbol, ":USDT")
+	if strings.HasSuffix(symbol, "_PERP") {
+		return symbol
+	}
+	if strings.HasSuffix(symbol, "PERP") {
+		symbol = strings.TrimSuffix(symbol, "PERP")
+		symbol = strings.TrimSuffix(symbol, "_")
+	}
+	return symbol + "_PERP"
+}
+
+func (s *Server) getCurrentFunding(w http.ResponseWriter, r *http.Request) {
+	if s.market == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "market data service unavailable"})
+		return
+	}
+	symbol := strings.TrimSpace(r.URL.Query().Get("symbol"))
+	if symbol == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "symbol is required"})
+		return
+	}
+	funding, err := s.market.GetCurrentFunding(r.Context(), normalizeFundingSymbol(symbol))
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"data": funding})
+}
+
+func (s *Server) getEconomicEvents(w http.ResponseWriter, r *http.Request) {
+	if s.market == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "market data service unavailable"})
+		return
+	}
+	hours := 24
+	if hoursStr := strings.TrimSpace(r.URL.Query().Get("hours")); hoursStr != "" {
+		if val, err := strconv.Atoi(hoursStr); err == nil && val > 0 && val <= 168 {
+			hours = val
+		}
+	}
+	events, err := s.market.GetHighImpactEvents(r.Context(), hours)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"data": events})
+}
+
+func (s *Server) getFearGreed(w http.ResponseWriter, r *http.Request) {
+	if s.market == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "market data service unavailable"})
+		return
+	}
+	snapshot, err := s.market.GetFearGreed(r.Context())
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"data": snapshot})
+}
+
+func (s *Server) getLiquidationSummary(w http.ResponseWriter, r *http.Request) {
+	if s.market == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "market data service unavailable"})
+		return
+	}
+	summary, err := s.market.GetLiquidationSummary(r.Context())
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"data": summary})
 }
 
 func (s *Server) listBacktestJobs(w http.ResponseWriter, r *http.Request) {

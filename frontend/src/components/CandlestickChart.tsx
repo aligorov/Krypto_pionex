@@ -26,6 +26,8 @@ export const CandlestickChart: React.FC<CandlestickChartProps> = ({
   upperPrice,
   currentPrice,
   stopLoss,
+  entryPrice,
+  antiHuntStop,
   gridLevels,
   gridCount,
   direction = 'NEUTRAL',

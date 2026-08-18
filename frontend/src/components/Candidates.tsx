@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { api, describeError, getCachedAutoGrid, setCachedAutoGrid } from '../api';
 
 import { CandlestickChart } from './CandlestickChart';
+import { FundingBadge } from './FundingBadge';
 import type { AIKitResponse, AutoGridCandidate, AutoGridState } from '../types';
 
 interface Props {
@@ -242,6 +243,7 @@ export default function Candidates({ canOperate: _canOperate }: Props) {
                   </th>
                   <th>Режим рынка</th>
                   <th>Конгльюэнс</th>
+                  <th>Фандинг</th>
                   <th>Позиция в диапазоне</th>
                   <th>Радар входа (Снайпер)</th>
                   <th onClick={() => handleSort('volatilityPct')} style={{ cursor: 'pointer', whiteSpace: 'nowrap' }}>
@@ -381,6 +383,9 @@ function CandidateRow({
       </td>
       <td>
         <ConfluenceBadge assumptions={assumptions} />
+      </td>
+      <td>
+        <FundingBadge symbol={candidate.symbol} />
       </td>
       <td>{formatNumber(rangePosition)}%</td>
       <td>

@@ -11,6 +11,10 @@ import (
 // interval) above which funding conditions are considered extreme.
 const ExtremeFundingThreshold = 0.001
 
+// LiquidationCascadeThresholdUSD matches the autogrid worker gate: totals
+// above this within one hour read as a liquidation cascade.
+const LiquidationCascadeThresholdUSD = 50_000_000
+
 // FundingInfo summarizes the latest cross-exchange funding conditions.
 // Missing exchanges stay at zero; the average only includes exchanges that
 // reported within the freshness window.
@@ -36,6 +40,20 @@ type EconomicEvent struct {
 	EventTime time.Time `json:"eventTime"`
 	Impact    string    `json:"impact"`
 	Country   string    `json:"country"`
+}
+
+// LiquidationSummary aggregates the trailing hour of liquidation events.
+// An empty table yields a zero summary with Cascade=false.
+type LiquidationSummary struct {
+	Total1hUSD float64 `json:"total1hUSD"`
+	Cascade    bool    `json:"cascade"` // total1hUSD > LiquidationCascadeThresholdUSD
+}
+
+// FearGreedSnapshot is the latest Fear & Greed reading (0-100) with its
+// human classification ("Fear", "Greed", ...).
+type FearGreedSnapshot struct {
+	Value          float64 `json:"value"`
+	Classification string  `json:"classification"`
 }
 
 // FundingIsExtreme reports whether an average funding rate exceeds the
@@ -169,20 +187,63 @@ func (s *Service) GetHighImpactEvents(ctx context.Context, hoursAhead int) ([]Ec
 	return events, nil
 }
 
-// GetFearGreed returns the latest Fear & Greed index value (0-100).
-func (s *Service) GetFearGreed(ctx context.Context) (float64, error) {
+// GetFearGreed returns the latest Fear & Greed index snapshot (0-100 plus
+// classification). When the stored classification is NULL it is derived from
+// the standard alternative.me bands.
+func (s *Service) GetFearGreed(ctx context.Context) (*FearGreedSnapshot, error) {
 	var value *float64
+	var classification *string
 	if err := s.db.QueryRow(ctx, `
-		SELECT value
+		SELECT value, classification
 		FROM sentiment_snapshots
 		WHERE source = 'fng'
 		ORDER BY captured_at DESC
 		LIMIT 1
-	`).Scan(&value); err != nil {
-		return 0, fmt.Errorf("query latest fear & greed: %w", err)
+	`).Scan(&value, &classification); err != nil {
+		return nil, fmt.Errorf("query latest fear & greed: %w", err)
 	}
 	if value == nil {
-		return 0, fmt.Errorf("latest fear & greed value is NULL")
+		return nil, fmt.Errorf("latest fear & greed value is NULL")
 	}
-	return *value, nil
+	snapshot := &FearGreedSnapshot{Value: *value}
+	if classification != nil && *classification != "" {
+		snapshot.Classification = *classification
+	} else {
+		snapshot.Classification = classifyFearGreed(snapshot.Value)
+	}
+	return snapshot, nil
+}
+
+// classifyFearGreed maps a 0-100 index value to the standard band names.
+func classifyFearGreed(value float64) string {
+	switch {
+	case value < 25:
+		return "Extreme Fear"
+	case value < 45:
+		return "Fear"
+	case value <= 55:
+		return "Neutral"
+	case value <= 75:
+		return "Greed"
+	default:
+		return "Extreme Greed"
+	}
+}
+
+// GetLiquidationSummary sums liquidation events (USD) over the trailing
+// hour across all symbols. An empty table (or no recent rows) returns a
+// zero summary with Cascade=false rather than an error.
+func (s *Service) GetLiquidationSummary(ctx context.Context) (*LiquidationSummary, error) {
+	var total float64
+	if err := s.db.QueryRow(ctx, `
+		SELECT COALESCE(SUM(value_usd), 0)
+		FROM liquidation_events
+		WHERE captured_at > NOW() - INTERVAL '1 hour'
+	`).Scan(&total); err != nil {
+		return nil, fmt.Errorf("sum liquidation events: %w", err)
+	}
+	return &LiquidationSummary{
+		Total1hUSD: total,
+		Cascade:    total > LiquidationCascadeThresholdUSD,
+	}, nil
 }
