@@ -8,8 +8,8 @@ echo "=================================================="
 # Force fetch all tags and branches from origin
 git fetch -f --tags origin
 
-# Detect latest version tag
-LATEST_TAG=$(git tag -l "v1.*" "1.0.0.*" | sort -V | tail -n 1)
+# Detect latest version tag (v* so future major versions are never skipped)
+LATEST_TAG=$(git tag -l "v*" | sort -V | tail -n 1)
 if [ -z "$LATEST_TAG" ]; then
     LATEST_TAG="main"
 fi
