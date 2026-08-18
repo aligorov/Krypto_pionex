@@ -371,6 +371,8 @@ export interface AutoGridBot {
   upperPrice: string;
   gridNum: number;
   leverage: number;
+  entryPrice?: string;
+  antiHuntStop?: string;
   leverageReason?: string;
   leverageMode?: string;
   baseLeverage?: number;

@@ -12,6 +12,8 @@ export interface CandlestickChartProps {
   upperPrice?: number;
   currentPrice?: number;
   stopLoss?: number;
+  entryPrice?: number;
+  antiHuntStop?: number;
   gridLevels?: GridLevel[];
   gridCount?: number;
   direction?: string;
@@ -154,6 +156,30 @@ export const CandlestickChart: React.FC<CandlestickChartProps> = ({
       });
     }
 
+    // Draw Entry Price (where the bot was deployed)
+    if (entryPrice && entryPrice > 0) {
+      candleSeries.createPriceLine({
+        price: entryPrice,
+        color: '#10b981',
+        lineWidth: 2,
+        lineStyle: LineStyle.Dotted,
+        axisLabelVisible: true,
+        title: `ВХОД [${entryPrice.toFixed(6)}]`,
+      });
+    }
+
+    // Draw Anti-Hunt Stop (structural invalidation level)
+    if (antiHuntStop && antiHuntStop > 0) {
+      candleSeries.createPriceLine({
+        price: antiHuntStop,
+        color: '#dc2626',
+        lineWidth: 2,
+        lineStyle: LineStyle.Solid,
+        axisLabelVisible: true,
+        title: `ANTI-HUNT [${antiHuntStop.toFixed(6)}]`,
+      });
+    }
+
     // Draw Current Price Line
     if (currentPrice && currentPrice > 0) {
       candleSeries.createPriceLine({
@@ -214,7 +240,7 @@ export const CandlestickChart: React.FC<CandlestickChartProps> = ({
       window.removeEventListener('resize', handleResize);
       chart.remove();
     };
-  }, [symbol, interval, lowerPrice, upperPrice, stopLoss, currentPrice, gridCount, gridLevels]);
+  }, [symbol, interval, lowerPrice, upperPrice, stopLoss, currentPrice, entryPrice, antiHuntStop, gridCount, gridLevels]);
 
   return (
     <div style={{

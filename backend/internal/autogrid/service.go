@@ -159,6 +159,8 @@ type ActiveBot struct {
 	AdjustmentsCount    int              `json:"adjustmentsCount"`
 	PnLTargetUSDT       *decimal.Decimal `json:"pnlTargetUsdt"`
 	MaxLossUSDT         *decimal.Decimal `json:"maxLossUsdt"`
+	EntryPrice          *decimal.Decimal `json:"entryPrice,omitempty"`
+	AntiHuntStop        *decimal.Decimal `json:"antiHuntStop,omitempty"`
 	LeverageReason      string           `json:"leverageReason,omitempty"`
 	LeverageMode        string           `json:"leverageMode,omitempty"`
 	BaseLeverage        int              `json:"baseLeverage,omitempty"`
@@ -928,7 +930,9 @@ func (s *Service) listActiveBots(ctx context.Context, settingsID string) ([]Acti
 		       lower_price, upper_price, grid_num, leverage, quote_investment,
 		       reconciliation_state, adjustments_count,
 		       pnl_target_usdt, max_loss_usdt,
-		       realized_pnl_usdt, unrealized_pnl_usdt, updated_at
+		       realized_pnl_usdt, unrealized_pnl_usdt,
+		       anti_hunt_stop_price, struct_context->>'entryPrice',
+		       updated_at
 		FROM grid_bots
 		WHERE autogrid_settings_id = $1
 		  AND status NOT IN ('STOPPED', 'CANCELLED', 'COMPLETED', 'LIQUIDATED', 'FAILED')
@@ -937,16 +941,24 @@ func (s *Service) listActiveBots(ctx context.Context, settingsID string) ([]Acti
 	if err != nil {
 		return nil, fmt.Errorf("list real AutoGrid bots: %w", err)
 	}
+	var entryPriceStr *string
 	for rows.Next() {
 		var item ActiveBot
 		item.Source = "REAL"
+		if entryPriceStr != nil {
+			if ep, err := decimal.NewFromString(*entryPriceStr); err == nil {
+				item.EntryPrice = &ep
+			}
+		}
 		if err := rows.Scan(
 			&item.ID, &item.BotNumber, &item.AccountID, &item.BUOrderID, &item.Symbol,
 			&item.Status, &item.Direction, &item.GridType, &item.LowerPrice,
 			&item.UpperPrice, &item.GridNum, &item.Leverage,
 			&item.QuoteInvestment, &item.ReconciliationState,
 			&item.AdjustmentsCount, &item.PnLTargetUSDT, &item.MaxLossUSDT,
-			&item.RealizedPNLUSDT, &item.UnrealizedPNLUSDT, &item.UpdatedAt,
+			&item.RealizedPNLUSDT, &item.UnrealizedPNLUSDT,
+			&item.AntiHuntStop, &entryPriceStr,
+			&item.UpdatedAt,
 		); err != nil {
 			rows.Close()
 			return nil, fmt.Errorf("scan real AutoGrid bot: %w", err)
@@ -964,8 +976,9 @@ func (s *Service) listActiveBots(ctx context.Context, settingsID string) ([]Acti
 		       upper_price, grid_num, leverage, quote_investment,
 		       COALESCE(adjustments_count, 0),
 		       realized_pnl_usdt, unrealized_pnl_usdt,
-		       pnl_target_usdt, max_loss_usdt, updated_at,
-		       model_state
+		       pnl_target_usdt, max_loss_usdt,
+		       entry_price, anti_hunt_stop_price,
+		       updated_at, model_state
 		FROM paper_grid_bots
 		WHERE settings_id = $1 AND status = 'RUNNING'
 		ORDER BY opened_at DESC
@@ -985,8 +998,9 @@ func (s *Service) listActiveBots(ctx context.Context, settingsID string) ([]Acti
 			&item.GridNum, &item.Leverage, &item.QuoteInvestment,
 			&item.AdjustmentsCount,
 			&item.RealizedPNLUSDT, &item.UnrealizedPNLUSDT,
-			&item.PnLTargetUSDT, &item.MaxLossUSDT, &item.UpdatedAt,
-			&rawModelState,
+			&item.PnLTargetUSDT, &item.MaxLossUSDT,
+			&item.EntryPrice, &item.AntiHuntStop,
+			&item.UpdatedAt, &rawModelState,
 		); err != nil {
 			return nil, fmt.Errorf("scan paper AutoGrid bot: %w", err)
 		}

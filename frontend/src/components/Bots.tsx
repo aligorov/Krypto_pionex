@@ -98,6 +98,8 @@ export default function Bots({ canOperate }: Props) {
               symbol={selectedBotForChart.symbol}
               lowerPrice={Number(selectedBotForChart.lowerPrice)}
               upperPrice={Number(selectedBotForChart.upperPrice)}
+              entryPrice={selectedBotForChart.entryPrice ? Number(selectedBotForChart.entryPrice) : undefined}
+              antiHuntStop={selectedBotForChart.antiHuntStop ? Number(selectedBotForChart.antiHuntStop) : undefined}
               direction={selectedBotForChart.direction}
               gridCount={selectedBotForChart.gridNum}
               onClose={() => setSelectedBotForChart(null)}

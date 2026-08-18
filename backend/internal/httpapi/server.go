@@ -38,6 +38,7 @@ const (
 )
 
 type Server struct {
+	candleCache  map[string]cachedCandles
 	auth         *auth.Service
 	accounts     *accounts.Service
 	autogrid     *autogrid.Service
@@ -53,6 +54,11 @@ type Server struct {
 	logger       *slog.Logger
 }
 
+type cachedCandles struct {
+	data      []candleOut
+	fetchedAt time.Time
+}
+
 func NewServer(
 	authService *auth.Service,
 	accountService *accounts.Service,
@@ -66,7 +72,8 @@ func NewServer(
 	logger *slog.Logger,
 ) *Server {
 	return &Server{
-		auth: authService, accounts: accountService,
+		candleCache: make(map[string]cachedCandles),
+		auth:        authService, accounts: accountService,
 		autogrid: autoGridService, control: controlService,
 		llm: llmService, telegram: telegramService,
 		publicPionex: sharedPublicClient(autoGridService),
@@ -1524,6 +1531,13 @@ func (s *Server) getMarketCandles(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	cacheKey := symbol + "|" + interval + "|" + string(rune('0'+limit%10))
+	if cached, ok := s.candleCache[cacheKey]; ok && time.Since(cached.fetchedAt) < 30*time.Second {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"symbol": symbol, "interval": interval, "candles": cached.data,
+		})
+		return
+	}
 	pionexSymbol := strings.ReplaceAll(symbol, "/", "_")
 	client := s.publicPionex
 	klines, err := client.GetKlines(r.Context(), pionexSymbol, interval, limit)
@@ -1569,6 +1583,10 @@ func (s *Server) getMarketCandles(w http.ResponseWriter, r *http.Request) {
 			Volume: v,
 		}
 	}
+	if len(s.candleCache) > 100 {
+		s.candleCache = make(map[string]cachedCandles)
+	}
+	s.candleCache[cacheKey] = cachedCandles{data: out, fetchedAt: time.Now()}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"symbol":   symbol,
 		"interval": interval,
