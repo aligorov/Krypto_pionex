@@ -650,48 +650,9 @@ func (worker *Worker) deployPaper(
 			smartReason = smart.Reason
 		}
 
-		mesh := ComputeAdaptiveMesh(
-			candidate.LowerPrice, candidate.UpperPrice, candidate.CurrentPrice,
-			atrPct, regime, settings.BudgetUSDT, settings.Leverage, 0.30,
-		)
-
-		trend := strings.ToLower(strings.TrimSpace(candidate.RecommendedTrend))
-		if trend == "no_trend" || trend == "" {
-			trend = "neutral"
-		}
-		if smartTrend != "" && smartTrend != trend {
-			worker.logger.Info("v2.0 smart direction override",
-				"component", "autogrid_worker", "symbol", candidate.Symbol,
-				"scanner_trend", trend, "smart_direction", smartTrend,
-				"reason", smartReason)
-			trend = smartTrend
-		}
-		atrPrice := candidate.CurrentPrice.Mul(decimal.NewFromFloat(atrPct / 100.0))
-		antiHuntStop := ComputeAntiHuntStop(
-			trend, mesh.LowerPrice, mesh.UpperPrice,
-			candidate.CurrentPrice, atrPrice, 1.5,
-		)
-
-		botLev := settings.Leverage
-		levReason := fmt.Sprintf("Фиксированное (%dx)", settings.Leverage)
-		levMode := "FIXED"
-		if smartLev > 0 && smartLev < settings.Leverage {
-			// Smart Direction runs conservative leverage (NEUTRAL/LONG/SHORT
-			// at 2x) — it may only scale DOWN from the operator's setting.
-			botLev = smartLev
-			levReason = fmt.Sprintf("Smart Direction (%dx): %s", smartLev, smartReason)
-			levMode = "SMART"
-		} else if settings.AdaptiveLeverageEnabled {
-			dyn := ComputeDynamicLeverage(atrPct, settings.Leverage)
-			botLev = dyn.Leverage
-			levReason = dyn.Reason
-			levMode = "ADAPTIVE"
-		}
-
-		confluence := EvaluateConfluence(candidate, nil, nil)
-
-		gridType := mesh.GridType
-
+		// Supervision mark first: a symbol with a RUNNING bot (or a full
+		// portfolio) needs no geometry work — skipping the candle fetch here
+		// saves the shared Pionex rate budget every scan.
 		tag, err := worker.db.Exec(ctx, `
 			UPDATE paper_grid_bots
 			SET candidate_id = $3, mark_price = $4,
@@ -751,6 +712,65 @@ func (worker *Worker) deployPaper(
 				continue
 			}
 		}
+
+		// v2.0 HAR-RV geometry: forecast next-day volatility from daily
+		// candles and derive range width / level count / vol-inverse
+		// leverage. Falls back to the ATR adaptive mesh when history or fit
+		// quality is insufficient — the paper fleet then still validates the
+		// exact pipeline REAL runs.
+		harGeo := worker.harGridGeometry(ctx, candidate.Symbol, decimalFloat(settings.FeeBps))
+		mesh := ComputeAdaptiveMesh(
+			candidate.LowerPrice, candidate.UpperPrice, candidate.CurrentPrice,
+			atrPct, regime, settings.BudgetUSDT, settings.Leverage, 0.30,
+		)
+		if harGeo != nil {
+			harGeo.applyToMesh(candidate.CurrentPrice, &mesh)
+		}
+
+		trend := strings.ToLower(strings.TrimSpace(candidate.RecommendedTrend))
+		if trend == "no_trend" || trend == "" {
+			trend = "neutral"
+		}
+		if smartTrend != "" && smartTrend != trend {
+			worker.logger.Info("v2.0 smart direction override",
+				"component", "autogrid_worker", "symbol", candidate.Symbol,
+				"scanner_trend", trend, "smart_direction", smartTrend,
+				"reason", smartReason)
+			trend = smartTrend
+		}
+		atrPrice := candidate.CurrentPrice.Mul(decimal.NewFromFloat(atrPct / 100.0))
+		antiHuntStop := ComputeAntiHuntStop(
+			trend, mesh.LowerPrice, mesh.UpperPrice,
+			candidate.CurrentPrice, atrPrice, 1.5,
+		)
+
+		// Leverage precedence: HAR vol-inverse cap, then Smart Direction's
+		// conservative cap — either may only scale DOWN from the operator's
+		// setting. Without HAR/smart inputs the ATR adaptive ladder applies.
+		botLev := settings.Leverage
+		levReason := fmt.Sprintf("Фиксированное (%dx)", settings.Leverage)
+		levMode := "FIXED"
+		if harGeo != nil {
+			botLev = harGeo.geo.Leverage
+			levReason = fmt.Sprintf("HAR σ=%.0f%%/год R²=%.2f (%dx)",
+				harGeo.forecastPct, harGeo.geo.Confidence, botLev)
+			levMode = "HAR"
+		}
+		if smartLev > 0 && smartLev < botLev {
+			botLev = smartLev
+			levReason = fmt.Sprintf("Smart Direction (%dx): %s", smartLev, smartReason)
+			levMode = "SMART"
+		}
+		if harGeo == nil && smartLev == 0 && settings.AdaptiveLeverageEnabled {
+			dyn := ComputeDynamicLeverage(atrPct, settings.Leverage)
+			botLev = dyn.Leverage
+			levReason = dyn.Reason
+			levMode = "ADAPTIVE"
+		}
+
+		confluence := EvaluateConfluence(candidate, nil, nil)
+
+		gridType := mesh.GridType
 		target, maxLoss := computeBotTargets(settings, candidate)
 
 		var botID string
@@ -1058,6 +1078,20 @@ func (worker *Worker) deployReal(
 			atrPct, regime, settings.BudgetUSDT, settings.Leverage, 0.30,
 		)
 
+		// v2.0 HAR-RV geometry — the same sizing the paper fleet validates:
+		// forecast next-day volatility from daily candles, derive range width
+		// / level count / vol-inverse leverage. Falls back to the ATR mesh
+		// when history or fit quality is insufficient.
+		harGeo := worker.harGridGeometry(ctx, candidate.Symbol, decimalFloat(settings.FeeBps))
+		if harGeo != nil {
+			harGeo.applyToMesh(candidate.CurrentPrice, &mesh)
+			worker.logger.Info("v2.0 har geometry applied",
+				"component", "autogrid_worker", "symbol", candidate.Symbol,
+				"forecast_vol_pct", harGeo.forecastPct, "r2", harGeo.geo.Confidence,
+				"range_pct", harGeo.geo.RangePct, "grid_num", mesh.GridNum,
+				"leverage_cap", harGeo.geo.Leverage)
+		}
+
 		pricePrecision := 6
 		if p, ok := candidate.ModelAssumptions["pricePrecision"].(float64); ok && p > 0 {
 			pricePrecision = int(p)
@@ -1138,12 +1172,17 @@ func (worker *Worker) deployReal(
 			}
 		}
 
+		// Leverage precedence: HAR vol-inverse cap, then Smart Direction's
+		// conservative cap — either may only scale DOWN from the operator's
+		// setting. Without HAR/smart inputs the ATR adaptive ladder applies.
 		botLev := settings.Leverage
-		if smartLev > 0 && smartLev < settings.Leverage {
-			// Smart Direction may only scale leverage DOWN from the
-			// operator's setting (NEUTRAL/LONG/SHORT at 2x).
+		if harGeo != nil && harGeo.geo.Leverage < botLev {
+			botLev = harGeo.geo.Leverage
+		}
+		if smartLev > 0 && smartLev < botLev {
 			botLev = smartLev
-		} else if settings.AdaptiveLeverageEnabled {
+		}
+		if harGeo == nil && smartLev == 0 && settings.AdaptiveLeverageEnabled {
 			dyn := ComputeDynamicLeverage(atrPct, settings.Leverage)
 			botLev = dyn.Leverage
 		}
