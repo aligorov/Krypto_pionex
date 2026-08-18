@@ -3,6 +3,7 @@ package autogrid
 import (
 	"strconv"
 	"testing"
+	"time"
 
 	"github.com/shopspring/decimal"
 )
@@ -277,45 +278,126 @@ func TestAllPresetsFitValidation(t *testing.T) {
 
 func testStringPtr(value string) *string { return &value }
 
-func TestNeutralGridPaperPNLCrossingsEarn(t *testing.T) {
+func TestNeutralGridPaperPNLPairsEarnOnlyOnReturn(t *testing.T) {
 	lower, upper := mustDecimal("100"), mustDecimal("120")
 	investment := mustDecimal("200")
-	// 20 levels → step 1 → per crossing: (200/20) × (1/110) ≈ 0.0909 minus fees.
-	profit, _ := neutralGridPaperPNL(lower, upper, 20, investment, 5, 9, mustDecimal("110"), mustDecimal("5"))
-	if !profit.IsPositive() {
-		t.Fatalf("4 crossings must earn simulated grid profit, got %s", profit)
+	feeBps := mustDecimal("5")
+	// A one-way traverse out of the range must book ZERO realized profit:
+	// Pionex attributes grid profit to completed buy/sell pairs only, and a
+	// one-way dump just loads inventory (the v1.3.21-and-earlier model booked
+	// phantom half round trips on the way down).
+	profit, _, _ := neutralGridPaperPNL(lower, upper, 20, investment, 1, 10, 2, mustDecimal("102"), feeBps)
+	if !profit.IsZero() {
+		t.Fatalf("one-way down traverse must earn nothing, got %s", profit)
 	}
-	if profit.GreaterThan(mustDecimal("0.4")) {
-		t.Fatalf("profit looks unclamped: %s", profit)
+	// The return leg closes the accumulated inventory: 8 completed pairs at
+	// lev 1 → perLevel 10 × (step 1/110 − fees 0.001) × 8 ≈ 0.6473.
+	profit, _, _ = neutralGridPaperPNL(lower, upper, 20, investment, 1, 2, 10, mustDecimal("110"), feeBps)
+	expected := mustDecimal("0.6473")
+	if profit.Sub(expected).Abs().GreaterThan(mustDecimal("0.0001")) {
+		t.Fatalf("return leg must earn 8 completed pairs ≈ 0.6473, got %s", profit)
 	}
 	// No movement, no profit.
-	profit, _ = neutralGridPaperPNL(lower, upper, 20, investment, 7, 7, mustDecimal("110"), mustDecimal("5"))
+	profit, _, _ = neutralGridPaperPNL(lower, upper, 20, investment, 1, 7, 7, mustDecimal("110"), feeBps)
 	if !profit.IsZero() {
 		t.Fatalf("zero crossings must earn nothing, got %s", profit)
+	}
+	// Extending inventory further past an already-loaded side earns nothing.
+	profit, _, _ = neutralGridPaperPNL(lower, upper, 20, investment, 1, 14, 17, mustDecimal("107"), feeBps)
+	if !profit.IsZero() {
+		t.Fatalf("crossing away from inventory must earn nothing, got %s", profit)
 	}
 }
 
 func TestNeutralGridPaperPNLInventoryBelowMid(t *testing.T) {
 	lower, upper := mustDecimal("100"), mustDecimal("120")
 	investment := mustDecimal("200")
-	// Price at the range bottom: full inventory, unrealized must be negative.
-	_, unrealized := neutralGridPaperPNL(lower, upper, 20, investment, 0, 0, mustDecimal("100"), mustDecimal("5"))
+	feeBps := mustDecimal("5")
+	// Price at the range bottom (lev 1): 10 levels × notional 10 = 100
+	// bought at an average entry of 105 → 100 × (100−105)/105 ≈ −4.7619.
+	_, unrealized, notional := neutralGridPaperPNL(lower, upper, 20, investment, 1, 0, 0, mustDecimal("100"), feeBps)
 	if !unrealized.IsNegative() {
 		t.Fatalf("inventory at range bottom must be under water, got %s", unrealized)
 	}
-	// Bidirectional inventory model (v1.1.3): above the midpoint the grid
-	// holds SHORT inventory, so a price above the short entry is also under
-	// water — symmetric to the long case below the midpoint.
-	_, unrealized = neutralGridPaperPNL(lower, upper, 20, investment, 10, 10, mustDecimal("118"), mustDecimal("5"))
+	if notional.Cmp(mustDecimal("100")) != 0 {
+		t.Fatalf("full bottom inventory must hold 100 notional at lev 1, got %s", notional)
+	}
+	// Above the midpoint the grid holds SHORT inventory: a price above the
+	// short entry is under water, symmetric to the long case.
+	_, unrealized, notional = neutralGridPaperPNL(lower, upper, 20, investment, 1, 10, 10, mustDecimal("118"), feeBps)
 	if !unrealized.IsNegative() {
 		t.Fatalf("short inventory above mid must be under water, got %s", unrealized)
 	}
+	if notional.Cmp(mustDecimal("80")) != 0 {
+		t.Fatalf("8 levels above mid must hold 80 notional at lev 1, got %s", notional)
+	}
+	// The short leg earns when price falls back through the levels it sold:
+	// 6 return crossings close 6 of the 8 short levels → 6 completed pairs.
+	// (Residual inventory is always under water by construction — recovered
+	// value is booked as realized pairs, never as positive unrealized.)
+	shortReturn, _, _ := neutralGridPaperPNL(lower, upper, 20, investment, 1, 18, 12, mustDecimal("106"), feeBps)
+	expectedReturn := mustDecimal("0.4855")
+	if shortReturn.Sub(expectedReturn).Abs().GreaterThan(mustDecimal("0.0001")) {
+		t.Fatalf("short return leg must earn 6 completed pairs ≈ 0.4855, got %s", shortReturn)
+	}
 	// At the midpoint itself there is no inventory in either direction.
-	_, unrealized = neutralGridPaperPNL(lower, upper, 20, investment, 10, 10, mustDecimal("110"), mustDecimal("5"))
-	if !unrealized.IsZero() {
-		t.Fatalf("no inventory at mid, got %s", unrealized)
+	_, unrealized, notional = neutralGridPaperPNL(lower, upper, 20, investment, 1, 10, 10, mustDecimal("110"), feeBps)
+	if !unrealized.IsZero() || !notional.IsZero() {
+		t.Fatalf("no inventory at mid, got unrealized %s notional %s", unrealized, notional)
 	}
 }
+
+func TestNeutralGridPaperPNLLeverageScales(t *testing.T) {
+	lower, upper := mustDecimal("100"), mustDecimal("120")
+	investment := mustDecimal("200")
+	feeBps := mustDecimal("5")
+	profit1, unrealized1, notional1 := neutralGridPaperPNL(lower, upper, 20, investment, 1, 2, 10, mustDecimal("110"), feeBps)
+	profit4, unrealized4, notional4 := neutralGridPaperPNL(lower, upper, 20, investment, 4, 2, 10, mustDecimal("110"), feeBps)
+	for name, pair := range map[string][2]decimal.Decimal{
+		"pairProfit": {profit1, profit4},
+		"unrealized": {unrealized1, unrealized4},
+		"notional":   {notional1, notional4},
+	} {
+		if pair[1].Cmp(pair[0].Mul(decimal.NewFromInt(4))) != 0 {
+			t.Fatalf("%s must scale ×4 with leverage: lev1 %s vs lev4 %s", name, pair[0], pair[1])
+		}
+	}
+}
+
+func TestFundingAccrual(t *testing.T) {
+	now := time.Now()
+	exposure := mustDecimal("400")
+	rate := mustDecimal("10")
+	// No full 8h boundary yet → nothing.
+	if delta, _ := fundingAccrual(exposure, rate, now.Add(-7*time.Hour-time.Minute), nil, now); delta != nil {
+		t.Fatalf("7h59m must not accrue, got %s", delta)
+	}
+	// 17h → 2 boundaries × 400 × 0.001 = 0.8, anchor advances by 16h.
+	delta, next := fundingAccrual(exposure, rate, now.Add(-17*time.Hour), nil, now)
+	if delta == nil || next == nil {
+		t.Fatalf("17h must accrue 2 boundaries")
+	}
+	if delta.Cmp(mustDecimal("0.8")) != 0 {
+		t.Fatalf("2 boundaries on 400 at 10bps must be 0.8, got %s", delta)
+	}
+	if !next.Equal(now.Add(-17 * time.Hour).Add(16 * time.Hour)) {
+		t.Fatalf("anchor must advance by exactly 16h, got %v", next)
+	}
+	// A persisted last_funding_at newer than opened_at wins as the anchor.
+	delta2, _ := fundingAccrual(exposure, rate, now.Add(-17*time.Hour), ptrTime(now.Add(-9*time.Hour)), now)
+	if delta2 == nil || delta2.Cmp(mustDecimal("0.4")) != 0 {
+		t.Fatalf("one boundary since the newer anchor must accrue 0.4, got %v", delta2)
+	}
+	// Zero exposure or zero rate → nothing to settle.
+	if delta3, _ := fundingAccrual(decimal.Zero, rate, now.Add(-20*time.Hour), nil, now); delta3 != nil {
+		t.Fatalf("zero exposure must not accrue, got %s", delta3)
+	}
+	if delta4, _ := fundingAccrual(exposure, decimal.Zero, now.Add(-20*time.Hour), nil, now); delta4 != nil {
+		t.Fatalf("zero rate must not accrue, got %s", delta4)
+	}
+}
+
+func ptrTime(value time.Time) *time.Time { return &value }
 
 func TestGridLevelForPriceClamps(t *testing.T) {
 	lower, upper := mustDecimal("100"), mustDecimal("120")

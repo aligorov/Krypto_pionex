@@ -1855,7 +1855,7 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 		SELECT id, COALESCE(bot_number, 0), symbol, direction, entry_price, leverage, quote_investment,
 		       lower_price, upper_price, pnl_target_usdt, max_loss_usdt,
 		       grid_num, last_grid_level, realized_pnl_usdt, COALESCE(adjustments_count, 0),
-		       anti_hunt_stop_price
+		       anti_hunt_stop_price, opened_at, last_funding_at
 		FROM paper_grid_bots
 		WHERE settings_id = $1 AND status = 'RUNNING'
 	`, settings.ID)
@@ -1875,6 +1875,8 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 		lastLevel                *int
 		realized                 decimal.Decimal
 		adjustmentsCount         int
+		openedAt                 time.Time
+		lastFundingAt            *time.Time
 	}
 	bots := make([]paperBot, 0)
 	for rows.Next() {
@@ -1884,6 +1886,7 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 			&item.leverage, &item.investment, &item.lower, &item.upper,
 			&item.pnlTarget, &item.maxLoss, &item.gridNum, &item.lastLevel,
 			&item.realized, &item.adjustmentsCount, &item.antiHuntStop,
+			&item.openedAt, &item.lastFundingAt,
 		); err != nil {
 			rows.Close()
 			return err
@@ -1920,24 +1923,35 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 		realized := bot.realized
 		unrealized := decimal.Zero
 		currentLevel := 0
+		// Funding exposure: leveraged notional that funding settles on. Long
+		// inventory/positions pay the (positive) rate, short ones receive it —
+		// the standard perpetual convention Pionex applies every 8 hours.
+		fundingExposure := decimal.Zero
+		fundingPays := true
 		if bot.direction == "NEUTRAL" {
-			// Native-grid simulation: each level pair crossed accrues one
-			// filled round trip; inventory below the midpoint is marked.
-			// Trading fees and slippage are fully deducted per crossing.
+			// Native-grid simulation (v1.3.22): realized profit accrues only
+			// on crossings that close previously accumulated inventory
+			// (completed buy/sell pairs, mirroring the exchange's own Grid
+			// Profit attribution); the uniform ladder is marked with leveraged
+			// per-level notional. Fees and slippage apply per completed pair.
 			currentLevel = gridLevelForPrice(bot.lower, bot.upper, bot.gridNum, price)
 			previousLevel := currentLevel
 			if bot.lastLevel != nil {
 				previousLevel = *bot.lastLevel
 			}
-			var crossingProfit decimal.Decimal
-			crossingProfit, unrealized = neutralGridPaperPNL(
-				bot.lower, bot.upper, bot.gridNum, bot.investment,
+			var pairProfit, inventoryNotional decimal.Decimal
+			pairProfit, unrealized, inventoryNotional = neutralGridPaperPNL(
+				bot.lower, bot.upper, bot.gridNum, bot.investment, bot.leverage,
 				previousLevel, currentLevel, price, effectiveFeeBps,
 			)
-			realized = realized.Add(crossingProfit)
+			realized = realized.Add(pairProfit)
+			fundingExposure = inventoryNotional
+			fundingPays = price.LessThan(bot.lower.Add(bot.upper).Div(decimal.NewFromInt(2)))
 		} else {
 			// Directional grid: account for entry taker fee and slippage
 			entryCost := bot.investment.Mul(decimal.NewFromInt(int64(bot.leverage))).Mul(feeRate)
+			fundingExposure = bot.investment.Mul(decimal.NewFromInt(int64(bot.leverage)))
+			fundingPays = bot.direction == "LONG"
 			switch bot.direction {
 			case "LONG":
 				gross := bot.investment.Mul(decimal.NewFromInt(int64(bot.leverage))).Mul(price.Div(bot.entry).Sub(decimal.NewFromInt(1)))
@@ -1946,6 +1960,25 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 				gross := bot.investment.Mul(decimal.NewFromInt(int64(bot.leverage))).Mul(decimal.NewFromInt(1).Sub(price.Div(bot.entry)))
 				unrealized = gross.Sub(entryCost)
 			}
+		}
+		if fundingDelta, nextFundingAt := fundingAccrual(
+			fundingExposure, settings.PaperFundingRateBps,
+			bot.openedAt, bot.lastFundingAt, time.Now(),
+		); fundingDelta != nil {
+			if fundingPays {
+				realized = realized.Sub(*fundingDelta)
+			} else {
+				realized = realized.Add(*fundingDelta)
+			}
+			// Persist the accrual anchor separately: realized itself flows to
+			// the mark/close/adjust UPDATE below, and a crash in between can
+			// lose at most one 8h accrual — never double-count.
+			_, _ = worker.db.Exec(ctx, `
+				UPDATE paper_grid_bots SET last_funding_at = $2, updated_at = NOW() WHERE id = $1
+			`, bot.id, *nextFundingAt)
+			_ = LogBotEvent(ctx, worker.db, bot.id, bot.botNumber, "PAPER", bot.symbol, "FUNDING", &price, fundingDelta, map[string]any{
+				"pays": fundingPays, "funding_usdt": fundingDelta.StringFixed(6),
+			})
 		}
 		botTarget, botMaxLoss := settings.PnLTargetUSDT, settings.MaxLossUSDT
 		if bot.pnlTarget != nil {

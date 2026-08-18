@@ -1,6 +1,8 @@
 package autogrid
 
 import (
+	"time"
+
 	"github.com/shopspring/decimal"
 )
 
@@ -171,58 +173,86 @@ func adjustDecision(input botActionInput, action, reason string) manageDecision 
 }
 
 // neutralGridPaperPNL simulates what a native neutral grid earns between two
-// observation points: every pair of level crossings is one filled
-// buy-low/sell-high round trip worth (per-level capital × relative step),
-// while the inventory accumulated below the range midpoint carries mark PnL.
-// Fees apply per round trip from the configured fee basis points.
+// observation points using leveraged ladder economics (v1.3.22):
+//
+// Realized profit follows the exchange's own attribution — Pionex books grid
+// profit only on COMPLETED buy/sell pairs, so a crossing only earns when it
+// moves back through levels that already accumulated inventory. A one-way
+// traverse out of the range books zero profit and just loads inventory.
+//
+// Inventory is marked as the exact uniform ladder: levels-from-mid ×
+// per-level notional (investment × leverage / gridNum), with the average
+// entry at the midpoint of the filled half. Funding is NOT modeled here; the
+// supervision loop accrues it separately per 8h boundary on inventoryNotional.
 func neutralGridPaperPNL(
 	lower, upper decimal.Decimal,
 	gridNum int,
 	investment decimal.Decimal,
+	leverage int,
 	lastLevel, currentLevel int,
 	price decimal.Decimal,
 	feeBps decimal.Decimal,
-) (crossingProfit, unrealized decimal.Decimal) {
+) (pairProfit, unrealized, inventoryNotional decimal.Decimal) {
 	if !upper.GreaterThan(lower) || gridNum < 2 || !price.GreaterThan(decimal.Zero) {
-		return decimal.Zero, decimal.Zero
+		return decimal.Zero, decimal.Zero, decimal.Zero
 	}
 	width := upper.Sub(lower)
 	mid := upper.Add(lower).Div(decimal.NewFromInt(2))
 	levelWidth := width.Div(decimal.NewFromInt(int64(gridNum)))
-	perLevelCapital := investment.Div(decimal.NewFromInt(int64(gridNum)))
+	if leverage < 1 {
+		leverage = 1
+	}
+	perLevelNotional := investment.Mul(decimal.NewFromInt(int64(leverage))).Div(decimal.NewFromInt(int64(gridNum)))
 	stepPct := levelWidth.Div(mid)
 	feePct := feeBps.Mul(decimal.NewFromInt(2)).Div(decimal.NewFromInt(10000))
 
-	crossings := currentLevel - lastLevel
-	if crossings < 0 {
-		crossings = -crossings
+	// Pair completion: inventory is long (midLevel − lastLevel) levels when the
+	// bot sits below the midpoint. A crossing in the direction OF that
+	// inventory closes min(|delta|, |inventory|) round trips; a crossing away
+	// from it only extends the inventory and earns nothing.
+	delta := currentLevel - lastLevel
+	invPrev := gridNum/2 - lastLevel
+	pairs := 0
+	if delta != 0 && ((delta > 0) == (invPrev > 0)) && invPrev != 0 {
+		absDelta, absInv := delta, invPrev
+		if absDelta < 0 {
+			absDelta = -absDelta
+		}
+		if absInv < 0 {
+			absInv = -absInv
+		}
+		if absDelta < absInv {
+			pairs = absDelta
+		} else {
+			pairs = absInv
+		}
 	}
-	crossingProfit = perLevelCapital.Mul(stepPct.Sub(feePct)).Mul(decimal.NewFromInt(int64(crossings))).Div(decimal.NewFromInt(2))
+	pairProfit = perLevelNotional.Mul(stepPct.Sub(feePct)).Mul(decimal.NewFromInt(int64(pairs)))
 
-	// Inventory model:
-	// Below the midpoint, the grid accumulates long inventory bought on dips.
-	// Above the midpoint, the grid accumulates short inventory sold on rallies.
-	position := price.Sub(mid).Div(width.Div(decimal.NewFromInt(2)))
-	if position.GreaterThan(decimal.NewFromInt(1)) {
-		position = decimal.NewFromInt(1)
+	// Inventory mark (stateless, consistent with the pair model under
+	// monotone movement between observations): levelsFromMid is positive when
+	// price is below the midpoint (long inventory bought on dips) and negative
+	// above it (short inventory sold on rallies).
+	halfLevels := decimal.NewFromInt(int64(gridNum)).Div(decimal.NewFromInt(2))
+	levelsFromMid := mid.Sub(price).Div(levelWidth)
+	if levelsFromMid.GreaterThan(halfLevels) {
+		levelsFromMid = halfLevels
 	}
-	if position.LessThan(decimal.NewFromInt(-1)) {
-		position = decimal.NewFromInt(-1)
+	if levelsFromMid.LessThan(halfLevels.Neg()) {
+		levelsFromMid = halfLevels.Neg()
 	}
-	if position.IsNegative() {
-		inventory := investment.Mul(position.Neg())
-		entry := mid.Add(position.Mul(width.Div(decimal.NewFromInt(4))))
+	inventoryNotional = levelsFromMid.Abs().Mul(perLevelNotional)
+	if inventoryNotional.IsPositive() {
+		entry := mid.Sub(levelsFromMid.Mul(levelWidth).Div(decimal.NewFromInt(2)))
 		if entry.GreaterThan(decimal.Zero) {
-			unrealized = inventory.Mul(price.Sub(entry).Div(entry))
-		}
-	} else if position.IsPositive() {
-		inventory := investment.Mul(position)
-		entry := mid.Add(position.Mul(width.Div(decimal.NewFromInt(4))))
-		if entry.GreaterThan(decimal.Zero) {
-			unrealized = inventory.Mul(entry.Sub(price).Div(entry))
+			if levelsFromMid.IsPositive() {
+				unrealized = inventoryNotional.Mul(price.Sub(entry).Div(entry))
+			} else {
+				unrealized = inventoryNotional.Mul(entry.Sub(price).Div(entry))
+			}
 		}
 	}
-	return crossingProfit, unrealized
+	return pairProfit, unrealized, inventoryNotional
 }
 
 // gridLevelForPrice maps a price to its grid level, clamped into the range.
@@ -239,4 +269,38 @@ func gridLevelForPrice(lower, upper decimal.Decimal, gridNum int, price decimal.
 		return gridNum - 1
 	}
 	return int(level)
+}
+
+// fundingAccrual returns the funding cash flow (absolute magnitude; the
+// caller applies the pay/receive sign) accrued since the last settled 8h
+// boundary, together with the next settlement anchor. Nil when no full
+// boundary has been crossed yet. Pionex settles perpetual funding every 8
+// hours and reflects it in the position's floating PnL; the paper simulator
+// books it into realized so stop/target decisions see it immediately.
+func fundingAccrual(
+	exposure decimal.Decimal,
+	rateBps decimal.Decimal,
+	openedAt time.Time,
+	lastFundingAt *time.Time,
+	now time.Time,
+) (*decimal.Decimal, *time.Time) {
+	if !exposure.IsPositive() || rateBps.IsNegative() || !rateBps.IsPositive() {
+		return nil, nil
+	}
+	anchor := openedAt
+	if lastFundingAt != nil && lastFundingAt.After(anchor) {
+		anchor = *lastFundingAt
+	}
+	const fundingInterval = 8 * time.Hour
+	elapsed := now.Sub(anchor)
+	if elapsed < fundingInterval {
+		return nil, nil
+	}
+	boundaries := int64(elapsed / fundingInterval)
+	delta := exposure.Mul(rateBps).Div(decimal.NewFromInt(10000)).Mul(decimal.NewFromInt(boundaries))
+	if delta.IsZero() {
+		return nil, nil
+	}
+	next := anchor.Add(time.Duration(boundaries) * fundingInterval)
+	return &delta, &next
 }

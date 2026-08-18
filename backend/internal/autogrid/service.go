@@ -49,8 +49,9 @@ type Settings struct {
 	MinProfitFactor         decimal.Decimal `json:"minProfitFactor"`
 	FeeBps                  decimal.Decimal `json:"feeBps"`
 	SlippageBps             decimal.Decimal `json:"slippageBps"`
-	PnLTargetMode           string          `json:"pnlTargetMode"` // DYNAMIC or FIXED
-	PnLTargetUSDT           decimal.Decimal `json:"pnlTargetUsdt"` // FIXED mode amounts
+	PaperFundingRateBps     decimal.Decimal `json:"paperFundingRateBps"` // paper simulator, per 8h boundary
+	PnLTargetMode           string          `json:"pnlTargetMode"`       // DYNAMIC or FIXED
+	PnLTargetUSDT           decimal.Decimal `json:"pnlTargetUsdt"`       // FIXED mode amounts
 	MaxLossUSDT             decimal.Decimal `json:"maxLossUsdt"`
 	ManageIntervalSeconds   int             `json:"manageIntervalSeconds"`
 	RangeBreakBufferPct     decimal.Decimal `json:"rangeBreakBufferPct"`
@@ -291,7 +292,7 @@ func (s *Service) GetSettings(ctx context.Context) (*Settings, error) {
 		       density_grid_enabled, candle_interval, scan_mode, lookback_candles,
 		       max_symbols_per_scan, scan_interval_seconds, min_volume_24h,
 		       min_volatility_pct, max_volatility_pct, max_drawdown_pct,
-		       min_profit_factor, fee_bps, slippage_bps,
+		       min_profit_factor, fee_bps, slippage_bps, paper_funding_rate_bps,
 		       pnl_target_mode, pnl_target_usdt, max_loss_usdt, manage_interval_seconds,
 		       range_break_buffer_pct, max_adjustments_per_bot, ai_kit_enabled,
 		       ai_autotune_enabled, ai_autotune_interval_seconds,
@@ -1016,7 +1017,8 @@ func settingsScanTargets(item *Settings) []any {
 		&item.ScanIntervalSeconds, &item.MinVolume24h,
 		&item.MinVolatilityPct, &item.MaxVolatilityPct,
 		&item.MaxDrawdownPct, &item.MinProfitFactor, &item.FeeBps,
-		&item.SlippageBps, &item.PnLTargetMode, &item.PnLTargetUSDT, &item.MaxLossUSDT,
+		&item.SlippageBps, &item.PaperFundingRateBps,
+		&item.PnLTargetMode, &item.PnLTargetUSDT, &item.MaxLossUSDT,
 		&item.ManageIntervalSeconds, &item.RangeBreakBufferPct,
 		&item.MaxAdjustmentsPerBot, &item.AIKitEnabled,
 		&item.AIAutotuneEnabled, &item.AIAutotuneInterval,
