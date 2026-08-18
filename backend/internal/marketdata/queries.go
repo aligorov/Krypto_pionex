@@ -111,6 +111,61 @@ func (s *Service) GetCurrentFunding(ctx context.Context, symbol string) (*Fundin
 	return info, nil
 }
 
+// GetCurrentFundingBatch is the multi-symbol variant of GetCurrentFunding in
+// a single round-trip. Symbols without snapshots inside the 10-minute window
+// are simply absent from the result map — callers treat that as "no data".
+func (s *Service) GetCurrentFundingBatch(ctx context.Context, symbols []string) (map[string]*FundingInfo, error) {
+	if len(symbols) == 0 {
+		return map[string]*FundingInfo{}, nil
+	}
+	rows, err := s.db.Query(ctx, `
+		SELECT symbol, exchange, funding_rate
+		FROM (
+			SELECT DISTINCT ON (symbol, exchange) symbol, exchange, funding_rate
+			FROM funding_snapshots
+			WHERE symbol = ANY($1) AND captured_at >= NOW() - INTERVAL '10 minutes'
+			ORDER BY symbol, exchange, captured_at DESC
+		) latest
+	`, symbols)
+	if err != nil {
+		return nil, fmt.Errorf("query funding snapshots batch: %w", err)
+	}
+	defer rows.Close()
+
+	result := make(map[string]*FundingInfo, len(symbols))
+	reported := make(map[string]int, len(symbols))
+	for rows.Next() {
+		var symbol, exchange string
+		var rate float64
+		if err := rows.Scan(&symbol, &exchange, &rate); err != nil {
+			return nil, fmt.Errorf("scan funding snapshot batch: %w", err)
+		}
+		info := result[symbol]
+		if info == nil {
+			info = &FundingInfo{}
+			result[symbol] = info
+		}
+		switch exchange {
+		case ExchangeBinance:
+			info.Binance = rate
+		case ExchangeBybit:
+			info.Bybit = rate
+		case ExchangeOKX:
+			info.OKX = rate
+		}
+		info.AverageRate += rate
+		reported[symbol]++
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate funding snapshots batch: %w", err)
+	}
+	for symbol, info := range result {
+		info.AverageRate /= float64(reported[symbol])
+		info.IsExtreme = FundingIsExtreme(info.AverageRate)
+	}
+	return result, nil
+}
+
 // GetOIChange24h returns the open interest change over the last 24 hours for
 // a symbol. Per-exchange USD figures are aggregated (summed) before the
 // percentage change is computed, so the result reflects total tracked OI.

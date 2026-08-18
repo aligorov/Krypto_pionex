@@ -29,6 +29,7 @@ type Worker struct {
 	risk         *risk.Engine
 	scanner      *marketdata.Scanner
 	publicClient *pionex.Client
+	market       *marketdata.Service
 	llm          *llm.Service
 	logger       *slog.Logger
 	owner        string
@@ -52,6 +53,7 @@ func NewWorker(
 	return &Worker{
 		db: db, service: service, accounts: accountService, risk: riskEngine,
 		scanner: marketdata.NewScanner(publicClient), publicClient: publicClient,
+		market: marketdata.NewService(db),
 		llm:    llmService,
 		logger: logger,
 		owner:  fmt.Sprintf("autogrid-%d", time.Now().UnixNano()),
@@ -285,6 +287,7 @@ func (worker *Worker) scanAndDeploy(
 		worker.service.FailScan(ctx, scanID, err)
 		return scanID, err
 	}
+	worker.hydrateCandidatesFunding(ctx, candidates)
 	if err := worker.service.CompleteScan(ctx, scanID, candidates); err != nil {
 		worker.service.FailScan(ctx, scanID, err)
 		return scanID, err
@@ -321,6 +324,78 @@ func (worker *Worker) scanAndDeploy(
 		}
 	}
 	return scanID, nil
+}
+
+// hydrateCandidatesFunding stamps the latest cross-exchange funding rate on
+// every scanned candidate in one batched query, so the UI column, the
+// persisted audit trail and the deploy gates all see the same number.
+// Symbols without collector coverage (Pionex-exclusive listings) keep a nil
+// rate — the funding column stays empty for them.
+func (worker *Worker) hydrateCandidatesFunding(ctx context.Context, candidates []marketdata.ScannerCandidate) {
+	if len(candidates) == 0 || worker.market == nil {
+		return
+	}
+	symbols := make([]string, 0, len(candidates))
+	for _, c := range candidates {
+		symbols = append(symbols, c.Symbol)
+	}
+	funding, err := worker.market.GetCurrentFundingBatch(ctx, symbols)
+	if err != nil {
+		worker.logger.Warn("funding hydration skipped",
+			"component", "autogrid_worker", "error", err)
+		return
+	}
+	hydrated := 0
+	for i := range candidates {
+		info := funding[candidates[i].Symbol]
+		if info == nil {
+			continue
+		}
+		rate := decimal.NewFromFloat(info.AverageRate)
+		candidates[i].FundingRate = &rate
+		if candidates[i].ModelAssumptions != nil {
+			candidates[i].ModelAssumptions["fundingIncluded"] = true
+			candidates[i].ModelAssumptions["fundingExtreme"] = info.IsExtreme
+		}
+		hydrated++
+	}
+	if hydrated > 0 {
+		worker.logger.Info("funding hydrated on candidates",
+			"component", "autogrid_worker", "hydrated", hydrated, "total", len(candidates))
+	}
+}
+
+// confluenceConfidence maps the confluence engine's strength (0..1) onto a
+// 0.5..1.0 confidence scale for the direction selector; absent confluence
+// data degrades to the conservative 0.6 default.
+func confluenceConfidence(assumptions map[string]any) float64 {
+	if c, ok := assumptions["confluence"].(map[string]any); ok {
+		if s, ok := c["strength"].(float64); ok && s > 0 {
+			conf := 0.5 + s*0.5
+			if conf > 1 {
+				conf = 1
+			}
+			return conf
+		}
+	}
+	return 0.6
+}
+
+// candidateHurst extracts the scanner's real Hurst exponent from the
+// candidate assumptions; 0.5 (random walk) is the neutral fallback.
+func candidateHurst(assumptions map[string]any) float64 {
+	if v, ok := assumptions["hurst"].(float64); ok {
+		return v
+	}
+	return 0.5
+}
+
+// candidateRegime extracts the detected regime with a safe fallback.
+func candidateRegime(assumptions map[string]any) string {
+	if v, ok := assumptions["regime"].(string); ok && v != "" {
+		return v
+	}
+	return "RANGE"
 }
 
 // enrichCandidatesWithAIKit runs every scanned pair through the native Pionex
@@ -513,6 +588,22 @@ func (worker *Worker) deployPaper(
 		worker.logger.Warn("Portfolio circuit breaker: recent stop-losses holding new deployments", "recentStopLossCount", recentStopLossCount)
 		return nil
 	}
+	// Smart Grid Engine v2.0 macro gates — PAPER runs the same exam as REAL
+	// capital, otherwise paper statistics prove a pipeline REAL would have
+	// blocked. High-impact economic events ahead or an ongoing liquidation
+	// cascade pause all entries.
+	blocked, blockReason := worker.CheckEconomicEvents(ctx, 12)
+	if blocked {
+		worker.logger.Warn("paper deploy blocked by economic event",
+			"component", "autogrid_worker", "reason", blockReason)
+		return nil
+	}
+	if cascade, cascadeUSD := worker.CheckLiquidationCascade(ctx, 50_000_000); cascade {
+		worker.logger.Warn("paper deploy blocked by liquidation cascade",
+			"component", "autogrid_worker", "usd_1h", cascadeUSD)
+		return nil
+	}
+	fng, _ := worker.GetFearGreed(ctx)
 	backtestGateOn := worker.backtestGateEnabled(ctx)
 	for _, candidate := range candidates {
 		if candidate.Decision != "ACCEPTED" {
@@ -530,6 +621,35 @@ func (worker *Worker) deployPaper(
 			regime = val
 		}
 
+		// v2.0.3 Smart Direction (paper): regime + cross-exchange funding +
+		// sentiment choose the direction and its leverage instead of the
+		// scanner's default neutral. Symbols without funding coverage
+		// (Pionex-exclusive listings) fall back to the scanner decision.
+		smartTrend, smartLev, smartReason := "", 0, ""
+		if fundingCtx, fundErr := worker.GetFundingForSymbol(ctx, candidate.Symbol); fundErr == nil {
+			smart := SelectDirection(
+				RegimeContext{
+					Regime:     regime,
+					Confidence: confluenceConfidence(candidate.ModelAssumptions),
+					HurstValue: candidateHurst(candidate.ModelAssumptions),
+				},
+				FundingContext{
+					AverageRate: fundingCtx.AverageRate,
+					IsExtreme:   fundingCtx.IsExtreme,
+				},
+				EventContext{FearGreedExtreme: fng},
+			)
+			if smart.Direction == "WAIT" || smart.Direction == "CLOSE_ALL" {
+				worker.logger.Info("v2.0 smart direction: skip",
+					"component", "autogrid_worker", "symbol", candidate.Symbol,
+					"reason", smart.Reason)
+				continue
+			}
+			smartTrend = strings.ToLower(smart.Direction)
+			smartLev = smart.Leverage
+			smartReason = smart.Reason
+		}
+
 		mesh := ComputeAdaptiveMesh(
 			candidate.LowerPrice, candidate.UpperPrice, candidate.CurrentPrice,
 			atrPct, regime, settings.BudgetUSDT, settings.Leverage, 0.30,
@@ -538,6 +658,13 @@ func (worker *Worker) deployPaper(
 		trend := strings.ToLower(strings.TrimSpace(candidate.RecommendedTrend))
 		if trend == "no_trend" || trend == "" {
 			trend = "neutral"
+		}
+		if smartTrend != "" && smartTrend != trend {
+			worker.logger.Info("v2.0 smart direction override",
+				"component", "autogrid_worker", "symbol", candidate.Symbol,
+				"scanner_trend", trend, "smart_direction", smartTrend,
+				"reason", smartReason)
+			trend = smartTrend
 		}
 		atrPrice := candidate.CurrentPrice.Mul(decimal.NewFromFloat(atrPct / 100.0))
 		antiHuntStop := ComputeAntiHuntStop(
@@ -548,7 +675,13 @@ func (worker *Worker) deployPaper(
 		botLev := settings.Leverage
 		levReason := fmt.Sprintf("Фиксированное (%dx)", settings.Leverage)
 		levMode := "FIXED"
-		if settings.AdaptiveLeverageEnabled {
+		if smartLev > 0 && smartLev < settings.Leverage {
+			// Smart Direction runs conservative leverage (NEUTRAL/LONG/SHORT
+			// at 2x) — it may only scale DOWN from the operator's setting.
+			botLev = smartLev
+			levReason = fmt.Sprintf("Smart Direction (%dx): %s", smartLev, smartReason)
+			levMode = "SMART"
+		} else if settings.AdaptiveLeverageEnabled {
 			dyn := ComputeDynamicLeverage(atrPct, settings.Leverage)
 			botLev = dyn.Leverage
 			levReason = dyn.Reason
@@ -647,8 +780,8 @@ func (worker *Worker) deployPaper(
 			ON CONFLICT (settings_id, symbol) WHERE status = 'RUNNING'
 			DO NOTHING
 			RETURNING id, bot_number
-		`, settings.ID, candidate.ID, candidate.Symbol,
-			databaseTrend(candidate.RecommendedTrend), gridType,
+	`, settings.ID, candidate.ID, candidate.Symbol,
+		databaseTrend(trend), gridType,
 			mesh.LowerPrice, mesh.UpperPrice, mesh.GridNum,
 			botLev, settings.BudgetUSDT,
 			candidate.CurrentPrice, settings.PnLTargetMode, target, maxLoss,
@@ -666,7 +799,7 @@ func (worker *Worker) deployPaper(
 			"leverage": botLev, "gridNum": mesh.GridNum, "lowerPrice": mesh.LowerPrice, "upperPrice": mesh.UpperPrice, "budget": settings.BudgetUSDT,
 		})
 		_ = QueueTelegramEvent(ctx, worker.db, "BOT_CREATED", map[string]any{
-			"bot_number": botNumber, "symbol": candidate.Symbol, "direction": databaseTrend(candidate.RecommendedTrend),
+			"bot_number": botNumber, "symbol": candidate.Symbol, "direction": databaseTrend(trend),
 			"leverage": botLev, "lower_price": mesh.LowerPrice, "upper_price": mesh.UpperPrice,
 			"grid_num": mesh.GridNum, "quote_investment": settings.BudgetUSDT,
 		})
@@ -823,23 +956,24 @@ func (worker *Worker) deployReal(
 			continue
 		}
 
-		// v2.0 Smart Direction: regime + funding + FNG → direction override
+		// v2.0 Smart Direction: regime + funding + FNG → direction override.
+		// v2.0.3: feeds the scanner's REAL Hurst (was hardcoded 0.5, which
+		// dead-locked RANGE candidates into WAIT), reads the regime safely,
+		// and the decision now actually overrides trend + leverage below.
+		smartTrend, smartLev, smartReason := "", 0, ""
 		if fundingCtx, fundErr := worker.GetFundingForSymbol(ctx, candidate.Symbol); fundErr == nil {
 			fng, _ := worker.GetFearGreed(ctx)
 			smartDir := SelectDirection(
 				RegimeContext{
-					Regime:     candidate.ModelAssumptions["regime"].(string),
-					Confidence: 0.6, // conservative default
-					HurstValue: 0.5,
+					Regime:     candidateRegime(candidate.ModelAssumptions),
+					Confidence: confluenceConfidence(candidate.ModelAssumptions),
+					HurstValue: candidateHurst(candidate.ModelAssumptions),
 				},
 				FundingContext{
 					AverageRate: fundingCtx.AverageRate,
 					IsExtreme:   fundingCtx.IsExtreme,
 				},
-				EventContext{
-					HighImpactEvent24h: blocked,
-					FearGreedExtreme:   fng,
-				},
+				EventContext{FearGreedExtreme: fng},
 			)
 			if smartDir.Direction == "WAIT" || smartDir.Direction == "CLOSE_ALL" {
 				worker.logger.Info("v2.0 smart direction: skip",
@@ -847,15 +981,9 @@ func (worker *Worker) deployReal(
 					"reason", smartDir.Reason)
 				continue
 			}
-			if smartDir.Direction != strings.ToUpper(candidate.RecommendedTrend) &&
-				smartDir.Direction != "NEUTRAL" {
-				// Direction override: scanner said no_trend but funding+regime says directional
-				worker.logger.Info("v2.0 smart direction override",
-					"component", "autogrid_worker", "symbol", candidate.Symbol,
-					"scanner_trend", candidate.RecommendedTrend,
-					"smart_direction", smartDir.Direction,
-					"reason", smartDir.Reason)
-			}
+			smartTrend = strings.ToLower(smartDir.Direction)
+			smartLev = smartDir.Leverage
+			smartReason = smartDir.Reason
 		}
 		// Walk-forward backtest gate: the traded TF must have earned a fresh
 		// non-negative OOS verdict with bounded drawdown, and no neighbor TF
@@ -956,6 +1084,19 @@ func (worker *Worker) deployReal(
 		if trend == "neutral" || trend == "" {
 			trend = "no_trend"
 		}
+		if smartTrend != "" {
+			smartParam := smartTrend
+			if smartParam == "neutral" {
+				smartParam = "no_trend"
+			}
+			if smartParam != trend {
+				worker.logger.Info("v2.0 smart direction override",
+					"component", "autogrid_worker", "symbol", candidate.Symbol,
+					"scanner_trend", trend, "smart_direction", smartTrend,
+					"reason", smartReason)
+			}
+			trend = smartParam
+		}
 
 		atrPrice := candidate.CurrentPrice.Mul(decimal.NewFromFloat(atrPct / 100.0))
 		antiHuntStop := ComputeAntiHuntStop(
@@ -998,7 +1139,11 @@ func (worker *Worker) deployReal(
 		}
 
 		botLev := settings.Leverage
-		if settings.AdaptiveLeverageEnabled {
+		if smartLev > 0 && smartLev < settings.Leverage {
+			// Smart Direction may only scale leverage DOWN from the
+			// operator's setting (NEUTRAL/LONG/SHORT at 2x).
+			botLev = smartLev
+		} else if settings.AdaptiveLeverageEnabled {
 			dyn := ComputeDynamicLeverage(atrPct, settings.Leverage)
 			botLev = dyn.Leverage
 		}

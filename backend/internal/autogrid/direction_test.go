@@ -77,7 +77,11 @@ func TestSelectDirectionTrendUp(t *testing.T) {
 }
 
 func TestSelectDirectionRange(t *testing.T) {
-	// RANGE + high confidence + low Hurst -> NEUTRAL
+	// RANGE + low Hurst -> NEUTRAL regardless of confidence: since v2.0.3 the
+	// gate is the Hurst boundary (0.60, aligned with the confluence engine's
+	// HurstHardVetoNeutral) and confidence is informational only — the old
+	// confidence>0.55 requirement combined with a hardcoded Hurst=0.5 input
+	// dead-locked every RANGE candidate into WAIT.
 	decision := SelectDirection(
 		RegimeContext{Regime: "RANGE", Confidence: 0.7, HurstValue: 0.42},
 		FundingContext{AverageRate: 0.0},
@@ -90,14 +94,25 @@ func TestSelectDirectionRange(t *testing.T) {
 		t.Errorf("expected leverage 2 (not 4x), got %d", decision.Leverage)
 	}
 
-	// RANGE + low confidence -> WAIT
+	// RANGE + low confidence but mean-reverting Hurst still deploys NEUTRAL
 	decision = SelectDirection(
 		RegimeContext{Regime: "RANGE", Confidence: 0.4, HurstValue: 0.42},
 		FundingContext{AverageRate: 0.0},
 		EventContext{},
 	)
-	if decision.Direction != "WAIT" {
-		t.Errorf("expected WAIT, got %s (reason: %s)", decision.Direction, decision.Reason)
+	if decision.Direction != "NEUTRAL" {
+		t.Errorf("expected NEUTRAL with low confidence, got %s (reason: %s)", decision.Direction, decision.Reason)
+	}
+
+	// RANGE + Hurst at the neutral midpoint (0.5) — the value that used to be
+	// hardcoded and made the strict `< 0.50` comparison always false
+	decision = SelectDirection(
+		RegimeContext{Regime: "RANGE", Confidence: 0.6, HurstValue: 0.5},
+		FundingContext{AverageRate: 0.0},
+		EventContext{},
+	)
+	if decision.Direction != "NEUTRAL" {
+		t.Errorf("expected NEUTRAL at Hurst 0.5, got %s (reason: %s)", decision.Direction, decision.Reason)
 	}
 
 	// RANGE + high Hurst (trending) -> WAIT
@@ -110,14 +125,22 @@ func TestSelectDirectionRange(t *testing.T) {
 		t.Errorf("expected WAIT, got %s (reason: %s)", decision.Direction, decision.Reason)
 	}
 
-	// RANGE + confidence exactly at boundary (0.55) -> WAIT (strict >)
+	// RANGE + Hurst just below the boundary (0.599) -> NEUTRAL; at 0.60 -> WAIT
 	decision = SelectDirection(
-		RegimeContext{Regime: "RANGE", Confidence: 0.55, HurstValue: 0.42},
+		RegimeContext{Regime: "RANGE", Confidence: 0.7, HurstValue: 0.599},
+		FundingContext{AverageRate: 0.0},
+		EventContext{},
+	)
+	if decision.Direction != "NEUTRAL" {
+		t.Errorf("expected NEUTRAL at Hurst 0.599, got %s (reason: %s)", decision.Direction, decision.Reason)
+	}
+	decision = SelectDirection(
+		RegimeContext{Regime: "RANGE", Confidence: 0.7, HurstValue: 0.60},
 		FundingContext{AverageRate: 0.0},
 		EventContext{},
 	)
 	if decision.Direction != "WAIT" {
-		t.Errorf("expected WAIT at confidence boundary, got %s (reason: %s)", decision.Direction, decision.Reason)
+		t.Errorf("expected WAIT at Hurst 0.60, got %s (reason: %s)", decision.Direction, decision.Reason)
 	}
 }
 

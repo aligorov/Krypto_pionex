@@ -92,12 +92,18 @@ func main() {
 		go autoWorker.Run(ctx)
 
 		// Smart Grid Engine v2.0: cross-exchange data collector
-		// (funding×3, OI, Fear&Greed, economic calendar → PostgreSQL)
+		// (funding×3, OI, Fear&Greed, economic calendar → PostgreSQL).
+		// Since v2.0.3 the collector derives its symbol universe dynamically
+		// from the Pionex PERP list (bulk Binance/Bybit funding covering the
+		// whole market; OKX per-symbol for the most liquid tail) instead of a
+		// hardcoded 3-symbol watch list.
 		dataService = marketdata.NewService(dbPool)
-		dataCollector := marketdata.NewCollector(dbPool, []string{
-			"BTC_USDT_PERP", "ETH_USDT_PERP", "SOL_USDT_PERP",
-		})
+		dataCollector := marketdata.NewCollector(dbPool, nil)
+		dataCollector.SetUniverse(marketdata.NewPionexUniverse(autoService.PublicAPI()))
 		go dataCollector.Run(ctx)
+		// Public Binance forced-liquidation stream backs the liquidation
+		// cascade gate and the Overview liquidations widget.
+		go marketdata.NewLiquidationListener(dbPool, "").Run(ctx)
 
 		// Start Telegram Outbox Dispatcher Loop. Credentials come from the
 		// telegram_settings table only — Zero-ENV policy, no fallbacks.

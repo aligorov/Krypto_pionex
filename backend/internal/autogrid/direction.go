@@ -67,15 +67,19 @@ func SelectDirection(regime RegimeContext, funding FundingContext, events EventC
 		return DirectionDecision{Direction: "WAIT", Reason: "TREND_UP but funding not favorable for LONG"}
 
 	case "RANGE":
-		// NEUTRAL only if confidence is high and vol is stable
-		if regime.Confidence > 0.55 && regime.HurstValue < 0.50 {
+		// NEUTRAL while the pair still mean-reverts hard enough for a grid.
+		// The 0.60 boundary is aligned with the confluence engine's
+		// HurstHardVetoNeutral — the original `HurstValue < 0.50` combined
+		// with the (pre-v2.0.3) hardcoded Hurst=0.5 input dead-locked every
+		// RANGE candidate into WAIT.
+		if regime.HurstValue < 0.60 {
 			return DirectionDecision{
 				Direction: "NEUTRAL",
 				Leverage:  2, // NOT 4x like before
 				Reason:    fmt.Sprintf("RANGE confidence %.2f, Hurst %.2f", regime.Confidence, regime.HurstValue),
 			}
 		}
-		return DirectionDecision{Direction: "WAIT", Reason: "RANGE but low confidence or trending Hurst"}
+		return DirectionDecision{Direction: "WAIT", Reason: fmt.Sprintf("RANGE but trending Hurst %.2f >= 0.60", regime.HurstValue)}
 	}
 
 	return DirectionDecision{Direction: "WAIT", Reason: "unknown regime"}

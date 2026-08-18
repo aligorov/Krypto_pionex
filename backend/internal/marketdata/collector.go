@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -175,6 +176,66 @@ type Collector struct {
 	cfg        CollectorConfig
 	httpClient *http.Client
 	limiters   map[string]*exchangeLimiter
+
+	// Dynamic universe (v2.0.3): when a UniverseSource is configured the
+	// funding/OI loops switch from the static watch list to bulk endpoints
+	// covering every Pionex PERP symbol.
+	universe     UniverseSource
+	universeMu   sync.Mutex
+	aliases      map[string]string // exchange-native symbol -> Pionex form
+	universeSize int
+	okxWatch     []string      // top-N by turnover for the per-symbol OKX feed
+	okxValid     map[string]bool // instruments confirmed to exist on OKX
+	universeTime time.Time
+}
+
+// SetUniverse switches the collector to full-market mode: the symbol list is
+// derived from the Pionex PERP universe and refreshed hourly.
+func (c *Collector) SetUniverse(source UniverseSource) {
+	c.universe = source
+}
+
+// universeRefreshInterval is how often the Pionex PERP universe is re-derived.
+const universeRefreshInterval = time.Hour
+
+// okxWatchSize is the per-symbol OKX feed breadth: OKX has no bulk funding
+// endpoint, so it covers only the most liquid tail by turnover.
+const okxWatchSize = 20
+
+// ensureUniverse refreshes the alias map and OKX watch list at most hourly.
+// A failed refresh keeps the last known universe so a transient Pionex outage
+// cannot blind the collector.
+func (c *Collector) ensureUniverse(ctx context.Context) bool {
+	c.universeMu.Lock()
+	defer c.universeMu.Unlock()
+	if c.universeSize > 0 && time.Since(c.universeTime) < universeRefreshInterval {
+		return true
+	}
+	symbols, err := c.universe.RankedPerpSymbols(ctx)
+	if err != nil {
+		slog.Warn("collector universe refresh failed; keeping last known", "error", err)
+		return c.universeSize > 0
+	}
+	if len(symbols) == 0 {
+		return false
+	}
+	c.universeSize = len(symbols)
+	c.aliases = BuildExchangeAliasMap(symbols)
+	c.okxWatch = symbols
+	if len(c.okxWatch) > okxWatchSize {
+		c.okxWatch = c.okxWatch[:okxWatchSize]
+	}
+	c.okxValid = make(map[string]bool)
+	c.universeTime = time.Now()
+	slog.Info("collector universe refreshed",
+		"symbols", c.universeSize, "aliases", len(c.aliases), "okx_watch", len(c.okxWatch))
+	return true
+}
+
+func (c *Collector) aliasesSnapshot() map[string]string {
+	c.universeMu.Lock()
+	defer c.universeMu.Unlock()
+	return c.aliases
 }
 
 // NewCollector creates a collector for the given Pionex symbols with
@@ -215,6 +276,7 @@ func (c *Collector) Run(ctx context.Context) {
 		{"open_interest", c.cfg.OIInterval, c.collectOpenInterest},
 		{"sentiment", c.cfg.SentimentInterval, c.collectSentiment},
 		{"economic_events", c.cfg.EventsInterval, c.collectEconomicEvents},
+		{"retention", time.Hour, c.collectRetention},
 	}
 
 	var wg sync.WaitGroup
@@ -262,11 +324,79 @@ func (c *Collector) runTick(ctx context.Context, name string, tick func(context.
 // ---------------------------------------------------------------------------
 
 func (c *Collector) collectFunding(ctx context.Context) {
+	if c.universe != nil {
+		if !c.ensureUniverse(ctx) {
+			return
+		}
+		c.collectFundingBulk(ctx)
+		return
+	}
 	for _, symbol := range c.cfg.Symbols {
 		if ctx.Err() != nil {
 			return
 		}
 		c.collectFundingSymbol(ctx, symbol)
+	}
+}
+
+// collectFundingBulk covers the whole Pionex PERP universe with two bulk
+// requests (Binance premiumIndex array + Bybit linear tickers), then adds the
+// per-symbol OKX feed for the most liquid tail. OKX has no bulk endpoint.
+func (c *Collector) collectFundingBulk(ctx context.Context) {
+	var samples []fundingSample
+	if s, err := c.fetchBinancePremiumIndexAll(ctx); err != nil {
+		slog.Warn("funding collector: binance bulk fetch failed", "error", err)
+	} else {
+		samples = append(samples, s...)
+	}
+	if s, _, err := c.fetchBybitTickersAll(ctx); err != nil {
+		slog.Warn("funding collector: bybit bulk fetch failed", "error", err)
+	} else {
+		samples = append(samples, s...)
+	}
+	if err := c.insertFundingSamples(ctx, samples); err != nil {
+		slog.Warn("funding collector: bulk persist failed", "error", err)
+	}
+
+	c.universeMu.Lock()
+	okxWatch := append([]string(nil), c.okxWatch...)
+	c.universeMu.Unlock()
+
+	var okxSamples []fundingSample
+	for _, symbol := range okxWatch {
+		if ctx.Err() != nil {
+			break
+		}
+		if c.okxAbsent(symbol) {
+			continue // confirmed absent on OKX (Pionex-exclusive listing)
+		}
+		sample, err := c.fetchOKXFunding(ctx, symbol)
+		if err != nil {
+			if ctx.Err() == nil {
+				c.markOKXAbsent(symbol)
+			}
+			continue
+		}
+		okxSamples = append(okxSamples, *sample)
+	}
+	if err := c.insertFundingSamples(ctx, okxSamples); err != nil {
+		slog.Warn("funding collector: okx persist failed", "error", err)
+	}
+}
+
+func (c *Collector) okxAbsent(symbol string) bool {
+	c.universeMu.Lock()
+	defer c.universeMu.Unlock()
+	return c.okxValid != nil && c.okxValid[symbol] == false
+}
+
+// markOKXAbsent remembers that an instrument is not listed on OKX so the
+// per-symbol feed stops retrying it until the hourly universe refresh.
+func (c *Collector) markOKXAbsent(symbol string) {
+	c.universeMu.Lock()
+	defer c.universeMu.Unlock()
+	if c.okxValid != nil {
+		c.okxValid[symbol] = false
 	}
 }
 
@@ -300,6 +430,24 @@ func (c *Collector) collectFundingSymbol(ctx context.Context, symbol string) {
 // ---------------------------------------------------------------------------
 
 func (c *Collector) collectOpenInterest(ctx context.Context) {
+	if c.universe != nil {
+		if !c.ensureUniverse(ctx) {
+			return
+		}
+		// Bybit reports USD open interest (openInterestValue) directly in the
+		// bulk tickers response. Binance OI is per-symbol only (1 req/s would
+		// exceed the 5-minute cycle for ~400 symbols), so the bulk mode relies
+		// on Bybit alone — GetOIChange24h needs a single reporting exchange.
+		_, oi, err := c.fetchBybitTickersAll(ctx)
+		if err != nil {
+			slog.Warn("oi collector: bybit bulk fetch failed", "error", err)
+			return
+		}
+		if err := c.insertOISamples(ctx, oi); err != nil {
+			slog.Warn("oi collector: bulk persist failed", "error", err)
+		}
+		return
+	}
 	for _, symbol := range c.cfg.Symbols {
 		if ctx.Err() != nil {
 			return
@@ -479,15 +627,25 @@ type binancePremiumIndexResponse struct {
 	MarkPrice       string `json:"markPrice"`
 }
 
+// binancePremiumIndexEntry is one element of the ALL-symbols premiumIndex
+// array (no symbol query parameter).
+type binancePremiumIndexEntry struct {
+	Symbol          string `json:"symbol"`
+	LastFundingRate string `json:"lastFundingRate"`
+	MarkPrice       string `json:"markPrice"`
+}
+
 type binanceOpenInterestResponse struct {
 	OpenInterest string `json:"openInterest"`
 	Symbol       string `json:"symbol"`
 }
 
 type bybitTickerEntry struct {
-	FundingRate  string `json:"fundingRate"`
-	MarkPrice    string `json:"markPrice"`
-	OpenInterest string `json:"openInterest"`
+	Symbol            string `json:"symbol"`
+	FundingRate       string `json:"fundingRate"`
+	MarkPrice         string `json:"markPrice"`
+	OpenInterest      string `json:"openInterest"`
+	OpenInterestValue string `json:"openInterestValue"` // USD, bulk response only
 }
 
 type bybitTickersResponse struct {
@@ -631,6 +789,70 @@ func (c *Collector) fetchOKXFunding(ctx context.Context, pionexSymbol string) (*
 	return sample, nil
 }
 
+// fetchBinancePremiumIndexAll returns funding samples for every Binance
+// perp that maps back to a Pionex symbol, in ONE request (GET /fapi/v1/premiumIndex
+// without the symbol parameter returns the full array).
+func (c *Collector) fetchBinancePremiumIndexAll(ctx context.Context) ([]fundingSample, error) {
+	aliases := c.aliasesSnapshot()
+	endpoint := joinBase(c.cfg.BinanceBaseURL, "/fapi/v1/premiumIndex")
+
+	var resp []binancePremiumIndexEntry
+	if err := c.getJSON(ctx, ExchangeBinance, endpoint, &resp); err != nil {
+		return nil, err
+	}
+	samples := make([]fundingSample, 0, len(resp))
+	for _, e := range resp {
+		pionexSymbol, ok := aliases[e.Symbol]
+		if !ok {
+			continue
+		}
+		rate, err := strconv.ParseFloat(e.LastFundingRate, 64)
+		if err != nil {
+			continue
+		}
+		s := fundingSample{Symbol: pionexSymbol, Exchange: ExchangeBinance, Rate: rate}
+		if mark, err := strconv.ParseFloat(e.MarkPrice, 64); err == nil {
+			s.MarkPrice = mark
+		}
+		samples = append(samples, s)
+	}
+	return samples, nil
+}
+
+// fetchBybitTickersAll returns funding AND USD open-interest samples for
+// every Bybit linear contract that maps back to a Pionex symbol, in ONE
+// request (GET /v5/market/tickers?category=linear without the symbol
+// parameter returns the full list).
+func (c *Collector) fetchBybitTickersAll(ctx context.Context) ([]fundingSample, []oiSample, error) {
+	aliases := c.aliasesSnapshot()
+	endpoint := joinBase(c.cfg.BybitBaseURL, "/v5/market/tickers") + "?category=linear"
+
+	var resp bybitTickersResponse
+	if err := c.getJSON(ctx, ExchangeBybit, endpoint, &resp); err != nil {
+		return nil, nil, err
+	}
+	funding := make([]fundingSample, 0, len(resp.Result.List))
+	oi := make([]oiSample, 0, len(resp.Result.List))
+	for _, e := range resp.Result.List {
+		pionexSymbol, ok := aliases[e.Symbol]
+		if !ok {
+			continue
+		}
+		mark, _ := strconv.ParseFloat(e.MarkPrice, 64)
+		if rate, err := strconv.ParseFloat(e.FundingRate, 64); err == nil {
+			funding = append(funding, fundingSample{
+				Symbol: pionexSymbol, Exchange: ExchangeBybit, Rate: rate, MarkPrice: mark,
+			})
+		}
+		if v, err := strconv.ParseFloat(e.OpenInterestValue, 64); err == nil && v > 0 {
+			oi = append(oi, oiSample{
+				Symbol: pionexSymbol, Exchange: ExchangeBybit, OIUSD: v, Price: mark,
+			})
+		}
+	}
+	return funding, oi, nil
+}
+
 // ---------------------------------------------------------------------------
 // Persistence
 // ---------------------------------------------------------------------------
@@ -648,6 +870,94 @@ func (c *Collector) insertFundingSnapshot(ctx context.Context, sample fundingSam
 		return fmt.Errorf("insert funding snapshot %s/%s: %w", sample.Symbol, sample.Exchange, err)
 	}
 	return nil
+}
+
+// insertFundingSamples persists a bulk cycle (~800 rows at full market
+// coverage) in one batch instead of one round-trip per row.
+func (c *Collector) insertFundingSamples(ctx context.Context, samples []fundingSample) error {
+	if len(samples) == 0 || c.db == nil {
+		return nil
+	}
+	batch := &pgx.Batch{}
+	for _, s := range samples {
+		var markPrice any
+		if s.MarkPrice > 0 {
+			markPrice = s.MarkPrice
+		}
+		batch.Queue(`INSERT INTO funding_snapshots (symbol, exchange, funding_rate, mark_price) VALUES ($1, $2, $3, $4)`,
+			s.Symbol, s.Exchange, s.Rate, markPrice)
+	}
+	if err := c.db.SendBatch(ctx, batch).Close(); err != nil {
+		return fmt.Errorf("insert %d funding snapshots: %w", len(samples), err)
+	}
+	return nil
+}
+
+// insertOISamples persists a bulk OI cycle in one batch.
+func (c *Collector) insertOISamples(ctx context.Context, samples []oiSample) error {
+	if len(samples) == 0 || c.db == nil {
+		return nil
+	}
+	batch := &pgx.Batch{}
+	for _, s := range samples {
+		batch.Queue(`INSERT INTO oi_history (symbol, exchange, oi_usd, price) VALUES ($1, $2, $3, $4)`,
+			s.Symbol, s.Exchange, s.OIUSD, s.Price)
+	}
+	if err := c.db.SendBatch(ctx, batch).Close(); err != nil {
+		return fmt.Errorf("insert %d oi snapshots: %w", len(samples), err)
+	}
+	return nil
+}
+
+// Retention windows: funding is only ever queried within a 10-minute window
+// and OI within 24 hours, so anything older is dead weight. Liquidation
+// events share the OI window (the summary reads the trailing hour).
+const (
+	fundingRetention = 48 * time.Hour
+	oiRetention      = 8 * 24 * time.Hour
+	retentionBatch   = 50_000
+)
+
+// collectRetention prunes the smart-data tables in bounded batches so the
+// BRIN-indexed deletes never lock the tables for long.
+func (c *Collector) collectRetention(ctx context.Context) {
+	for _, table := range []struct {
+		name string
+		keep time.Duration
+	}{
+		{"funding_snapshots", fundingRetention},
+		{"oi_history", oiRetention},
+		{"liquidation_events", oiRetention},
+	} {
+		c.retentionDelete(ctx, table.name, table.keep)
+	}
+}
+
+func (c *Collector) retentionDelete(ctx context.Context, table string, keep time.Duration) {
+	if c.db == nil {
+		return
+	}
+	deleted := int64(0)
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		tag, err := c.db.Exec(ctx, fmt.Sprintf(
+			`DELETE FROM %s WHERE ctid IN (SELECT ctid FROM %s WHERE captured_at < NOW() - $1::INTERVAL LIMIT %d)`,
+			table, table, retentionBatch,
+		), keep.String())
+		if err != nil {
+			slog.Warn("retention delete failed", "table", table, "error", err)
+			return
+		}
+		deleted += tag.RowsAffected()
+		if tag.RowsAffected() < int64(retentionBatch) {
+			break
+		}
+	}
+	if deleted > 0 {
+		slog.Info("retention pruned old rows", "table", table, "deleted", deleted)
+	}
 }
 
 func (c *Collector) insertOISnapshot(ctx context.Context, sample oiSample) error {
