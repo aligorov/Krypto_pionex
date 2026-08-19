@@ -104,3 +104,30 @@ func TestParseAuditDecisionRejection(t *testing.T) {
 		t.Errorf("expected non-empty rejection reason")
 	}
 }
+
+// Fail-closed normalization: a verdict without an explicit APPROVED decision
+// must reject — never silently approve an unexamined candidate.
+func TestParseAuditDecisionFailClosed(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+	}{
+		{"missing decision field", `{"confidence":0.9,"reasoning_summary":"model dropped the field"}`},
+		{"unrecognized decision", `{"decision":"REVIEW","confidence":0.9}`},
+		{"empty decision", `{"decision":"  ","confidence":0.9}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			decision, err := ParseAuditDecision(tc.raw)
+			if err != nil {
+				t.Fatalf("ParseAuditDecision failed: %v", err)
+			}
+			if decision.Decision != "REJECTED" {
+				t.Fatalf("expected REJECTED, got %s", decision.Decision)
+			}
+			if decision.RejectionReason == nil || *decision.RejectionReason == "" {
+				t.Fatal("expected a fail-closed rejection reason")
+			}
+		})
+	}
+}

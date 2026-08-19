@@ -22,6 +22,18 @@ import (
 	"github.com/shopspring/decimal"
 )
 
+// protectiveCloseExemptReasons is the single source of truth for close
+// reasons that must NOT arm the circuit breaker or the per-symbol cooldown.
+// Every operator-driven stop path must be listed here: CloseAllActiveBots
+// writes the status string itself ('STOPPED'/'EMERGENCY_STOPPED' from
+// SetStatus, 'AUTOGRID_STOP'/'EMERGENCY_STOP' from the HTTP handlers), and
+// manual closes write 'MANUAL_CLOSE'/'MCP_MANUAL_CLOSE'. A missing entry
+// turns a routine fleet stop into N "protective closes" that freeze deploys
+// for an hour plus 2h per-symbol cooldowns.
+const protectiveCloseExemptReasons = `'TAKE_PROFIT', 'TAKE_PROFIT_NATIVE', 'TRAILING_TAKE_PROFIT', 'BREAKEVEN_LOCK',
+	'MANUAL_CLOSE', 'MCP_MANUAL_CLOSE', 'USER_CANCEL', 'ALREADY_CLOSED', 'EXTERNAL_CLOSE', 'REMOTE_FAILED',
+	'STOPPED', 'EMERGENCY_STOPPED', 'AUTOGRID_STOP', 'EMERGENCY_STOP'`
+
 type Worker struct {
 	db           *pgxpool.Pool
 	service      *Service
@@ -586,15 +598,13 @@ func (worker *Worker) deployPaper(
 			WHERE settings_id = $1
 			  AND status = 'COMPLETED'
 			  AND COALESCE(closed_reason, '') NOT IN (
-			      'TAKE_PROFIT', 'TRAILING_TAKE_PROFIT', 'BREAKEVEN_LOCK',
-			      'MANUAL_CLOSE', 'USER_CANCEL', 'ALREADY_CLOSED', 'EXTERNAL_CLOSE', 'REMOTE_FAILED')
+			      `+protectiveCloseExemptReasons+`)
 			  AND closed_at > NOW() - INTERVAL '1 hour'
 			UNION ALL
 			SELECT 1 FROM grid_bots
 			WHERE status IN ('STOPPED', 'LIQUIDATED')
 			  AND COALESCE(closed_reason, '') NOT IN (
-			      'TAKE_PROFIT', 'TAKE_PROFIT_NATIVE', 'TRAILING_TAKE_PROFIT', 'BREAKEVEN_LOCK',
-			      'USER_CANCEL', 'ALREADY_CLOSED', 'EXTERNAL_CLOSE', 'REMOTE_FAILED')
+			      `+protectiveCloseExemptReasons+`)
 			  AND COALESCE(closed_at, updated_at) > NOW() - INTERVAL '1 hour'
 		) recent_stops
 	`, settings.ID).Scan(&recentStopLossCount); err == nil && recentStopLossCount >= 3 {
@@ -698,8 +708,7 @@ func (worker *Worker) deployPaper(
 				WHERE settings_id = $1 AND symbol = $2
 				  AND status = 'COMPLETED'
 				  AND COALESCE(closed_reason, '') NOT IN (
-				      'TAKE_PROFIT', 'TRAILING_TAKE_PROFIT', 'BREAKEVEN_LOCK',
-				      'MANUAL_CLOSE', 'USER_CANCEL', 'ALREADY_CLOSED', 'EXTERNAL_CLOSE', 'REMOTE_FAILED')
+				      `+protectiveCloseExemptReasons+`)
 				  AND closed_at > NOW() - INTERVAL '2 hours'
 			)
 		`, settings.ID, candidate.Symbol).Scan(&recentlyStopped); err == nil && recentlyStopped {
@@ -844,7 +853,7 @@ func (worker *Worker) deployPaper(
 			DO NOTHING
 			RETURNING id, bot_number
 	`, settings.ID, candidate.ID, candidate.Symbol,
-		databaseTrend(trend), gridType,
+			databaseTrend(trend), gridType,
 			mesh.LowerPrice, mesh.UpperPrice, mesh.GridNum,
 			botLev, settings.BudgetUSDT,
 			candidate.CurrentPrice, settings.PnLTargetMode, target, maxLoss,
@@ -977,8 +986,7 @@ func (worker *Worker) deployReal(
 		SELECT COUNT(*) FROM grid_bots
 		WHERE status IN ('STOPPED', 'LIQUIDATED')
 		  AND COALESCE(closed_reason, '') NOT IN (
-		      'TAKE_PROFIT', 'TAKE_PROFIT_NATIVE', 'TRAILING_TAKE_PROFIT', 'BREAKEVEN_LOCK',
-		      'USER_CANCEL', 'ALREADY_CLOSED', 'EXTERNAL_CLOSE', 'REMOTE_FAILED')
+		      `+protectiveCloseExemptReasons+`)
 		  AND COALESCE(closed_at, updated_at) > NOW() - INTERVAL '1 hour'
 	`).Scan(&recentStopLossCountReal); err == nil && recentStopLossCountReal >= 3 {
 		worker.logger.Warn("Portfolio circuit breaker: recent real stop-losses holding new deployments", "recentStopLossCountReal", recentStopLossCountReal)
@@ -1113,8 +1121,7 @@ func (worker *Worker) deployReal(
 				WHERE account_id = $1 AND symbol = $2
 				  AND status IN ('STOPPED', 'LIQUIDATED')
 				  AND COALESCE(closed_reason, '') NOT IN (
-				      'TAKE_PROFIT', 'TAKE_PROFIT_NATIVE', 'TRAILING_TAKE_PROFIT', 'BREAKEVEN_LOCK',
-				      'USER_CANCEL', 'ALREADY_CLOSED', 'EXTERNAL_CLOSE', 'REMOTE_FAILED')
+				      `+protectiveCloseExemptReasons+`)
 				  AND COALESCE(closed_at, updated_at) > NOW() - INTERVAL '2 hours'
 			)
 		`, *settings.AccountID, candidate.Symbol).Scan(&recentlyStoppedReal); err == nil && recentlyStoppedReal {
@@ -2386,15 +2393,29 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 		}
 
 		if decision.Action == ActionAdjustUp || decision.Action == ActionAdjustDown {
+			// Reset the pair-counting baseline under the NEW geometry. The old
+			// code persisted currentLevel (computed against the OLD bounds),
+			// so the next manage tick saw a phantom half-grid traverse and
+			// booked gridNum/2 fictional completed pairs. Recomputing the
+			// level against the shifted bounds makes the first tick after the
+			// shift a no-op baseline (price sits at the new mid).
+			newLevel := gridLevelForPrice(decision.NewLower, decision.NewUpper, bot.gridNum, price)
+			// Crystallize the underwater inventory mark into realized. The
+			// paper model is stateless: without this the pre-shift inventory
+			// loss silently vanishes when the grid recenters. A real
+			// adjust_params keeps the position; charging the mark (already net
+			// of exit fee) here is the pessimistic-but-honest equivalent and
+			// compounds toward truth across repeated shifts.
+			shiftRealized := realized.Add(unrealized)
 			_, _ = worker.db.Exec(ctx, `
 				UPDATE paper_grid_bots
 				SET lower_price = $2, upper_price = $3,
 				    adjustments_count = adjustments_count + 1,
-				    mark_price = $4, unrealized_pnl_usdt = $5,
-				    realized_pnl_usdt = $6, last_grid_level = $7,
+				    mark_price = $4, unrealized_pnl_usdt = 0,
+				    realized_pnl_usdt = $5, last_grid_level = $6,
 				    updated_at = NOW()
 				WHERE id = $1
-			`, bot.id, decision.NewLower, decision.NewUpper, price, unrealized, realized, currentLevel)
+			`, bot.id, decision.NewLower, decision.NewUpper, price, shiftRealized, newLevel)
 
 			worker.logger.Info("adjusted paper grid range on the fly",
 				"component", "autogrid_worker", "symbol", bot.symbol,

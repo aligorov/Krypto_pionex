@@ -2,6 +2,7 @@ package marketdata
 
 import (
 	"math"
+	"sort"
 
 	"github.com/aligorov/pionex-bot/backend/internal/pionex"
 )
@@ -36,11 +37,19 @@ const (
 )
 
 // DetectRegime computes trend/range classification from OHLCV candles.
+//
+// Pionex /market/klines returns candles newest-first. Every metric below is
+// order-dependent (EMA, RSI, ADX, "last N" windows, window return), so the
+// series is sorted ascending by timestamp first; without this a raw feed is
+// time-mirrored: TREND_UP ↔ TREND_DOWN, RSI → 100−RSI, and window reads hit
+// the oldest candles instead of the newest.
 func DetectRegime(candles []pionex.KlineCandle) RegimeResult {
 	result := RegimeResult{Regime: "RANGE", Choppiness: 50.0, RSI: 50.0}
 	if len(candles) < 30 {
 		return result
 	}
+	candles = append([]pionex.KlineCandle(nil), candles...)
+	sort.Slice(candles, func(i, j int) bool { return candles[i].Time < candles[j].Time })
 	closes := make([]float64, 0, len(candles))
 	for _, candle := range candles {
 		value, _ := candle.Close.Float64()

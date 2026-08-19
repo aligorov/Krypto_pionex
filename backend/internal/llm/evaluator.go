@@ -192,12 +192,16 @@ func ParseAuditDecision(rawResponse string) (*AuditDecision, error) {
 		return nil, fmt.Errorf("failed to parse LLM JSON (%w): %s", err, cleaned)
 	}
 
+	// Fail-closed: only an explicit APPROVED verdict approves. A missing or
+	// unrecognized decision field must land on REJECTED — the deploy gate
+	// treats any non-REJECTED audit as cleared, so defaulting the other way
+	// would let an unexamined candidate through on a malformed response.
 	decision := strings.ToUpper(strings.TrimSpace(parsed.Decision))
-	if decision != "APPROVED" && decision != "REJECTED" {
-		if parsed.RejectionReason != nil && *parsed.RejectionReason != "" {
-			decision = "REJECTED"
-		} else {
-			decision = "APPROVED"
+	if decision != "APPROVED" {
+		decision = "REJECTED"
+		if parsed.RejectionReason == nil {
+			reason := "LLM verdict missing or unrecognized; fail-closed rejection"
+			parsed.RejectionReason = &reason
 		}
 	}
 

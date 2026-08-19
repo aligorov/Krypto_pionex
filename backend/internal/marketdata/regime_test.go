@@ -62,6 +62,24 @@ func TestDetectRegimeRange(t *testing.T) {
 	}
 }
 
+// Pionex /market/klines returns newest-first candles; DetectRegime must be
+// invariant to feed order. Before the sort fix a reversed feed flipped
+// TREND_UP ↔ TREND_DOWN (mirrored windowReturn) and inverted RSI.
+func TestDetectRegimeOrderInvariant(t *testing.T) {
+	ascending := synthCandles(func(i int) float64 { return 100 * math.Pow(1.02, float64(i)) }, 80)
+	descending := make([]pionex.KlineCandle, 0, len(ascending))
+	for i := len(ascending) - 1; i >= 0; i-- {
+		descending = append(descending, ascending[i])
+	}
+	got := DetectRegime(descending)
+	if got.Regime != "TREND_UP" {
+		t.Fatalf("newest-first feed must classify like ascending feed: expected TREND_UP, got %+v", got)
+	}
+	if got.RecommendedTrend() != "long" {
+		t.Fatalf("expected long grid, got %s", got.RecommendedTrend())
+	}
+}
+
 func TestRangePositionBounds(t *testing.T) {
 	candles := synthCandles(func(i int) float64 { return 100 + float64(i) }, 60)
 	position := rangePositionPct(candles)
