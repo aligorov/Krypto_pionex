@@ -736,7 +736,7 @@ func (worker *Worker) deployPaper(
 		// leverage. Falls back to the ATR adaptive mesh when history or fit
 		// quality is insufficient — the paper fleet then still validates the
 		// exact pipeline REAL runs.
-		harGeo := worker.harGridGeometry(ctx, candidate.Symbol, decimalFloat(settings.FeeBps))
+		harGeo := worker.harGridGeometry(ctx, candidate.Symbol, decimalFloat(settings.FeeBps.Add(settings.SlippageBps)), settings.BudgetUSDT.InexactFloat64())
 		mesh := ComputeAdaptiveMesh(
 			candidate.LowerPrice, candidate.UpperPrice, candidate.CurrentPrice,
 			atrPct, regime, settings.BudgetUSDT, settings.Leverage, 0.30,
@@ -1138,7 +1138,7 @@ func (worker *Worker) deployReal(
 		// forecast next-day volatility from daily candles, derive range width
 		// / level count / vol-inverse leverage. Falls back to the ATR mesh
 		// when history or fit quality is insufficient.
-		harGeo := worker.harGridGeometry(ctx, candidate.Symbol, decimalFloat(settings.FeeBps))
+		harGeo := worker.harGridGeometry(ctx, candidate.Symbol, decimalFloat(settings.FeeBps.Add(settings.SlippageBps)), settings.BudgetUSDT.InexactFloat64())
 		if harGeo != nil {
 			harGeo.applyToMesh(candidate.CurrentPrice, &mesh)
 			worker.logger.Info("v2.0 har geometry applied",

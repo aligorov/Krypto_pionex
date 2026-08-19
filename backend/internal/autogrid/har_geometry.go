@@ -25,7 +25,12 @@ const harMinConfidence = 0.05
 // real deploys. Returns nil on any failure — insufficient history, candle
 // fetch error, degenerate or weak fit — and the caller keeps the
 // battle-tested ATR adaptive mesh.
-func (worker *Worker) harGridGeometry(ctx context.Context, symbol string, feeBps float64) *harGeometryResult {
+//
+// Since v2.0.10 feeBps must be fee+slippage (round-trip viability), and
+// budgetUsdt caps the level count so each level's order notional stays
+// exchange-executable (≈$5 floor) — a 100-level grid on a $200 budget is
+// fine on paper but would fail Pionex min-order checks in REAL mode.
+func (worker *Worker) harGridGeometry(ctx context.Context, symbol string, feeBps, budgetUsdt float64) *harGeometryResult {
 	candles, err := worker.publicClient.GetKlines(ctx, symbol, "1D", 60)
 	if err != nil {
 		worker.logger.Debug("har geometry: candle fetch failed, mesh fallback",
@@ -47,7 +52,7 @@ func (worker *Worker) harGridGeometry(ctx context.Context, symbol string, feeBps
 		return nil
 	}
 	return &harGeometryResult{
-		geo:         marketdata.ComputeGridGeometry(forecast, model.RSquared, feeBps),
+		geo:         marketdata.ComputeGridGeometry(forecast, model.RSquared, feeBps, budgetUsdt),
 		forecastPct: forecast,
 	}
 }

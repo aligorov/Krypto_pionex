@@ -207,7 +207,7 @@ func TestForecastVolatilityFromCandles(t *testing.T) {
 // is allowed; the step must still cover 3× the fee.
 func TestGridGeometryLowVol(t *testing.T) {
 	const feeBps = 5.0
-	g := ComputeGridGeometry(10, 0.42, feeBps) // 10% annualized ≈ 0.52% daily
+	g := ComputeGridGeometry(10, 0.42, feeBps, 0) // 10% annualized ≈ 0.52% daily
 	if g.RangePct != 3.0 {
 		t.Fatalf("range must clamp to the 3%% floor, got %.2f", g.RangePct)
 	}
@@ -234,7 +234,7 @@ func TestGridGeometryLowVol(t *testing.T) {
 // High volatility: 100% annualized ≈ 5.23% daily → wide range, no leverage,
 // stop at half the range.
 func TestGridGeometryHighVol(t *testing.T) {
-	g := ComputeGridGeometry(100, 0.3, 5)
+	g := ComputeGridGeometry(100, 0.3, 5, 0)
 	wantRange := 100 / math.Sqrt(365) * 2.5 // ≈ 13.09%, inside [3, 25]
 	if math.Abs(g.RangePct-wantRange) > 1e-9 {
 		t.Fatalf("range = %.4f, want %.4f (2.5 × daily vol)", g.RangePct, wantRange)
@@ -245,7 +245,7 @@ func TestGridGeometryHighVol(t *testing.T) {
 	if math.Abs(g.StopPct-wantRange*0.5) > 1e-9 {
 		t.Fatalf("stop = %.4f, want %.4f", g.StopPct, wantRange*0.5)
 	}
-	if g.RangePct <= ComputeGridGeometry(10, 0.3, 5).RangePct {
+	if g.RangePct <= ComputeGridGeometry(10, 0.3, 5, 0).RangePct {
 		t.Fatal("high-vol range must be wider than the clamped low-vol range")
 	}
 	if g.GridCount < 8 || g.GridCount > 100 {
@@ -264,7 +264,7 @@ func TestGridGeometryLeverageBands(t *testing.T) {
 		{100, 1}, // 5.23% daily
 	}
 	for _, tc := range cases {
-		g := ComputeGridGeometry(tc.annualVolPct, 0.3, 5)
+		g := ComputeGridGeometry(tc.annualVolPct, 0.3, 5, 0)
 		if g.Leverage != tc.wantLeverage {
 			t.Fatalf("%.0f%% annualized (%.2f%% daily): leverage = %d, want %d",
 				tc.annualVolPct, tc.annualVolPct/math.Sqrt(365), g.Leverage, tc.wantLeverage)
@@ -281,7 +281,7 @@ func TestGridGeometryStepCoversFees(t *testing.T) {
 			minStep = 0.15
 		}
 		for _, annualVolPct := range []float64{5, 20, 45, 80, 150, 400} {
-			g := ComputeGridGeometry(annualVolPct, 0.3, feeBps)
+			g := ComputeGridGeometry(annualVolPct, 0.3, feeBps, 0)
 			if g.StepPct+1e-9 < minStep {
 				t.Fatalf("%.0f%% vol, %.0f bps fee: step %.4f%% below minimum %.4f%%",
 					annualVolPct, feeBps, g.StepPct, minStep)
@@ -295,5 +295,44 @@ func TestGridGeometryStepCoversFees(t *testing.T) {
 					annualVolPct, feeBps, g.RangePct)
 			}
 		}
+	}
+}
+
+func TestComputeGridGeometryBudgetCap(t *testing.T) {
+	// BANK-кейс (prod #304): σ=214%/год → 25% range, 1x leverage. Без капа
+	// бюджет даёт 166 уровней → клэмп 100 → $2/уровень — в REAL это ниже
+	// минимального размера ордера. С бюджетом $200 и этажом $5/уровень:
+	// maxByBudget = 200×1/5 = 40 уровней, шаг 0.625%.
+	g := ComputeGridGeometry(214, 0.12, 7, 200)
+	if g.Leverage != 1 {
+		t.Fatalf("σ=214%% must be 1x, got %d", g.Leverage)
+	}
+	if g.GridCount != 40 {
+		t.Fatalf("budget cap must limit to 40 levels (200×1/5), got %d", g.GridCount)
+	}
+	if g.StepPct < 0.5 {
+		t.Fatalf("step must widen to ~0.625%%, got %.3f", g.StepPct)
+	}
+
+	// 2x-плечо удваивает допустимые уровни: 200×2/5 = 80.
+	g = ComputeGridGeometry(56, 0.11, 7, 200)
+	if g.Leverage != 2 {
+		t.Fatalf("σ=56%% must be 2x, got %d", g.Leverage)
+	}
+	if g.GridCount > 80 {
+		t.Fatalf("2x budget cap is 80 levels, got %d", g.GridCount)
+	}
+
+	// Высокая вола + большой бюджет: 166 → клэмп 100 остаётся связывающим
+	// (бюджетный кап 1000×1/5 = 200 его не касается).
+	g = ComputeGridGeometry(214, 0.12, 7, 1000)
+	if g.GridCount != 100 {
+		t.Fatalf("high vol with big budget stays at 100-level clamp, got %d", g.GridCount)
+	}
+
+	// Крошечный бюджет не должен ронять уровни ниже структурного пола 8.
+	g = ComputeGridGeometry(214, 0.12, 7, 20)
+	if g.GridCount < 8 {
+		t.Fatalf("structural floor of 8 levels must hold, got %d", g.GridCount)
 	}
 }

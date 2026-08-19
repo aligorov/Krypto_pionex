@@ -16,20 +16,30 @@ type GridGeometry struct {
 	Confidence float64 // HAR model R² (quality of the forecast)
 }
 
+// minPerLevelNotionalUsdt caps the grid level count so each level's order
+// notional stays above a Pionex-executable size. At ~$2/level a real grid's
+// orders drop below exchange minimums on many futures pairs — the pre-flight
+// checkParams would reject the config in REAL mode, so the geometry must not
+// produce it in the first place.
+const minPerLevelNotionalUsdt = 5.0
+
 // ComputeGridGeometry converts a HAR volatility forecast into grid parameters.
 //
 //	forecastVolPct: annualized daily volatility in % (e.g. 45 = 45% a year)
 //	harR2:          in-sample R² of the HAR fit, stored verbatim as Confidence
-//	feeBps:         one-way taker fee in basis points (e.g. 5 = 0.05%)
+//	feeBps:         one-way fee+slippage in basis points (e.g. 7 = 0.07%)
+//	budgetUsdt:     quote investment; <= 0 disables the per-level notional cap
 //
 // Mapping rationale:
 //   - range  = 2.5 × daily volatility (covers roughly ±1.25σ of the next
 //     day's move, so the grid is neither instantly escaped nor idle),
-//   - step   ≥ 3 × fee (a round trip pays the fee twice; the third multiple
-//     is the safety buffer),
+//   - step   ≥ 3 × fee+slippage (a round trip pays the feed twice; the third
+//     multiple is the safety buffer),
 //   - leverage falls as volatility rises: 3x only in calm regimes, 1x once
-//     daily moves exceed 5%.
-func ComputeGridGeometry(forecastVolPct float64, harR2 float64, feeBps float64) GridGeometry {
+//     daily moves exceed 5%,
+//   - level count is additionally capped so each level's order notional
+//     (budget × leverage / levels) stays ≥ minPerLevelNotionalUsdt.
+func ComputeGridGeometry(forecastVolPct float64, harR2 float64, feeBps float64, budgetUsdt float64) GridGeometry {
 	// Annualized % → daily %: σ_daily = σ_annual / √365 (crypto trades 24/7).
 	dailyVolPct := forecastVolPct / math.Sqrt(365)
 
@@ -49,17 +59,6 @@ func ComputeGridGeometry(forecastVolPct float64, harR2 float64, feeBps float64) 
 		minStepPct = 0.15 // absolute minimum step, keeps level counts sane on cheap fees
 	}
 
-	// Number of fee-viable steps that fit in the range. floor(range/step)
-	// guarantees the realized step (= range/count) never drops below
-	// minStepPct unless the count floor below kicks in.
-	gridCount := int(rangePct / minStepPct)
-	if gridCount < 8 {
-		gridCount = 8 // fewer levels fragments capital and misses fills
-	}
-	if gridCount > 100 {
-		gridCount = 100 // practical ceiling for futures grids
-	}
-
 	// Leverage inversely proportional to volatility.
 	leverage := 2
 	if dailyVolPct > 5.0 {
@@ -67,6 +66,24 @@ func ComputeGridGeometry(forecastVolPct float64, harR2 float64, feeBps float64) 
 	}
 	if dailyVolPct < 1.0 {
 		leverage = 3 // very low vol → 3x max
+	}
+
+	// Number of fee-viable steps that fit in the range. floor(range/step)
+	// guarantees the realized step (= range/count) never drops below
+	// minStepPct unless a floor below kicks in.
+	gridCount := int(rangePct / minStepPct)
+	if budgetUsdt > 0 {
+		// Per-level notional cap: budget × leverage / levels ≥ floor.
+		maxByBudget := int(budgetUsdt*float64(leverage) / minPerLevelNotionalUsdt)
+		if gridCount > maxByBudget {
+			gridCount = maxByBudget
+		}
+	}
+	if gridCount < 8 {
+		gridCount = 8 // fewer levels fragments capital and misses fills
+	}
+	if gridCount > 100 {
+		gridCount = 100 // practical ceiling for futures grids
 	}
 
 	// Stop at half the range below the lower bound: outside normal grid
