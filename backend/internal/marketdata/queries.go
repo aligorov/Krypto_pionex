@@ -212,6 +212,55 @@ func (s *Service) GetOIChange24h(ctx context.Context, symbol string) (*OIInfo, e
 	return info, nil
 }
 
+// GetOIChange1h returns the aggregate open interest change over roughly the
+// last hour (window widened to 80 minutes to guarantee an oldest sample at
+// the 5-minute collector cadence). The entry-time funding-flush gate uses it
+// to detect forced deleveraging: extreme funding + falling OI.
+func (s *Service) GetOIChange1h(ctx context.Context, symbol string) (*OIInfo, error) {
+	rows, err := s.db.Query(ctx, `
+		SELECT exchange,
+		       (array_agg(oi_usd ORDER BY captured_at DESC))[1] AS latest_usd,
+		       (array_agg(oi_usd ORDER BY captured_at ASC))[1]  AS oldest_usd
+		FROM oi_history
+		WHERE symbol = $1
+		  AND captured_at >= NOW() - INTERVAL '80 minutes'
+		  AND oi_usd IS NOT NULL
+		GROUP BY exchange
+		HAVING MIN(captured_at) < NOW() - INTERVAL '40 minutes'
+		   AND MAX(captured_at) > NOW() - INTERVAL '10 minutes'
+	`, symbol)
+	if err != nil {
+		return nil, fmt.Errorf("query oi history 1h for %s: %w", symbol, err)
+	}
+	defer rows.Close()
+
+	var latest, oldest float64
+	exchanges := 0
+	for rows.Next() {
+		var exchange string
+		var latestUSD, oldestUSD float64
+		if err := rows.Scan(&exchange, &latestUSD, &oldestUSD); err != nil {
+			return nil, fmt.Errorf("scan oi history 1h: %w", err)
+		}
+		latest += latestUSD
+		oldest += oldestUSD
+		exchanges++
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate oi history 1h for %s: %w", symbol, err)
+	}
+	if exchanges == 0 {
+		return nil, fmt.Errorf("no recent open interest history for %s", symbol)
+	}
+
+	info := &OIInfo{CurrentUSD: latest}
+	if oldest > 0 {
+		info.ChangePct = (latest - oldest) / oldest * 100
+	}
+	info.IsRising = info.ChangePct > 0
+	return info, nil
+}
+
 // GetHighImpactEvents returns High impact events scheduled within the next
 // hoursAhead hours, oldest first.
 func (s *Service) GetHighImpactEvents(ctx context.Context, hoursAhead int) ([]EconomicEvent, error) {

@@ -676,6 +676,16 @@ func (worker *Worker) deployPaper(
 			smartReason = smart.Reason
 		}
 
+		// Entry gate (v2.0.12): funding extreme + falling OI = forced
+		// deleveraging in progress. This is the CAUSE of falling knives —
+		// RSI/ADX/Hurst all lag a fresh dump. Block only while the flush
+		// runs; once OI stabilizes the gate lifts on its own.
+		if blocked, why := worker.fundingFlushBlocked(ctx, candidate.Symbol, candidate.FundingRate); blocked {
+			worker.logger.Info("entry gate: funding flush in progress, skip",
+				"component", "autogrid_worker", "symbol", candidate.Symbol, "reason", why)
+			continue
+		}
+
 		// Supervision mark first: a symbol with a RUNNING bot (or a full
 		// portfolio) needs no geometry work — skipping the candle fetch here
 		// saves the shared Pionex rate budget every scan.
@@ -712,6 +722,19 @@ func (worker *Worker) deployPaper(
 				  AND closed_at > NOW() - INTERVAL '2 hours'
 			)
 		`, settings.ID, candidate.Symbol).Scan(&recentlyStopped); err == nil && recentlyStopped {
+			continue
+		}
+		// Entry gate (v2.0.12): anchor to the LIVE price. The scan price is
+		// captured at scan start and ages through AI Kit calls, LLM audits
+		// and backtest waits; deploying a grid centered minutes in the past
+		// is how bots open already outside their range (ENSO class). A drift
+		// beyond half an ATR means the candidate itself is stale.
+		if freshPrice, ok := worker.revalidateFreshPrice(ctx, &candidate, atrPct); ok {
+			candidate.CurrentPrice = freshPrice
+		} else {
+			worker.logger.Info("entry gate: stale candidate price, skip",
+				"component", "autogrid_worker", "symbol", candidate.Symbol,
+				"scan_price", candidate.CurrentPrice.String(), "live_price", freshPrice.String())
 			continue
 		}
 		// Walk-forward backtest gate — PAPER runs the same exam as REAL
@@ -751,6 +774,17 @@ func (worker *Worker) deployPaper(
 			atrPct, regime, settings.BudgetUSDT, settings.Leverage, 0.30,
 		)
 		if harGeo != nil {
+			// Entry gate (v2.0.12): block deployment into an active
+			// volatility expansion — a fixed-step grid holds per-pair edge
+			// constant while inventory risk grows with sigma² (A–S penalty).
+			// Only the expansion itself is blocked (ratio ≥ 1.5× forecast);
+			// elevated-but-decaying post-flush vol stays deployable.
+			if blocked, ratio := worker.volExpansionBlocked(ctx, candidate.Symbol, harGeo.forecastPct); blocked {
+				worker.logger.Info("entry gate: volatility expansion, skip",
+					"component", "autogrid_worker", "symbol", candidate.Symbol,
+					"rv_har_ratio", math.Round(ratio*100)/100)
+				continue
+			}
 			harGeo.applyToMesh(candidate.CurrentPrice, &mesh)
 		}
 
@@ -895,7 +929,7 @@ func (worker *Worker) deployPaper(
 // by deploy time. The planned trend must survive a fresh look.
 func (worker *Worker) revalidateCandidateTrend(
 	ctx context.Context,
-	candidate Candidate,
+	candidate *Candidate,
 	settings Settings,
 ) (bool, string) {
 	candles, err := worker.publicClient.GetKlines(ctx, candidate.Symbol, settings.CandleInterval, settings.LookbackCandles)
@@ -905,8 +939,22 @@ func (worker *Worker) revalidateCandidateTrend(
 	regime := marketdata.DetectRegime(candles)
 	freshTrend := regime.RecommendedTrend()
 
+	atrPct := 2.0
+	if val, ok := candidate.ModelAssumptions["atrPct"].(float64); ok && val > 0 {
+		atrPct = val
+	}
 	tickers, tickerErr := worker.publicClient.GetTickers(ctx, candidate.Symbol, "PERP")
 	if tickerErr == nil && len(tickers) > 0 && tickers[0].Open.GreaterThan(decimal.Zero) {
+		// v2.0.12: the trend was re-checked — now also the PRICE. The scan
+		// price ages through the whole enrichment pipeline; geometry, entry
+		// and the anti-hunt stop must anchor to the live price, and a drift
+		// beyond half an ATR voids the candidate itself.
+		if fresh, ok := worker.revalidateFreshPrice(ctx, candidate, atrPct); ok {
+			candidate.CurrentPrice = fresh
+		} else {
+			return false, fmt.Sprintf("price drifted beyond 0.5 ATR since scan (%s → %s)",
+				candidate.CurrentPrice.StringFixed(6), fresh.StringFixed(6))
+		}
 		change24h, _ := tickers[0].Close.Sub(tickers[0].Open).
 			Div(tickers[0].Open).Mul(decimal.NewFromInt(100)).Float64()
 		if change24h >= 3.0 && freshTrend == "short" {
@@ -1034,7 +1082,14 @@ func (worker *Worker) deployReal(
 			worker.rejectCandidate(ctx, candidate, "AI-аудит не завершён для этого кандидата (кап аудита/сбой LLM) — деплой заблокирован", nil)
 			continue
 		}
-		if ok, reason := worker.revalidateCandidateTrend(ctx, candidate, settings); !ok {
+		// Entry gate (v2.0.12): funding extreme + falling OI = forced
+		// deleveraging in progress (mirror of the paper path).
+		if blocked, why := worker.fundingFlushBlocked(ctx, candidate.Symbol, candidate.FundingRate); blocked {
+			worker.logger.Info("entry gate: funding flush in progress, skip real deploy",
+				"component", "autogrid_worker", "symbol", candidate.Symbol, "reason", why)
+			continue
+		}
+		if ok, reason := worker.revalidateCandidateTrend(ctx, &candidate, settings); !ok {
 			worker.logger.Info("skip real deploy after fresh trend revalidation",
 				"component", "autogrid_worker", "symbol", candidate.Symbol, "reason", reason)
 			continue
@@ -1147,6 +1202,14 @@ func (worker *Worker) deployReal(
 		// when history or fit quality is insufficient.
 		harGeo := worker.harGridGeometry(ctx, candidate.Symbol, decimalFloat(settings.FeeBps.Add(settings.SlippageBps)), settings.BudgetUSDT.InexactFloat64())
 		if harGeo != nil {
+			// Entry gate (v2.0.12): volatility expansion block (mirror of
+			// the paper path).
+			if blocked, ratio := worker.volExpansionBlocked(ctx, candidate.Symbol, harGeo.forecastPct); blocked {
+				worker.logger.Info("entry gate: volatility expansion, skip real deploy",
+					"component", "autogrid_worker", "symbol", candidate.Symbol,
+					"rv_har_ratio", math.Round(ratio*100)/100)
+				continue
+			}
 			harGeo.applyToMesh(candidate.CurrentPrice, &mesh)
 			worker.logger.Info("v2.0 har geometry applied",
 				"component", "autogrid_worker", "symbol", candidate.Symbol,
