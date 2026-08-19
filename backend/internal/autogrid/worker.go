@@ -867,6 +867,16 @@ func (worker *Worker) deployPaper(
 			"grid_num": mesh.GridNum, "quote_investment": settings.BudgetUSDT,
 		})
 	}
+	// A successful paper deploy round clears a stale deploy-block note —
+	// without this the circuit-breaker message from a past close wave sits
+	// in the UI for hours while the fleet is live and farming (prod:
+	// 19:10Z breaker note still displayed at 03:00Z with 10 bots RUNNING).
+	if activeCount > 0 {
+		_, _ = worker.db.Exec(ctx, `
+			UPDATE autogrid_settings SET last_error = NULL, updated_at = NOW()
+			WHERE id = $1
+		`, settings.ID)
+	}
 	return nil
 }
 
