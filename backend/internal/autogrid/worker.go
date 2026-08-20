@@ -537,7 +537,9 @@ func (worker *Worker) enrichCandidatesWithAIKit(
 // scaled to the budget and the FINAL leverage (v2.0.19: the PnL model marks
 // directional positions on budget×leverage notional — unscaled stops died in
 // noise, prod SKHY #328); FIXED mode returns the operator's amounts verbatim.
-func computeBotTargets(settings Settings, candidate Candidate, leverage int) (*decimal.Decimal, *decimal.Decimal) {
+// rangeSpanPct is the deployed mesh span in % — it floors the stop-out above
+// a full normal traverse (v2.0.24); 0 skips the floor.
+func computeBotTargets(settings Settings, candidate Candidate, leverage int, rangeSpanPct float64) (*decimal.Decimal, *decimal.Decimal) {
 	if settings.PnLTargetMode != "DYNAMIC" {
 		if settings.PnLTargetUSDT.IsZero() || settings.MaxLossUSDT.IsZero() {
 			return nil, nil
@@ -564,6 +566,7 @@ func computeBotTargets(settings Settings, candidate Candidate, leverage int) (*d
 		ScannerVolatilityPct: vol,
 		ScannerATRPct:        atr,
 		ScannerDrawdownPct:   drawdown,
+		RangeSpanPct:         rangeSpanPct,
 	})
 	target := decimal.NewFromFloat(targets.TargetUSDT)
 	loss := decimal.NewFromFloat(targets.MaxLossUSDT)
@@ -588,7 +591,7 @@ func percentReading(value any) float64 {
 
 // isEntryTimingFavorable validates that the current price is positioned
 // favorably within the channel structure before launching a grid:
-// - NEUTRAL: must be within the core median channel (35% to 65%) to avoid boundary traps.
+// - NEUTRAL: must be within the healthy channel (20% to 80%), avoiding extreme boundary traps.
 // - LONG: must be in the lower pullback accumulation zone (15% to 45%).
 // - SHORT: must be in the upper relief rebound zone (55% to 85%).
 func isEntryTimingFavorable(candidate Candidate) bool {
@@ -1010,7 +1013,11 @@ func (worker *Worker) deployPaper(
 		confluence := EvaluateConfluence(candidate, nil, nil)
 
 		gridType := mesh.GridType
-		target, maxLoss := computeBotTargets(settings, candidate, botLev)
+		meshSpanPct := 0.0
+		if mesh.UpperPrice.GreaterThan(mesh.LowerPrice) && candidate.CurrentPrice.IsPositive() {
+			meshSpanPct, _ = mesh.UpperPrice.Sub(mesh.LowerPrice).Div(candidate.CurrentPrice).Mul(decimal.NewFromInt(100)).Float64()
+		}
+		target, maxLoss := computeBotTargets(settings, candidate, botLev, meshSpanPct)
 		if trancheOn {
 			// TP/SL govern the bot as deployed: half capital → half target
 			// and half max loss for tranche 1 (tranche 2's top-up doubles
@@ -1595,7 +1602,11 @@ func (worker *Worker) deployReal(
 		// AI Kit/scanner readings, or the operator's fixed amount) is enforced
 		// by Pionex itself (profit_amount), so it survives even if this
 		// process is down. The management loop double-checks it locally.
-		botTarget, botMaxLoss := computeBotTargets(settings, candidate, botLev)
+		botTargetSpan := 0.0
+		if mesh.UpperPrice.GreaterThan(mesh.LowerPrice) && candidate.CurrentPrice.IsPositive() {
+			botTargetSpan, _ = mesh.UpperPrice.Sub(mesh.LowerPrice).Div(candidate.CurrentPrice).Mul(decimal.NewFromInt(100)).Float64()
+		}
+		botTarget, botMaxLoss := computeBotTargets(settings, candidate, botLev, botTargetSpan)
 		if settings.TrancheDeployEnabled {
 			// v2.0.15 (restored — the v2.0.13 patch was lost to a failed
 			// batch): tranche 1 commits HALF the capital, so native

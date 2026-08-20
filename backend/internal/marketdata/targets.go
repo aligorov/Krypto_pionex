@@ -8,8 +8,8 @@ import (
 // stop-out are derived from what the pair's own volatility actually offers,
 // scaled to the invested budget.
 //
-// take-profit % of budget = clamp(0.6 × effective daily volatility, 2.5..6)
-// stop-out    % of budget = clamp(0.5 × expected drawdown,     1.0..6)
+// take-profit % of budget = clamp(0.6 × effective daily volatility, 1.8..6)
+// stop-out    % of budget = clamp(max(0.5 × drawdown, 0.15 × grid span), 1.0..4)
 //
 // The effective volatility prefers the native Pionex AI Kit reading (live
 // per-pair estimate from the exchange) and falls back to the scanner's
@@ -18,15 +18,28 @@ import (
 const (
 	dynamicTargetVolFraction = 0.60
 	dynamicLossDDFraction    = 0.50
-	dynamicTargetMinPct      = 2.5
+	dynamicTargetMinPct      = 1.8
 	// 6.0 (was 15.0, v2.0.23): a TP ceiling of 15% of budget only binds on
 	// extreme-vol pairs and left them hanging for the range to break instead
 	// of banking the harvest (2026-08-20 external audit §4). Leverage
 	// scaling keeps the PRICE distance intact — 6%×lev is still a wide
-	// target in price terms.
+	// target in price terms. v2.0.24: kept at 6.0 (not 5.0) so RR ≥ 1.5
+	// holds with the 4.0 loss ceiling below.
 	dynamicTargetMaxPct      = 6.0
 	dynamicLossMinPct        = 1.0
-	dynamicLossMaxPct        = 6.0
+	// 4.0 (was 6.0, v2.0.24): with the target capped at 6, any lossPct above
+	// 6/1.35 = 4.44 silently broke the minRiskRewardRatio floor (at lossPct=6
+	// the clamps produced RR 1.0). 4.0 guarantees RR ≥ 1.5 everywhere while
+	// still clearing the widest normal traverse (D(25% range) = 3.33).
+	dynamicLossMaxPct        = 4.0
+	// dynamicLossRangeFloorK couples the loss floor to the DEPLOYED grid
+	// span: a full down-traverse of a neutral grid marks −100·r/(8−2r)% ≈
+	// −0.126·r of budget×leverage (manage.go neutralGridPaperPNL — half the
+	// notional loads at an average entry a quarter-range above the bottom).
+	// A $-stop below that fires INSIDE normal oscillation: the pre-v2.0.24
+	// floor of 1.0 tripped on every range ≥ 8.3%. 0.15 adds fee/funding
+	// headroom over the exact traverse drawdown (5-agent review 2026-08-20).
+	dynamicLossRangeFloorK   = 0.15
 	minRiskRewardRatio       = 1.35
 )
 
@@ -49,6 +62,12 @@ type DynamicTargetsInput struct {
 	ScannerVolatilityPct float64
 	ScannerATRPct        float64
 	ScannerDrawdownPct   float64
+	// RangeSpanPct is the DEPLOYED grid span (upper−lower)/mid in % — the
+	// quantity the PnL model actually marks against. It couples the loss
+	// floor to a full normal traverse (see dynamicLossRangeFloorK) so the
+	// $-stop sits structurally outside the grid's own oscillation. 0 =
+	// unknown (manual deploys) — the floor then contributes nothing.
+	RangeSpanPct float64
 }
 
 type DynamicTargets struct {
@@ -77,7 +96,13 @@ func ComputeDynamicTargets(input DynamicTargetsInput) DynamicTargets {
 		ddSource = "scanner_model"
 	}
 
-	lossPct := clamp(dynamicLossDDFraction*drawdown, dynamicLossMinPct, dynamicLossMaxPct)
+	lossFloor := dynamicLossDDFraction * drawdown
+	if input.RangeSpanPct > 0 {
+		if rangeFloor := dynamicLossRangeFloorK * input.RangeSpanPct; rangeFloor > lossFloor {
+			lossFloor = rangeFloor
+		}
+	}
+	lossPct := clamp(lossFloor, dynamicLossMinPct, dynamicLossMaxPct)
 	rawTargetPct := math.Max(dynamicTargetVolFraction*vol, lossPct*minRiskRewardRatio)
 	targetPct := clamp(rawTargetPct, dynamicTargetMinPct, dynamicTargetMaxPct)
 	budget := math.Max(input.Budget, 0)

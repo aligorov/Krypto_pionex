@@ -58,8 +58,58 @@ func TestComputeDynamicTargetsClamps(t *testing.T) {
 	if flat.TargetPct != dynamicTargetMinPct || flat.LossPct != dynamicLossMinPct {
 		t.Fatalf("floor clamps must hold: %+v", flat)
 	}
-	if flat.TargetUSDT != 25 || flat.MaxLossUSDT != 10 {
+	if flat.TargetUSDT != 18 || flat.MaxLossUSDT != 10 {
 		t.Fatalf("floored USDT values wrong: %+v", flat)
+	}
+}
+
+// v2.0.24: the loss floor couples to the DEPLOYED grid span — a $-stop below
+// a full normal traverse fires inside the grid's own oscillation (pre-fix the
+// 1.0 floor tripped on every range ≥ 8.3%).
+func TestComputeDynamicTargetsRangeCoupledLossFloor(t *testing.T) {
+	wide := ComputeDynamicTargets(DynamicTargetsInput{
+		Budget: 100, Leverage: 2, RangeSpanPct: 25,
+		ScannerVolatilityPct: 2, ScannerATRPct: 1.5, ScannerDrawdownPct: 1,
+	})
+	if wide.LossPct < 3.74 || wide.LossPct > 3.76 {
+		t.Fatalf("25%% span must floor the loss at 0.15×25 = 3.75, got %v", wide.LossPct)
+	}
+	if wide.TargetPct < minRiskRewardRatio*wide.LossPct-1e-9 {
+		t.Fatalf("RR floor must hold: target %v loss %v", wide.TargetPct, wide.LossPct)
+	}
+	// A tight grid keeps the absolute floor — no over-stopping quiet pairs.
+	tight := ComputeDynamicTargets(DynamicTargetsInput{
+		Budget: 100, RangeSpanPct: 3,
+		ScannerVolatilityPct: 2, ScannerATRPct: 1.5, ScannerDrawdownPct: 1,
+	})
+	if tight.LossPct != dynamicLossMinPct {
+		t.Fatalf("3%% span must stay at the absolute floor, got %v", tight.LossPct)
+	}
+	// Zero span (manual deploys) contributes nothing — DD path unchanged.
+	manual := ComputeDynamicTargets(DynamicTargetsInput{
+		Budget: 100, ScannerVolatilityPct: 2, ScannerATRPct: 1.5, ScannerDrawdownPct: 2,
+	})
+	if manual.LossPct != 1.0 {
+		t.Fatalf("zero span must fall back to the DD floor, got %v", manual.LossPct)
+	}
+}
+
+// v2.0.24: the 4.0 loss ceiling repairs the silent RR break — with the
+// target capped at 6, any lossPct above 6/1.35 used to clamp the ratio to
+// as low as 1.0. The invariant must hold across the whole input space.
+func TestComputeDynamicTargetsRRInvariant(t *testing.T) {
+	for _, dd := range []float64{1, 3, 5, 8, 12, 20, 40, 95} {
+		for _, vol := range []float64{1, 3, 8, 20, 60} {
+			for _, span := range []float64{0, 3, 8, 15, 25} {
+				got := ComputeDynamicTargets(DynamicTargetsInput{
+					Budget: 100, Leverage: 2, RangeSpanPct: span,
+					ScannerVolatilityPct: vol, ScannerATRPct: vol / 2, ScannerDrawdownPct: dd,
+				})
+				if got.TargetPct < minRiskRewardRatio*got.LossPct-1e-9 {
+					t.Fatalf("RR invariant broken at dd=%v vol=%v span=%v: %+v", dd, vol, span, got)
+				}
+			}
+		}
 	}
 }
 

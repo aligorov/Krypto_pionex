@@ -480,7 +480,16 @@ func scoreCandidate(
 		} else if regime.RSI < 40.0 {
 			reasons = append(reasons, fmt.Sprintf("Anti-FOMO: RSI (%.1f) < 40 - пара перепродана на лоях, вход в нейтральную сетку заблокирован", regime.RSI))
 		}
-		if regime.RangePositionPct > 70.0 || regime.RangePositionPct < 30.0 {
+		// v2.0.24: the NEUTRAL position band widens to [20,80] — aligned with
+		// isEntryTimingFavorable's NEUTRAL gate, which reads the SAME
+		// scan-time Donchian position. The scanner band was strictly tighter
+		// (pure double-filter), and the extra width only admits "quiet
+		// extremes" already cleared by the trend/Hurst/squeeze vetoes (5-agent
+		// review 2026-08-20; unlocked HEMI/SOXSX/SOXLX/SKHY-class candidates,
+		// break-up tail capped at −MaxLoss/2 by the v2.0.14 up-trend stop).
+		// RSI stays [40,60]: the worker gate has NO RSI component, so widening
+		// it loosens protection for zero empirical unlocks.
+		if regime.RangePositionPct > 80.0 || regime.RangePositionPct < 20.0 {
 			reasons = append(reasons, fmt.Sprintf("Anti-FOMO: положение в канале (%.1f%%) на экстремуме - вход в нейтральную сетку заблокирован", regime.RangePositionPct))
 		}
 	}
