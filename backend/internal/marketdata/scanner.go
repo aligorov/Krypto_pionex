@@ -485,7 +485,11 @@ func scoreCandidate(
 		}
 	}
 
-	if len(sorted) >= 3 {
+	if len(sorted) >= 3 && !(config.CascadeShortMode && recommendedTrend == "short") {
+		// v2.0.21: the flash-spike veto waits for "stabilization" — in a
+		// liquidation cascade every short target spikes by definition, and
+		// the whole point of the cascade scan is to enter DURING the
+		// instability. Lifted for shorts in that window only.
 		for i := len(sorted) - 3; i < len(sorted); i++ {
 			cOpen, _ := sorted[i].Open.Float64()
 			cClose, _ := sorted[i].Close.Float64()

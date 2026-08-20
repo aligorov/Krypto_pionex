@@ -137,7 +137,7 @@ func TestDeployPaperCooldownAfterProtectiveClose(t *testing.T) {
 	}
 
 	// Round 1: the structural close 10 minutes ago must block the redeploy.
-	if err := worker.deployPaper(ctx, settings, scanID); err != nil {
+	if err := worker.deployPaper(ctx, settings, scanID, false); err != nil {
 		t.Fatalf("deployPaper round 1: %v", err)
 	}
 	var running int
@@ -178,7 +178,7 @@ func TestDeployPaperCooldownAfterProtectiveClose(t *testing.T) {
 	`, scanID2, symbol); err != nil {
 		t.Fatalf("insert candidate round 2: %v", err)
 	}
-	if err := worker.deployPaper(ctx, settings, scanID2); err != nil {
+	if err := worker.deployPaper(ctx, settings, scanID2, false); err != nil {
 		t.Fatalf("deployPaper round 2: %v", err)
 	}
 	if err := pool.QueryRow(ctx, `
@@ -408,7 +408,7 @@ func TestPaperDeployRunsBacktestGate(t *testing.T) {
 	}
 
 	// Round 1: every TF still QUEUED — deployment must wait, not jump the gate.
-	if err := worker.deployPaper(ctx, settings, scanID); err != nil {
+	if err := worker.deployPaper(ctx, settings, scanID, false); err != nil {
 		t.Fatalf("deployPaper round 1: %v", err)
 	}
 	if got := runningBots(); got != 0 {
@@ -436,7 +436,7 @@ func TestPaperDeployRunsBacktestGate(t *testing.T) {
 	`, symbol, tradedTF); err != nil {
 		t.Fatalf("finish traded job: %v", err)
 	}
-	if err := worker.deployPaper(ctx, settings, scanID); err != nil {
+	if err := worker.deployPaper(ctx, settings, scanID, false); err != nil {
 		t.Fatalf("deployPaper round 2: %v", err)
 	}
 	if got := runningBots(); got != 0 {
@@ -466,7 +466,7 @@ func TestPaperDeployRunsBacktestGate(t *testing.T) {
 	`, symbol, tradedTF); err != nil {
 		t.Fatalf("pass traded job: %v", err)
 	}
-	if err := worker.deployPaper(ctx, settings, scanID); err != nil {
+	if err := worker.deployPaper(ctx, settings, scanID, false); err != nil {
 		t.Fatalf("deployPaper round 3: %v", err)
 	}
 	if got := runningBots(); got != 1 {
