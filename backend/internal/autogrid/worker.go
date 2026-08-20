@@ -1265,6 +1265,8 @@ func (worker *Worker) deployReal(
 			worker.logger.Info("smart direction contradicts demoted scanner trend: skip real deploy",
 				"component", "autogrid_worker", "symbol", candidate.Symbol,
 				"smart", smartTrend, "scanner", candidate.RecommendedTrend)
+			worker.rejectCandidate(ctx, candidate,
+				fmt.Sprintf("smart direction (%s) против демотированного тренда сканера (no_trend после 24h ±3%% против направления)", smartTrend), nil)
 			continue
 		}
 		// Walk-forward backtest gate: the traded TF must have earned a fresh
@@ -1828,6 +1830,13 @@ func (worker *Worker) autotuneIfDue(ctx context.Context, settings Settings) {
 func (worker *Worker) rejectCandidate(
 	ctx context.Context, candidate Candidate, reason string, assumptions map[string]any,
 ) {
+	// A nil map marshals to the jsonb scalar `null`, and
+	// `model_assumptions || 'null'::jsonb` turns the column into an ARRAY —
+	// every reader (listCandidates, GetState) then fails on the whole scan.
+	// Normalize to an empty object: `|| '{}'` is a no-op merge.
+	if assumptions == nil {
+		assumptions = map[string]any{}
+	}
 	_, _ = worker.db.Exec(ctx, `
 		UPDATE autogrid_candidates
 		SET decision = 'REJECTED', rejection_reason = $2,
@@ -2228,17 +2237,20 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 							"component", "autogrid_worker", "bot_id", bot.id, "error", err)
 					} else {
 						// Same-tick decision safety: decideBotAction below
-						// reads this struct — refresh the doubled fields so
-						// the top-up tick can't fire a half-size TP/SL
-						// against the doubled position.
+						// reads the LOCAL copies taken before the tranche
+						// block, not the struct fields — refresh BOTH, or
+						// the top-up tick can fire a half-size TP/SL against
+						// the doubled position.
 						bot.investment = base
 						if bot.pnlTarget != nil {
 							doubled := bot.pnlTarget.Mul(decimal.NewFromInt(2))
 							bot.pnlTarget = &doubled
+							botTarget = doubled
 						}
 						if bot.maxLoss != nil {
 							doubled := bot.maxLoss.Mul(decimal.NewFromInt(2))
 							bot.maxLoss = &doubled
+							botMaxLoss = doubled
 						}
 					}
 					worker.logger.Info("tranche 2 deployed (REAL invest_in)",

@@ -49,6 +49,25 @@ func TestDeployPaperCooldownAfterProtectiveClose(t *testing.T) {
 	t.Cleanup(pool.Close)
 
 	worker, _, settings := newCooldownTestWorker(t, pool)
+	// v2.0.12 added revalidateFreshPrice to deployPaper (fail-closed on an
+	// unreadable price). The fake symbol has no live ticker, so round 2 was
+	// silently skipped and the test has been red since — point the worker's
+	// public client at a stub ticker server pinned to the candidate price.
+	tickers := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"result":    true,
+			"timestamp": time.Now().UnixMilli(),
+			"data": map[string]any{
+				"tickers": []map[string]any{
+					{"symbol": "COOLDOWN_USDT_PERP", "close": "100", "open": "100",
+						"high": "101", "low": "99", "volume": "1000"},
+				},
+			},
+		})
+	}))
+	t.Cleanup(tickers.Close)
+	worker.publicClient = pionex.NewClient(tickers.URL, "test-key", "test-secret")
 
 	const symbol = "COOLDOWN_USDT_PERP"
 	// Passing walk-forward verdicts so the backtest gate (applied to paper
@@ -110,6 +129,12 @@ func TestDeployPaperCooldownAfterProtectiveClose(t *testing.T) {
 	`, scanID, symbol); err != nil {
 		t.Fatalf("insert candidate: %v", err)
 	}
+	var candidateID string
+	if err := pool.QueryRow(ctx, `
+		SELECT id FROM autogrid_candidates WHERE scan_id = $1 AND symbol = $2
+	`, scanID, symbol).Scan(&candidateID); err != nil {
+		t.Fatalf("fetch candidate id: %v", err)
+	}
 
 	// Round 1: the structural close 10 minutes ago must block the redeploy.
 	if err := worker.deployPaper(ctx, settings, scanID); err != nil {
@@ -126,13 +151,34 @@ func TestDeployPaperCooldownAfterProtectiveClose(t *testing.T) {
 	}
 
 	// Round 2: same history, but closed in profit — redeploy is allowed.
+	// v2.0.19: late gates persist rejectCandidate on the SAME row, and a
+	// cooldown-time reject (round 1) marks this scan's candidate REJECTED —
+	// matching production, the next scan mints a FRESH candidate row, so
+	// round 2 deploys from a new scan run.
 	if _, err := pool.Exec(ctx, `
 		UPDATE paper_grid_bots SET closed_reason = 'TAKE_PROFIT'
 		WHERE symbol = $1 AND status = 'COMPLETED'
 	`, symbol); err != nil {
 		t.Fatalf("flip close reason: %v", err)
 	}
-	if err := worker.deployPaper(ctx, settings, scanID); err != nil {
+	var scanID2 string
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO autogrid_scan_runs (status) VALUES ('SUCCEEDED') RETURNING id
+	`).Scan(&scanID2); err != nil {
+		t.Fatalf("insert scan run round 2: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO autogrid_candidates (
+			scan_id, symbol, decision, current_price, lower_price, upper_price,
+			grid_num, recommended_trend, model_assumptions
+		) VALUES (
+			$1, $2, 'ACCEPTED', 100, 90, 110,
+			10, 'no_trend', '{"atrPct": 1.0, "regime": "RANGE"}'::jsonb
+		)
+	`, scanID2, symbol); err != nil {
+		t.Fatalf("insert candidate round 2: %v", err)
+	}
+	if err := worker.deployPaper(ctx, settings, scanID2); err != nil {
 		t.Fatalf("deployPaper round 2: %v", err)
 	}
 	if err := pool.QueryRow(ctx, `
@@ -142,6 +188,15 @@ func TestDeployPaperCooldownAfterProtectiveClose(t *testing.T) {
 	}
 	if running != 1 {
 		t.Fatalf("TAKE_PROFIT close must not block redeploy, got %d running bots", running)
+	}
+	// The cooldown-time rejection must be visible on the round-1 candidate.
+	var round1Decision, round1Reason string
+	if err := pool.QueryRow(ctx, `
+		SELECT decision, COALESCE(rejection_reason, '') FROM autogrid_candidates WHERE id = $1
+	`, candidateID).Scan(&round1Decision, &round1Reason); err == nil {
+		if round1Decision != "REJECTED" || round1Reason == "" {
+			t.Fatalf("cooldown skip must persist a rejection reason, got %q / %q", round1Decision, round1Reason)
+		}
 	}
 }
 
