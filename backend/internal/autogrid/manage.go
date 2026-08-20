@@ -210,6 +210,16 @@ func adjustDecision(input botActionInput, action, reason string) manageDecision 
 	}
 }
 
+// pionexMakerFeeBps is the documented Pionex futures maker fee (0.02%,
+// https://www.pionex.com/en/fees): the futures grid engine quotes passive
+// limit orders, so a COMPLETED pair pays maker on both legs. Protective
+// closes are the exception — they cross the book and pay taker — which is
+// why the exit-fee honesty mark keeps the taker fee+slippage composite.
+// Booking pairs at the taker composite overstated friction by ~10 bps per
+// pair and made paper systematically underreport the harvest REAL grids
+// keep (2026-08-20 external audit §2, verified against the official fee page).
+const pionexMakerFeeBps = 2.0
+
 // neutralGridPaperPNL simulates what a native neutral grid earns between two
 // observation points using leveraged ladder economics (v1.3.22):
 //
@@ -222,6 +232,9 @@ func adjustDecision(input botActionInput, action, reason string) manageDecision 
 // per-level notional (investment × leverage / gridNum), with the average
 // entry at the midpoint of the filled half. Funding is NOT modeled here; the
 // supervision loop accrues it separately per 8h boundary on inventoryNotional.
+//
+// The feeBps argument is the PER-LEG fee pair fills pay — pass the maker fee
+// (pionexMakerFeeBps), not the taker+slippage composite.
 func neutralGridPaperPNL(
 	lower, upper decimal.Decimal,
 	gridNum int,

@@ -9,8 +9,13 @@ func TestComputeDynamicTargetsScalesWithVolatility(t *testing.T) {
 	wild := ComputeDynamicTargets(DynamicTargetsInput{
 		Budget: 200, ScannerVolatilityPct: 20, ScannerATRPct: 12, ScannerDrawdownPct: 30,
 	})
-	if !(wild.TargetUSDT > quiet.TargetUSDT*2) {
-		t.Fatalf("wild market must yield a much larger target: quiet=%v wild=%v", quiet.TargetUSDT, wild.TargetUSDT)
+	// v2.0.23: the 6% ceiling compresses extreme-vol targets instead of
+	// letting them run to 15% — scaling stays monotone but bounded.
+	if !(wild.TargetUSDT > quiet.TargetUSDT) {
+		t.Fatalf("wild market must yield a larger target: quiet=%v wild=%v", quiet.TargetUSDT, wild.TargetUSDT)
+	}
+	if wild.TargetPct != dynamicTargetMaxPct {
+		t.Fatalf("extreme volatility must clamp at the %.1f%% ceiling, got %v", dynamicTargetMaxPct, wild.TargetPct)
 	}
 	if !(quiet.TargetUSDT > 0 && wild.TargetUSDT > 0) {
 		t.Fatalf("targets must be positive: %+v %+v", quiet, wild)

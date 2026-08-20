@@ -351,6 +351,26 @@ func TestPaperDeployRunsBacktestGate(t *testing.T) {
 	t.Cleanup(pool.Close)
 
 	worker, _, settings := newCooldownTestWorker(t, pool)
+	// The fake symbol has no live ticker on the real API, and the fresh-price
+	// gate runs BEFORE the backtest gate — without a stub pinned to the
+	// candidate price every round fail-closes as "stale" and the test never
+	// reaches the gate it exists to pin (same disease the cooldown test had;
+	// red since v2.0.12, surfaced by the 2026-08-20 postgres run).
+	tickers := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"result":    true,
+			"timestamp": time.Now().UnixMilli(),
+			"data": map[string]any{
+				"tickers": []map[string]any{
+					{"symbol": "BTGATE_USDT_PERP", "close": "100", "open": "100",
+						"high": "101", "low": "99", "volume": "1000"},
+				},
+			},
+		})
+	}))
+	t.Cleanup(tickers.Close)
+	worker.publicClient = pionex.NewClient(tickers.URL, "test-key", "test-secret")
 	tradedTF := normalizeBacktestTF(settings.CandleInterval)
 	allTFs := append([]string{tradedTF}, neighborBacktestTFs(tradedTF)...)
 

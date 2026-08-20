@@ -2760,6 +2760,12 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 
 	effectiveFeeBps := settings.FeeBps.Add(settings.SlippageBps)
 	feeRate := effectiveFeeBps.Div(decimal.NewFromInt(10000))
+	// Completed grid pairs pay MAKER on both legs (Pionex futures grid quotes
+	// passive limit orders: 0.02% maker vs 0.05% taker — pionex.com/en/fees);
+	// the taker+slippage composite stays reserved for exits, which cross the
+	// book. v2.0.23: pairs used to be booked at the taker composite, costing
+	// paper ~10 bps per pair against reality (2026-08-20 external audit §2).
+	pairFeeBps := decimal.NewFromFloat(pionexMakerFeeBps)
 
 	// Real cross-exchange funding (v2.0.6): per-symbol signed 8h rate from
 	// the collector replaces the flat PaperFundingRateBps default whenever
@@ -2821,7 +2827,8 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 			// on crossings that close previously accumulated inventory
 			// (completed buy/sell pairs, mirroring the exchange's own Grid
 			// Profit attribution); the uniform ladder is marked with leveraged
-			// per-level notional. Fees and slippage apply per completed pair.
+			// per-level notional. Maker pair fees apply per completed pair;
+			// taker+slippage only on exits (v2.0.23).
 			currentLevel = gridLevelForPrice(bot.lower, bot.upper, bot.gridNum, price)
 			previousLevel := currentLevel
 			if bot.lastLevel != nil {
@@ -2830,7 +2837,7 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 			var pairProfit, inventoryNotional decimal.Decimal
 			pairProfit, unrealized, inventoryNotional = neutralGridPaperPNL(
 				bot.lower, bot.upper, bot.gridNum, bot.investment, bot.leverage,
-				previousLevel, currentLevel, price, effectiveFeeBps,
+				previousLevel, currentLevel, price, pairFeeBps,
 			)
 			realized = realized.Add(pairProfit)
 			fundingExposure = inventoryNotional

@@ -8,8 +8,8 @@ import (
 // stop-out are derived from what the pair's own volatility actually offers,
 // scaled to the invested budget.
 //
-// take-profit % of budget = clamp(0.5 × effective daily volatility, 1.5..12)
-// stop-out    % of budget = clamp(0.6 × expected drawdown,     1.0..8)
+// take-profit % of budget = clamp(0.6 × effective daily volatility, 2.5..6)
+// stop-out    % of budget = clamp(0.5 × expected drawdown,     1.0..6)
 //
 // The effective volatility prefers the native Pionex AI Kit reading (live
 // per-pair estimate from the exchange) and falls back to the scanner's
@@ -19,7 +19,12 @@ const (
 	dynamicTargetVolFraction = 0.60
 	dynamicLossDDFraction    = 0.50
 	dynamicTargetMinPct      = 2.5
-	dynamicTargetMaxPct      = 15.0
+	// 6.0 (was 15.0, v2.0.23): a TP ceiling of 15% of budget only binds on
+	// extreme-vol pairs and left them hanging for the range to break instead
+	// of banking the harvest (2026-08-20 external audit §4). Leverage
+	// scaling keeps the PRICE distance intact — 6%×lev is still a wide
+	// target in price terms.
+	dynamicTargetMaxPct      = 6.0
 	dynamicLossMinPct        = 1.0
 	dynamicLossMaxPct        = 6.0
 	minRiskRewardRatio       = 1.35

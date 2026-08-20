@@ -17,8 +17,15 @@ const (
 	backtestGateFlag    = "backtest_gate"
 	backtestFreshWindow = 12 * time.Hour
 	// Traded-TF hard ceilings: the parameters we are about to deploy must
-	// have earned non-negative OOS with bounded drawdown and no stop-storm.
+	// have earned near-breakeven OOS with bounded drawdown and no stop-storm.
 	backtestMaxDrawdown = 0.15
+	// backtestMinOOSPct is the traded-TF OOS floor. A neutral grid's
+	// walk-forward OOS includes trend segments the strategy deliberately
+	// does not trade, so a small negative OOS with bounded drawdown and no
+	// stop-storm is still a harvestable chopper — 0.0 rejected SNDKX/EDEN-
+	// class flat choppers on a single trend fold (2026-08-20 external
+	// audit §3). Drawdown, stop-storm and neighbor-fragility vetoes stand.
+	backtestMinOOSPct = -1.5
 	// Neighbor fragility ceiling: a healthy traded TF with a catastrophic
 	// neighbor (MUBARAK-style 71% DD one TF away) means the symbol's range
 	// behavior is fragile — regime shifts surface on other TFs first.
@@ -107,8 +114,9 @@ func evaluateBacktestGate(traded BacktestJobSummary, neighbors []BacktestJobSumm
 		verdict.Reason = "backtest produced no folds"
 		return verdict
 	}
-	if traded.OOSPct < 0 {
-		verdict.Reason = fmt.Sprintf("backtest gate: OOS %.2f%% < 0 on traded TF %s", traded.OOSPct, traded.Interval)
+	if traded.OOSPct < backtestMinOOSPct {
+		verdict.Reason = fmt.Sprintf("backtest gate: OOS %.2f%% < %.1f%% on traded TF %s",
+			traded.OOSPct, backtestMinOOSPct, traded.Interval)
 		return verdict
 	}
 	if traded.MaxDD > backtestMaxDrawdown {

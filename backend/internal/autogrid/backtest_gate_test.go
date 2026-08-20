@@ -38,15 +38,24 @@ func TestBacktestGateFragileNeighbor(t *testing.T) {
 }
 
 func TestBacktestGateTradedTFMustPass(t *testing.T) {
-	traded := BacktestJobSummary{Interval: "60M", State: "done", Folds: 4, OOSPct: -0.36, MaxDD: 0.0223, StopHits: 3}
-	verdict := evaluateBacktestGate(traded, nil)
-	if verdict.Allowed {
-		t.Fatalf("negative OOS on traded TF must reject: %s", verdict.Reason)
+	// v2.0.23 OOS floor: a shallow negative OOS (trend folds the grid
+	// deliberately does not trade) passes; a deep negative or a stop-storm
+	// still rejects.
+	shallow := BacktestJobSummary{Interval: "60M", State: "done", Folds: 4, OOSPct: -0.36, MaxDD: 0.0223, StopHits: 0}
+	if verdict := evaluateBacktestGate(shallow, nil); !verdict.Allowed {
+		t.Fatalf("OOS -0.36%% above the %.1f%% floor must pass: %s", backtestMinOOSPct, verdict.Reason)
+	}
+	storm := BacktestJobSummary{Interval: "60M", State: "done", Folds: 4, OOSPct: -0.36, MaxDD: 0.0223, StopHits: 3}
+	if verdict := evaluateBacktestGate(storm, nil); verdict.Allowed {
+		t.Fatalf("stop-storm on traded TF must reject: %s", verdict.Reason)
+	}
+	deep := BacktestJobSummary{Interval: "60M", State: "done", Folds: 4, OOSPct: -2.0, MaxDD: 0.0223, StopHits: 0}
+	if verdict := evaluateBacktestGate(deep, nil); verdict.Allowed {
+		t.Fatalf("OOS below the %.1f%% floor must reject: %s", backtestMinOOSPct, verdict.Reason)
 	}
 
-	traded.OOSPct = 3.58
-	traded.StopHits = 0
-	verdict = evaluateBacktestGate(traded, []BacktestJobSummary{
+	traded := BacktestJobSummary{Interval: "60M", State: "done", Folds: 4, OOSPct: 3.58, MaxDD: 0.0223, StopHits: 0}
+	verdict := evaluateBacktestGate(traded, []BacktestJobSummary{
 		{Interval: "30M", State: "done", Folds: 4, OOSPct: 1.2, MaxDD: 0.05, StopHits: 0},
 		{Interval: "4H", State: "done", Folds: 4, OOSPct: 0.4, MaxDD: 0.03, StopHits: 1},
 	})
