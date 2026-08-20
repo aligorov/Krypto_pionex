@@ -1332,7 +1332,7 @@ func (s *Service) AdjustBot(
 			if !input.QuoteInvestment.GreaterThan(decimal.Zero) {
 				return "", errors.New("invest_in requires a positive quoteInvestment")
 			}
-			if err := s.risk.ValidateNewGrid(ctx, *accountID, botSymbol, botLeverage, input.QuoteInvestment); err != nil {
+			if err := s.risk.ValidateGridTopUp(ctx, *accountID, botSymbol, botLeverage, input.QuoteInvestment); err != nil {
 				return "", fmt.Errorf("invest_in rejected by risk engine: %w", err)
 			}
 		}

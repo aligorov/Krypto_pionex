@@ -82,10 +82,14 @@ func (worker *Worker) GetFearGreed(ctx context.Context) (int, error) {
 	err := worker.db.QueryRow(ctx, `
         SELECT value FROM sentiment_snapshots
         WHERE source = 'fng'
+          AND captured_at > NOW() - INTERVAL '36 hours'
         ORDER BY captured_at DESC LIMIT 1
     `).Scan(&value)
 	if err != nil {
-		return 50, nil // neutral default
+		// Neutral default both on error and on staleness: a frozen euphoria
+		// (>=85) or panic (1..15) reading must not freeze entries fleet-wide
+		// for as long as the feed is dead (2026-08-20 audit).
+		return 50, nil
 	}
 	return int(value), nil
 }

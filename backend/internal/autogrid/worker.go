@@ -668,31 +668,50 @@ func (worker *Worker) deployPaper(
 
 		// v2.0.3 Smart Direction (paper): regime + cross-exchange funding +
 		// sentiment choose the direction and its leverage instead of the
-		// scanner's default neutral. Symbols without funding coverage
-		// (Pionex-exclusive listings) fall back to the scanner decision.
+		// scanner's default neutral. v2.0.15: SelectDirection now ALWAYS
+		// runs — with a zero FundingContext when coverage is missing — so
+		// sentiment gates (euphoria/panic) can no longer be bypassed by a
+		// funding-data gap, and the fallback is governed (2x clamp) instead
+		// of the raw scanner trend with the adaptive ladder.
 		smartTrend, smartLev, smartReason := "", 0, ""
+		fundingInput := FundingContext{}
 		if fundingCtx, fundErr := worker.GetFundingForSymbol(ctx, candidate.Symbol); fundErr == nil {
-			smart := SelectDirection(
-				RegimeContext{
-					Regime:     regime,
-					Confidence: confluenceConfidence(candidate.ModelAssumptions),
-					HurstValue: candidateHurst(candidate.ModelAssumptions),
-				},
-				FundingContext{
-					AverageRate: fundingCtx.AverageRate,
-					IsExtreme:   fundingCtx.IsExtreme,
-				},
-				EventContext{FearGreedExtreme: fng},
-			)
-			if smart.Direction == "WAIT" || smart.Direction == "CLOSE_ALL" {
-				worker.logger.Info("v2.0 smart direction: skip",
-					"component", "autogrid_worker", "symbol", candidate.Symbol,
-					"reason", smart.Reason)
-				continue
+			fundingInput = FundingContext{
+				AverageRate: fundingCtx.AverageRate,
+				IsExtreme:   fundingCtx.IsExtreme,
 			}
-			smartTrend = strings.ToLower(smart.Direction)
-			smartLev = smart.Leverage
-			smartReason = smart.Reason
+		}
+		smart := SelectDirection(
+			RegimeContext{
+				Regime:     regime,
+				Confidence: confluenceConfidence(candidate.ModelAssumptions),
+				HurstValue: candidateHurst(candidate.ModelAssumptions),
+			},
+			fundingInput,
+			EventContext{FearGreedExtreme: fng},
+		)
+		if smart.Direction == "WAIT" || smart.Direction == "CLOSE_ALL" {
+			worker.logger.Info("v2.0 smart direction: skip",
+				"component", "autogrid_worker", "symbol", candidate.Symbol,
+				"reason", smart.Reason)
+			continue
+		}
+		smartTrend = strings.ToLower(smart.Direction)
+		smartLev = smart.Leverage
+		smartReason = smart.Reason
+		// v2.0.15 demotion guard: the scanner demotes counter-tape trends
+		// (24h ±3% against the direction) to no_trend, but the regime string
+		// survives — SelectDirection would re-arm the demoted direction and
+		// the override below would deploy against the tape the guard exists
+		// to filter. A directional smart pick over a demoted scanner trend
+		// is a skip, not an override.
+		if (smartTrend == "long" || smartTrend == "short") &&
+			(strings.ToLower(strings.TrimSpace(candidate.RecommendedTrend)) == "no_trend" ||
+				strings.TrimSpace(candidate.RecommendedTrend) == "") {
+			worker.logger.Info("smart direction contradicts demoted scanner trend: skip",
+				"component", "autogrid_worker", "symbol", candidate.Symbol,
+				"smart", smartTrend, "scanner", candidate.RecommendedTrend)
+			continue
 		}
 
 		// Entry gate (v2.0.12): funding extreme + falling OI = forced
@@ -1150,29 +1169,42 @@ func (worker *Worker) deployReal(
 		// dead-locked RANGE candidates into WAIT), reads the regime safely,
 		// and the decision now actually overrides trend + leverage below.
 		smartTrend, smartLev, smartReason := "", 0, ""
+		fngReal, _ := worker.GetFearGreed(ctx)
+		fundingInput := FundingContext{}
 		if fundingCtx, fundErr := worker.GetFundingForSymbol(ctx, candidate.Symbol); fundErr == nil {
-			fng, _ := worker.GetFearGreed(ctx)
-			smartDir := SelectDirection(
-				RegimeContext{
-					Regime:     candidateRegime(candidate.ModelAssumptions),
-					Confidence: confluenceConfidence(candidate.ModelAssumptions),
-					HurstValue: candidateHurst(candidate.ModelAssumptions),
-				},
-				FundingContext{
-					AverageRate: fundingCtx.AverageRate,
-					IsExtreme:   fundingCtx.IsExtreme,
-				},
-				EventContext{FearGreedExtreme: fng},
-			)
-			if smartDir.Direction == "WAIT" || smartDir.Direction == "CLOSE_ALL" {
-				worker.logger.Info("v2.0 smart direction: skip",
-					"component", "autogrid_worker", "symbol", candidate.Symbol,
-					"reason", smartDir.Reason)
-				continue
+			fundingInput = FundingContext{
+				AverageRate: fundingCtx.AverageRate,
+				IsExtreme:   fundingCtx.IsExtreme,
 			}
-			smartTrend = strings.ToLower(smartDir.Direction)
-			smartLev = smartDir.Leverage
-			smartReason = smartDir.Reason
+		}
+		// v2.0.15: always run (zero funding context on gaps) — sentiment
+		// gates must not depend on funding-data availability (mirror).
+		smartDir := SelectDirection(
+			RegimeContext{
+				Regime:     candidateRegime(candidate.ModelAssumptions),
+				Confidence: confluenceConfidence(candidate.ModelAssumptions),
+				HurstValue: candidateHurst(candidate.ModelAssumptions),
+			},
+			fundingInput,
+			EventContext{FearGreedExtreme: fngReal},
+		)
+		if smartDir.Direction == "WAIT" || smartDir.Direction == "CLOSE_ALL" {
+			worker.logger.Info("v2.0 smart direction: skip",
+				"component", "autogrid_worker", "symbol", candidate.Symbol,
+				"reason", smartDir.Reason)
+			continue
+		}
+		smartTrend = strings.ToLower(smartDir.Direction)
+		smartLev = smartDir.Leverage
+		smartReason = smartDir.Reason
+		// v2.0.15 demotion guard (mirror of the paper path).
+		if (smartTrend == "long" || smartTrend == "short") &&
+			(strings.ToLower(strings.TrimSpace(candidate.RecommendedTrend)) == "no_trend" ||
+				strings.TrimSpace(candidate.RecommendedTrend) == "") {
+			worker.logger.Info("smart direction contradicts demoted scanner trend: skip real deploy",
+				"component", "autogrid_worker", "symbol", candidate.Symbol,
+				"smart", smartTrend, "scanner", candidate.RecommendedTrend)
+			continue
 		}
 		// Walk-forward backtest gate: the traded TF must have earned a fresh
 		// non-negative OOS verdict with bounded drawdown, and no neighbor TF
@@ -1403,6 +1435,20 @@ func (worker *Worker) deployReal(
 		// by Pionex itself (profit_amount), so it survives even if this
 		// process is down. The management loop double-checks it locally.
 		botTarget, botMaxLoss := computeBotTargets(settings, candidate)
+		if settings.TrancheDeployEnabled {
+			// v2.0.15 (restored — the v2.0.13 patch was lost to a failed
+			// batch): tranche 1 commits HALF the capital, so native
+			// ProfitStop and the stored per-bot targets must be half too;
+			// the invest_in top-up doubles them back.
+			if botTarget != nil {
+				half := botTarget.Div(decimal.NewFromInt(2))
+				botTarget = &half
+			}
+			if botMaxLoss != nil {
+				half := botMaxLoss.Div(decimal.NewFromInt(2))
+				botMaxLoss = &half
+			}
+		}
 		if botTarget != nil && botTarget.GreaterThan(decimal.Zero) {
 			targetVal := botTarget.Round(2)
 			data.ProfitStopType = "profit_amount"
@@ -1925,7 +1971,18 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 		realized := remote.BUOrderData.ProfitWithdrawn
 		unrealized := decimal.Zero
 		if !remote.BUOrderData.Position.IsZero() && price.GreaterThan(decimal.Zero) {
-			unrealized = remote.BUOrderData.Position.Mul(price.Sub(remote.BUOrderData.PositionOpenPrice))
+			position := remote.BUOrderData.Position
+			// Pionex may report the grid position as an unsigned magnitude
+			// even for short grids. If a SHORT reports a positive position,
+			// treat it as a magnitude and negate: profit for a short is
+			// open−price, and an unsigned feed would otherwise invert every
+			// short bot's PnL (closing winners, holding losers). A signed
+			// feed (negative position) already encodes the side and passes
+			// through unchanged.
+			if bot.direction == "SHORT" && position.IsPositive() {
+				position = position.Neg()
+			}
+			unrealized = position.Mul(price.Sub(remote.BUOrderData.PositionOpenPrice))
 		}
 
 		// A durable stop intent (grid.stop / autogrid.stop / manual close)
@@ -2069,6 +2126,7 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 							UPDATE grid_bots
 							SET pnl_target_usdt = pnl_target_usdt * 2,
 							    max_loss_usdt = max_loss_usdt * 2,
+							    peak_pnl_usdt = peak_pnl_usdt * 2,
 							    model_state = jsonb_set(model_state, '{trancheDeployed}', '2'::jsonb),
 							    updated_at = NOW()
 							WHERE id = $1
@@ -2151,12 +2209,26 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 				worker.logger.Error("adjust native grid range",
 					"component", "autogrid_worker", "bot_id", bot.id, "error", err)
 			} else {
+				// v2.0.15: move the local anti-hunt stop with the range
+				// (same distance-beyond-bound as at deploy) — the native
+				// exchange stop cannot be updated via adjust_params, and a
+				// stale local stop would stop gating anything.
+				setStop := ""
+				var stopArg []any
+				if bot.antiHuntStop != nil && bot.antiHuntStop.GreaterThan(decimal.Zero) {
+					newStop := decision.NewLower.Sub(bot.lower.Sub(*bot.antiHuntStop))
+					if bot.direction == "SHORT" {
+						newStop = decision.NewUpper.Add(bot.antiHuntStop.Sub(bot.upper))
+					}
+					setStop = ", anti_hunt_stop_price = $4"
+					stopArg = append(stopArg, newStop)
+				}
 				_, _ = worker.db.Exec(ctx, `
 					UPDATE grid_bots
 					SET lower_price = $2, upper_price = $3,
-					    adjustments_count = adjustments_count + 1, updated_at = NOW()
+					    adjustments_count = adjustments_count + 1`+setStop+`, updated_at = NOW()
 					WHERE id = $1
-				`, bot.id, decision.NewLower, decision.NewUpper)
+				`, append([]any{bot.id, decision.NewLower, decision.NewUpper}, stopArg...)...)
 				worker.logger.Info("adjusted native grid range",
 					"component", "autogrid_worker", "symbol", bot.symbol,
 					"lower", decision.NewLower.String(), "upper", decision.NewUpper.String())
@@ -2660,15 +2732,36 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 			if exitNotional.IsPositive() {
 				shiftRealized = shiftRealized.Add(exitNotional.Mul(feeRate))
 			}
+			// v2.0.15 re-anchors, applied as extra SET clauses after the
+			// fixed $1..$6 parameters:
+			//   1. directional grids re-anchor entry_price — their
+			//      unrealized is re-derived from entry every tick, so
+			//      without it each shift double-counts position PnL;
+			//   2. the anti-hunt stop moves with the range, preserving its
+			//      deploy-time distance-beyond-bound — a stale deploy stop
+			//      drifts away from the shifted bounds and protects nothing.
+			setClauses := ""
+			var extraArgs []any
+			if bot.direction != "NEUTRAL" {
+				setClauses += fmt.Sprintf(", entry_price = $%d", 7+len(extraArgs))
+				extraArgs = append(extraArgs, price)
+			}
+			if bot.antiHuntStop != nil && bot.antiHuntStop.GreaterThan(decimal.Zero) {
+				newStop := decision.NewLower.Sub(bot.lower.Sub(*bot.antiHuntStop))
+				if bot.direction == "SHORT" {
+					newStop = decision.NewUpper.Add(bot.antiHuntStop.Sub(bot.upper))
+				}
+				setClauses += fmt.Sprintf(", anti_hunt_stop_price = $%d", 7+len(extraArgs))
+				extraArgs = append(extraArgs, newStop)
+			}
 			_, _ = worker.db.Exec(ctx, `
 				UPDATE paper_grid_bots
 				SET lower_price = $2, upper_price = $3,
 				    adjustments_count = adjustments_count + 1,
 				    mark_price = $4, unrealized_pnl_usdt = 0,
-				    realized_pnl_usdt = $5, last_grid_level = $6,
-				    updated_at = NOW()
+				    realized_pnl_usdt = $5, last_grid_level = $6`+setClauses+`
 				WHERE id = $1
-			`, bot.id, decision.NewLower, decision.NewUpper, price, shiftRealized, newLevel)
+			`, append([]any{bot.id, decision.NewLower, decision.NewUpper, price, shiftRealized, newLevel}, extraArgs...)...)
 
 			worker.logger.Info("adjusted paper grid range on the fly",
 				"component", "autogrid_worker", "symbol", bot.symbol,

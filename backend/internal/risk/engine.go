@@ -137,6 +137,58 @@ func (e *Engine) ValidateNewGrid(
 	return nil
 }
 
+// ValidateGridTopUp validates additional margin on an EXISTING grid (the
+// tranche-2 invest_in path). It applies every durable gate ValidateNewGrid
+// enforces EXCEPT the active-bot count: a top-up does not create a bot, and
+// counting the funded bot against MaxActiveGridBots would reject every
+// top-up in a full fleet.
+func (e *Engine) ValidateGridTopUp(
+	ctx context.Context,
+	accountID, symbol string,
+	requestedLeverage int,
+	additionalUSD decimal.Decimal,
+) error {
+	if err := e.ValidateNewOrder(ctx, requestedLeverage, additionalUSD); err != nil {
+		return err
+	}
+	if err := e.ValidateDailyLoss(ctx); err != nil {
+		return err
+	}
+	settings, err := e.LoadSettings(ctx)
+	if err != nil {
+		return err
+	}
+	var accountExposure, symbolExposure decimal.Decimal
+	err = e.db.QueryRow(ctx, `
+		SELECT
+			COALESCE(SUM(quote_investment), 0),
+			COALESCE(SUM(quote_investment) FILTER (WHERE symbol = $2), 0)
+		FROM grid_bots
+		WHERE account_id = $1
+		  AND status IN (
+			'PENDING_SUBMISSION', 'SUBMISSION_UNKNOWN', 'RUNNING',
+			'STOP_REQUESTED', 'STOPPING'
+		  )
+	`, accountID, symbol).Scan(&accountExposure, &symbolExposure)
+	if err != nil {
+		return fmt.Errorf("risk engine: load active grid exposure: %w", err)
+	}
+	if accountExposure.Add(additionalUSD).GreaterThan(settings.MaxAccountExposureUSD) {
+		return fmt.Errorf(
+			"%w: current %s + requested %s, max %s",
+			ErrExposureLimitExceeded, accountExposure, additionalUSD,
+			settings.MaxAccountExposureUSD,
+		)
+	}
+	if symbolExposure.Add(additionalUSD).GreaterThan(settings.MaxSymbolExposureUSD) {
+		return fmt.Errorf(
+			"risk engine: symbol exposure limit exceeded: current %s + requested %s, max %s",
+			symbolExposure, additionalUSD, settings.MaxSymbolExposureUSD,
+		)
+	}
+	return nil
+}
+
 // UpdateSettings persists the complete risk policy atomically.
 func (e *Engine) UpdateSettings(ctx context.Context, settings RiskSettings) (*RiskSettings, error) {
 	if settings.MaxLeverage < 1 || settings.MaxLeverage > 100 {
