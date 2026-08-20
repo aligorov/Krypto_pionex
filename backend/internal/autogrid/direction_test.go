@@ -220,14 +220,26 @@ func TestSelectDirectionBlockingGates(t *testing.T) {
 		t.Errorf("expected WAIT on high-impact event, got %s (reason: %s)", decision.Direction, decision.Reason)
 	}
 
-	// Liquidation cascade -> WAIT regardless of regime (even a perfect SHORT setup)
+	// Liquidation cascade (v2.0.21 semantics): a long-side unwind is the
+	// SHORT participation window — TREND_DOWN shorts stay live; the shapes
+	// that would load the knife (LONG/NEUTRAL) wait. The blanket freeze was
+	// the 2026-08-20 audit finding: it surrendered the best short entries
+	// of the cycle exactly when they set up.
 	decision = SelectDirection(
 		RegimeContext{Regime: "TREND_DOWN", Confidence: 0.9, HurstValue: 0.7},
 		FundingContext{AverageRate: 0.0005},
 		EventContext{LiquidationCascade: true},
 	)
+	if decision.Direction != "SHORT" {
+		t.Errorf("expected SHORT through a liquidation cascade in TREND_DOWN, got %s (reason: %s)", decision.Direction, decision.Reason)
+	}
+	decision = SelectDirection(
+		RegimeContext{Regime: "RANGE", Confidence: 0.9, HurstValue: 0.4},
+		FundingContext{AverageRate: 0.0},
+		EventContext{LiquidationCascade: true},
+	)
 	if decision.Direction != "WAIT" {
-		t.Errorf("expected WAIT on liquidation cascade, got %s (reason: %s)", decision.Direction, decision.Reason)
+		t.Errorf("expected WAIT on liquidation cascade for NEUTRAL (knife loading), got %s (reason: %s)", decision.Direction, decision.Reason)
 	}
 
 	// Both gates + fear/greed extreme still -> WAIT
@@ -343,5 +355,82 @@ func TestShouldResetGridBreakout(t *testing.T) {
 	plan = ShouldResetGrid("NEUTRAL", lower, upper, decimal.NewFromFloat(111.1), bufferPct, 3)
 	if plan != nil {
 		t.Errorf("expected nil exactly at boundary, got %s", plan.Action)
+	}
+}
+
+func TestSelectDirectionCascadeShortWindow(t *testing.T) {
+	regimeDown := RegimeContext{Regime: "TREND_DOWN"}
+	// Active cascade overrides the FNG panic freeze for shorts — the forced
+	// unwind window is the short entry, freezing it surrenders the cycle.
+	got := SelectDirection(regimeDown, FundingContext{}, EventContext{
+		FearGreedExtreme: 8, LiquidationCascade: true,
+	})
+	if got.Direction != "SHORT" {
+		t.Fatalf("cascade must allow SHORT through panic, got %q (%s)", got.Direction, got.Reason)
+	}
+	// Without a cascade the panic freeze holds (v2.0.14 semantics).
+	got = SelectDirection(regimeDown, FundingContext{}, EventContext{FearGreedExtreme: 8})
+	if got.Direction != "WAIT" {
+		t.Fatalf("panic without cascade must freeze directionals, got %q", got.Direction)
+	}
+	// NEUTRAL must not load the knife during a cascade.
+	got = SelectDirection(RegimeContext{Regime: "RANGE", HurstValue: 0.4}, FundingContext{},
+		EventContext{LiquidationCascade: true})
+	if got.Direction != "WAIT" {
+		t.Fatalf("cascade must freeze NEUTRAL (knife loading), got %q", got.Direction)
+	}
+	// LONG in TREND_UP stays frozen during a long-side cascade.
+	got = SelectDirection(RegimeContext{Regime: "TREND_UP"}, FundingContext{},
+		EventContext{LiquidationCascade: true})
+	if got.Direction != "WAIT" {
+		t.Fatalf("cascade must freeze LONG, got %q", got.Direction)
+	}
+}
+
+func TestSelectDirectionFundingCarry(t *testing.T) {
+	rng := RegimeContext{Regime: "RANGE", HurstValue: 0.45}
+	// Stable positive carry → paid to hold short.
+	got := SelectDirection(rng, FundingContext{Avg48h: 0.0005, Stable48h: true}, EventContext{})
+	if got.Direction != "SHORT" {
+		t.Fatalf("stable positive carry must pick SHORT, got %q (%s)", got.Direction, got.Reason)
+	}
+	// Stable negative carry → paid to hold long.
+	got = SelectDirection(rng, FundingContext{Avg48h: -0.0005, Stable48h: true}, EventContext{})
+	if got.Direction != "LONG" {
+		t.Fatalf("stable negative carry must pick LONG, got %q", got.Direction)
+	}
+	// Unstable or trivial carry → neutral as before.
+	got = SelectDirection(rng, FundingContext{Avg48h: 0.0005, Stable48h: false}, EventContext{})
+	if got.Direction != "NEUTRAL" {
+		t.Fatalf("unstable carry must stay NEUTRAL, got %q", got.Direction)
+	}
+	got = SelectDirection(rng, FundingContext{Avg48h: 0.0001, Stable48h: true}, EventContext{})
+	if got.Direction != "NEUTRAL" {
+		t.Fatalf("trivial carry must stay NEUTRAL, got %q", got.Direction)
+	}
+	// Extreme spot rate vetoes carry even when the 48h average is stable.
+	got = SelectDirection(rng, FundingContext{Avg48h: 0.0005, Stable48h: true, IsExtreme: true}, EventContext{})
+	if got.Direction != "NEUTRAL" {
+		t.Fatalf("extreme funding must veto carry, got %q", got.Direction)
+	}
+}
+
+func TestBetaGateTrend(t *testing.T) {
+	if down, up := betaGateTrend("TREND_DOWN", 30, -1.2); !down || up {
+		t.Fatalf("BTC downtrend must gate down-only, got down=%v up=%v", down, up)
+	}
+	if down, up := betaGateTrend("TREND_UP", 30, 0.9); down || !up {
+		t.Fatalf("BTC uptrend must gate up-only, got down=%v up=%v", down, up)
+	}
+	// Below the stricter activation band the gate stays off (DetectRegime
+	// calls a trend at ADX≥22; the gate needs ≥25 plus a real slope).
+	if down, up := betaGateTrend("TREND_DOWN", 23, -1.2); down || up {
+		t.Fatalf("ADX 23 must not activate the beta gate, got down=%v up=%v", down, up)
+	}
+	if down, up := betaGateTrend("TREND_DOWN", 30, -0.2); down || up {
+		t.Fatalf("flat slope must not activate the beta gate, got down=%v up=%v", down, up)
+	}
+	if down, up := betaGateTrend("RANGE", 40, 2.0); down || up {
+		t.Fatalf("RANGE must never activate the gate, got down=%v up=%v", down, up)
 	}
 }

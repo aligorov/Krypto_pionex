@@ -59,6 +59,15 @@ type Worker struct {
 	// 60M klines batch per manage tick for as long as the tape trends.
 	// The manage loop is single-goroutine, so a plain map is race-free.
 	trancheTBRegime map[string]trancheTBTrend
+	// betaRegime caches the BTC market regime behind the v2.0.21 beta
+	// gate (same single-goroutine argument as trancheTBRegime).
+	betaRegime betaRegimeCache
+	// cascadeShortWindow is set for the duration of an out-of-turn
+	// cascade-triggered scan: shorts are the wanted product of that scan
+	// (relaxed anti-FOMO floors, flush-gate exemption for shorts,
+	// non-short candidates rejected). Command processing is
+	// single-goroutine, so a plain bool is race-free.
+	cascadeShortWindow bool
 }
 
 type trancheTBTrend struct {
@@ -66,10 +75,18 @@ type trancheTBTrend struct {
 	trending  bool
 }
 
+type betaRegimeCache struct {
+	checkedAt time.Time
+	regime    string
+	adx       float64
+	emaSlope  float64
+}
+
 type queuedCommand struct {
 	ID          string
 	CommandType string
 	ActorID     *string
+	Arguments   map[string]any
 }
 
 func NewWorker(
@@ -235,8 +252,8 @@ func (worker *Worker) claim(ctx context.Context) (*queuedCommand, error) {
 		    attempts = attempts + 1, updated_at = NOW()
 		FROM next_command
 		WHERE command.id = next_command.id
-		RETURNING command.id, command.command_type, command.actor_id
-	`, worker.owner).Scan(&command.ID, &command.CommandType, &command.ActorID)
+		RETURNING command.id, command.command_type, command.actor_id, command.arguments
+	`, worker.owner).Scan(&command.ID, &command.CommandType, &command.ActorID, &command.Arguments)
 	if err != nil {
 		return nil, err
 	}
@@ -306,6 +323,16 @@ func (worker *Worker) scanAndDeploy(
 	if err != nil {
 		return "", err
 	}
+	// v2.0.21 cascade-triggered scan: an out-of-turn scan queued while a
+	// long-liquidation cascade runs — shorts are the product of this pass.
+	cascadeShort := false
+	if command.Arguments != nil {
+		if flag, ok := command.Arguments["cascadeShort"].(bool); ok {
+			cascadeShort = flag
+		}
+	}
+	worker.cascadeShortWindow = cascadeShort
+	defer func() { worker.cascadeShortWindow = false }()
 	requestedBy := ""
 	if command.ActorID != nil {
 		requestedBy = *command.ActorID
@@ -314,7 +341,9 @@ func (worker *Worker) scanAndDeploy(
 	if err != nil {
 		return "", err
 	}
-	candidates, err := worker.scanner.ScanMarkets(ctx, worker.service.scannerConfig(*settings))
+	scanConfig := worker.service.scannerConfig(*settings)
+	scanConfig.CascadeShortMode = cascadeShort
+	candidates, err := worker.scanner.ScanMarkets(ctx, scanConfig)
 	if err != nil {
 		worker.service.FailScan(ctx, scanID, err)
 		return scanID, err
@@ -658,6 +687,11 @@ func (worker *Worker) deployPaper(
 		worker.noteDeployBlock(ctx, fmt.Sprintf("каскад ликвидаций лонгов $%.0fM/час — LONG/NEUTRAL деплои на паузе, SHORT доступны", cascadeUSD/1_000_000))
 	}
 	fng, _ := worker.GetFearGreed(ctx)
+	// v2.0.21 global beta gate: BTC's tape gates altcoin NEUTRAL/LONG
+	// entries — the 2026-08-20 stops were local-RANGE alts loading long
+	// inventory into a market-wide bleed.
+	betaName, betaADX, betaSlope := worker.marketBetaRegime(ctx)
+	betaDown, betaUp := betaGateTrend(betaName, betaADX, betaSlope)
 	backtestGateOn := worker.backtestGateEnabled(ctx)
 	for _, candidate := range candidates {
 		if candidate.Decision != "ACCEPTED" {
@@ -694,6 +728,9 @@ func (worker *Worker) deployPaper(
 			}
 			fundingKnown = true
 		}
+		// v2.0.21 carry picture: 48h stable funding turns RANGE into a
+		// paid-to-hold directional pick (paper mirror of the REAL path).
+		fundingInput.Avg48h, _, fundingInput.Stable48h = worker.fundingStats48h(ctx, candidate.Symbol)
 		smart := SelectDirection(
 			RegimeContext{
 				Regime:     regime,
@@ -701,7 +738,7 @@ func (worker *Worker) deployPaper(
 				HurstValue: candidateHurst(candidate.ModelAssumptions),
 			},
 			fundingInput,
-			EventContext{FearGreedExtreme: fng},
+			EventContext{FearGreedExtreme: fng, LiquidationCascade: worker.cascadeShortWindow},
 		)
 		if smart.Direction == "WAIT" || smart.Direction == "CLOSE_ALL" {
 			worker.rejectCandidate(ctx, candidate, "smart direction: "+smart.Reason, nil)
@@ -745,10 +782,14 @@ func (worker *Worker) deployPaper(
 		// deleveraging in progress. This is the CAUSE of falling knives —
 		// RSI/ADX/Hurst all lag a fresh dump. Block only while the flush
 		// runs; once OI stabilizes the gate lifts on its own.
-		if blocked, why := worker.fundingFlushBlocked(ctx, candidate.Symbol, candidate.FundingRate); blocked {
+		// v2.0.21: in a cascade-short window the flush is exactly the short
+		// entry — the gate would block the trade it exists to enable.
+		flushBlocked, flushWhy := worker.fundingFlushBlocked(ctx, candidate.Symbol, candidate.FundingRate)
+		scannerShort := strings.EqualFold(strings.TrimSpace(candidate.RecommendedTrend), "short")
+		if flushBlocked && !(worker.cascadeShortWindow && scannerShort) {
 			worker.logger.Info("entry gate: funding flush in progress, skip",
-				"component", "autogrid_worker", "symbol", candidate.Symbol, "reason", why)
-			worker.rejectCandidate(ctx, candidate, "entry gate: "+why, nil)
+				"component", "autogrid_worker", "symbol", candidate.Symbol, "reason", flushWhy)
+			worker.rejectCandidate(ctx, candidate, "entry gate: "+flushWhy, nil)
 			continue
 		}
 
@@ -889,6 +930,27 @@ func (worker *Worker) deployPaper(
 			worker.rejectCandidate(ctx, candidate, fmt.Sprintf(
 				"каскад ликвидаций лонгов $%.0fM/час — входы LONG/NEUTRAL на паузе (SHORT доступны)",
 				cascadeUSD/1_000_000), nil)
+			continue
+		}
+		// v2.0.21 cascade-short window: this out-of-turn scan exists to
+		// deploy shorts into the forced unwind — everything else waits for
+		// the regular scheduler.
+		if worker.cascadeShortWindow && trend != "short" {
+			worker.rejectCandidate(ctx, candidate,
+				"каскад-триггер: внеочередной скан деплоит только SHORT-кандидаты", nil)
+			continue
+		}
+		// v2.0.21 beta gate.
+		if betaDown && trend != "short" {
+			worker.rejectCandidate(ctx, candidate,
+				fmt.Sprintf("beta gate: BTC %s (ADX %.0f, slope %.2f%%) — NEUTRAL/LONG деплои на паузе, SHORT доступны",
+					betaName, betaADX, betaSlope), nil)
+			continue
+		}
+		if betaUp && trend == "short" {
+			worker.rejectCandidate(ctx, candidate,
+				fmt.Sprintf("beta gate: BTC %s (ADX %.0f, slope +%.2f%%) — SHORT деплой против растущего рынка на паузе",
+					betaName, betaADX, betaSlope), nil)
 			continue
 		}
 		atrPrice := candidate.CurrentPrice.Mul(decimal.NewFromFloat(atrPct / 100.0))
@@ -1200,11 +1262,14 @@ func (worker *Worker) deployReal(
 			continue
 		}
 		// Entry gate (v2.0.12): funding extreme + falling OI = forced
-		// deleveraging in progress (mirror of the paper path).
-		if blocked, why := worker.fundingFlushBlocked(ctx, candidate.Symbol, candidate.FundingRate); blocked {
+		// deleveraging in progress (mirror of the paper path; v2.0.21
+		// cascade-short exemption for scanner-shorts, same as paper).
+		flushBlockedReal, flushWhyReal := worker.fundingFlushBlocked(ctx, candidate.Symbol, candidate.FundingRate)
+		scannerShortReal := strings.EqualFold(strings.TrimSpace(candidate.RecommendedTrend), "short")
+		if flushBlockedReal && !(worker.cascadeShortWindow && scannerShortReal) {
 			worker.logger.Info("entry gate: funding flush in progress, skip real deploy",
-				"component", "autogrid_worker", "symbol", candidate.Symbol, "reason", why)
-			worker.rejectCandidate(ctx, candidate, "entry gate: "+why, nil)
+				"component", "autogrid_worker", "symbol", candidate.Symbol, "reason", flushWhyReal)
+			worker.rejectCandidate(ctx, candidate, "entry gate: "+flushWhyReal, nil)
 			continue
 		}
 		if ok, reason := worker.revalidateCandidateTrend(ctx, &candidate, settings); !ok {
@@ -1220,6 +1285,8 @@ func (worker *Worker) deployReal(
 		// and the decision now actually overrides trend + leverage below.
 		smartTrend, smartLev, smartReason := "", 0, ""
 		fngReal, _ := worker.GetFearGreed(ctx)
+		betaNameReal, betaADXReal, betaSlopeReal := worker.marketBetaRegime(ctx)
+		betaDownReal, betaUpReal := betaGateTrend(betaNameReal, betaADXReal, betaSlopeReal)
 		fundingKnownReal := false
 		fundingInput := FundingContext{}
 		if fundingCtx, fundErr := worker.GetFundingForSymbol(ctx, candidate.Symbol); fundErr == nil {
@@ -1229,6 +1296,8 @@ func (worker *Worker) deployReal(
 			}
 			fundingKnownReal = true
 		}
+		// v2.0.21 carry picture (REAL mirror).
+		fundingInput.Avg48h, _, fundingInput.Stable48h = worker.fundingStats48h(ctx, candidate.Symbol)
 		// v2.0.15: always run (zero funding context on gaps) — sentiment
 		// gates must not depend on funding-data availability (mirror).
 		smartDir := SelectDirection(
@@ -1238,7 +1307,7 @@ func (worker *Worker) deployReal(
 				HurstValue: candidateHurst(candidate.ModelAssumptions),
 			},
 			fundingInput,
-			EventContext{FearGreedExtreme: fngReal},
+			EventContext{FearGreedExtreme: fngReal, LiquidationCascade: worker.cascadeShortWindow},
 		)
 		if smartDir.Direction == "WAIT" || smartDir.Direction == "CLOSE_ALL" {
 			worker.rejectCandidate(ctx, candidate, "smart direction: "+smartDir.Reason, nil)
@@ -1421,6 +1490,25 @@ func (worker *Worker) deployReal(
 			worker.rejectCandidate(ctx, candidate, fmt.Sprintf(
 				"каскад ликвидаций лонгов $%.0fM/час — входы LONG/NEUTRAL на паузе (SHORT доступны)",
 				cascadeUSD/1_000_000), nil)
+			continue
+		}
+		// v2.0.21 cascade-short window (REAL mirror).
+		if worker.cascadeShortWindow && trend != "short" {
+			worker.rejectCandidate(ctx, candidate,
+				"каскад-триггер: внеочередной скан деплоит только SHORT-кандидаты", nil)
+			continue
+		}
+		// v2.0.21 beta gate (REAL mirror).
+		if betaDownReal && trend != "short" {
+			worker.rejectCandidate(ctx, candidate,
+				fmt.Sprintf("beta gate: BTC %s (ADX %.0f, slope %.2f%%) — NEUTRAL/LONG деплои на паузе, SHORT доступны",
+					betaNameReal, betaADXReal, betaSlopeReal), nil)
+			continue
+		}
+		if betaUpReal && trend == "short" {
+			worker.rejectCandidate(ctx, candidate,
+				fmt.Sprintf("beta gate: BTC %s (ADX %.0f, slope +%.2f%%) — SHORT деплой против растущего рынка на паузе",
+					betaNameReal, betaADXReal, betaSlopeReal), nil)
 			continue
 		}
 
@@ -1903,6 +1991,7 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 		worker.logger.Error("manage paper bots", "component", "autogrid_worker", "error", err)
 	}
 	worker.autotuneIfDue(ctx, *settings)
+	worker.maybeQueueCascadeShortScan(ctx, *settings)
 	// Pin the implicitly resolved account into settings when possible so
 	// deploys and supervision stay on the same account. Supervision itself
 	// must not depend on it: real bots carry their own account_id and are
@@ -3095,6 +3184,68 @@ func (worker *Worker) regimeForSymbol(ctx context.Context, symbol string) string
 	return marketdata.DetectRegime(candles).Regime
 }
 
+// betaGateTrend is the pure policy core of the v2.0.21 global beta gate:
+// BTC's own tape decides whether altcoin NEUTRAL/LONG grids may open.
+// Alts mean-revert locally while the market bleeds — every 2026-08-20 stop
+// (IRENX/RIVER: local RANGE, market −3..−12%) was a neutral grid loading
+// long inventory against BTC's trend. Activation is deliberately stricter
+// than DetectRegime's ADX≥22: ADX≥25 plus a real slope.
+func betaGateTrend(regime string, adx, emaSlopePct float64) (down, up bool) {
+	if adx < 25 {
+		return false, false
+	}
+	switch regime {
+	case "TREND_DOWN":
+		return emaSlopePct < -0.5, false
+	case "TREND_UP":
+		return false, emaSlopePct > 0.5
+	}
+	return false, false
+}
+
+// marketBetaRegime caches BTC's regime for 5 minutes; the deploy paths ask
+// for it once per candidate loop.
+func (worker *Worker) marketBetaRegime(ctx context.Context) (string, float64, float64) {
+	if time.Since(worker.betaRegime.checkedAt) < 5*time.Minute {
+		return worker.betaRegime.regime, worker.betaRegime.adx, worker.betaRegime.emaSlope
+	}
+	candles, err := worker.publicClient.GetKlines(ctx, "BTC_USDT_PERP", "60M", 60)
+	if err != nil || len(candles) < 30 {
+		// Fail-open: no BTC reading → no gate (the per-symbol gates still run).
+		return "", 0, 0
+	}
+	result := marketdata.DetectRegime(candles)
+	worker.betaRegime = betaRegimeCache{
+		checkedAt: time.Now(),
+		regime:    result.Regime,
+		adx:       result.ADX,
+		emaSlope:  result.EMASlopePct,
+	}
+	return result.Regime, result.ADX, result.EMASlopePct
+}
+
+// fundingStats48h returns the stable carry picture for a symbol: the 48h
+// average per-8h rate qualifies as a carry setup when it is non-trivial,
+// sampled densely enough, and not dominated by its own variance.
+func (worker *Worker) fundingStats48h(ctx context.Context, symbol string) (avg, stddev float64, stable bool) {
+	var samples int
+	if err := worker.db.QueryRow(ctx, `
+		SELECT AVG(funding_rate), COALESCE(STDDEV_POP(funding_rate), 0), COUNT(*)
+		FROM funding_snapshots
+		WHERE symbol = $1 AND captured_at > NOW() - INTERVAL '48 hours'
+	`, symbol).Scan(&avg, &stddev, &samples); err != nil || samples < 12 {
+		return 0, 0, false
+	}
+	magnitude := math.Abs(avg)
+	if magnitude < fundingCarryThreshold {
+		return avg, stddev, false
+	}
+	if magnitude >= 0.001 {
+		return avg, stddev, false // extreme territory is a squeeze window, not carry
+	}
+	return avg, stddev, stddev < 0.6*magnitude
+}
+
 func clampInterval(seconds int) int {
 	if seconds < 15 {
 		return 15
@@ -3103,6 +3254,57 @@ func clampInterval(seconds int) int {
 		return 3600
 	}
 	return seconds
+}
+
+// maybeQueueCascadeShortScan (v2.0.21) turns the long-liquidation cascade
+// detector from a passive freeze into the short side's entry trigger: while
+// forced unwinding runs, an out-of-turn scan with cascadeShort semantics is
+// queued at most once per 15 minutes. Latency from cascade start to a
+// deployed SHORT grid drops from hours (waiting for the scheduled scan to
+// see post-dump candidates that anti-FOMO then rejects as oversold) to
+// ~10-15 minutes.
+func (worker *Worker) maybeQueueCascadeShortScan(ctx context.Context, settings Settings) {
+	if settings.Status != "RUNNING" {
+		return
+	}
+	cascade, cascadeUSD := worker.CheckLiquidationCascade(ctx, 50_000_000)
+	if !cascade {
+		return
+	}
+	var scanRecently bool
+	if err := worker.db.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM control_commands
+			WHERE command_type = 'autogrid.scan'
+			  AND status IN ('QUEUED', 'EXECUTING')
+			  AND created_at > NOW() - INTERVAL '10 minutes'
+		)
+	`).Scan(&scanRecently); err == nil && scanRecently {
+		return
+	}
+	bucket := time.Now().Unix() / (15 * 60)
+	tag, err := worker.db.Exec(ctx, `
+		INSERT INTO control_commands (
+			actor_type, command_type, resource_type, resource_id,
+			arguments, sanitized_arguments, idempotency_key, status
+		) VALUES (
+			'SYSTEM', 'autogrid.scan', 'autogrid', $1,
+			'{"cascadeShort": true}'::jsonb, '{}'::jsonb, $2, 'QUEUED'
+		)
+		ON CONFLICT (idempotency_key) DO NOTHING
+	`, settings.ID, fmt.Sprintf("cascade-short-%s-%d", settings.ID, bucket))
+	if err != nil {
+		worker.logger.Error("queue cascade-short scan",
+			"component", "autogrid_worker", "error", err)
+		return
+	}
+	if tag.RowsAffected() > 0 {
+		worker.logger.Warn("cascade-short scan queued: forced unwind window detected",
+			"component", "autogrid_worker", "usd_1h", cascadeUSD)
+		worker.noteDeployBlock(ctx, fmt.Sprintf(
+			"каскад ликвидаций $%.0fM/час: внеочередной SHORT-скан поставлен (LONG/NEUTRAL на паузе)",
+			cascadeUSD/1_000_000))
+	}
 }
 
 func (worker *Worker) scheduleDueScan(ctx context.Context) error {

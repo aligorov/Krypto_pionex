@@ -68,6 +68,13 @@ type ScanConfig struct {
 	BaseLeverage        int
 	AdaptiveLeverage    bool
 	GridType            string
+	// CascadeShortMode (v2.0.21) marks an out-of-turn scan queued during a
+	// long-liquidation cascade: short-side anti-FOMO floors are lifted for
+	// that pass — by definition every symbol is oversold at the channel
+	// bottom during forced unwinding, and the floors would reject exactly
+	// the continuation entries this scan exists to deploy. All other
+	// vetoes (volatility caps, LONG floors, Hurst, backtest) stay armed.
+	CascadeShortMode bool
 }
 
 type MarketClient interface {
@@ -450,15 +457,21 @@ func scoreCandidate(
 			reasons = append(reasons, fmt.Sprintf("Anti-FOMO: положение в канале (%.1f%%) > %.0f%% - вход в LONG выше середины заблокирован", regime.RangePositionPct, posCap))
 		}
 	} else if recommendedTrend == "short" {
-		rsiFloor, posFloor := 42.0, 60.0
-		if strongTrend {
-			rsiFloor, posFloor = 35.0, 40.0
-		}
-		if regime.RSI < rsiFloor {
-			reasons = append(reasons, fmt.Sprintf("Anti-FOMO: RSI (%.1f) < %.0f - пара перепродана, вход в SHORT на локальном дне заблокирован", regime.RSI, rsiFloor))
-		}
-		if regime.RangePositionPct < posFloor {
-			reasons = append(reasons, fmt.Sprintf("Anti-FOMO: положение в канале (%.1f%%) < %.0f%% - вход в SHORT ниже середины заблокирован", regime.RangePositionPct, posFloor))
+		if config.CascadeShortMode {
+			// v2.0.21 cascade window: skip the RSI/position floors for
+			// shorts (see ScanConfig.CascadeShortMode) — the oversold
+			// reading IS the signal during a forced unwind.
+		} else {
+			rsiFloor, posFloor := 42.0, 60.0
+			if strongTrend {
+				rsiFloor, posFloor = 35.0, 40.0
+			}
+			if regime.RSI < rsiFloor {
+				reasons = append(reasons, fmt.Sprintf("Anti-FOMO: RSI (%.1f) < %.0f - пара перепродана, вход в SHORT на локальном дне заблокирован", regime.RSI, rsiFloor))
+			}
+			if regime.RangePositionPct < posFloor {
+				reasons = append(reasons, fmt.Sprintf("Anti-FOMO: положение в канале (%.1f%%) < %.0f%% - вход в SHORT ниже середины заблокирован", regime.RangePositionPct, posFloor))
+			}
 		}
 	} else {
 		// NEUTRAL grid
