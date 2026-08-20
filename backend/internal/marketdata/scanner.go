@@ -431,12 +431,13 @@ func scoreCandidate(
 	}
 
 	// Anti-FOMO Overbought / Oversold protection. v2.0.14: the LONG/SHORT
-	// bands widen when ADX > 30 — a genuine trend carries RSI/channel
-	// position persistently high (or low), and the static bands made
-	// directional entries unreachable for the entire duration of every
-	// walking rally or dump. "Trending" and "overextended" are different
-	// states; the ADX gate separates them. NEUTRAL bands stay static.
-	strongTrend := regime.ADX > 30.0
+	// bands widen in a genuine trend — "trending" and "overextended" are
+	// different states; the ADX gate separates them. NEUTRAL bands stay
+	// static. v2.0.19: threshold 25 (was 30) — DetectRegime calls a trend
+	// at ADX ≥ 22, and the 22–30 dead zone left directionals unreachable
+	// for the entire duration of every moderate trend (prod: PRL/SNXXX
+	// SHORT rejections at RSI 39/pos 43 in confirmed TREND_DOWN).
+	strongTrend := regime.ADX > 25.0
 	if recommendedTrend == "long" {
 		rsiCap, posCap := 58.0, 40.0
 		if strongTrend {

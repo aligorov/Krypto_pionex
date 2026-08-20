@@ -27,6 +27,14 @@ const (
 
 type DynamicTargetsInput struct {
 	Budget float64
+	// Leverage scales the USDT amounts to the exposure the PnL model
+	// actually measures: mark-to-market computes directional PnL on
+	// budget×leverage notional, so an unscaled 1%-of-budget stop fires on a
+	// ~0.5% price move at 2x and ~0.25% at 4x — pure noise (prod: SHORT
+	// #328 STOP_LOSS 45 minutes after deploy). Scaling both amounts keeps
+	// the stop distance in PRICE terms constant across leverage while
+	// preserving the RR ratio. 0 or 1 = unscaled (1x).
+	Leverage int
 	// AIVolatilityPct / AIDrawdownPct come from the native Pionex AI Kit
 	// when an account is configured; zero means "not available".
 	AIVolatilityPct float64
@@ -68,9 +76,13 @@ func ComputeDynamicTargets(input DynamicTargetsInput) DynamicTargets {
 	rawTargetPct := math.Max(dynamicTargetVolFraction*vol, lossPct*minRiskRewardRatio)
 	targetPct := clamp(rawTargetPct, dynamicTargetMinPct, dynamicTargetMaxPct)
 	budget := math.Max(input.Budget, 0)
+	lev := 1.0
+	if input.Leverage > 1 {
+		lev = float64(input.Leverage)
+	}
 	return DynamicTargets{
-		TargetUSDT:     budget * targetPct / 100,
-		MaxLossUSDT:    budget * lossPct / 100,
+		TargetUSDT:     budget * targetPct / 100 * lev,
+		MaxLossUSDT:    budget * lossPct / 100 * lev,
 		TargetPct:      targetPct,
 		LossPct:        lossPct,
 		VolSource:      volSource,

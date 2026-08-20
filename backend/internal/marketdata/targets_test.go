@@ -58,6 +58,30 @@ func TestComputeDynamicTargetsClamps(t *testing.T) {
 	}
 }
 
+func TestComputeDynamicTargetsScaleWithLeverage(t *testing.T) {
+	base := ComputeDynamicTargets(DynamicTargetsInput{
+		Budget: 100, ScannerVolatilityPct: 2, ScannerATRPct: 1.5, ScannerDrawdownPct: 5,
+	})
+	lev2 := ComputeDynamicTargets(DynamicTargetsInput{
+		Budget: 100, Leverage: 2, ScannerVolatilityPct: 2, ScannerATRPct: 1.5, ScannerDrawdownPct: 5,
+	})
+	lev4 := ComputeDynamicTargets(DynamicTargetsInput{
+		Budget: 100, Leverage: 4, ScannerVolatilityPct: 2, ScannerATRPct: 1.5, ScannerDrawdownPct: 5,
+	})
+	// The PnL model marks directional bots on budget×leverage notional; the
+	// USDT amounts must scale with it or the stop distance in PRICE terms
+	// collapses (prod SKHY #328: $1 stop on $200 notional = 0.5% move).
+	if !(lev2.TargetUSDT == 2*base.TargetUSDT && lev2.MaxLossUSDT == 2*base.MaxLossUSDT) {
+		t.Fatalf("2x leverage must double USDT amounts: base=%+v lev2=%+v", base, lev2)
+	}
+	if !(lev4.MaxLossUSDT == 4*base.MaxLossUSDT) {
+		t.Fatalf("4x leverage must quadruple the loss: base=%f lev4=%f", base.MaxLossUSDT, lev4.MaxLossUSDT)
+	}
+	if !(base.TargetUSDT/lev2.TargetUSDT == base.MaxLossUSDT/lev2.MaxLossUSDT) {
+		t.Fatal("RR ratio must be unchanged by leverage scaling")
+	}
+}
+
 func TestGridLevelsForRangeScalesWithATR(t *testing.T) {
 	// Same range width: a wild pair (high ATR) needs fewer, wider levels.
 	calm := GridLevelsForRange(10, 1)

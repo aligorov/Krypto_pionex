@@ -1539,10 +1539,13 @@ func (s *Service) perpPrice(ctx context.Context, symbol string) (decimal.Decimal
 
 // computeManualTargets derives dynamic targets for a manually deployed bot
 // from live klines (sigma + ATR blend) when no scanner candidate exists.
+// Leverage scales the USDT amounts to the marked exposure (v2.0.19 parity
+// with computeBotTargets).
 func (s *Service) computeManualTargets(
 	ctx context.Context,
 	settings Settings,
 	symbol string,
+	leverage int,
 ) (*decimal.Decimal, *decimal.Decimal) {
 	if settings.PnLTargetMode != "DYNAMIC" {
 		if settings.PnLTargetUSDT.IsZero() || settings.MaxLossUSDT.IsZero() {
@@ -1566,6 +1569,7 @@ func (s *Service) computeManualTargets(
 	}
 	targets := marketdata.ComputeDynamicTargets(marketdata.DynamicTargetsInput{
 		Budget:               settings.BudgetUSDT.InexactFloat64(),
+		Leverage:             leverage,
 		ScannerVolatilityPct: vol,
 		ScannerATRPct:        regime.ATRPct,
 		ScannerDrawdownPct:   drawdown,
@@ -1720,7 +1724,7 @@ func (s *Service) DeployManualBot(
 			return nil, "", fmt.Errorf(
 				"cannot fetch live PERP price for %s: %w", input.Symbol, livePriceErr)
 		}
-		botTarget, botMaxLoss := s.computeManualTargets(ctx, *settings, input.Symbol)
+		botTarget, botMaxLoss := s.computeManualTargets(ctx, *settings, input.Symbol, leverage)
 		var id string
 		if err := s.db.QueryRow(ctx, `
 			INSERT INTO paper_grid_bots (
@@ -1796,7 +1800,7 @@ func (s *Service) DeployManualBot(
 			Leverage: leverage, QuoteInvestment: settings.BudgetUSDT,
 		},
 	}
-	botTarget, botMaxLoss := s.computeManualTargets(ctx, *settings, input.Symbol)
+	botTarget, botMaxLoss := s.computeManualTargets(ctx, *settings, input.Symbol, leverage)
 	if botTarget != nil && botTarget.GreaterThan(decimal.Zero) {
 		params.BUOrderData.ProfitStopType = "profit_amount"
 		params.BUOrderData.ProfitStop = botTarget

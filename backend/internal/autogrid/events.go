@@ -131,6 +131,11 @@ func QueueTelegramEvent(
 		shouldSend = notifyStop
 		tmpl = tmplStop
 	case "DELIST_SWEEP", "TRANCHE_2":
+		// v2.0.19: shouldSend was never set in this branch (var defaults to
+		// false), so sweep closes and tranche-2 top-ups were silently
+		// dropped from Telegram — operators learned nothing while bots
+		// closed "by themselves".
+		shouldSend = notifyAdjust
 		tmpl = tmplAdjust // same rendering slot as range shifts; vars overlap
 	case "RANGE_ADJUST", "ADJUST_RANGE":
 		shouldSend = notifyAdjust

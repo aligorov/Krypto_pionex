@@ -72,3 +72,30 @@ func TestRealizedVolPct15mTooShort(t *testing.T) {
 		t.Fatalf("short history: got %.4f, want 0", got)
 	}
 }
+
+func TestTrancheAdversePctDirectionSigned(t *testing.T) {
+	entry := decimal.NewFromFloat(100)
+	// LONG: only price BELOW entry is adverse; a rally is profit and must
+	// not arm the signal tranche (v2.0.19 — the |price−entry| form topped
+	// up directional bots at their own local extremes).
+	if got := trancheAdversePct("LONG", decimal.NewFromFloat(99), entry); got < 0.0099 || got > 0.0101 {
+		t.Fatalf("LONG below entry must report 1%% adverse, got %v", got)
+	}
+	if got := trancheAdversePct("LONG", decimal.NewFromFloat(105), entry); got != 0 {
+		t.Fatalf("LONG profit excursion must not count as adverse, got %v", got)
+	}
+	// SHORT mirrors: only price ABOVE entry is adverse.
+	if got := trancheAdversePct("SHORT", decimal.NewFromFloat(101.5), entry); got < 0.0149 || got > 0.0151 {
+		t.Fatalf("SHORT above entry must report 1.5%% adverse, got %v", got)
+	}
+	if got := trancheAdversePct("SHORT", decimal.NewFromFloat(95), entry); got != 0 {
+		t.Fatalf("SHORT profit excursion must not count as adverse, got %v", got)
+	}
+	// NEUTRAL: inventory loads either way — both sides count.
+	if got := trancheAdversePct("NEUTRAL", decimal.NewFromFloat(103), entry); got < 0.0299 || got > 0.0301 {
+		t.Fatalf("NEUTRAL must count either-side excursion, got %v", got)
+	}
+	if got := trancheAdversePct("LONG", decimal.NewFromFloat(0), entry); got != 0 {
+		t.Fatalf("degenerate price must return 0, got %v", got)
+	}
+}

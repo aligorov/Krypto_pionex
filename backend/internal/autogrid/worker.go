@@ -513,8 +513,10 @@ func (worker *Worker) enrichCandidatesWithAIKit(
 // computeBotTargets derives the per-bot PnL target and stop-out. In DYNAMIC
 // mode the numbers come from the pair's own readings (native AI Kit estimate
 // when enriched, otherwise the scanner sigma/ATR blend and model drawdown),
-// scaled to the budget; FIXED mode returns the operator's amounts.
-func computeBotTargets(settings Settings, candidate Candidate) (*decimal.Decimal, *decimal.Decimal) {
+// scaled to the budget and the FINAL leverage (v2.0.19: the PnL model marks
+// directional positions on budget×leverage notional — unscaled stops died in
+// noise, prod SKHY #328); FIXED mode returns the operator's amounts verbatim.
+func computeBotTargets(settings Settings, candidate Candidate, leverage int) (*decimal.Decimal, *decimal.Decimal) {
 	if settings.PnLTargetMode != "DYNAMIC" {
 		if settings.PnLTargetUSDT.IsZero() || settings.MaxLossUSDT.IsZero() {
 			return nil, nil
@@ -535,6 +537,7 @@ func computeBotTargets(settings Settings, candidate Candidate) (*decimal.Decimal
 	drawdown, _ := candidate.MaxDrawdownPct.Float64()
 	targets := marketdata.ComputeDynamicTargets(marketdata.DynamicTargetsInput{
 		Budget:               settings.BudgetUSDT.InexactFloat64(),
+		Leverage:             leverage,
 		AIVolatilityPct:      aiVol,
 		AIDrawdownPct:        aiDD,
 		ScannerVolatilityPct: vol,
@@ -643,11 +646,16 @@ func (worker *Worker) deployPaper(
 		worker.noteDeployBlock(ctx, "деплой заблокирован: макро-событие USD «"+blockReason+"» (окно T−2ч…T+1ч)")
 		return nil
 	}
-	if cascade, cascadeUSD := worker.CheckLiquidationCascade(ctx, 50_000_000); cascade {
-		worker.logger.Warn("paper deploy blocked by liquidation cascade",
+	// v2.0.19: a LONG-side cascade (forced long unwinding) pauses LONG and
+	// NEUTRAL entries but not SHORT — the unwind window is precisely when
+	// short participation pays, and the detector itself is already scoped to
+	// side='long' (v2.0.14). The per-candidate cut happens after the final
+	// direction (smart override included) is known below.
+	cascadeLong, cascadeUSD := worker.CheckLiquidationCascade(ctx, 50_000_000)
+	if cascadeLong {
+		worker.logger.Warn("liquidation cascade: LONG/NEUTRAL paper deploys paused, SHORT stay live",
 			"component", "autogrid_worker", "usd_1h", cascadeUSD)
-		worker.noteDeployBlock(ctx, fmt.Sprintf("деплой заблокирован: каскад ликвидаций $%.0fM/час", cascadeUSD/1_000_000))
-		return nil
+		worker.noteDeployBlock(ctx, fmt.Sprintf("каскад ликвидаций лонгов $%.0fM/час — LONG/NEUTRAL деплои на паузе, SHORT доступны", cascadeUSD/1_000_000))
 	}
 	fng, _ := worker.GetFearGreed(ctx)
 	backtestGateOn := worker.backtestGateEnabled(ctx)
@@ -656,6 +664,8 @@ func (worker *Worker) deployPaper(
 			continue
 		}
 		if !isEntryTimingFavorable(candidate) {
+			worker.rejectCandidate(ctx, candidate,
+				"вход-тайминг: текущая позиция в канале вне благоприятной зоны для этого направления", nil)
 			continue
 		}
 		atrPct := 2.0
@@ -675,12 +685,14 @@ func (worker *Worker) deployPaper(
 		// funding-data gap, and the fallback is governed (2x clamp) instead
 		// of the raw scanner trend with the adaptive ladder.
 		smartTrend, smartLev, smartReason := "", 0, ""
+		fundingKnown := false
 		fundingInput := FundingContext{}
 		if fundingCtx, fundErr := worker.GetFundingForSymbol(ctx, candidate.Symbol); fundErr == nil {
 			fundingInput = FundingContext{
 				AverageRate: fundingCtx.AverageRate,
 				IsExtreme:   fundingCtx.IsExtreme,
 			}
+			fundingKnown = true
 		}
 		smart := SelectDirection(
 			RegimeContext{
@@ -692,14 +704,26 @@ func (worker *Worker) deployPaper(
 			EventContext{FearGreedExtreme: fng},
 		)
 		if smart.Direction == "WAIT" || smart.Direction == "CLOSE_ALL" {
+			worker.rejectCandidate(ctx, candidate, "smart direction: "+smart.Reason, nil)
 			worker.logger.Info("v2.0 smart direction: skip",
 				"component", "autogrid_worker", "symbol", candidate.Symbol,
 				"reason", smart.Reason)
 			continue
 		}
-		smartTrend = strings.ToLower(smart.Direction)
-		smartLev = smart.Leverage
-		smartReason = smart.Reason
+		// v2.0.19: a directional smart pick is a funding-informed conviction
+		// (squeeze fuel, crowded carry). With NO funding coverage at all —
+		// Pionex-exclusive listings the cross-exchange collector never sees —
+		// that conviction is blind; the scanner's own anti-FOMO-vetted trend
+		// governs instead of the override (prod: SKHY #328).
+		if fundingKnown || smart.Direction == "NEUTRAL" {
+			smartTrend = strings.ToLower(smart.Direction)
+			smartLev = smart.Leverage
+			smartReason = smart.Reason
+		} else {
+			worker.logger.Info("smart direction needs funding context; scanner trend governs",
+				"component", "autogrid_worker", "symbol", candidate.Symbol,
+				"smart", smart.Direction)
+		}
 		// v2.0.15 demotion guard: the scanner demotes counter-tape trends
 		// (24h ±3% against the direction) to no_trend, but the regime string
 		// survives — SelectDirection would re-arm the demoted direction and
@@ -712,6 +736,8 @@ func (worker *Worker) deployPaper(
 			worker.logger.Info("smart direction contradicts demoted scanner trend: skip",
 				"component", "autogrid_worker", "symbol", candidate.Symbol,
 				"smart", smartTrend, "scanner", candidate.RecommendedTrend)
+			worker.rejectCandidate(ctx, candidate,
+				fmt.Sprintf("smart direction (%s) против демотированного тренда сканера (no_trend после 24h ±3%% против направления)", smartTrend), nil)
 			continue
 		}
 
@@ -722,6 +748,7 @@ func (worker *Worker) deployPaper(
 		if blocked, why := worker.fundingFlushBlocked(ctx, candidate.Symbol, candidate.FundingRate); blocked {
 			worker.logger.Info("entry gate: funding flush in progress, skip",
 				"component", "autogrid_worker", "symbol", candidate.Symbol, "reason", why)
+			worker.rejectCandidate(ctx, candidate, "entry gate: "+why, nil)
 			continue
 		}
 
@@ -761,6 +788,8 @@ func (worker *Worker) deployPaper(
 				  AND closed_at > NOW() - INTERVAL '2 hours'
 			)
 		`, settings.ID, candidate.Symbol).Scan(&recentlyStopped); err == nil && recentlyStopped {
+			worker.rejectCandidate(ctx, candidate,
+				"cooldown: защитное закрытие символа менее 2 часов назад — повторный вход отложен", nil)
 			continue
 		}
 		// Entry gate (v2.0.12): anchor to the LIVE price. The scan price is
@@ -774,6 +803,8 @@ func (worker *Worker) deployPaper(
 			worker.logger.Info("entry gate: stale candidate price, skip",
 				"component", "autogrid_worker", "symbol", candidate.Symbol,
 				"scan_price", candidate.CurrentPrice.String(), "live_price", freshPrice.String())
+			worker.rejectCandidate(ctx, candidate,
+				"entry gate: цена кандидата устарела (дрейф > 0.5 ATR с момента скана)", nil)
 			continue
 		}
 		// Walk-forward backtest gate — PAPER runs the same exam as REAL
@@ -835,6 +866,8 @@ func (worker *Worker) deployPaper(
 			worker.logger.Info("entry gate: volatility expansion, skip",
 				"component", "autogrid_worker", "symbol", candidate.Symbol,
 				"rv_ref_ratio", math.Round(ratio*100)/100)
+			worker.rejectCandidate(ctx, candidate,
+				fmt.Sprintf("entry gate: расширение волатильности (RV/базлайн %.2f ≥ 1.5) — вход в ускорение заблокирован", math.Round(ratio*100)/100), nil)
 			continue
 		}
 		if harGeo != nil {
@@ -851,6 +884,12 @@ func (worker *Worker) deployPaper(
 				"scanner_trend", trend, "smart_direction", smartTrend,
 				"reason", smartReason)
 			trend = smartTrend
+		}
+		if cascadeLong && trend != "short" {
+			worker.rejectCandidate(ctx, candidate, fmt.Sprintf(
+				"каскад ликвидаций лонгов $%.0fM/час — входы LONG/NEUTRAL на паузе (SHORT доступны)",
+				cascadeUSD/1_000_000), nil)
+			continue
 		}
 		atrPrice := candidate.CurrentPrice.Mul(decimal.NewFromFloat(atrPct / 100.0))
 		antiHuntStop := ComputeAntiHuntStop(
@@ -869,6 +908,9 @@ func (worker *Worker) deployPaper(
 				worker.logger.Info("skip paper deploy: price too close to anti-hunt stop",
 					"component", "autogrid_worker", "symbol", candidate.Symbol,
 					"price", candidate.CurrentPrice.String(), "stop", antiHuntStop.String())
+				worker.rejectCandidate(ctx, candidate,
+					fmt.Sprintf("анти-хант: цена %s слишком близко к стопу %s (< 1.5 ATR запаса) — риск мгновенного STRUCT_INVALID",
+						candidate.CurrentPrice.String(), antiHuntStop.String()), nil)
 				continue
 			}
 		} else {
@@ -876,6 +918,9 @@ func (worker *Worker) deployPaper(
 				worker.logger.Info("skip paper deploy: price too close to anti-hunt stop",
 					"component", "autogrid_worker", "symbol", candidate.Symbol,
 					"price", candidate.CurrentPrice.String(), "stop", antiHuntStop.String())
+				worker.rejectCandidate(ctx, candidate,
+					fmt.Sprintf("анти-хант: цена %s слишком близко к стопу %s (< 1.5 ATR запаса) — риск мгновенного STRUCT_INVALID",
+						candidate.CurrentPrice.String(), antiHuntStop.String()), nil)
 				continue
 			}
 		}
@@ -910,7 +955,7 @@ func (worker *Worker) deployPaper(
 		confluence := EvaluateConfluence(candidate, nil, nil)
 
 		gridType := mesh.GridType
-		target, maxLoss := computeBotTargets(settings, candidate)
+		target, maxLoss := computeBotTargets(settings, candidate, botLev)
 		if trancheOn {
 			// TP/SL govern the bot as deployed: half capital → half target
 			// and half max loss for tranche 1 (tranche 2's top-up doubles
@@ -1125,11 +1170,11 @@ func (worker *Worker) deployReal(
 		worker.noteDeployBlock(ctx, "REAL деплой заблокирован: макро-событие USD «"+blockReason+"» (окно T−2ч…T+1ч)")
 		return nil
 	}
-	cascade, cascadeUSD := worker.CheckLiquidationCascade(ctx, 50_000_000)
-	if cascade {
-		worker.logger.Warn("deploy blocked by liquidation cascade", "component", "autogrid_worker", "usd_1h", cascadeUSD)
-		worker.noteDeployBlock(ctx, fmt.Sprintf("REAL деплой заблокирован: каскад ликвидаций $%.0fM/час", cascadeUSD/1_000_000))
-		return nil
+	cascadeLong, cascadeUSD := worker.CheckLiquidationCascade(ctx, 50_000_000)
+	if cascadeLong {
+		worker.logger.Warn("liquidation cascade: LONG/NEUTRAL real deploys paused, SHORT stay live",
+			"component", "autogrid_worker", "usd_1h", cascadeUSD)
+		worker.noteDeployBlock(ctx, fmt.Sprintf("REAL: каскад ликвидаций лонгов $%.0fM/час — LONG/NEUTRAL деплои на паузе, SHORT доступны", cascadeUSD/1_000_000))
 	}
 	// When the LLM brain is enabled, an UNAUDITED candidate is not
 	// deployable — regardless of why the audit is missing (beyond the
@@ -1144,6 +1189,8 @@ func (worker *Worker) deployReal(
 			continue
 		}
 		if !isEntryTimingFavorable(candidate) {
+			worker.rejectCandidate(ctx, candidate,
+				"вход-тайминг: текущая позиция в канале вне благоприятной зоны для этого направления", nil)
 			continue
 		}
 		if llmBrainEnabled && candidate.ModelAssumptions["llmAuditId"] == nil {
@@ -1157,11 +1204,13 @@ func (worker *Worker) deployReal(
 		if blocked, why := worker.fundingFlushBlocked(ctx, candidate.Symbol, candidate.FundingRate); blocked {
 			worker.logger.Info("entry gate: funding flush in progress, skip real deploy",
 				"component", "autogrid_worker", "symbol", candidate.Symbol, "reason", why)
+			worker.rejectCandidate(ctx, candidate, "entry gate: "+why, nil)
 			continue
 		}
 		if ok, reason := worker.revalidateCandidateTrend(ctx, &candidate, settings); !ok {
 			worker.logger.Info("skip real deploy after fresh trend revalidation",
 				"component", "autogrid_worker", "symbol", candidate.Symbol, "reason", reason)
+			worker.rejectCandidate(ctx, candidate, "ре-валидация тренда: "+reason, nil)
 			continue
 		}
 
@@ -1171,12 +1220,14 @@ func (worker *Worker) deployReal(
 		// and the decision now actually overrides trend + leverage below.
 		smartTrend, smartLev, smartReason := "", 0, ""
 		fngReal, _ := worker.GetFearGreed(ctx)
+		fundingKnownReal := false
 		fundingInput := FundingContext{}
 		if fundingCtx, fundErr := worker.GetFundingForSymbol(ctx, candidate.Symbol); fundErr == nil {
 			fundingInput = FundingContext{
 				AverageRate: fundingCtx.AverageRate,
 				IsExtreme:   fundingCtx.IsExtreme,
 			}
+			fundingKnownReal = true
 		}
 		// v2.0.15: always run (zero funding context on gaps) — sentiment
 		// gates must not depend on funding-data availability (mirror).
@@ -1190,14 +1241,23 @@ func (worker *Worker) deployReal(
 			EventContext{FearGreedExtreme: fngReal},
 		)
 		if smartDir.Direction == "WAIT" || smartDir.Direction == "CLOSE_ALL" {
+			worker.rejectCandidate(ctx, candidate, "smart direction: "+smartDir.Reason, nil)
 			worker.logger.Info("v2.0 smart direction: skip",
 				"component", "autogrid_worker", "symbol", candidate.Symbol,
 				"reason", smartDir.Reason)
 			continue
 		}
-		smartTrend = strings.ToLower(smartDir.Direction)
-		smartLev = smartDir.Leverage
-		smartReason = smartDir.Reason
+		// v2.0.19 mirror: funding-blind directional picks don't override —
+		// see the paper-path comment (prod: SKHY #328).
+		if fundingKnownReal || smartDir.Direction == "NEUTRAL" {
+			smartTrend = strings.ToLower(smartDir.Direction)
+			smartLev = smartDir.Leverage
+			smartReason = smartDir.Reason
+		} else {
+			worker.logger.Info("smart direction needs funding context; scanner trend governs",
+				"component", "autogrid_worker", "symbol", candidate.Symbol,
+				"smart", smartDir.Direction)
+		}
 		// v2.0.15 demotion guard (mirror of the paper path).
 		if (smartTrend == "long" || smartTrend == "short") &&
 			(strings.ToLower(strings.TrimSpace(candidate.RecommendedTrend)) == "no_trend" ||
@@ -1263,6 +1323,8 @@ func (worker *Worker) deployReal(
 				  AND COALESCE(closed_at, updated_at) > NOW() - INTERVAL '2 hours'
 			)
 		`, *settings.AccountID, candidate.Symbol).Scan(&recentlyStoppedReal); err == nil && recentlyStoppedReal {
+			worker.rejectCandidate(ctx, candidate,
+				"cooldown: защитное закрытие символа менее 2 часов назад — повторный вход отложен", nil)
 			continue
 		}
 		atrPct := 2.0
@@ -1301,6 +1363,8 @@ func (worker *Worker) deployReal(
 			worker.logger.Info("entry gate: volatility expansion, skip real deploy",
 				"component", "autogrid_worker", "symbol", candidate.Symbol,
 				"rv_ref_ratio", math.Round(ratio*100)/100)
+			worker.rejectCandidate(ctx, candidate,
+				fmt.Sprintf("entry gate: расширение волатильности (RV/базлайн %.2f ≥ 1.5) — вход в ускорение заблокирован", math.Round(ratio*100)/100), nil)
 			continue
 		}
 		if harGeo != nil {
@@ -1351,6 +1415,12 @@ func (worker *Worker) deployReal(
 			}
 			trend = smartParam
 		}
+		if cascadeLong && trend != "short" {
+			worker.rejectCandidate(ctx, candidate, fmt.Sprintf(
+				"каскад ликвидаций лонгов $%.0fM/час — входы LONG/NEUTRAL на паузе (SHORT доступны)",
+				cascadeUSD/1_000_000), nil)
+			continue
+		}
 
 		atrPrice := candidate.CurrentPrice.Mul(decimal.NewFromFloat(atrPct / 100.0))
 		antiHuntStop := ComputeAntiHuntStop(
@@ -1380,6 +1450,9 @@ func (worker *Worker) deployReal(
 				deployErrors = append(deployErrors, fmt.Sprintf(
 					"%s: price %s too close to anti-hunt stop %s (< 1.5 ATR room) — skipped",
 					candidate.Symbol, candidate.CurrentPrice.String(), antiHuntStop.String()))
+				worker.rejectCandidate(ctx, candidate,
+					fmt.Sprintf("анти-хант: цена %s слишком близко к стопу %s (< 1.5 ATR запаса)",
+						candidate.CurrentPrice.String(), antiHuntStop.String()), nil)
 				continue
 			}
 		} else {
@@ -1388,6 +1461,9 @@ func (worker *Worker) deployReal(
 				deployErrors = append(deployErrors, fmt.Sprintf(
 					"%s: price %s too close to anti-hunt stop %s (< 1.5 ATR room) — skipped",
 					candidate.Symbol, candidate.CurrentPrice.String(), antiHuntStop.String()))
+				worker.rejectCandidate(ctx, candidate,
+					fmt.Sprintf("анти-хант: цена %s слишком близко к стопу %s (< 1.5 ATR запаса)",
+						candidate.CurrentPrice.String(), antiHuntStop.String()), nil)
 				continue
 			}
 		}
@@ -1435,7 +1511,7 @@ func (worker *Worker) deployReal(
 		// AI Kit/scanner readings, or the operator's fixed amount) is enforced
 		// by Pionex itself (profit_amount), so it survives even if this
 		// process is down. The management loop double-checks it locally.
-		botTarget, botMaxLoss := computeBotTargets(settings, candidate)
+		botTarget, botMaxLoss := computeBotTargets(settings, candidate, botLev)
 		if settings.TrancheDeployEnabled {
 			// v2.0.15 (restored — the v2.0.13 patch was lost to a failed
 			// batch): tranche 1 commits HALF the capital, so native
@@ -2088,57 +2164,90 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 						entry = e
 					}
 				}
-				topUp := ""
-				if time.Since(bot.createdAt) >= trancheTimeBox {
-					// v2.0.14: the unconditional top-up must not fire into a
-					// confirmed trend either way — adding margin at stretched
-					// highs (or into a falling knife) is exactly what the
-					// signal path exists to gate. Defer until the tape is
-					// not strongly trending; the confirmed-adverse path and
-					// the next cycles stay available.
-					if worker.trancheTimeBoxTrending(ctx, bot.symbol) {
-						topUp = ""
-					} else {
-						topUp = "time-box 24h"
-					}
-				} else if bot.atrEntry > 0 {
-					adverse := price.Sub(entry).Abs().Div(entry)
-					limit := decimal.NewFromFloat(bot.atrEntry * 2.0 * 0.75 / 100.0)
-					if adverse.GreaterThanOrEqual(limit) && worker.trancheTurnConfirmed(ctx, bot.symbol, price, entry) {
-						topUp = "подтверждённый adverse 0.75×ATR(1h)"
-					}
+			topUp := ""
+			if time.Since(bot.createdAt) >= trancheTimeBox {
+				// v2.0.14: the unconditional top-up must not fire into a
+				// confirmed trend either way — adding margin at stretched
+				// highs (or into a falling knife) is exactly what the
+				// signal path exists to gate. Defer until the tape is
+				// not strongly trending; the confirmed-adverse path and
+				// the next cycles stay available.
+				if worker.trancheTimeBoxTrending(ctx, bot.symbol) {
+					topUp = ""
+				} else {
+					topUp = "time-box 24h"
 				}
-				if topUp != "" {
-					pending := base.Sub(bot.investment)
-					if _, err := worker.service.AdjustBot(ctx, worker.accounts, settings.ID, bot.id, AdjustBotInput{
-						Mode:            "invest_in",
-						QuoteInvestment: pending.Round(2),
-					}); err != nil {
-						worker.logger.Error("tranche 2 invest_in failed",
+			} else if bot.atrEntry > 0 {
+				// v2.0.19: the excursion must be adverse FOR THE DIRECTION —
+				// |price−entry| also fired on a directional bot's PROFIT
+				// excursion (LONG rallying 0.75 ATR, two red candles →
+				// top-up at the local top). The regime gate mirrors the
+				// time-box: no second tranche into a confirmed trend.
+				adverse := trancheAdversePct(bot.direction, price, entry)
+				limit := bot.atrEntry * 2.0 * 0.75 / 100.0
+				if adverse >= limit &&
+					!worker.trancheTimeBoxTrending(ctx, bot.symbol) &&
+					worker.trancheTurnConfirmed(ctx, bot.symbol, price, entry) {
+					topUp = "подтверждённый adverse 0.75×ATR(1h)"
+				}
+			}
+			if topUp != "" {
+				pending := base.Sub(bot.investment)
+				if _, err := worker.service.AdjustBot(ctx, worker.accounts, settings.ID, bot.id, AdjustBotInput{
+					Mode:            "invest_in",
+					QuoteInvestment: pending.Round(2),
+				}); err != nil {
+					worker.logger.Error("tranche 2 invest_in failed",
+						"component", "autogrid_worker", "bot_id", bot.id, "error", err)
+					if _, markErr := worker.db.Exec(ctx, `
+						UPDATE grid_bots
+						SET model_state = jsonb_set(model_state, '{trancheFailAt}', to_jsonb(to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'))),
+						    updated_at = NOW()
+						WHERE id = $1
+					`, bot.id); markErr != nil {
+						worker.logger.Error("tranche 2 fail-marker write failed",
+							"component", "autogrid_worker", "bot_id", bot.id, "error", markErr)
+					}
+				} else {
+					// v2.0.19: peak_pnl_usdt must NOT double here. The
+					// freshly injected margin starts at ~0 PnL, so doubling
+					// the stored peak armed the trailing floor
+					// max(0.8·2P, 0.5·2T) against total ≈ P on the very next
+					// manage tick — an instant false TRAILING_TAKE_PROFIT on
+					// exactly the most successful bots. Paper never doubled
+					// it; this aligns REAL with the paper semantics.
+					if _, err := worker.db.Exec(ctx, `
+						UPDATE grid_bots
+						SET pnl_target_usdt = pnl_target_usdt * 2,
+						    max_loss_usdt = max_loss_usdt * 2,
+						    model_state = jsonb_set(model_state, '{trancheDeployed}', '2'::jsonb),
+						    updated_at = NOW()
+						WHERE id = $1
+					`, bot.id); err != nil {
+						worker.logger.Error("tranche 2 target doubling failed (invest_in already committed)",
 							"component", "autogrid_worker", "bot_id", bot.id, "error", err)
-						_, _ = worker.db.Exec(ctx, `
-							UPDATE grid_bots
-							SET model_state = jsonb_set(model_state, '{trancheFailAt}', to_jsonb(to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'))),
-							    updated_at = NOW()
-							WHERE id = $1
-						`, bot.id)
 					} else {
-						_, _ = worker.db.Exec(ctx, `
-							UPDATE grid_bots
-							SET pnl_target_usdt = pnl_target_usdt * 2,
-							    max_loss_usdt = max_loss_usdt * 2,
-							    peak_pnl_usdt = peak_pnl_usdt * 2,
-							    model_state = jsonb_set(model_state, '{trancheDeployed}', '2'::jsonb),
-							    updated_at = NOW()
-							WHERE id = $1
-						`, bot.id)
-						worker.logger.Info("tranche 2 deployed (REAL invest_in)",
-							"component", "autogrid_worker", "symbol", bot.symbol, "reason", topUp)
-						_ = QueueTelegramEvent(ctx, worker.db, "TRANCHE_2", map[string]any{
-							"bot_number": bot.botNumber, "symbol": bot.symbol, "reason": topUp,
-						})
+						// Same-tick decision safety: decideBotAction below
+						// reads this struct — refresh the doubled fields so
+						// the top-up tick can't fire a half-size TP/SL
+						// against the doubled position.
+						bot.investment = base
+						if bot.pnlTarget != nil {
+							doubled := bot.pnlTarget.Mul(decimal.NewFromInt(2))
+							bot.pnlTarget = &doubled
+						}
+						if bot.maxLoss != nil {
+							doubled := bot.maxLoss.Mul(decimal.NewFromInt(2))
+							bot.maxLoss = &doubled
+						}
 					}
+					worker.logger.Info("tranche 2 deployed (REAL invest_in)",
+						"component", "autogrid_worker", "symbol", bot.symbol, "reason", topUp)
+					_ = QueueTelegramEvent(ctx, worker.db, "TRANCHE_2", map[string]any{
+						"bot_number": bot.botNumber, "symbol": bot.symbol, "reason": topUp,
+					})
 				}
+			}
 			}
 		}
 
@@ -2470,19 +2579,30 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 	// unobtainable for 45+ minutes (delisting/renaming — the LAB case) or
 	// the manage loop is wedged; either way it must not sit unsupervised
 	// forever. Close it as an ops cleanup; exempt from the breaker.
-	sweep, sweepErr := worker.db.Exec(ctx, `
-		UPDATE paper_grid_bots
-		SET status = 'COMPLETED', closed_reason = 'DELISTED_NO_PRICE',
-		    closed_at = NOW(), updated_at = NOW()
-		WHERE settings_id = $1 AND status = 'RUNNING'
-		  AND updated_at < NOW() - INTERVAL '45 minutes'
-	`, settings.ID)
-	if sweepErr == nil && sweep.RowsAffected() > 0 {
-		worker.logger.Warn("delist sweep closed stale paper bots",
-			"component", "autogrid_worker", "closed", sweep.RowsAffected())
-		_ = QueueTelegramEvent(ctx, worker.db, "DELIST_SWEEP", map[string]any{
-			"closed": sweep.RowsAffected(),
-		})
+	// v2.0.19 — two-tier, price-aware: the 45-minute tier additionally
+	// requires the symbol to be MISSING from the live price map (the true
+	// delist signature). A ticker-feed outage or manage-loop wedge ages
+	// EVERY bot at once — that fleet-wide shape must not mass-close live
+	// bots; only the 6-hour tier catches a genuinely wedged loop. An empty
+	// price map means the feed itself failed — sweep is skipped entirely.
+	if presentSymbols := mapKeys(priceBySymbol); len(presentSymbols) > 0 {
+		sweep, sweepErr := worker.db.Exec(ctx, `
+			UPDATE paper_grid_bots
+			SET status = 'COMPLETED', closed_reason = 'DELISTED_NO_PRICE',
+			    closed_at = NOW(), updated_at = NOW()
+			WHERE settings_id = $1 AND status = 'RUNNING'
+			  AND (
+			    (updated_at < NOW() - INTERVAL '45 minutes' AND NOT (symbol = ANY($2::text[])))
+			    OR updated_at < NOW() - INTERVAL '6 hours'
+			  )
+		`, settings.ID, presentSymbols)
+		if sweepErr == nil && sweep.RowsAffected() > 0 {
+			worker.logger.Warn("delist sweep closed stale paper bots",
+				"component", "autogrid_worker", "closed", sweep.RowsAffected())
+			_ = QueueTelegramEvent(ctx, worker.db, "DELIST_SWEEP", map[string]any{
+				"closed": sweep.RowsAffected(),
+			})
+		}
 	}
 	rows, err := worker.db.Query(ctx, `
 		SELECT id, COALESCE(bot_number, 0), symbol, direction, entry_price, leverage, quote_investment,
@@ -2841,14 +2961,20 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 					if !worker.trancheTimeBoxTrending(ctx, bot.symbol) {
 						trancheReason = "time-box 24h"
 					}
-				} else if bot.atrEntry > 0 && price.IsPositive() {
-					adverse := price.Sub(bot.entry).Abs().Div(bot.entry)
-					// ATR(1h) ≈ 2 × ATR(15m) — the entry-time scanner figure.
-					limit := decimal.NewFromFloat(bot.atrEntry * 2.0 * 0.75 / 100.0)
-					if adverse.GreaterThanOrEqual(limit) && worker.trancheTurnConfirmed(ctx, bot.symbol, price, bot.entry) {
-						trancheReason = "подтверждённый adverse 0.75×ATR(1h)"
-					}
+			} else if bot.atrEntry > 0 && price.IsPositive() {
+				// v2.0.19: direction-signed adverse (profit excursions of
+				// directional bots no longer count) + the same regime gate
+				// as the time-box — no second tranche into a confirmed
+				// trend (mirror of the REAL path).
+				adverse := trancheAdversePct(bot.direction, price, bot.entry)
+				// ATR(1h) ≈ 2 × ATR(15m) — the entry-time scanner figure.
+				limit := bot.atrEntry * 2.0 * 0.75 / 100.0
+				if adverse >= limit &&
+					!worker.trancheTimeBoxTrending(ctx, bot.symbol) &&
+					worker.trancheTurnConfirmed(ctx, bot.symbol, price, bot.entry) {
+					trancheReason = "подтверждённый adverse 0.75×ATR(1h)"
 				}
+			}
 				if trancheReason != "" {
 					tag, tErr := worker.db.Exec(ctx, `
 						UPDATE paper_grid_bots
@@ -2894,6 +3020,44 @@ func (worker *Worker) priceMap(ctx context.Context) (map[string]decimal.Decimal,
 		}
 	}
 	return prices, nil
+}
+
+// mapKeys returns the key slice of a string-keyed map.
+func mapKeys[V any](m map[string]V) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
+// trancheAdversePct returns the adverse excursion fraction SIGNED by the
+// bot's direction: for LONG only price BELOW entry is adverse (a rally is
+// profit — topping up after a rally plus a reversal buys the local top), for
+// SHORT only price ABOVE entry, for NEUTRAL either side (inventory loads
+// both ways). Pre-v2.0.19 the |price−entry| form fed directional bots'
+// PROFIT-side excursions into the signal path.
+func trancheAdversePct(direction string, price, entry decimal.Decimal) float64 {
+	if !entry.IsPositive() || !price.IsPositive() {
+		return 0
+	}
+	var adverse decimal.Decimal
+	switch direction {
+	case "LONG":
+		if price.GreaterThanOrEqual(entry) {
+			return 0
+		}
+		adverse = entry.Sub(price)
+	case "SHORT":
+		if price.LessThanOrEqual(entry) {
+			return 0
+		}
+		adverse = price.Sub(entry)
+	default:
+		adverse = price.Sub(entry).Abs()
+	}
+	pct, _ := adverse.Div(entry).Float64()
+	return pct
 }
 
 // trancheTimeBoxTrending reports whether the tape is strongly trending for
@@ -3096,8 +3260,25 @@ func (worker *Worker) enrichAndAuditCandidatesWithLLM(
 		return candidates[i].Score.GreaterThan(candidates[j].Score)
 	})
 	auditedCount := 0
+	// v2.0.19: the audit cap must never be the reason free slots stay empty.
+	// deployReal hard-fails unaudited candidates, so with N free slots the
+	// bottom (N−5) ACCEPTED candidates could NEVER deploy (prod: 7 ACCEPTED
+	// / 7 free slots at cap 5). Raise the cap to cover the free slots.
+	auditCap := 5
+	var runningBots int
+	countTable := "paper_grid_bots"
+	if settings.ExecutionMode != "PAPER" {
+		countTable = "grid_bots"
+	}
+	if err := worker.db.QueryRow(ctx, fmt.Sprintf(
+		`SELECT COUNT(*) FROM %s WHERE status = 'RUNNING'`, countTable,
+	)).Scan(&runningBots); err == nil {
+		if free := settings.MaxActiveBots - runningBots; free > auditCap {
+			auditCap = free
+		}
+	}
 	for _, candidate := range candidates {
-		if candidate.Decision != "ACCEPTED" || auditedCount >= 5 {
+		if candidate.Decision != "ACCEPTED" || auditedCount >= auditCap {
 			continue
 		}
 		candles, err := worker.publicClient.GetKlines(ctx, candidate.Symbol, "15M", 30)
