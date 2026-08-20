@@ -22,6 +22,14 @@ import (
 	"github.com/shopspring/decimal"
 )
 
+// trancheFlag converts the deploy-time tranche marker for model_state.
+func trancheFlag(on bool) int {
+	if on {
+		return 1
+	}
+	return 0
+}
+
 // protectiveCloseExemptReasons is the single source of truth for close
 // reasons that must NOT arm the circuit breaker or the per-symbol cooldown.
 // Every operator-driven stop path must be listed here: CloseAllActiveBots
@@ -768,23 +776,37 @@ func (worker *Worker) deployPaper(
 		// leverage. Falls back to the ATR adaptive mesh when history or fit
 		// quality is insufficient — the paper fleet then still validates the
 		// exact pipeline REAL runs.
-		harGeo := worker.harGridGeometry(ctx, candidate.Symbol, decimalFloat(settings.FeeBps.Add(settings.SlippageBps)), settings.BudgetUSDT.InexactFloat64())
+		// v2.0.13 tranches: commit HALF the budget up front; the manage loop
+		// tops up after a confirmed adverse excursion or the 24h time-box.
+		// Knife inventory drag is quadratic in depth, so the initial half
+		// halves the damage of every un-timed entry. Geometry (levels, $5
+		// per-level floor) must size against the actually-committed amount.
+		investAmount := settings.BudgetUSDT
+		trancheOn := settings.TrancheDeployEnabled
+		if trancheOn {
+			investAmount = settings.BudgetUSDT.Div(decimal.NewFromInt(2))
+		}
+		harGeo := worker.harGridGeometry(ctx, candidate.Symbol, decimalFloat(settings.FeeBps.Add(settings.SlippageBps)), investAmount.InexactFloat64())
 		mesh := ComputeAdaptiveMesh(
 			candidate.LowerPrice, candidate.UpperPrice, candidate.CurrentPrice,
-			atrPct, regime, settings.BudgetUSDT, settings.Leverage, 0.30,
+			atrPct, regime, investAmount, settings.Leverage, 0.30,
 		)
+		// Entry gate (v2.0.12): block deployment into an active volatility
+		// expansion — a fixed-step grid holds per-pair edge constant while
+		// inventory risk grows with sigma² (A–S penalty). Since v2.0.13 the
+		// gate covers HAR-less symbols too (new listings) via a 24h
+		// self-baseline.
+		forecastPct := 0.0
 		if harGeo != nil {
-			// Entry gate (v2.0.12): block deployment into an active
-			// volatility expansion — a fixed-step grid holds per-pair edge
-			// constant while inventory risk grows with sigma² (A–S penalty).
-			// Only the expansion itself is blocked (ratio ≥ 1.5× forecast);
-			// elevated-but-decaying post-flush vol stays deployable.
-			if blocked, ratio := worker.volExpansionBlocked(ctx, candidate.Symbol, harGeo.forecastPct); blocked {
-				worker.logger.Info("entry gate: volatility expansion, skip",
-					"component", "autogrid_worker", "symbol", candidate.Symbol,
-					"rv_har_ratio", math.Round(ratio*100)/100)
-				continue
-			}
+			forecastPct = harGeo.forecastPct
+		}
+		if blocked, ratio := worker.volExpansionBlocked(ctx, candidate.Symbol, forecastPct); blocked {
+			worker.logger.Info("entry gate: volatility expansion, skip",
+				"component", "autogrid_worker", "symbol", candidate.Symbol,
+				"rv_ref_ratio", math.Round(ratio*100)/100)
+			continue
+		}
+		if harGeo != nil {
 			harGeo.applyToMesh(candidate.CurrentPrice, &mesh)
 		}
 
@@ -858,6 +880,19 @@ func (worker *Worker) deployPaper(
 
 		gridType := mesh.GridType
 		target, maxLoss := computeBotTargets(settings, candidate)
+		if trancheOn {
+			// TP/SL govern the bot as deployed: half capital → half target
+			// and half max loss for tranche 1 (tranche 2's top-up doubles
+			// them back on the manage side).
+			if target != nil {
+				half := target.Div(decimal.NewFromInt(2))
+				target = &half
+			}
+			if maxLoss != nil {
+				half := maxLoss.Div(decimal.NewFromInt(2))
+				maxLoss = &half
+			}
+		}
 
 		var botID string
 		var botNumber int
@@ -878,6 +913,9 @@ func (worker *Worker) deployPaper(
 					'leverageReason', $19::TEXT,
 					'leverageMode', $20::TEXT,
 					'baseLeverage', $21::INT,
+					'trancheDeployed', $22::INT,
+					'trancheBase', $23::TEXT,
+					'atrPctEntry', $24::FLOAT8,
 					'warning', 'paper PnL is not a native Pionex grid backtest'
 				),
 				$13, $14,
@@ -889,10 +927,11 @@ func (worker *Worker) deployPaper(
 	`, settings.ID, candidate.ID, candidate.Symbol,
 			databaseTrend(trend), gridType,
 			mesh.LowerPrice, mesh.UpperPrice, mesh.GridNum,
-			botLev, settings.BudgetUSDT,
+			botLev, investAmount,
 			candidate.CurrentPrice, settings.PnLTargetMode, target, maxLoss,
 			confluence.Status, mesh.GridStepPct, confluence.Score, antiHuntStop,
-			levReason, levMode, settings.Leverage).Scan(&botID, &botNumber)
+			levReason, levMode, settings.Leverage,
+			trancheFlag(trancheOn), settings.BudgetUSDT.String(), atrPct).Scan(&botID, &botNumber)
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				continue
@@ -1191,25 +1230,36 @@ func (worker *Worker) deployReal(
 			regime = val
 		}
 
+		// v2.0.13 tranches: REAL commits HALF the budget at create; the
+		// manage loop tops up via the native invest_in endpoint after a
+		// confirmed adverse excursion or the 24h time-box (paper mirror).
+		investAmount := settings.BudgetUSDT
+		if settings.TrancheDeployEnabled {
+			investAmount = settings.BudgetUSDT.Div(decimal.NewFromInt(2))
+		}
 		mesh := ComputeAdaptiveMesh(
 			candidate.LowerPrice, candidate.UpperPrice, candidate.CurrentPrice,
-			atrPct, regime, settings.BudgetUSDT, settings.Leverage, 0.30,
+			atrPct, regime, investAmount, settings.Leverage, 0.30,
 		)
 
 		// v2.0 HAR-RV geometry — the same sizing the paper fleet validates:
 		// forecast next-day volatility from daily candles, derive range width
 		// / level count / vol-inverse leverage. Falls back to the ATR mesh
 		// when history or fit quality is insufficient.
-		harGeo := worker.harGridGeometry(ctx, candidate.Symbol, decimalFloat(settings.FeeBps.Add(settings.SlippageBps)), settings.BudgetUSDT.InexactFloat64())
+		harGeo := worker.harGridGeometry(ctx, candidate.Symbol, decimalFloat(settings.FeeBps.Add(settings.SlippageBps)), investAmount.InexactFloat64())
+		// Entry gate (v2.0.12, v2.0.13): volatility expansion block, with the
+		// 24h self-baseline fallback covering HAR-less new listings.
+		forecastPct := 0.0
 		if harGeo != nil {
-			// Entry gate (v2.0.12): volatility expansion block (mirror of
-			// the paper path).
-			if blocked, ratio := worker.volExpansionBlocked(ctx, candidate.Symbol, harGeo.forecastPct); blocked {
-				worker.logger.Info("entry gate: volatility expansion, skip real deploy",
-					"component", "autogrid_worker", "symbol", candidate.Symbol,
-					"rv_har_ratio", math.Round(ratio*100)/100)
-				continue
-			}
+			forecastPct = harGeo.forecastPct
+		}
+		if blocked, ratio := worker.volExpansionBlocked(ctx, candidate.Symbol, forecastPct); blocked {
+			worker.logger.Info("entry gate: volatility expansion, skip real deploy",
+				"component", "autogrid_worker", "symbol", candidate.Symbol,
+				"rv_ref_ratio", math.Round(ratio*100)/100)
+			continue
+		}
+		if harGeo != nil {
 			harGeo.applyToMesh(candidate.CurrentPrice, &mesh)
 			worker.logger.Info("v2.0 har geometry applied",
 				"component", "autogrid_worker", "symbol", candidate.Symbol,
@@ -1331,7 +1381,7 @@ func (worker *Worker) deployReal(
 			Row: mesh.GridNum, GridType: gridTypeStr,
 			Trend:           trend,
 			Leverage:        botLev,
-			QuoteInvestment: settings.BudgetUSDT.Round(2),
+			QuoteInvestment: investAmount.Round(2),
 		}
 		if settings.StopLossMode == "ADAPTIVE_ATR" {
 			data.LossStopType = "price"
@@ -1369,7 +1419,7 @@ func (worker *Worker) deployReal(
 				"component", "autogrid_worker", "symbol", candidate.Symbol, "error", checkErr,
 			)
 		} else if check != nil && check.GetMinInvestment().GreaterThan(decimal.Zero) &&
-			settings.BudgetUSDT.LessThan(check.GetMinInvestment()) {
+			investAmount.LessThan(check.GetMinInvestment()) {
 			deployErrors = append(deployErrors, fmt.Sprintf(
 				"%s: budget %s below Pionex minimum investment %s",
 				candidate.Symbol, settings.BudgetUSDT, check.GetMinInvestment(),
@@ -1403,6 +1453,23 @@ func (worker *Worker) deployReal(
 
 		var botNum int
 		_ = worker.db.QueryRow(ctx, `SELECT COALESCE(bot_number, 0) FROM grid_bots WHERE id = $1`, botID).Scan(&botNum)
+
+		// v2.0.13: per-bot tranche markers (audit F1/F6) — deriving the
+		// pending tranche from live settings would auto-inject real margin
+		// into every old bot on any budget raise. Markers match the paper
+		// model_state contract.
+		_, _ = worker.db.Exec(ctx, `
+			UPDATE grid_bots
+			SET model_state = jsonb_build_object(
+			        'trancheDeployed', $2::INT,
+			        'trancheBase', $3::TEXT,
+			        'trancheEntry', $4::TEXT,
+			        'atrPctEntry', $5::FLOAT8
+			    ),
+			    updated_at = NOW()
+			WHERE id = $1
+		`, botID, trancheFlag(settings.TrancheDeployEnabled), settings.BudgetUSDT.String(),
+			candidate.CurrentPrice.String(), atrPct)
 
 		_ = LogBotEvent(ctx, worker.db, botID, botNum, "REAL", candidate.Symbol, "CREATED", &candidate.CurrentPrice, nil, map[string]any{
 			"leverage": botLev, "gridNum": mesh.GridNum, "lowerPrice": lowerPrice, "upperPrice": upperPrice, "budget": settings.BudgetUSDT,
@@ -1714,7 +1781,13 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 		SELECT id, account_id, bu_order_id, status, symbol, direction,
 		       lower_price, upper_price, grid_num, adjustments_count,
 		       pnl_target_usdt, max_loss_usdt, quote_investment,
-		       anti_hunt_stop_price, COALESCE(bot_number, 0)
+		       anti_hunt_stop_price, COALESCE(bot_number, 0),
+		       COALESCE(peak_pnl_usdt, 0), created_at,
+		       COALESCE(NULLIF(model_state->>'trancheDeployed','')::INT, 0),
+		       NULLIF(model_state->>'trancheBase',''),
+		       NULLIF(model_state->>'trancheEntry',''),
+		       COALESCE(NULLIF(model_state->>'atrPctEntry','')::FLOAT8, 0),
+		       NULLIF(model_state->>'trancheFailAt','')
 		FROM grid_bots
 		WHERE autogrid_settings_id = $1 AND bu_order_id IS NOT NULL
 		  AND status IN ('RUNNING', 'STOP_REQUESTED', 'STOPPING')
@@ -1731,6 +1804,13 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 		antiHuntStop                                            *decimal.Decimal
 		investment                                              decimal.Decimal
 		botNumber                                               int
+		peak                                                    decimal.Decimal
+		createdAt                                               time.Time
+		trancheDeployed                                         int
+		trancheBase                                             *string
+		trancheEntry                                            *string
+		atrEntry                                                float64
+		trancheFailAt                                           *string
 	}
 	bots := make([]managedBot, 0)
 	for rows.Next() {
@@ -1740,6 +1820,9 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 			&item.direction, &item.lower, &item.upper, &item.rowNum,
 			&item.adjustments, &item.pnlTarget, &item.maxLoss, &item.investment,
 			&item.antiHuntStop, &item.botNumber,
+			&item.peak, &item.createdAt,
+			&item.trancheDeployed, &item.trancheBase, &item.trancheEntry,
+			&item.atrEntry, &item.trancheFailAt,
 		); err != nil {
 			rows.Close()
 			return clampInterval(settings.ManageIntervalSeconds), err
@@ -1873,7 +1956,9 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 					ELSE $3
 				END,
 			    last_remote_status = $4, realized_pnl_usdt = $5,
-			    unrealized_pnl_usdt = $6, last_reconciled_at = NOW(),
+			    unrealized_pnl_usdt = $6,
+			    peak_pnl_usdt = GREATEST(COALESCE(peak_pnl_usdt, 0), $5 + $6),
+			    last_reconciled_at = NOW(),
 			    last_error = NULL, updated_at = NOW()
 			WHERE id = $1
 		`, bot.id, bot.localStatus, persistedReconciliation, remoteStatus, realized, unrealized)
@@ -1913,6 +1998,74 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 			botMaxLoss = *bot.maxLoss
 		}
 
+		// v2.0.13 tranche 2 (REAL): paper-parity trigger — marker-based (a
+		// settings budget raise must never auto-inject margin into old
+		// bots), adverse measured from the stored entry against 0.75×ATR(1h)
+		// with two confirming 15m closes, or the 24h time-box. invest_in is
+		// at-least-once on the exchange: a failed attempt arms a 1h backoff
+		// marker so a persist failure cannot machine-gun real margin.
+		trancheBackoff := false
+		if bot.trancheFailAt != nil {
+			if failedAt, pErr := time.Parse(time.RFC3339, strings.TrimSpace(*bot.trancheFailAt)); pErr == nil &&
+				time.Since(failedAt) < time.Hour {
+				trancheBackoff = true
+			}
+		}
+		if !trancheBackoff && bot.trancheDeployed == 1 && bot.trancheBase != nil && bot.localStatus == "RUNNING" && price.IsPositive() {
+			if base, bErr := decimal.NewFromString(*bot.trancheBase); bErr == nil && base.GreaterThan(bot.investment) {
+				entry := price
+				if bot.trancheEntry != nil {
+					if e, eErr := decimal.NewFromString(*bot.trancheEntry); eErr == nil && e.IsPositive() {
+						entry = e
+					}
+				}
+				topUp := ""
+				if time.Since(bot.createdAt) >= trancheTimeBox {
+					topUp = "time-box 24h"
+				} else if bot.atrEntry > 0 {
+					adverse := price.Sub(entry).Abs().Div(entry)
+					limit := decimal.NewFromFloat(bot.atrEntry * 2.0 * 0.75 / 100.0)
+					if adverse.GreaterThanOrEqual(limit) && worker.trancheTurnConfirmed(ctx, bot.symbol, price, entry) {
+						topUp = "подтверждённый adverse 0.75×ATR(1h)"
+					}
+				}
+				if topUp != "" {
+					pending := base.Sub(bot.investment)
+					if _, err := worker.service.AdjustBot(ctx, worker.accounts, settings.ID, bot.id, AdjustBotInput{
+						Mode:            "invest_in",
+						QuoteInvestment: pending.Round(2),
+					}); err != nil {
+						worker.logger.Error("tranche 2 invest_in failed",
+							"component", "autogrid_worker", "bot_id", bot.id, "error", err)
+						_, _ = worker.db.Exec(ctx, `
+							UPDATE grid_bots
+							SET model_state = jsonb_set(model_state, '{trancheFailAt}', to_jsonb(to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'))),
+							    updated_at = NOW()
+							WHERE id = $1
+						`, bot.id)
+					} else {
+						_, _ = worker.db.Exec(ctx, `
+							UPDATE grid_bots
+							SET pnl_target_usdt = pnl_target_usdt * 2,
+							    max_loss_usdt = max_loss_usdt * 2,
+							    model_state = jsonb_set(model_state, '{trancheDeployed}', '2'::jsonb),
+							    updated_at = NOW()
+							WHERE id = $1
+						`, bot.id)
+						worker.logger.Info("tranche 2 deployed (REAL invest_in)",
+							"component", "autogrid_worker", "symbol", bot.symbol, "reason", topUp)
+						_ = QueueTelegramEvent(ctx, worker.db, "TRANCHE_2", map[string]any{
+							"bot_number": bot.botNumber, "symbol": bot.symbol, "reason": topUp,
+						})
+					}
+				}
+			}
+		}
+
+		peakNow := bot.peak
+		if current := realized.Add(unrealized); current.GreaterThan(peakNow) {
+			peakNow = current
+		}
 		decision := decideBotAction(botActionInput{
 			Direction:        bot.direction,
 			Lower:            bot.lower,
@@ -1920,7 +2073,7 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 			CurrentPrice:     price,
 			RealizedPNL:      realized,
 			UnrealizedPNL:    unrealized,
-			PeakPNL:          realized.Add(unrealized),
+			PeakPNL:          peakNow,
 			Budget:           bot.investment,
 			PnLTarget:        botTarget,
 			MaxLoss:          botMaxLoss,
@@ -2216,7 +2369,11 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 		SELECT id, COALESCE(bot_number, 0), symbol, direction, entry_price, leverage, quote_investment,
 		       lower_price, upper_price, pnl_target_usdt, max_loss_usdt,
 		       grid_num, last_grid_level, realized_pnl_usdt, COALESCE(adjustments_count, 0),
-		       anti_hunt_stop_price, opened_at, last_funding_at
+		       anti_hunt_stop_price, opened_at, last_funding_at,
+		       COALESCE(peak_pnl_usdt, 0),
+		       COALESCE(NULLIF(model_state->>'trancheDeployed','')::INT, 0),
+		       NULLIF(model_state->>'trancheBase',''),
+		       COALESCE(NULLIF(model_state->>'atrPctEntry','')::FLOAT8, 0)
 		FROM paper_grid_bots
 		WHERE settings_id = $1 AND status = 'RUNNING'
 	`, settings.ID)
@@ -2238,6 +2395,10 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 		adjustmentsCount         int
 		openedAt                 time.Time
 		lastFundingAt            *time.Time
+		peak                     decimal.Decimal
+		trancheDeployed          int
+		trancheBase              *string
+		atrEntry                 float64
 	}
 	bots := make([]paperBot, 0)
 	for rows.Next() {
@@ -2248,6 +2409,7 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 			&item.pnlTarget, &item.maxLoss, &item.gridNum, &item.lastLevel,
 			&item.realized, &item.adjustmentsCount, &item.antiHuntStop,
 			&item.openedAt, &item.lastFundingAt,
+			&item.peak, &item.trancheDeployed, &item.trancheBase, &item.atrEntry,
 		); err != nil {
 			rows.Close()
 			return err
@@ -2385,9 +2547,12 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 			botMaxLoss = *bot.maxLoss
 		}
 		total := realized.Add(unrealized)
-		peakPnL := total
-		if realized.GreaterThan(peakPnL) {
-			peakPnL = realized
+		// v2.0.13: persisted peak makes TRAILING_TAKE_PROFIT / BREAKEVEN_LOCK
+		// stateful — the old in-memory approximation reset with every cycle,
+		// so a bot that touched 90% of target and rolled over never trailed.
+		peakPnL := bot.peak
+		if total.GreaterThan(peakPnL) {
+			peakPnL = total
 		}
 		if peakPnL.IsNegative() {
 			peakPnL = decimal.Zero
@@ -2466,10 +2631,14 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 			// Crystallize the underwater inventory mark into realized. The
 			// paper model is stateless: without this the pre-shift inventory
 			// loss silently vanishes when the grid recenters. A real
-			// adjust_params keeps the position; charging the mark (already net
-			// of exit fee) here is the pessimistic-but-honest equivalent and
-			// compounds toward truth across repeated shifts.
+			// adjust_params keeps the position, so the exit-fee component
+			// charged into `unrealized` for close decisions is added BACK —
+			// no position is exited on a shift, and repeated shifts must not
+			// stack phantom exit fees (v2.0.13 audit fix).
 			shiftRealized := realized.Add(unrealized)
+			if exitNotional.IsPositive() {
+				shiftRealized = shiftRealized.Add(exitNotional.Mul(feeRate))
+			}
 			_, _ = worker.db.Exec(ctx, `
 				UPDATE paper_grid_bots
 				SET lower_price = $2, upper_price = $3,
@@ -2498,9 +2667,56 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 			UPDATE paper_grid_bots
 			SET mark_price = $2, unrealized_pnl_usdt = $3,
 			    realized_pnl_usdt = $4, last_grid_level = $5,
+			    peak_pnl_usdt = GREATEST(peak_pnl_usdt, $3 + $4),
 			    updated_at = NOW()
 			WHERE id = $1
 		`, bot.id, price, unrealized, realized, currentLevel)
+
+		// v2.0.13 tranche 2 (paper): top the bot up to its full base after a
+		// CONFIRMED adverse excursion (>= 0.75x ATR(1h) from entry with two
+		// consecutive 15m closes turning back) or the 24h time-box. Runs
+		// AFTER the mark so this tick's funding accrual and PnL persist; the
+		// next cycle re-marks with the full investment (the stateless ladder
+		// simply doubles per-level notional; last_grid_level keeps the pair
+		// baseline). Targets double with NULL propagating — a NULL target
+		// means "follow settings", and 0x2 would pin it off.
+		if bot.trancheDeployed == 1 && bot.trancheBase != nil {
+			if base, bErr := decimal.NewFromString(*bot.trancheBase); bErr == nil && base.GreaterThan(bot.investment) {
+				trancheReason := ""
+				if time.Since(bot.openedAt) >= trancheTimeBox {
+					trancheReason = "time-box 24h"
+				} else if bot.atrEntry > 0 && price.IsPositive() {
+					adverse := price.Sub(bot.entry).Abs().Div(bot.entry)
+					// ATR(1h) ≈ 2 × ATR(15m) — the entry-time scanner figure.
+					limit := decimal.NewFromFloat(bot.atrEntry * 2.0 * 0.75 / 100.0)
+					if adverse.GreaterThanOrEqual(limit) && worker.trancheTurnConfirmed(ctx, bot.symbol, price, bot.entry) {
+						trancheReason = "подтверждённый adverse 0.75×ATR(1h)"
+					}
+				}
+				if trancheReason != "" {
+					tag, tErr := worker.db.Exec(ctx, `
+						UPDATE paper_grid_bots
+						SET quote_investment = $2,
+						    pnl_target_usdt = pnl_target_usdt * 2,
+						    max_loss_usdt = max_loss_usdt * 2,
+						    model_state = jsonb_set(model_state, '{trancheDeployed}', '2'::jsonb),
+						    updated_at = NOW()
+						WHERE id = $1 AND status = 'RUNNING'
+						  AND COALESCE(NULLIF(model_state->>'trancheDeployed','')::INT, 0) = 1
+					`, bot.id, base)
+					if tErr == nil && tag.RowsAffected() == 1 {
+						worker.logger.Info("tranche 2 deployed",
+							"component", "autogrid_worker", "symbol", bot.symbol, "reason", trancheReason)
+						_ = LogBotEvent(ctx, worker.db, bot.id, bot.botNumber, "PAPER", bot.symbol, "TRANCHE_2", &price, nil, map[string]any{
+							"reason": trancheReason, "investment": base.String(),
+						})
+						_ = QueueTelegramEvent(ctx, worker.db, "TRANCHE_2", map[string]any{
+							"bot_number": bot.botNumber, "symbol": bot.symbol, "reason": trancheReason,
+						})
+					}
+				}
+			}
+		}
 	}
 	return nil
 }

@@ -130,6 +130,8 @@ func QueueTelegramEvent(
 	case "STOP_LOSS":
 		shouldSend = notifyStop
 		tmpl = tmplStop
+	case "TRANCHE_2":
+		tmpl = tmplAdjust // same rendering slot as range shifts; vars overlap
 	case "RANGE_ADJUST", "ADJUST_RANGE":
 		shouldSend = notifyAdjust
 		tmpl = tmplAdjust

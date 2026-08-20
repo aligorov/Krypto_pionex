@@ -217,14 +217,19 @@ func (s *Service) GetOIChange24h(ctx context.Context, symbol string) (*OIInfo, e
 // the 5-minute collector cadence). The entry-time funding-flush gate uses it
 // to detect forced deleveraging: extreme funding + falling OI.
 func (s *Service) GetOIChange1h(ctx context.Context, symbol string) (*OIInfo, error) {
+	// oi_usd = contracts x mark price, so a falling price alone moves the USD
+	// figure and the gate would read "deleveraging" on every dip. Normalize
+	// per exchange to contract units (usd/price) before comparing.
 	rows, err := s.db.Query(ctx, `
 		SELECT exchange,
 		       (array_agg(oi_usd ORDER BY captured_at DESC))[1] AS latest_usd,
-		       (array_agg(oi_usd ORDER BY captured_at ASC))[1]  AS oldest_usd
+		       (array_agg(price  ORDER BY captured_at DESC))[1] AS latest_price,
+		       (array_agg(oi_usd ORDER BY captured_at ASC))[1]  AS oldest_usd,
+		       (array_agg(price  ORDER BY captured_at ASC))[1]  AS oldest_price
 		FROM oi_history
 		WHERE symbol = $1
 		  AND captured_at >= NOW() - INTERVAL '80 minutes'
-		  AND oi_usd IS NOT NULL
+		  AND oi_usd IS NOT NULL AND price IS NOT NULL AND price > 0
 		GROUP BY exchange
 		HAVING MIN(captured_at) < NOW() - INTERVAL '40 minutes'
 		   AND MAX(captured_at) > NOW() - INTERVAL '10 minutes'
@@ -234,29 +239,31 @@ func (s *Service) GetOIChange1h(ctx context.Context, symbol string) (*OIInfo, er
 	}
 	defer rows.Close()
 
-	var latest, oldest float64
-	exchanges := 0
+	var latestUSD, latestContracts, oldestContracts float64
+	samples := 0
 	for rows.Next() {
 		var exchange string
-		var latestUSD, oldestUSD float64
-		if err := rows.Scan(&exchange, &latestUSD, &oldestUSD); err != nil {
+		var latestOI, latestPX, oldestOI, oldestPX float64
+		if err := rows.Scan(&exchange, &latestOI, &latestPX, &oldestOI, &oldestPX); err != nil {
 			return nil, fmt.Errorf("scan oi history 1h: %w", err)
 		}
-		latest += latestUSD
-		oldest += oldestUSD
-		exchanges++
+		latestUSD += latestOI
+		latestContracts += latestOI / latestPX
+		oldestContracts += oldestOI / oldestPX
+		samples++
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate oi history 1h for %s: %w", symbol, err)
 	}
-	if exchanges == 0 {
+	if samples == 0 || oldestContracts <= 0 {
 		return nil, fmt.Errorf("no recent open interest history for %s", symbol)
 	}
 
-	info := &OIInfo{CurrentUSD: latest}
-	if oldest > 0 {
-		info.ChangePct = (latest - oldest) / oldest * 100
-	}
+	// Aggregate (summed) contract units, preserving the USD-weighted
+	// semantics of the 24h variant: a small exchange with a big local swing
+	// cannot veto the aggregate signal.
+	info := &OIInfo{CurrentUSD: latestUSD}
+	info.ChangePct = (latestContracts - oldestContracts) / oldestContracts * 100
 	info.IsRising = info.ChangePct > 0
 	return info, nil
 }

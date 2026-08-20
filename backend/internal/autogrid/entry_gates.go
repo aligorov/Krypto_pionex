@@ -4,6 +4,7 @@ import (
 	"context"
 	"math"
 	"sort"
+	"time"
 
 	"github.com/aligorov/pionex-bot/backend/internal/marketdata"
 	"github.com/aligorov/pionex-bot/backend/internal/pionex"
@@ -41,6 +42,13 @@ const (
 	volExpansionRatioThreshold = 1.5
 	// volExpansionWindow is how many 15m returns feed the trailing RV (2h).
 	volExpansionWindow = 8
+	// volExpansionBaseline is the self-referencing fallback window (24h) used
+	// when no HAR forecast exists (new listings).
+	volExpansionBaseline = 96
+	// trancheTimeBox deploys the second tranche unconditionally after this
+	// age — capping the insurance premium (deferred pair production on the
+	// half-sized grid).
+	trancheTimeBox = 24 * time.Hour
 	// oiFlushChangePct — OI must be falling by at least this much over the
 	// last hour for the funding+OI flush block to arm; smaller moves are
 	// collector noise.
@@ -83,22 +91,64 @@ func RealizedVolPct15m(candles []pionex.KlineCandle, window int) float64 {
 
 // volExpansionBlocked reports whether the symbol is in an active volatility
 // expansion: trailing 2h realized vol at or above volExpansionRatioThreshold
-// times the HAR next-day forecast (both annualized, so the ratio is
-// scale-free). Only evaluated when a HAR forecast exists — the ATR-mesh
-// fallback path already resizes geometry for high-vol symbols.
+// times a reference level (both annualized, so the ratio is scale-free).
+//
+// With a HAR forecast the reference is the model's next-day estimate. WITHOUT
+// one — new listings with <31 daily candles, the knife-prone cohort the
+// 2026-08-19 audit showed was uncovered — the reference degrades to the
+// symbol's own trailing 24h realized vol: block when the last 2h run at 1.5x
+// the past day's baseline. Self-referencing removes the dependence on a
+// daily-anchored model at the cost of missing slow vol ramps; both failure
+// directions stay bounded by the range sizing itself.
 func (worker *Worker) volExpansionBlocked(ctx context.Context, symbol string, forecastAnnPct float64) (bool, float64) {
-	if forecastAnnPct <= 0 {
+	if forecastAnnPct > 0 {
+		candles, err := worker.publicClient.GetKlines(ctx, symbol, "15M", volExpansionWindow+4)
+		if err != nil || len(candles) < volExpansionWindow+1 {
+			// No fresh candles → cannot prove expansion → do not block. The
+			// research ranks a false block (missing the post-flush window)
+			// above a false pass (range sizing still bounds the damage).
+			return false, 0
+		}
+		ratio := RealizedVolPct15m(candles, volExpansionWindow) / forecastAnnPct
+		return ratio >= volExpansionRatioThreshold, ratio
+	}
+	candles, err := worker.publicClient.GetKlines(ctx, symbol, "15M", volExpansionBaseline+4)
+	if err != nil || len(candles) < volExpansionBaseline+1 {
 		return false, 0
 	}
-	candles, err := worker.publicClient.GetKlines(ctx, symbol, "15M", volExpansionWindow+4)
-	if err != nil || len(candles) < volExpansionWindow+1 {
-		// No fresh candles → cannot prove expansion → do not block. The
-		// research ranks a false block (missing the post-flush window) above
-		// a false pass (HAR range sizing still bounds the damage).
+	baseline := RealizedVolPct15m(candles, volExpansionBaseline)
+	if baseline <= 0 {
 		return false, 0
 	}
-	ratio := RealizedVolPct15m(candles, volExpansionWindow) / forecastAnnPct
+	ratio := RealizedVolPct15m(candles, volExpansionWindow) / baseline
 	return ratio >= volExpansionRatioThreshold, ratio
+}
+
+// trancheTurnConfirmed checks the second tranche's direction gate: after an
+// adverse excursion the price must have ticked back toward entry on the last
+// CLOSED 15m candle (dz/dt > 0 discretized) before the remaining budget is
+// committed. Blindly averaging down on a falling knife is the exact failure
+// tranches exist to blunt.
+func (worker *Worker) trancheTurnConfirmed(ctx context.Context, symbol string, price, entry decimal.Decimal) bool {
+	// Two CONSECUTIVE confirming closes: a single up-tick is a coin flip
+	// (audit: one close adds ~30-45 min delay and near-zero information);
+	// two in a row filter most whipsaw false-turns.
+	candles, err := worker.publicClient.GetKlines(ctx, symbol, "15M", 6)
+	if err != nil || len(candles) < 4 {
+		return false
+	}
+	sorted := append([]pionex.KlineCandle(nil), candles...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Time < sorted[j].Time })
+	c1, _ := sorted[len(sorted)-2].Close.Float64() // last CLOSED candle
+	c2, _ := sorted[len(sorted)-3].Close.Float64()
+	c3, _ := sorted[len(sorted)-4].Close.Float64()
+	if c1 <= 0 || c2 <= 0 || c3 <= 0 {
+		return false
+	}
+	if price.LessThan(entry) {
+		return c1 > c2 && c2 > c3 // adverse-down: two closes turning up
+	}
+	return c1 < c2 && c2 < c3 // adverse-up: two closes turning down
 }
 
 // fundingFlushBlocked reports whether the symbol is mid deleveraging-flush:

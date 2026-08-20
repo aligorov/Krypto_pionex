@@ -74,7 +74,7 @@ func ComputeGridGeometry(forecastVolPct float64, harR2 float64, feeBps float64, 
 	gridCount := int(rangePct / minStepPct)
 	if budgetUsdt > 0 {
 		// Per-level notional cap: budget × leverage / levels ≥ floor.
-		maxByBudget := int(budgetUsdt*float64(leverage) / minPerLevelNotionalUsdt)
+		maxByBudget := int(budgetUsdt * float64(leverage) / minPerLevelNotionalUsdt)
 		if gridCount > maxByBudget {
 			gridCount = maxByBudget
 		}

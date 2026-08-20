@@ -184,7 +184,7 @@ type Collector struct {
 	universeMu   sync.Mutex
 	aliases      map[string]string // exchange-native symbol -> Pionex form
 	universeSize int
-	okxWatch     []string      // top-N by turnover for the per-symbol OKX feed
+	okxWatch     []string        // top-N by turnover for the per-symbol OKX feed
 	okxValid     map[string]bool // instruments confirmed to exist on OKX
 	universeTime time.Time
 }
