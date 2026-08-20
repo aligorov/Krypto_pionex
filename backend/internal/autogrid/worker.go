@@ -40,7 +40,8 @@ func trancheFlag(on bool) int {
 // for an hour plus 2h per-symbol cooldowns.
 const protectiveCloseExemptReasons = `'TAKE_PROFIT', 'TAKE_PROFIT_NATIVE', 'TRAILING_TAKE_PROFIT', 'BREAKEVEN_LOCK',
 	'MANUAL_CLOSE', 'MCP_MANUAL_CLOSE', 'USER_CANCEL', 'ALREADY_CLOSED', 'EXTERNAL_CLOSE', 'REMOTE_FAILED',
-	'STOPPED', 'EMERGENCY_STOPPED', 'AUTOGRID_STOP', 'EMERGENCY_STOP'`
+	'STOPPED', 'EMERGENCY_STOPPED', 'AUTOGRID_STOP', 'EMERGENCY_STOP',
+	'DELISTED_NO_PRICE'`
 
 type Worker struct {
 	db           *pgxpool.Pool
@@ -2458,6 +2459,31 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 	if err != nil {
 		return err
 	}
+	// v2.0.17: every pass is OBSERVABLE. The 2026-08-20 incident — bots
+	// unsupervised for hours while no error surfaced — was undiagnosable
+	// because the pass itself logged nothing and the mark UPDATE swallowed
+	// its errors.
+	passMarked, passSkipped := 0, 0
+	// Delist sweep (v2.0.17): a RUNNING bot whose updated_at is stale beyond
+	// 45 minutes has had NO supervision — neither manage marks (which touch
+	// updated_at) nor scan supervision marks. That means its price has been
+	// unobtainable for 45+ minutes (delisting/renaming — the LAB case) or
+	// the manage loop is wedged; either way it must not sit unsupervised
+	// forever. Close it as an ops cleanup; exempt from the breaker.
+	sweep, sweepErr := worker.db.Exec(ctx, `
+		UPDATE paper_grid_bots
+		SET status = 'COMPLETED', closed_reason = 'DELISTED_NO_PRICE',
+		    closed_at = NOW(), updated_at = NOW()
+		WHERE settings_id = $1 AND status = 'RUNNING'
+		  AND updated_at < NOW() - INTERVAL '45 minutes'
+	`, settings.ID)
+	if sweepErr == nil && sweep.RowsAffected() > 0 {
+		worker.logger.Warn("delist sweep closed stale paper bots",
+			"component", "autogrid_worker", "closed", sweep.RowsAffected())
+		_ = QueueTelegramEvent(ctx, worker.db, "DELIST_SWEEP", map[string]any{
+			"closed": sweep.RowsAffected(),
+		})
+	}
 	rows, err := worker.db.Query(ctx, `
 		SELECT id, COALESCE(bot_number, 0), symbol, direction, entry_price, leverage, quote_investment,
 		       lower_price, upper_price, pnl_target_usdt, max_loss_usdt,
@@ -2511,6 +2537,12 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 	}
 	rows.Close()
 
+	defer func() {
+		worker.logger.Info("manage paper pass",
+			"component", "autogrid_worker",
+			"bots", len(bots), "marked", passMarked, "skipped_no_price", passSkipped)
+	}()
+
 	effectiveFeeBps := settings.FeeBps.Add(settings.SlippageBps)
 	feeRate := effectiveFeeBps.Div(decimal.NewFromInt(10000))
 
@@ -2543,6 +2575,7 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 			}
 		}
 		if !ok || price.IsZero() {
+			passSkipped++
 			continue
 		}
 		// A zero entry price cannot be divided against; repair it from the
@@ -2777,14 +2810,19 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 			})
 			continue
 		}
-		_, _ = worker.db.Exec(ctx, `
+		if _, mErr := worker.db.Exec(ctx, `
 			UPDATE paper_grid_bots
 			SET mark_price = $2, unrealized_pnl_usdt = $3,
 			    realized_pnl_usdt = $4, last_grid_level = $5,
 			    peak_pnl_usdt = GREATEST(peak_pnl_usdt, $3 + $4),
 			    updated_at = NOW()
 			WHERE id = $1
-		`, bot.id, price, unrealized, realized, currentLevel)
+		`, bot.id, price, unrealized, realized, currentLevel); mErr != nil {
+			worker.logger.Error("paper bot mark UPDATE failed",
+				"component", "autogrid_worker", "bot_id", bot.id, "symbol", bot.symbol, "error", mErr)
+		} else {
+			passMarked++
+		}
 
 		// v2.0.13 tranche 2 (paper): top the bot up to its full base after a
 		// CONFIRMED adverse excursion (>= 0.75x ATR(1h) from entry with two
