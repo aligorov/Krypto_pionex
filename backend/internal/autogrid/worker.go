@@ -2026,7 +2026,7 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 				END,
 			    last_remote_status = $4, realized_pnl_usdt = $5,
 			    unrealized_pnl_usdt = $6,
-			    peak_pnl_usdt = GREATEST(COALESCE(peak_pnl_usdt, 0), $5 + $6),
+			    peak_pnl_usdt = GREATEST(COALESCE(peak_pnl_usdt, 0), $5::NUMERIC + $6::NUMERIC),
 			    last_reconciled_at = NOW(),
 			    last_error = NULL, updated_at = NOW()
 			WHERE id = $1
@@ -2814,7 +2814,7 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 			UPDATE paper_grid_bots
 			SET mark_price = $2, unrealized_pnl_usdt = $3,
 			    realized_pnl_usdt = $4, last_grid_level = $5,
-			    peak_pnl_usdt = GREATEST(peak_pnl_usdt, $3 + $4),
+			    peak_pnl_usdt = GREATEST(peak_pnl_usdt, $3::NUMERIC + $4::NUMERIC),
 			    updated_at = NOW()
 			WHERE id = $1
 		`, bot.id, price, unrealized, realized, currentLevel); mErr != nil {
