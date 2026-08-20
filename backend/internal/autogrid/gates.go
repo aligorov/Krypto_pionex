@@ -40,11 +40,16 @@ func (worker *Worker) CheckEconomicEvents(ctx context.Context, hoursAhead int) (
 
 // CheckLiquidationCascade checks if there were major liquidations recently.
 // Reads from the liquidation_events table (populated by the collector).
+// CheckLiquidationCascade arms on LONG liquidations only (v2.0.14): forced
+// long unwinding is the falling-knife signature this gate exists for. A
+// short-squeeze cascade (side='short') marks a violent UP move — precisely
+// when participation finally makes sense — and must not freeze entries.
 func (worker *Worker) CheckLiquidationCascade(ctx context.Context, thresholdUSD float64) (bool, float64) {
 	var totalUSD float64
 	err := worker.db.QueryRow(ctx, `
         SELECT COALESCE(SUM(value_usd), 0) FROM liquidation_events
         WHERE captured_at > NOW() - INTERVAL '1 hour'
+          AND side = 'long'
     `).Scan(&totalUSD)
 	if err != nil {
 		return false, 0

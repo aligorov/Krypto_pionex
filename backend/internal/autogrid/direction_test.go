@@ -20,20 +20,32 @@ func TestSelectDirectionTrendDown(t *testing.T) {
 		t.Errorf("expected leverage 2, got %d", decision.Leverage)
 	}
 
-	// TREND_DOWN + negative funding -> WAIT
+	// v2.0.14: TREND_DOWN + modestly negative (non-extreme) funding -> SHORT
+	// (dumps flip funding negative; that used to veto the best short setups)
 	decision = SelectDirection(
 		RegimeContext{Regime: "TREND_DOWN", Confidence: 0.8, HurstValue: 0.7},
 		FundingContext{AverageRate: -0.0005},
 		EventContext{},
 	)
-	if decision.Direction != "WAIT" {
-		t.Errorf("expected WAIT, got %s (reason: %s)", decision.Direction, decision.Reason)
+	if decision.Direction != "SHORT" {
+		t.Errorf("expected SHORT, got %s (reason: %s)", decision.Direction, decision.Reason)
 	}
 
-	// TREND_DOWN + neutral funding -> WAIT
+	// v2.0.14: TREND_DOWN + neutral funding -> SHORT (not extreme)
 	decision = SelectDirection(
 		RegimeContext{Regime: "TREND_DOWN", Confidence: 0.8, HurstValue: 0.7},
 		FundingContext{AverageRate: 0.0},
+		EventContext{},
+	)
+	if decision.Direction != "SHORT" {
+		t.Errorf("expected SHORT, got %s (reason: %s)", decision.Direction, decision.Reason)
+	}
+
+	// v2.0.14: TREND_DOWN + EXTREME negative funding -> WAIT (crowded shorts
+	// are squeeze fuel even in a downtrend)
+	decision = SelectDirection(
+		RegimeContext{Regime: "TREND_DOWN", Confidence: 0.8, HurstValue: 0.7},
+		FundingContext{AverageRate: -0.005, IsExtreme: true},
 		EventContext{},
 	)
 	if decision.Direction != "WAIT" {
@@ -55,24 +67,77 @@ func TestSelectDirectionTrendUp(t *testing.T) {
 		t.Errorf("expected leverage 2, got %d", decision.Leverage)
 	}
 
-	// TREND_UP + positive funding -> WAIT
+	// v2.0.14: TREND_UP + modestly positive (non-extreme) funding -> LONG
+	// (rallies carry positive funding; LONG used to be unreachable in every
+	// up-market)
 	decision = SelectDirection(
 		RegimeContext{Regime: "TREND_UP", Confidence: 0.8, HurstValue: 0.7},
 		FundingContext{AverageRate: 0.0005},
 		EventContext{},
 	)
-	if decision.Direction != "WAIT" {
-		t.Errorf("expected WAIT, got %s (reason: %s)", decision.Direction, decision.Reason)
+	if decision.Direction != "LONG" {
+		t.Errorf("expected LONG, got %s (reason: %s)", decision.Direction, decision.Reason)
 	}
 
-	// TREND_UP + neutral funding -> WAIT
+	// v2.0.14: TREND_UP + neutral funding -> LONG (not extreme)
 	decision = SelectDirection(
 		RegimeContext{Regime: "TREND_UP", Confidence: 0.8, HurstValue: 0.7},
 		FundingContext{AverageRate: 0.0},
 		EventContext{},
 	)
+	if decision.Direction != "LONG" {
+		t.Errorf("expected LONG, got %s (reason: %s)", decision.Direction, decision.Reason)
+	}
+
+	// v2.0.14: TREND_UP + EXTREME positive funding -> WAIT (crowded longs)
+	decision = SelectDirection(
+		RegimeContext{Regime: "TREND_UP", Confidence: 0.8, HurstValue: 0.7},
+		FundingContext{AverageRate: 0.005, IsExtreme: true},
+		EventContext{},
+	)
 	if decision.Direction != "WAIT" {
 		t.Errorf("expected WAIT, got %s (reason: %s)", decision.Direction, decision.Reason)
+	}
+}
+
+// v2.0.14 FNG scoping: euphoria (>=85) freezes everything; extreme panic
+// (1..15) freezes directionals only — capitulation stays harvestable by
+// NEUTRAL grids (Nagel: reversal premium is highest post-flush).
+func TestSelectDirectionFearGreedScoping(t *testing.T) {
+	panicCtx := EventContext{FearGreedExtreme: 8}
+	decision := SelectDirection(
+		RegimeContext{Regime: "RANGE", Confidence: 0.7, HurstValue: 0.42},
+		FundingContext{AverageRate: 0.0},
+		panicCtx,
+	)
+	if decision.Direction != "NEUTRAL" {
+		t.Errorf("panic zone must allow NEUTRAL, got %s (%s)", decision.Direction, decision.Reason)
+	}
+	decision = SelectDirection(
+		RegimeContext{Regime: "TREND_DOWN", Confidence: 0.8, HurstValue: 0.7},
+		FundingContext{AverageRate: 0.0},
+		panicCtx,
+	)
+	if decision.Direction != "WAIT" {
+		t.Errorf("panic zone must freeze SHORT, got %s (%s)", decision.Direction, decision.Reason)
+	}
+	decision = SelectDirection(
+		RegimeContext{Regime: "TREND_UP", Confidence: 0.8, HurstValue: 0.7},
+		FundingContext{AverageRate: 0.0},
+		panicCtx,
+	)
+	if decision.Direction != "WAIT" {
+		t.Errorf("panic zone must freeze LONG, got %s (%s)", decision.Direction, decision.Reason)
+	}
+
+	euphoria := EventContext{FearGreedExtreme: 88}
+	decision = SelectDirection(
+		RegimeContext{Regime: "RANGE", Confidence: 0.7, HurstValue: 0.42},
+		FundingContext{AverageRate: 0.0},
+		euphoria,
+	)
+	if decision.Direction != "WAIT" {
+		t.Errorf("euphoria must freeze NEUTRAL too, got %s (%s)", decision.Direction, decision.Reason)
 	}
 }
 

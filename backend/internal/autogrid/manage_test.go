@@ -506,3 +506,44 @@ func TestPercentileBounds(t *testing.T) {
 		t.Fatalf("empty input must return 0, got %v", p)
 	}
 }
+
+// v2.0.14 up-trend stop: a NEUTRAL grid broken UP in a confirmed uptrend
+// with the mark already at half the max loss must EXIT instead of shifting
+// (the PEPE class: repeated up-shifts crystallized short-inventory losses
+// until the stop). Below the threshold the shift still fires — rally
+// participation is allowed while the bleed is small.
+func TestNeutralUpTrendStop(t *testing.T) {
+	input := baseActionInput()
+	input.CurrentPrice = mustDecimal("126") // above upper*(1+1%)
+	input.Regime = "TREND_UP"
+	input.RealizedPNL = mustDecimal("1")
+	input.UnrealizedPNL = mustDecimal("-5.5") // total -4.5 <= -(8/2)
+
+	decision := decideBotAction(input)
+	if decision.Action != ActionCloseRangeBreak || decision.Reason != "RANGE_BREAK_UP_TREND_STOP" {
+		t.Fatalf("expected RANGE_BREAK_UP_TREND_STOP close, got %+v", decision)
+	}
+
+	// Same break, small bleed -> shift up as before.
+	input.UnrealizedPNL = mustDecimal("-1") // total 0
+	decision = decideBotAction(input)
+	if decision.Action != ActionAdjustUp {
+		t.Fatalf("small-bleed up-break must still shift, got %+v", decision)
+	}
+
+	// Same deep bleed but RANGE regime -> shift (no confirmed trend).
+	input.UnrealizedPNL = mustDecimal("-5.5")
+	input.Regime = "RANGE"
+	decision = decideBotAction(input)
+	if decision.Action != ActionAdjustUp {
+		t.Fatalf("RANGE-regime up-break must shift regardless of mark, got %+v", decision)
+	}
+
+	// MaxLoss = 0 (off) -> guard prevents division/threshold nonsense.
+	input.Regime = "TREND_UP"
+	input.MaxLoss = decimal.Zero
+	decision = decideBotAction(input)
+	if decision.Action != ActionAdjustUp {
+		t.Fatalf("MaxLoss=0 must disable the trend stop, got %+v", decision)
+	}
+}

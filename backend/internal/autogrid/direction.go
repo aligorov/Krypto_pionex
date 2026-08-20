@@ -41,38 +41,60 @@ func SelectDirection(regime RegimeContext, funding FundingContext, events EventC
 	if events.LiquidationCascade {
 		return DirectionDecision{Direction: "WAIT", Reason: "liquidation cascade in progress"}
 	}
-	// Sentiment paralysis zones (wired in v2.0.8 — the field was fetched but
-	// never read): crowd euphoria (>=85) and panic (1..15) are the worst
-	// entry windows for ANY direction. 0 is the zero-value/no-signal case.
-	if events.FearGreedExtreme >= 85 || (events.FearGreedExtreme >= 1 && events.FearGreedExtreme <= 15) {
-		return DirectionDecision{Direction: "WAIT", Reason: fmt.Sprintf("Fear&Greed extreme %d — paralysis zone", events.FearGreedExtreme)}
-	}
+	// Sentiment paralysis zones (wired in v2.0.8; scoped in v2.0.14).
+	// Euphoria (>=85) blocks everything — for a grid, overpaying at the
+	// crowd's top is the worst entry window in any shape. Extreme panic
+	// (1..15) now blocks only DIRECTIONAL entries: capitulation is the
+	// richest mean-reversion harvest window (Nagel 2012) and freezing
+	// NEUTRAL grids through it surrendered the best windows of the cycle.
+	// 0 is the zero-value/no-signal case.
+	fng := events.FearGreedExtreme
+	panicZone := fng >= 1 && fng <= 15
 
 	// 2. REGIME-BASED DIRECTION
+	if fng >= 85 {
+		return DirectionDecision{Direction: "WAIT", Reason: fmt.Sprintf("Fear&Greed euphoria %d — paralysis zone (all shapes)", fng)}
+	}
 	switch regime.Regime {
 	case "TREND_DOWN":
-		// SHORT only if funding is positive (shorts earn carry)
-		if funding.AverageRate > 0.0001 {
+		if panicZone {
+			return DirectionDecision{Direction: "WAIT", Reason: fmt.Sprintf("Fear&Greed panic %d — directional freeze", fng)}
+		}
+		// v2.0.14 symmetric relaxation: SHORT when shorts EARN carry
+		// (classic), or when funding is merely not extreme — in dumps
+		// funding typically flips negative (shorts pay), which used to
+		// veto the best short setups outright. Extreme funding still
+		// vetoes: crowded shorts squeeze.
+		if funding.AverageRate > 0.0001 || !funding.IsExtreme {
 			return DirectionDecision{
 				Direction: "SHORT",
 				Leverage:  2,
-				Reason:    fmt.Sprintf("TREND_DOWN + funding %.4f%% (shorts earn carry)", funding.AverageRate*100),
+				Reason:    fmt.Sprintf("TREND_DOWN + funding %.4f%% (не экстремальный)", funding.AverageRate*100),
 			}
 		}
-		return DirectionDecision{Direction: "WAIT", Reason: "TREND_DOWN but funding not favorable for SHORT"}
+		return DirectionDecision{Direction: "WAIT", Reason: "TREND_DOWN but funding extreme — crowded shorts risk"}
 
 	case "TREND_UP":
-		// LONG only if funding is negative (longs earn carry)
-		if funding.AverageRate < -0.0001 {
+		if panicZone {
+			return DirectionDecision{Direction: "WAIT", Reason: fmt.Sprintf("Fear&Greed panic %d — directional freeze", fng)}
+		}
+		// v2.0.14 symmetric relaxation: LONG when longs EARN carry, or when
+		// funding is merely not extreme — rallies carry positive funding
+		// (longs pay), which previously made LONG unreachable in every
+		// up-market (2026-08-20 audit: deployable rally universe ~0-2%).
+		// Extreme funding still vetoes: crowded longs are squeeze fuel.
+		if funding.AverageRate < -0.0001 || !funding.IsExtreme {
 			return DirectionDecision{
 				Direction: "LONG",
 				Leverage:  2,
-				Reason:    fmt.Sprintf("TREND_UP + funding %.4f%% (longs earn carry)", funding.AverageRate*100),
+				Reason:    fmt.Sprintf("TREND_UP + funding %.4f%% (не экстремальный)", funding.AverageRate*100),
 			}
 		}
-		return DirectionDecision{Direction: "WAIT", Reason: "TREND_UP but funding not favorable for LONG"}
+		return DirectionDecision{Direction: "WAIT", Reason: "TREND_UP but funding extreme — crowded longs risk"}
 
 	case "RANGE":
+		// panicZone deliberately does NOT freeze NEUTRAL: capitulation is
+		// the richest harvest window for a mean-reversion grid.
 		// NEUTRAL while the pair still mean-reverts hard enough for a grid.
 		// The 0.60 boundary is aligned with the confluence engine's
 		// HurstHardVetoNeutral — the original `HurstValue < 0.50` combined

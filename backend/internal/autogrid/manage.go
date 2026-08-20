@@ -149,6 +149,12 @@ func decideBotAction(input botActionInput) manageDecision {
 			}
 			return adjustDecision(input, ActionAdjustDown, "RANGE_SHIFT_DOWN")
 		default: // NEUTRAL holds inventory on a downside break
+			// Note (v2.0.14 audit): the down side needs no loss-bounded
+			// trend stop — adverseDown (TREND_DOWN or unknown) already
+			// closes here at ANY loss. The deliberate asymmetry vs the
+			// up-side stop: a down-break in a downtrend is a continuing
+			// knife (exit now), while an up-break in an uptrend may be
+			// profitable rally participation (exit only at -MaxLoss/2).
 			if adverseDown {
 				return manageDecision{Action: ActionCloseRangeBreak, Reason: "RANGE_BREAK_DOWN"}
 			}
@@ -174,6 +180,16 @@ func decideBotAction(input botActionInput) manageDecision {
 			}
 			return adjustDecision(input, ActionAdjustUp, "RANGE_SHIFT_UP")
 		default: // NEUTRAL sits on unsold inventory on an upside break
+			// v2.0.14 trend stop (up): the pre-v2.0.14 path shifted up
+			// UNCONDITIONALLY — a walking rally (PEPE 2026-08-20: 3 shifts
+			// in one hour, each crystallizing short-inventory losses) bled
+			// the bot to the stop through repeated re-entries. Once the
+			// regime is confirmed against the inventory AND the mark has
+			// already reached half the max loss, exit instead of shifting.
+			if input.Regime == "TREND_UP" && input.MaxLoss.GreaterThan(decimal.Zero) &&
+				total.LessThanOrEqual(input.MaxLoss.Div(decimal.NewFromInt(2)).Neg()) {
+				return manageDecision{Action: ActionCloseRangeBreak, Reason: "RANGE_BREAK_UP_TREND_STOP"}
+			}
 			return adjustDecision(input, ActionAdjustUp, "RANGE_SHIFT_UP")
 		}
 	}

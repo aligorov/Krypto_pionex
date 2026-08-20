@@ -430,20 +430,34 @@ func scoreCandidate(
 			regime.ADX, regime.EMASlopePct, change24hPct, change6hPct))
 	}
 
-	// Anti-FOMO Overbought / Oversold protection:
+	// Anti-FOMO Overbought / Oversold protection. v2.0.14: the LONG/SHORT
+	// bands widen when ADX > 30 — a genuine trend carries RSI/channel
+	// position persistently high (or low), and the static bands made
+	// directional entries unreachable for the entire duration of every
+	// walking rally or dump. "Trending" and "overextended" are different
+	// states; the ADX gate separates them. NEUTRAL bands stay static.
+	strongTrend := regime.ADX > 30.0
 	if recommendedTrend == "long" {
-		if regime.RSI > 58.0 {
-			reasons = append(reasons, fmt.Sprintf("Anti-FOMO: RSI (%.1f) > 58 - пара перекуплена, вход в LONG на локальном хае заблокирован", regime.RSI))
+		rsiCap, posCap := 58.0, 40.0
+		if strongTrend {
+			rsiCap, posCap = 65.0, 60.0
 		}
-		if regime.RangePositionPct > 40.0 {
-			reasons = append(reasons, fmt.Sprintf("Anti-FOMO: положение в канале (%.1f%%) > 40%% - вход в LONG выше середины заблокирован", regime.RangePositionPct))
+		if regime.RSI > rsiCap {
+			reasons = append(reasons, fmt.Sprintf("Anti-FOMO: RSI (%.1f) > %.0f - пара перекуплена, вход в LONG на локальном хае заблокирован", regime.RSI, rsiCap))
+		}
+		if regime.RangePositionPct > posCap {
+			reasons = append(reasons, fmt.Sprintf("Anti-FOMO: положение в канале (%.1f%%) > %.0f%% - вход в LONG выше середины заблокирован", regime.RangePositionPct, posCap))
 		}
 	} else if recommendedTrend == "short" {
-		if regime.RSI < 42.0 {
-			reasons = append(reasons, fmt.Sprintf("Anti-FOMO: RSI (%.1f) < 42 - пара перепродана, вход в SHORT на локальном дне заблокирован", regime.RSI))
+		rsiFloor, posFloor := 42.0, 60.0
+		if strongTrend {
+			rsiFloor, posFloor = 35.0, 40.0
 		}
-		if regime.RangePositionPct < 60.0 {
-			reasons = append(reasons, fmt.Sprintf("Anti-FOMO: положение в канале (%.1f%%) < 60%% - вход в SHORT ниже середины заблокирован", regime.RangePositionPct))
+		if regime.RSI < rsiFloor {
+			reasons = append(reasons, fmt.Sprintf("Anti-FOMO: RSI (%.1f) < %.0f - пара перепродана, вход в SHORT на локальном дне заблокирован", regime.RSI, rsiFloor))
+		}
+		if regime.RangePositionPct < posFloor {
+			reasons = append(reasons, fmt.Sprintf("Anti-FOMO: положение в канале (%.1f%%) < %.0f%% - вход в SHORT ниже середины заблокирован", regime.RangePositionPct, posFloor))
 		}
 	} else {
 		// NEUTRAL grid

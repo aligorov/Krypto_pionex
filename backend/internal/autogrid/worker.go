@@ -53,6 +53,16 @@ type Worker struct {
 	llm          *llm.Service
 	logger       *slog.Logger
 	owner        string
+	// trancheTBRegime throttles the trend check behind the tranche-2
+	// time-box: without it every pending bot older than 24h re-fetches a
+	// 60M klines batch per manage tick for as long as the tape trends.
+	// The manage loop is single-goroutine, so a plain map is race-free.
+	trancheTBRegime map[string]trancheTBTrend
+}
+
+type trancheTBTrend struct {
+	checkedAt time.Time
+	trending  bool
 }
 
 type queuedCommand struct {
@@ -73,10 +83,11 @@ func NewWorker(
 	return &Worker{
 		db: db, service: service, accounts: accountService, risk: riskEngine,
 		scanner: marketdata.NewScanner(publicClient), publicClient: publicClient,
-		market: marketdata.NewService(db),
-		llm:    llmService,
-		logger: logger,
-		owner:  fmt.Sprintf("autogrid-%d", time.Now().UnixNano()),
+		market:          marketdata.NewService(db),
+		llm:             llmService,
+		logger:          logger,
+		owner:           fmt.Sprintf("autogrid-%d", time.Now().UnixNano()),
+		trancheTBRegime: make(map[string]trancheTBTrend),
 	}
 }
 
@@ -2021,7 +2032,17 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 				}
 				topUp := ""
 				if time.Since(bot.createdAt) >= trancheTimeBox {
-					topUp = "time-box 24h"
+					// v2.0.14: the unconditional top-up must not fire into a
+					// confirmed trend either way — adding margin at stretched
+					// highs (or into a falling knife) is exactly what the
+					// signal path exists to gate. Defer until the tape is
+					// not strongly trending; the confirmed-adverse path and
+					// the next cycles stay available.
+					if worker.trancheTimeBoxTrending(ctx, bot.symbol) {
+						topUp = ""
+					} else {
+						topUp = "time-box 24h"
+					}
 				} else if bot.atrEntry > 0 {
 					adverse := price.Sub(entry).Abs().Div(entry)
 					limit := decimal.NewFromFloat(bot.atrEntry * 2.0 * 0.75 / 100.0)
@@ -2684,7 +2705,11 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 			if base, bErr := decimal.NewFromString(*bot.trancheBase); bErr == nil && base.GreaterThan(bot.investment) {
 				trancheReason := ""
 				if time.Since(bot.openedAt) >= trancheTimeBox {
-					trancheReason = "time-box 24h"
+					// v2.0.14: no blind top-ups inside confirmed trends
+					// (either direction) — see the REAL-path comment.
+					if !worker.trancheTimeBoxTrending(ctx, bot.symbol) {
+						trancheReason = "time-box 24h"
+					}
 				} else if bot.atrEntry > 0 && price.IsPositive() {
 					adverse := price.Sub(bot.entry).Abs().Div(bot.entry)
 					// ATR(1h) ≈ 2 × ATR(15m) — the entry-time scanner figure.
@@ -2738,6 +2763,20 @@ func (worker *Worker) priceMap(ctx context.Context) (map[string]decimal.Decimal,
 		}
 	}
 	return prices, nil
+}
+
+// trancheTimeBoxTrending reports whether the tape is strongly trending for
+// the tranche-2 time-box, fetching the regime at most once per 5 minutes per
+// symbol (the check would otherwise run every manage tick for every 24h+
+// pending bot).
+func (worker *Worker) trancheTimeBoxTrending(ctx context.Context, symbol string) bool {
+	if cached, ok := worker.trancheTBRegime[symbol]; ok && time.Since(cached.checkedAt) < 5*time.Minute {
+		return cached.trending
+	}
+	regime := worker.regimeForSymbol(ctx, symbol)
+	trending := regime == "TREND_UP" || regime == "TREND_DOWN"
+	worker.trancheTBRegime[symbol] = trancheTBTrend{checkedAt: time.Now(), trending: trending}
+	return trending
 }
 
 // regimeForSymbol lazily recomputes the market regime for a managed symbol.
