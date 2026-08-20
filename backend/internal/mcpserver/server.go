@@ -501,6 +501,7 @@ type AutoGridSettingsUpdateInput struct {
 	MinProfitFactor         string `json:"minProfitFactor"`
 	FeeBps                  string `json:"feeBps"`
 	SlippageBps             string `json:"slippageBps"`
+	PnLTargetMode           string `json:"pnlTargetMode,omitempty"` // DYNAMIC or FIXED
 	PnLTargetUSDT           string `json:"pnlTargetUsdt"`
 	MaxLossUSDT             string `json:"maxLossUsdt"`
 	ManageIntervalSeconds   int    `json:"manageIntervalSeconds"`
@@ -592,6 +593,13 @@ func registerAutoGridTools(
 		if input.AccountID != "" {
 			accountID := input.AccountID
 			update.AccountID = &accountID
+		}
+		if input.PnLTargetMode != "" {
+			mode := strings.ToUpper(strings.TrimSpace(input.PnLTargetMode))
+			if mode != "DYNAMIC" && mode != "FIXED" {
+				return nil, DataOutput{}, fmt.Errorf("invalid pnlTargetMode %q: must be DYNAMIC or FIXED", input.PnLTargetMode)
+			}
+			update.PnLTargetMode = mode
 		}
 		decimalFields := []struct {
 			raw  string

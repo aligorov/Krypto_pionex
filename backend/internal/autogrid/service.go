@@ -331,6 +331,16 @@ func (s *Service) UpdateSettings(
 	if input.ScanMode != "FULL" && input.ScanMode != "TOP_K" {
 		input.ScanMode = "TOP_K"
 	}
+	// v2.0.16: an omitted mode must preserve the stored one — a partial MCP
+	// update (or any caller not sending the full form) used to blank
+	// pnl_target_mode, silently disarming the whole PnL-exit layer (the very
+	// gap found in prod on 2026-08-20).
+	if input.PnLTargetMode != "DYNAMIC" && input.PnLTargetMode != "FIXED" {
+		input.PnLTargetMode = current.PnLTargetMode
+		if input.PnLTargetMode != "DYNAMIC" && input.PnLTargetMode != "FIXED" {
+			input.PnLTargetMode = "DYNAMIC" // sane default for a blank column
+		}
+	}
 	if err := s.validateSettings(ctx, input); err != nil {
 		return nil, err
 	}
