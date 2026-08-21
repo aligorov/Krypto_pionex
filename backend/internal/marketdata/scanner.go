@@ -406,13 +406,25 @@ func scoreCandidate(
 	if volume.LessThan(config.MinVolume24h) {
 		reasons = append(reasons, "24h quote turnover below limit")
 	}
-	if volatilityPct < config.MinVolatilityPct {
+	minVol := config.MinVolatilityPct
+	if isMajorSymbol(symbol.BaseCurrency, symbol.Symbol) {
+		if minVol > 0.4 {
+			minVol = 0.4
+		}
+	}
+	if volatilityPct < minVol {
 		reasons = append(reasons, "volatility below grid threshold")
 	}
 	if volatilityPct > config.MaxVolatilityPct {
 		reasons = append(reasons, "volatility above risk threshold")
 	}
-	if evPct < config.MinExpectedValuePct {
+	minEV := config.MinExpectedValuePct
+	if isMajorSymbol(symbol.BaseCurrency, symbol.Symbol) {
+		if minEV > 0.0 {
+			minEV = 0.0
+		}
+	}
+	if evPct < minEV {
 		reasons = append(reasons, "model EV below limit")
 	}
 	if sharpe < config.MinSharpe {
@@ -427,7 +439,7 @@ func scoreCandidate(
 	if !ValidateMinGridStep(gridStep*100, config.FeeBps, config.SlippageBps) {
 		reasons = append(reasons, "grid step too narrow for trading fees")
 	}
-	if regime.IsSqueeze {
+	if regime.IsSqueeze && recommendedTrend == "no_trend" {
 		reasons = append(reasons, "volatility squeeze: impending explosive breakout")
 	}
 	if recommendedTrend == "no_trend" && (regime.ADX > 32.0 || math.Abs(regime.EMASlopePct) > 3.0 ||
@@ -550,14 +562,22 @@ func scoreCandidate(
 		regime.Choppiness, regime.IsSqueeze, config,
 	)
 
-	// Entry Fit: directional grids require entry on favorable side of structure,
+	// Entry Fit: directional grids require entry within viable channel structure,
 	// neutral grids prefer entries near the midpoint.
 	entryFit := 1.0
 	switch recommendedTrend {
 	case "long":
-		entryFit = clamp((40-regime.RangePositionPct)/40, 0, 1)
+		if regime.RangePositionPct <= 50.0 {
+			entryFit = clamp((regime.RangePositionPct-10)/40, 0.5, 1.0)
+		} else {
+			entryFit = clamp(1.0-(regime.RangePositionPct-50)/50, 0.5, 1.0)
+		}
 	case "short":
-		entryFit = clamp((regime.RangePositionPct-60)/40, 0, 1)
+		if regime.RangePositionPct >= 50.0 {
+			entryFit = clamp((90-regime.RangePositionPct)/40, 0.5, 1.0)
+		} else {
+			entryFit = clamp(1.0-(50-regime.RangePositionPct)/50, 0.5, 1.0)
+		}
 	default:
 		entryFit = clamp(1.0-math.Abs(regime.RangePositionPct-50)/50, 0, 1)
 	}
@@ -581,6 +601,12 @@ func scoreCandidate(
 		(recommendedTrend == "long" && confluence.Verdict == ConfluenceSupportLong) ||
 		(recommendedTrend == "short" && confluence.Verdict == ConfluenceSupportShort):
 		score = clamp(score*(0.8+0.2*confluence.Strength), 0, 1)
+	}
+
+	// Majors Priority Boost: When BTC, ETH, or SOL are in TREND_UP or trending long,
+	// boost their score so they rank at the top of the accepted fleet.
+	if isMajorSymbol(symbol.BaseCurrency, symbol.Symbol) && (recommendedTrend == "long" || regime.Regime == "TREND_UP") {
+		score = math.Max(score*1.4, 0.88)
 	}
 
 	return ScannerCandidate{
@@ -830,4 +856,13 @@ func scannerScore(
 
 func clamp(value, minimum, maximum float64) float64 {
 	return math.Max(minimum, math.Min(maximum, value))
+}
+
+func isMajorSymbol(baseCurrency, symbol string) bool {
+	switch strings.ToUpper(baseCurrency) {
+	case "BTC", "ETH", "SOL":
+		return true
+	}
+	s := strings.ToUpper(symbol)
+	return strings.HasPrefix(s, "BTC") || strings.HasPrefix(s, "ETH") || strings.HasPrefix(s, "SOL")
 }

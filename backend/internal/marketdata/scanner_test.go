@@ -113,3 +113,18 @@ func TestScannerMultiTierPipeline(t *testing.T) {
 		}
 	}
 }
+
+func TestScannerMajorSymbolPriority(t *testing.T) {
+	if !isMajorSymbol("BTC", "BTC_USDT_PERP") {
+		t.Fatal("expected BTC to be recognized as major symbol")
+	}
+	if !isMajorSymbol("ETH", "ETH_USDT_PERP") {
+		t.Fatal("expected ETH to be recognized as major symbol")
+	}
+	if !isMajorSymbol("SOL", "SOL_USDT_PERP") {
+		t.Fatal("expected SOL to be recognized as major symbol")
+	}
+	if isMajorSymbol("TUT", "TUT_USDT_PERP") {
+		t.Fatal("expected TUT NOT to be recognized as major symbol")
+	}
+}
