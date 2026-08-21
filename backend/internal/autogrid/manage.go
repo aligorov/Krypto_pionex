@@ -68,32 +68,30 @@ func decideBotAction(input botActionInput) manageDecision {
 		return manageDecision{Action: ActionCloseTakeProfit, Reason: "TAKE_PROFIT"}
 	}
 
-	// 2. Trailing Take-Profit & Breakeven Lock
+	// 2. Trailing Take-Profit & Early Profit Lock
 	if input.PnLTarget.GreaterThan(decimal.Zero) {
-		// v2.0.30: trailing arms at 50% of target (was 70%). The 50-70%
-		// band was a dead zone — prod CRWVX #366 peaked at +$3.59, $0.035
-		// below the 50% breakeven-lock arm and far below the 70% trailing
-		// arm, carried NO floor at all, and gave the whole mark back to a
-		// STOP_LOSS. Bots on this tape routinely die to a range break
-		// before touching 70%; banking 50% of target beats donating the
-		// peak. At the arm point the floor equals max(0.8·peak, 0.5·T) —
-		// a bot that touches 50% and retraces exits near its peak.
-		target50Pct := input.PnLTarget.Mul(decimal.NewFromFloat(0.50))
-		if input.PeakPNL.GreaterThanOrEqual(target50Pct) {
-			// 3. Breakeven Lock first: if the peak was real but the mark
-			// collapsed to ~zero, exit with the lock's name (distinct
-			// Telegram/UI story) before the trailing floor catches it.
-			breakevenFloor := input.Budget.Mul(decimal.NewFromFloat(0.002)) // 0.2% of budget to cover fees
+		// Early Profit Locking: arm trailing as soon as bot reaches 30% of target
+		// (or >= $1.50 USDT profit). This ensures that every winning move is banked
+		// and never allowed to reverse into a losing stop-loss.
+		targetArmThreshold := input.PnLTarget.Mul(decimal.NewFromFloat(0.30))
+		minArmDollar := decimal.NewFromFloat(1.50)
+		if targetArmThreshold.GreaterThan(minArmDollar) {
+			targetArmThreshold = minArmDollar
+		}
+
+		if input.PeakPNL.GreaterThanOrEqual(targetArmThreshold) {
+			// Breakeven Lock: if peak was >= $1.50 but profit decays near zero, lock profit (+0.2% budget)
+			breakevenFloor := input.Budget.Mul(decimal.NewFromFloat(0.002))
 			if total.LessThanOrEqual(breakevenFloor) {
 				return manageDecision{Action: ActionCloseTakeProfit, Reason: "BREAKEVEN_LOCK"}
 			}
 
-			// Trailing floor: Pullback tolerance 20% of peak profit.
+			// Trailing Floor: Allow 20% pullback from peak, but guarantee floor >= 25% of target or $1.00
 			pullbackTolerance := input.PeakPNL.Mul(decimal.NewFromFloat(0.20))
 			trailingFloor := input.PeakPNL.Sub(pullbackTolerance)
-			minFloor := input.PnLTarget.Mul(decimal.NewFromFloat(0.50))
-			if minFloor.GreaterThan(trailingFloor) {
-				trailingFloor = minFloor
+			minGuaranteedFloor := input.PnLTarget.Mul(decimal.NewFromFloat(0.25))
+			if minGuaranteedFloor.GreaterThan(trailingFloor) {
+				trailingFloor = minGuaranteedFloor
 			}
 			if total.LessThan(trailingFloor) {
 				return manageDecision{Action: ActionCloseTakeProfit, Reason: "TRAILING_TAKE_PROFIT"}
