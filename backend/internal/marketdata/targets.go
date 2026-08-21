@@ -16,31 +16,14 @@ import (
 // sigma/ATR blend; drawdown prefers the AI Kit maxDrawDown and falls back to
 // the scanner model drawdown.
 const (
-	dynamicTargetVolFraction = 0.60
+	dynamicTargetVolFraction = 0.75
 	dynamicLossDDFraction    = 0.50
-	dynamicTargetMinPct      = 1.8
-	// 6.0 (was 15.0, v2.0.23): a TP ceiling of 15% of budget only binds on
-	// extreme-vol pairs and left them hanging for the range to break instead
-	// of banking the harvest (2026-08-20 external audit §4). Leverage
-	// scaling keeps the PRICE distance intact — 6%×lev is still a wide
-	// target in price terms. v2.0.24: kept at 6.0 (not 5.0) so RR ≥ 1.5
-	// holds with the 4.0 loss ceiling below.
-	dynamicTargetMaxPct      = 6.0
-	dynamicLossMinPct        = 1.0
-	// 4.0 (was 6.0, v2.0.24): with the target capped at 6, any lossPct above
-	// 6/1.35 = 4.44 silently broke the minRiskRewardRatio floor (at lossPct=6
-	// the clamps produced RR 1.0). 4.0 guarantees RR ≥ 1.5 everywhere while
-	// still clearing the widest normal traverse (D(25% range) = 3.33).
-	dynamicLossMaxPct        = 4.0
-	// dynamicLossRangeFloorK couples the loss floor to the DEPLOYED grid
-	// span: a full down-traverse of a neutral grid marks −100·r/(8−2r)% ≈
-	// −0.126·r of budget×leverage (manage.go neutralGridPaperPNL — half the
-	// notional loads at an average entry a quarter-range above the bottom).
-	// A $-stop below that fires INSIDE normal oscillation: the pre-v2.0.24
-	// floor of 1.0 tripped on every range ≥ 8.3%. 0.15 adds fee/funding
-	// headroom over the exact traverse drawdown (5-agent review 2026-08-20).
+	dynamicTargetMinPct      = 2.5
+	dynamicTargetMaxPct      = 7.5
+	dynamicLossMinPct        = 1.2
+	dynamicLossMaxPct        = 4.5
 	dynamicLossRangeFloorK   = 0.15
-	minRiskRewardRatio       = 1.35
+	minRiskRewardRatio       = 1.40
 )
 
 type DynamicTargetsInput struct {
