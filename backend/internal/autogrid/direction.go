@@ -84,7 +84,7 @@ func SelectDirection(regime RegimeContext, funding FundingContext, events EventC
 		if funding.AverageRate > 0.0001 || !funding.IsExtreme {
 			return DirectionDecision{
 				Direction: "SHORT",
-				Leverage:  2,
+				Leverage:  3,
 				Reason:    fmt.Sprintf("TREND_DOWN + funding %.4f%% (не экстремальный)", funding.AverageRate*100),
 			}
 		}
@@ -109,7 +109,7 @@ func SelectDirection(regime RegimeContext, funding FundingContext, events EventC
 		if funding.AverageRate < -0.0001 || !funding.IsExtreme {
 			return DirectionDecision{
 				Direction: "LONG",
-				Leverage:  2,
+				Leverage:  3,
 				Reason:    fmt.Sprintf("TREND_UP + funding %.4f%% (не экстремальный)", funding.AverageRate*100),
 			}
 		}
@@ -147,14 +147,14 @@ func SelectDirection(regime RegimeContext, funding FundingContext, events EventC
 				if funding.Avg48h <= -fundingCarryThreshold {
 					return DirectionDecision{
 						Direction: "LONG",
-						Leverage:  2,
+						Leverage:  3,
 						Reason:    fmt.Sprintf("RANGE + carry: фандинг %.3f%%/8ч стабилен 48ч (long получает)", funding.Avg48h*100),
 					}
 				}
 			}
 			return DirectionDecision{
 				Direction: "NEUTRAL",
-				Leverage:  2, // NOT 4x like before
+				Leverage:  2,
 				Reason:    fmt.Sprintf("RANGE confidence %.2f, Hurst %.2f", regime.Confidence, regime.HurstValue),
 			}
 		}

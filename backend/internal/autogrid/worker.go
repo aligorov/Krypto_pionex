@@ -592,10 +592,9 @@ func percentReading(value any) float64 {
 
 // isEntryTimingFavorable validates that the current price is positioned
 // favorably within the channel structure before launching a grid:
-// - NEUTRAL: must be within the healthy channel (20% to 80%), avoiding extreme boundary traps.
-// - LONG: momentum entries span the lower pullback zone up to the channel
-//   top (10% to 88%, v2.0.25 momentum grids; the old 15-45 docstring was stale).
-// - SHORT: must be in the upper relief rebound zone (55% to 85%).
+// - NEUTRAL: strictly within central healthy channel (25% to 75%), avoiding boundary traps.
+// - LONG: Golden Pocket pullback, or lower accumulation zone (10% to 60%, extended to 72% with MACD/StochRSI momentum).
+// - SHORT: Golden Pocket relief rally, or upper distribution zone (40% to 90%, extended to 28% with MACD/StochRSI momentum).
 func isEntryTimingFavorable(candidate Candidate) bool {
 	rangePos := 50.0
 	if val, ok := candidate.ModelAssumptions["rangePositionPct"].(float64); ok {
@@ -607,16 +606,75 @@ func isEntryTimingFavorable(candidate Candidate) bool {
 		rangePos = pos
 	}
 
+	fibInPocket := false
+	var macdUp, macdDown, stochUp, stochDown bool
+	var srNearSup, srNearRes float64
+	if confMap, ok := candidate.ModelAssumptions["confluence"].(map[string]any); ok {
+		if v, ok := confMap["fibInGoldenPocket"].(bool); ok {
+			fibInPocket = v
+		}
+		if v, ok := confMap["macdCrossedUp"].(bool); ok {
+			macdUp = v
+		}
+		if v, ok := confMap["macdCrossedDown"].(bool); ok {
+			macdDown = v
+		}
+		if v, ok := confMap["stochCrossedUp"].(bool); ok {
+			stochUp = v
+		}
+		if v, ok := confMap["stochCrossedDown"].(bool); ok {
+			stochDown = v
+		}
+		if v, ok := confMap["srNearestSupport"].(float64); ok {
+			srNearSup = v
+		}
+		if v, ok := confMap["srNearestResist"].(float64); ok {
+			srNearRes = v
+		}
+	}
+
 	switch candidate.RecommendedTrend {
 	case "long":
-		// Accumulation, Dip buying & Momentum continuation: enter from lower bounce (10%) up to channel breakout (88%)
-		return rangePos >= 10.0 && rangePos <= 88.0
+		// Golden Pocket entry is top-tier priority
+		if fibInPocket {
+			return true
+		}
+		// S/R wall check: don't buy directly under an immediate resistance wall (< 0.4% above)
+		if srNearRes > 0 && candidate.CurrentPrice.GreaterThan(decimal.Zero) {
+			currP, _ := candidate.CurrentPrice.Float64()
+			if currP > 0 && (srNearRes-currP)/currP*100 < 0.4 {
+				return false
+			}
+		}
+		// Momentum confirmation allows upper channel entries (up to 72%)
+		if macdUp || stochUp {
+			return rangePos >= 10.0 && rangePos <= 72.0
+		}
+		// Normal accumulation & pullback zone: 10% to 60% of channel
+		return rangePos >= 10.0 && rangePos <= 60.0
+
 	case "short":
-		// Distribution, Rip selling & Breakdown continuation: enter from channel breakdown (12%) up to upper resistance (90%)
-		return rangePos >= 12.0 && rangePos <= 90.0
+		// Golden Pocket relief bounce is top-tier priority
+		if fibInPocket {
+			return true
+		}
+		// S/R floor check: don't short directly above an immediate support floor (< 0.4% below)
+		if srNearSup > 0 && candidate.CurrentPrice.GreaterThan(decimal.Zero) {
+			currP, _ := candidate.CurrentPrice.Float64()
+			if currP > 0 && (currP-srNearSup)/currP*100 < 0.4 {
+				return false
+			}
+		}
+		// Momentum confirmation allows lower channel entries (down to 28%)
+		if macdDown || stochDown {
+			return rangePos >= 28.0 && rangePos <= 90.0
+		}
+		// Normal distribution & relief zone: 40% to 90% of channel
+		return rangePos >= 40.0 && rangePos <= 90.0
+
 	default:
-		// Neutral range: trade healthy channel (20% to 80%), avoiding extreme 20% boundary traps
-		return rangePos >= 20.0 && rangePos <= 80.0
+		// Neutral range: central healthy channel (25% to 75%), avoiding boundary traps
+		return rangePos >= 25.0 && rangePos <= 75.0
 	}
 }
 

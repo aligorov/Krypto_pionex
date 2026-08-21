@@ -16,8 +16,8 @@ func TestSelectDirectionTrendDown(t *testing.T) {
 	if decision.Direction != "SHORT" {
 		t.Errorf("expected SHORT, got %s (reason: %s)", decision.Direction, decision.Reason)
 	}
-	if decision.Leverage != 2 {
-		t.Errorf("expected leverage 2, got %d", decision.Leverage)
+	if decision.Leverage != 3 {
+		t.Errorf("expected leverage 3, got %d", decision.Leverage)
 	}
 
 	// v2.0.14: TREND_DOWN + modestly negative (non-extreme) funding -> SHORT
@@ -63,8 +63,8 @@ func TestSelectDirectionTrendUp(t *testing.T) {
 	if decision.Direction != "LONG" {
 		t.Errorf("expected LONG, got %s (reason: %s)", decision.Direction, decision.Reason)
 	}
-	if decision.Leverage != 2 {
-		t.Errorf("expected leverage 2, got %d", decision.Leverage)
+	if decision.Leverage != 3 {
+		t.Errorf("expected leverage 3, got %d", decision.Leverage)
 	}
 
 	// v2.0.14: TREND_UP + modestly positive (non-extreme) funding -> LONG
