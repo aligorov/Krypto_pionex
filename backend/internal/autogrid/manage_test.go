@@ -593,3 +593,24 @@ func TestNeutralUpTrendStop(t *testing.T) {
 		t.Fatalf("MaxLoss=0 must not disable the structural TREND_UP exit, got %+v", decision)
 	}
 }
+
+// v2.0.30: the 50-70% dead zone is closed — trailing arms at 50% of target.
+// Under the old 70% arm this bot (peak exactly 50% of target, small
+// pullback) held with NO floor; now it banks near the peak. This is the
+// prod CRWVX #366 shape: +$3.59 peak, $0.035 below the old lock arm, whole
+// mark later donated to a STOP_LOSS.
+func TestDecideBotActionTrailingArmsAtHalfTarget(t *testing.T) {
+	input := baseActionInput() // Target 12, Budget 200
+	input.PeakPNL = mustDecimal("6")   // exactly 50% of target
+	input.RealizedPNL = mustDecimal("5.5") // below floor max(0.8*6, 6) = 6
+	decision := decideBotAction(input)
+	if decision.Action != ActionCloseTakeProfit || decision.Reason != "TRAILING_TAKE_PROFIT" {
+		t.Fatalf("peak at 50%% of target with pullback must trail out (v2.0.30), got %+v", decision)
+	}
+	// And while ABOVE the floor it keeps running (no premature exit).
+	input.RealizedPNL = mustDecimal("6.05")
+	decision = decideBotAction(input)
+	if decision.Action != ActionHold {
+		t.Fatalf("above the trailing floor must hold, got %+v", decision)
+	}
+}

@@ -1043,6 +1043,17 @@ func (worker *Worker) deployPaper(
 		if mesh.UpperPrice.GreaterThan(mesh.LowerPrice) && candidate.CurrentPrice.IsPositive() {
 			meshSpanPct, _ = mesh.UpperPrice.Sub(mesh.LowerPrice).Div(candidate.CurrentPrice).Mul(decimal.NewFromInt(100)).Float64()
 		}
+		// v2.0.30: narrow NEUTRAL grids de-gear to 1x. The v2.0.24
+		// range-coupled stop scales with the span, so a 2x bot on a 6-7%
+		// range carries a ~0.45% PRICE-distance stop — market noise, the
+		// deploy-STOP_LOSS churn class of 2026-08-21 (SNXXX deployed and
+		// stopped twice on the same tape). At 1x the price distance doubles
+		// and normal noise survives; wide-span bots are unaffected.
+		if trend == "neutral" && botLev > 1 && meshSpanPct > 0 && meshSpanPct < 10.0 {
+			botLev = 1
+			levReason = fmt.Sprintf("Узкий диапазон %.1f%% — де-гир до 1x (стоп вне шума)", meshSpanPct)
+			levMode = "NARROW_DEGEAR"
+		}
 		target, maxLoss := computeBotTargets(settings, candidate, botLev, meshSpanPct)
 		if trancheOn {
 			// TP/SL govern the bot as deployed: half capital → half target

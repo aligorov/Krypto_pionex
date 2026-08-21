@@ -70,9 +70,25 @@ func decideBotAction(input botActionInput) manageDecision {
 
 	// 2. Trailing Take-Profit & Breakeven Lock
 	if input.PnLTarget.GreaterThan(decimal.Zero) {
-		target70Pct := input.PnLTarget.Mul(decimal.NewFromFloat(0.70))
-		if input.PeakPNL.GreaterThanOrEqual(target70Pct) {
-			// Pullback tolerance: 20% of peak profit
+		// v2.0.30: trailing arms at 50% of target (was 70%). The 50-70%
+		// band was a dead zone — prod CRWVX #366 peaked at +$3.59, $0.035
+		// below the 50% breakeven-lock arm and far below the 70% trailing
+		// arm, carried NO floor at all, and gave the whole mark back to a
+		// STOP_LOSS. Bots on this tape routinely die to a range break
+		// before touching 70%; banking 50% of target beats donating the
+		// peak. At the arm point the floor equals max(0.8·peak, 0.5·T) —
+		// a bot that touches 50% and retraces exits near its peak.
+		target50Pct := input.PnLTarget.Mul(decimal.NewFromFloat(0.50))
+		if input.PeakPNL.GreaterThanOrEqual(target50Pct) {
+			// 3. Breakeven Lock first: if the peak was real but the mark
+			// collapsed to ~zero, exit with the lock's name (distinct
+			// Telegram/UI story) before the trailing floor catches it.
+			breakevenFloor := input.Budget.Mul(decimal.NewFromFloat(0.002)) // 0.2% of budget to cover fees
+			if total.LessThanOrEqual(breakevenFloor) {
+				return manageDecision{Action: ActionCloseTakeProfit, Reason: "BREAKEVEN_LOCK"}
+			}
+
+			// Trailing floor: Pullback tolerance 20% of peak profit.
 			pullbackTolerance := input.PeakPNL.Mul(decimal.NewFromFloat(0.20))
 			trailingFloor := input.PeakPNL.Sub(pullbackTolerance)
 			minFloor := input.PnLTarget.Mul(decimal.NewFromFloat(0.50))
@@ -81,15 +97,6 @@ func decideBotAction(input botActionInput) manageDecision {
 			}
 			if total.LessThan(trailingFloor) {
 				return manageDecision{Action: ActionCloseTakeProfit, Reason: "TRAILING_TAKE_PROFIT"}
-			}
-		}
-
-		// 3. Breakeven Lock (if reached 50% target, don't allow profit to turn into loss)
-		target50Pct := input.PnLTarget.Mul(decimal.NewFromFloat(0.50))
-		if input.PeakPNL.GreaterThanOrEqual(target50Pct) {
-			breakevenFloor := input.Budget.Mul(decimal.NewFromFloat(0.002)) // 0.2% of budget to cover fees
-			if total.LessThanOrEqual(breakevenFloor) {
-				return manageDecision{Action: ActionCloseTakeProfit, Reason: "BREAKEVEN_LOCK"}
 			}
 		}
 	}
