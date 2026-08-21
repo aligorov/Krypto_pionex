@@ -1466,20 +1466,24 @@ func (worker *Worker) deployReal(
 		// v2.0.13 tranches: REAL commits HALF the budget at create; the
 		// manage loop tops up via the native invest_in endpoint after a
 		// confirmed adverse excursion or the 24h time-box (paper mirror).
+		// Sizing the grid level count against the full slot budget ($200)
+		// enables 30-40 levels (step ~0.55%) with $5/level order capacity,
+		// doubling grid crossing captures vs halving levels to 20.
 		investAmount := settings.BudgetUSDT
 		if settings.TrancheDeployEnabled {
 			investAmount = settings.BudgetUSDT.Div(decimal.NewFromInt(2))
 		}
+		geometryBudget := settings.BudgetUSDT
 		mesh := ComputeAdaptiveMesh(
 			candidate.LowerPrice, candidate.UpperPrice, candidate.CurrentPrice,
-			atrPct, regime, investAmount, settings.Leverage, 0.30,
+			atrPct, regime, geometryBudget, settings.Leverage, 0.30,
 		)
 
 		// v2.0 HAR-RV geometry — the same sizing the paper fleet validates:
 		// forecast next-day volatility from daily candles, derive range width
 		// / level count / vol-inverse leverage. Falls back to the ATR mesh
 		// when history or fit quality is insufficient.
-		harGeo := worker.harGridGeometry(ctx, candidate.Symbol, decimalFloat(settings.FeeBps.Add(settings.SlippageBps)), investAmount.InexactFloat64())
+		harGeo := worker.harGridGeometry(ctx, candidate.Symbol, decimalFloat(settings.FeeBps.Add(settings.SlippageBps)), geometryBudget.InexactFloat64())
 		// Entry gate (v2.0.12, v2.0.13): volatility expansion block, with the
 		// 24h self-baseline fallback covering HAR-less new listings.
 		forecastPct := 0.0
