@@ -593,7 +593,8 @@ func percentReading(value any) float64 {
 // isEntryTimingFavorable validates that the current price is positioned
 // favorably within the channel structure before launching a grid:
 // - NEUTRAL: must be within the healthy channel (20% to 80%), avoiding extreme boundary traps.
-// - LONG: must be in the lower pullback accumulation zone (15% to 45%).
+// - LONG: momentum entries span the lower pullback zone up to the channel
+//   top (10% to 88%, v2.0.25 momentum grids; the old 15-45 docstring was stale).
 // - SHORT: must be in the upper relief rebound zone (55% to 85%).
 func isEntryTimingFavorable(candidate Candidate) bool {
 	rangePos := 50.0
@@ -830,6 +831,15 @@ func (worker *Worker) deployPaper(
 				"cooldown: защитное закрытие символа менее 2 часов назад — повторный вход отложен", nil)
 			continue
 		}
+		// v2.0.27 sector cap: correlated clusters stop together — 6 of 10
+		// bots were semis/AI-correlated on 2026-08-21 with no cap anywhere;
+		// one −5% semis day could fire 6-8 protective closes at once.
+		if sector := sectorForSymbol(candidate.Symbol); sector != "" &&
+			worker.sectorBotCount(ctx, settings.ID, sector) >= maxBotsPerSector {
+			worker.rejectCandidate(ctx, candidate,
+				fmt.Sprintf("sector cap: в секторе %s уже %d ботов — коррелированный кластер, вход отложен", sector, maxBotsPerSector), nil)
+			continue
+		}
 		// Entry gate (v2.0.12): anchor to the LIVE price. The scan price is
 		// captured at scan start and ages through AI Kit calls, LLM audits
 		// and backtest waits; deploying a grid centered minutes in the past
@@ -879,17 +889,24 @@ func (worker *Worker) deployPaper(
 		// v2.0.13 tranches: commit HALF the budget up front; the manage loop
 		// tops up after a confirmed adverse excursion or the 24h time-box.
 		// Knife inventory drag is quadratic in depth, so the initial half
-		// halves the damage of every un-timed entry. Geometry (levels, $5
-		// per-level floor) must size against the actually-committed amount.
+		// halves the damage of every un-timed entry. v2.0.27: PAPER sizes
+		// the LEVEL COUNT against the FULL slot budget — the time-box
+		// commits tranche 2 within 24h anyway, so steady state is the full
+		// budget, and tranche-1-sized levels ($5 cap on $100) pinned
+		// wide-span bots at 20 levels where the slot carries 40, halving
+		// feasible crossings (fleet audit 2026-08-21). REAL keeps
+		// tranche-sized geometry: its exchange create must satisfy
+		// min-order at the actually-committed amount.
 		investAmount := settings.BudgetUSDT
 		trancheOn := settings.TrancheDeployEnabled
 		if trancheOn {
 			investAmount = settings.BudgetUSDT.Div(decimal.NewFromInt(2))
 		}
-		harGeo := worker.harGridGeometry(ctx, candidate.Symbol, decimalFloat(settings.FeeBps.Add(settings.SlippageBps)), investAmount.InexactFloat64())
+		geometryBudget := settings.BudgetUSDT
+		harGeo := worker.harGridGeometry(ctx, candidate.Symbol, decimalFloat(settings.FeeBps.Add(settings.SlippageBps)), geometryBudget.InexactFloat64())
 		mesh := ComputeAdaptiveMesh(
 			candidate.LowerPrice, candidate.UpperPrice, candidate.CurrentPrice,
-			atrPct, regime, investAmount, settings.Leverage, 0.30,
+			atrPct, regime, geometryBudget, settings.Leverage, 0.30,
 		)
 		// Entry gate (v2.0.12): block deployment into an active volatility
 		// expansion — a fixed-step grid holds per-pair edge constant while
@@ -1031,6 +1048,18 @@ func (worker *Worker) deployPaper(
 				half := maxLoss.Div(decimal.NewFromInt(2))
 				maxLoss = &half
 			}
+		}
+
+		// v2.0.27: PAPER runs the same durable risk exam as REAL — kill
+		// switch, MaxLeverage, notional exposure caps and the daily-loss
+		// breaker used to bypass paper entirely (prod CRWVX #366 deployed
+		// at 4x with no check). Requested notional uses the FULL slot
+		// budget: the 24h tranche time-box commits the second half anyway.
+		if err := worker.risk.ValidateNewPaperGrid(ctx, candidate.Symbol, botLev, settings.BudgetUSDT); err != nil {
+			worker.rejectCandidate(ctx, candidate, "risk engine: "+err.Error(), nil)
+			worker.logger.Info("paper deploy blocked by risk engine",
+				"component", "autogrid_worker", "symbol", candidate.Symbol, "error", err)
+			continue
 		}
 
 		var botID string

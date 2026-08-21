@@ -174,8 +174,12 @@ func TestDecideBotActionNeutralUpsideBreakRangeShifts(t *testing.T) {
 	input.CurrentPrice = mustDecimal("122")
 	input.Regime = "RANGE"
 	decision := decideBotAction(input)
-	if decision.Action != ActionAdjustUp || decision.Reason != "RANGE_SHIFT_UP" {
-		t.Fatalf("expected range shift up in RANGE regime, got %+v", decision)
+	// v2.0.25: in non-adverse regimes the up-break routes through the DGT
+	// breakout reset (grid rebuilt at the new price) before the plain
+	// half-width shift — same ADJUST_UP action, rebuilt bounds. The exact
+	// reason is no longer pinned here; the rebuild path has its own tests.
+	if decision.Action != ActionAdjustUp {
+		t.Fatalf("expected adjust-up on upside break in RANGE regime, got %+v", decision)
 	}
 }
 
@@ -559,11 +563,15 @@ func TestNeutralUpTrendStop(t *testing.T) {
 		t.Fatalf("expected RANGE_BREAK_UP_TREND_STOP close, got %+v", decision)
 	}
 
-	// Same break, small bleed -> shift up as before.
+	// Same break, small bleed -> v2.0.25 tightened the v2.0.14 threshold:
+	// in a CONFIRMED uptrend a NEUTRAL up-break ALWAYS exits — the
+	// inventory has been sold into the rally and re-shifting opens fresh
+	// short inventory against the train (the PEPE class). Small bleed now
+	// trend-stops instead of shifting.
 	input.UnrealizedPNL = mustDecimal("-1") // total 0
 	decision = decideBotAction(input)
-	if decision.Action != ActionAdjustUp {
-		t.Fatalf("small-bleed up-break must still shift, got %+v", decision)
+	if decision.Action != ActionCloseRangeBreak || decision.Reason != "RANGE_BREAK_UP_TREND_STOP" {
+		t.Fatalf("small-bleed up-break in TREND_UP must close (v2.0.25), got %+v", decision)
 	}
 
 	// Same deep bleed but RANGE regime -> shift (no confirmed trend).
@@ -574,11 +582,14 @@ func TestNeutralUpTrendStop(t *testing.T) {
 		t.Fatalf("RANGE-regime up-break must shift regardless of mark, got %+v", decision)
 	}
 
-	// MaxLoss = 0 (off) -> guard prevents division/threshold nonsense.
+	// MaxLoss = 0 (targets off) no longer disables the up-break exit: the
+	// v2.0.25 trend-stop/profit-take on a TREND_UP up-break is a STRUCTURAL
+	// regime decision, not a $-threshold — the old MaxLoss guard existed
+	// only to protect the MaxLoss/2 division of the v2.0.14 formula.
 	input.Regime = "TREND_UP"
 	input.MaxLoss = decimal.Zero
 	decision = decideBotAction(input)
-	if decision.Action != ActionAdjustUp {
-		t.Fatalf("MaxLoss=0 must disable the trend stop, got %+v", decision)
+	if decision.Action != ActionCloseRangeBreak || decision.Reason != "RANGE_BREAK_UP_TREND_STOP" {
+		t.Fatalf("MaxLoss=0 must not disable the structural TREND_UP exit, got %+v", decision)
 	}
 }

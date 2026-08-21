@@ -76,8 +76,11 @@ func SelectDirection(regime RegimeContext, funding FundingContext, events EventC
 		// v2.0.14 symmetric relaxation: SHORT when shorts EARN carry
 		// (classic), or when funding is merely not extreme — in dumps
 		// funding typically flips negative (shorts pay), which used to
-		// veto the best short setups outright. Extreme funding still
-		// vetoes: crowded shorts squeeze.
+		// veto the best short setups outright. The SIGN is what matters
+		// (v2.0.27 comment fix): an extreme POSITIVE rate passes the first
+		// arm — shorts earn rich carry WITH the downtrend, a trend-protected
+		// trade. What stays vetoed is extreme NEGATIVE funding, where
+		// crowded paying shorts are the squeeze fuel.
 		if funding.AverageRate > 0.0001 || !funding.IsExtreme {
 			return DirectionDecision{
 				Direction: "SHORT",
@@ -100,7 +103,9 @@ func SelectDirection(regime RegimeContext, funding FundingContext, events EventC
 		// funding is merely not extreme — rallies carry positive funding
 		// (longs pay), which previously made LONG unreachable in every
 		// up-market (2026-08-20 audit: deployable rally universe ~0-2%).
-		// Extreme funding still vetoes: crowded longs are squeeze fuel.
+		// Sign-aware (v2.0.27 comment fix): extreme NEGATIVE passes (longs
+		// receive carry with the uptrend); extreme POSITIVE stays vetoed —
+		// crowded paying longs at the top are the dump fuel.
 		if funding.AverageRate < -0.0001 || !funding.IsExtreme {
 			return DirectionDecision{
 				Direction: "LONG",
@@ -117,6 +122,19 @@ func SelectDirection(regime RegimeContext, funding FundingContext, events EventC
 		// long inventory into forced unwind is the PEPE failure class.
 		if events.LiquidationCascade {
 			return DirectionDecision{Direction: "WAIT", Reason: "liquidation cascade — NEUTRAL grid would load the knife"}
+		}
+		// v2.0.27: extreme funding of EITHER sign is a crowding window, not
+		// a harvest window. A neutral grid holds one-sided inventory most
+		// of the time: below-mid long inventory at an extreme POSITIVE rate
+		// bleeds 0.3-0.4%/day (prod: XMR #355, +0.131%/8h, −$0.4-0.8/day
+		// against a $7.2 target), and extremes precede the violent
+		// resolution in either direction. The TREND branches keep their
+		// sign-aware logic above — earning carry WITH a confirmed trend
+		// through an extreme is a trend-protected trade; a directionless
+		// grid has no such protection.
+		if funding.IsExtreme {
+			return DirectionDecision{Direction: "WAIT", Reason: fmt.Sprintf(
+				"RANGE но фандинг экстремален %.3f%%/8ч — окно сквиза/флаша, не для нейтрального сбора", funding.AverageRate*100)}
 		}
 		// The 0.60 boundary is aligned with the confluence engine's
 		// HurstHardVetoNeutral.

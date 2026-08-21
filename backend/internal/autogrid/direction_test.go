@@ -408,10 +408,12 @@ func TestSelectDirectionFundingCarry(t *testing.T) {
 	if got.Direction != "NEUTRAL" {
 		t.Fatalf("trivial carry must stay NEUTRAL, got %q", got.Direction)
 	}
-	// Extreme spot rate vetoes carry even when the 48h average is stable.
+	// Extreme spot rate vetoes carry AND the whole RANGE deployment (v2.0.27
+	// strengthened the old NEUTRAL fallback to WAIT — a directionless grid
+	// must not carry one-sided inventory through a crowding window).
 	got = SelectDirection(rng, FundingContext{Avg48h: 0.0005, Stable48h: true, IsExtreme: true}, EventContext{})
-	if got.Direction != "NEUTRAL" {
-		t.Fatalf("extreme funding must veto carry, got %q", got.Direction)
+	if got.Direction != "WAIT" {
+		t.Fatalf("extreme funding must veto carry and neutral, got %q", got.Direction)
 	}
 }
 
@@ -432,5 +434,41 @@ func TestBetaGateTrend(t *testing.T) {
 	}
 	if down, up := betaGateTrend("RANGE", 40, 2.0); down || up {
 		t.Fatalf("RANGE must never activate the gate, got down=%v up=%v", down, up)
+	}
+}
+
+// v2.0.27: extreme funding of either sign vetoes NEUTRAL — a directionless
+// grid cannot carry one-sided inventory through a crowding window (prod XMR
+// #355 paid ~0.4%/day below mid on +0.131%/8h).
+func TestSelectDirectionRangeExtremeFundingVetoesNeutral(t *testing.T) {
+	decision := SelectDirection(
+		RegimeContext{Regime: "RANGE", Confidence: 0.6, HurstValue: 0.5},
+		FundingContext{AverageRate: 0.0013, IsExtreme: true},
+		EventContext{},
+	)
+	if decision.Direction != "WAIT" {
+		t.Fatalf("extreme funding in RANGE must WAIT, got %s (%s)", decision.Direction, decision.Reason)
+	}
+}
+
+// The TREND branches keep their sign-aware logic: earning carry WITH a
+// downtrend through an extreme POSITIVE rate is a trend-protected SHORT;
+// the mirror (crowded paying shorts, extreme NEGATIVE) stays vetoed.
+func TestSelectDirectionTrendDownFundingSignMatrix(t *testing.T) {
+	carry := SelectDirection(
+		RegimeContext{Regime: "TREND_DOWN", Confidence: 0.7, HurstValue: 0.7},
+		FundingContext{AverageRate: 0.0013, IsExtreme: true},
+		EventContext{},
+	)
+	if carry.Direction != "SHORT" {
+		t.Fatalf("extreme POSITIVE funding in TREND_DOWN is a carry-earning SHORT, got %s (%s)", carry.Direction, carry.Reason)
+	}
+	squeeze := SelectDirection(
+		RegimeContext{Regime: "TREND_DOWN", Confidence: 0.7, HurstValue: 0.7},
+		FundingContext{AverageRate: -0.0013, IsExtreme: true},
+		EventContext{},
+	)
+	if squeeze.Direction != "WAIT" {
+		t.Fatalf("extreme NEGATIVE funding in TREND_DOWN must WAIT (squeeze fuel), got %s (%s)", squeeze.Direction, squeeze.Reason)
 	}
 }

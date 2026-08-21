@@ -31,6 +31,12 @@ func newCooldownTestWorker(t *testing.T, pool *pgxpool.Pool) (*Worker, *Service,
 	worker := NewWorker(pool, service, accountService, riskEngine,
 		llm.NewService(pool, slog.New(slog.DiscardHandler)),
 		slog.New(slog.DiscardHandler))
+	// v2.0.27 routes paper deploys through the risk engine; migration 0001
+	// seeds risk_settings with the kill switch ON — disable it or every
+	// paper deploy in tests is blocked.
+	if _, err := pool.Exec(ctx, `UPDATE risk_settings SET kill_switch_enabled = false WHERE id = 1`); err != nil {
+		t.Fatalf("disable kill switch: %v", err)
+	}
 	return worker, service, *settings
 }
 

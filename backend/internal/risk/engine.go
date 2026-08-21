@@ -80,6 +80,9 @@ func (e *Engine) ValidateNewOrder(ctx context.Context, requestedLeverage int, in
 
 // ValidateNewGrid adds durable portfolio-state checks to the static limits.
 // Only non-terminal native grids for the selected Pionex account are counted.
+// Exposure is NOTIONAL (quote_investment × leverage, v2.0.27): the fleet
+// carries $2600 notional on $1600 invested, and investment-based sums
+// understate risk by exactly the leverage factor.
 func (e *Engine) ValidateNewGrid(
 	ctx context.Context,
 	accountID, symbol string,
@@ -100,8 +103,8 @@ func (e *Engine) ValidateNewGrid(
 	var activeBots int
 	err = e.db.QueryRow(ctx, `
 		SELECT
-			COALESCE(SUM(quote_investment), 0),
-			COALESCE(SUM(quote_investment) FILTER (WHERE symbol = $2), 0),
+			COALESCE(SUM(quote_investment * leverage), 0),
+			COALESCE(SUM(quote_investment * leverage) FILTER (WHERE symbol = $2), 0),
 			COUNT(*)
 		FROM grid_bots
 		WHERE account_id = $1
@@ -119,19 +122,75 @@ func (e *Engine) ValidateNewGrid(
 			activeBots, settings.MaxActiveGridBots,
 		)
 	}
-	nextAccountExposure := accountExposure.Add(investmentUSD)
+	nextAccountExposure := accountExposure.Add(investmentUSD.Mul(decimal.NewFromInt(int64(requestedLeverage))))
 	if nextAccountExposure.GreaterThan(settings.MaxAccountExposureUSD) {
 		return fmt.Errorf(
-			"%w: current %s + requested %s, max %s",
-			ErrExposureLimitExceeded, accountExposure, investmentUSD,
-			settings.MaxAccountExposureUSD,
+			"%w: current %s + requested, max %s",
+			ErrExposureLimitExceeded, accountExposure, settings.MaxAccountExposureUSD,
 		)
 	}
-	nextSymbolExposure := symbolExposure.Add(investmentUSD)
+	nextSymbolExposure := symbolExposure.Add(investmentUSD.Mul(decimal.NewFromInt(int64(requestedLeverage))))
 	if nextSymbolExposure.GreaterThan(settings.MaxSymbolExposureUSD) {
 		return fmt.Errorf(
-			"risk engine: symbol exposure limit exceeded: current %s + requested %s, max %s",
-			symbolExposure, investmentUSD, settings.MaxSymbolExposureUSD,
+			"risk engine: symbol exposure limit exceeded: current %s + requested, max %s",
+			symbolExposure, settings.MaxSymbolExposureUSD,
+		)
+	}
+	return nil
+}
+
+// ValidateNewPaperGrid enforces the same durable gates for PAPER deployments
+// (v2.0.27 — paper used to bypass the risk engine entirely: no kill switch,
+// no MaxLeverage, no exposure caps; prod CRWVX #366 deployed at 4x
+// unchecked). Exposure is notional like ValidateNewGrid; the requested
+// notional uses the FULL slot budget because the 24h tranche time-box
+// commits the second half anyway.
+func (e *Engine) ValidateNewPaperGrid(
+	ctx context.Context,
+	symbol string,
+	requestedLeverage int,
+	slotBudgetUSD decimal.Decimal,
+) error {
+	if err := e.ValidateNewOrder(ctx, requestedLeverage, slotBudgetUSD); err != nil {
+		return err
+	}
+	if err := e.ValidateDailyLoss(ctx); err != nil {
+		return err
+	}
+	settings, err := e.LoadSettings(ctx)
+	if err != nil {
+		return err
+	}
+	var accountNotional, symbolNotional decimal.Decimal
+	var activeBots int
+	err = e.db.QueryRow(ctx, `
+		SELECT
+			COALESCE(SUM(quote_investment * leverage), 0),
+			COALESCE(SUM(quote_investment * leverage) FILTER (WHERE symbol = $1), 0),
+			COUNT(*)
+		FROM paper_grid_bots
+		WHERE status = 'RUNNING'
+	`, symbol).Scan(&accountNotional, &symbolNotional, &activeBots)
+	if err != nil {
+		return fmt.Errorf("risk engine: load paper exposure: %w", err)
+	}
+	if activeBots >= settings.MaxActiveGridBots {
+		return fmt.Errorf(
+			"risk engine: paper active grid limit reached: current %d, max %d",
+			activeBots, settings.MaxActiveGridBots,
+		)
+	}
+	requestedNotional := slotBudgetUSD.Mul(decimal.NewFromInt(int64(requestedLeverage)))
+	if accountNotional.Add(requestedNotional).GreaterThan(settings.MaxAccountExposureUSD) {
+		return fmt.Errorf(
+			"%w (paper notional): current %s + requested %s, max %s",
+			ErrExposureLimitExceeded, accountNotional, requestedNotional, settings.MaxAccountExposureUSD,
+		)
+	}
+	if symbolNotional.Add(requestedNotional).GreaterThan(settings.MaxSymbolExposureUSD) {
+		return fmt.Errorf(
+			"risk engine: paper symbol exposure (notional) exceeded: current %s + requested %s, max %s",
+			symbolNotional, requestedNotional, settings.MaxSymbolExposureUSD,
 		)
 	}
 	return nil
@@ -161,8 +220,8 @@ func (e *Engine) ValidateGridTopUp(
 	var accountExposure, symbolExposure decimal.Decimal
 	err = e.db.QueryRow(ctx, `
 		SELECT
-			COALESCE(SUM(quote_investment), 0),
-			COALESCE(SUM(quote_investment) FILTER (WHERE symbol = $2), 0)
+			COALESCE(SUM(quote_investment * leverage), 0),
+			COALESCE(SUM(quote_investment * leverage) FILTER (WHERE symbol = $2), 0)
 		FROM grid_bots
 		WHERE account_id = $1
 		  AND status IN (
@@ -173,17 +232,18 @@ func (e *Engine) ValidateGridTopUp(
 	if err != nil {
 		return fmt.Errorf("risk engine: load active grid exposure: %w", err)
 	}
-	if accountExposure.Add(additionalUSD).GreaterThan(settings.MaxAccountExposureUSD) {
+	requestedNotional := additionalUSD.Mul(decimal.NewFromInt(int64(requestedLeverage)))
+	if accountExposure.Add(requestedNotional).GreaterThan(settings.MaxAccountExposureUSD) {
 		return fmt.Errorf(
 			"%w: current %s + requested %s, max %s",
-			ErrExposureLimitExceeded, accountExposure, additionalUSD,
+			ErrExposureLimitExceeded, accountExposure, requestedNotional,
 			settings.MaxAccountExposureUSD,
 		)
 	}
-	if symbolExposure.Add(additionalUSD).GreaterThan(settings.MaxSymbolExposureUSD) {
+	if symbolExposure.Add(requestedNotional).GreaterThan(settings.MaxSymbolExposureUSD) {
 		return fmt.Errorf(
 			"risk engine: symbol exposure limit exceeded: current %s + requested %s, max %s",
-			symbolExposure, additionalUSD, settings.MaxSymbolExposureUSD,
+			symbolExposure, requestedNotional, settings.MaxSymbolExposureUSD,
 		)
 	}
 	return nil
@@ -242,7 +302,11 @@ func (e *Engine) SetKillSwitch(ctx context.Context, enabled bool) error {
 	return nil
 }
 
-// ValidateDailyLoss checks if today's cumulative realized loss across real bots has breached max_daily_loss_usd.
+// ValidateDailyLoss checks the last 24h cumulative realized loss across REAL
+// and (since v2.0.27) PAPER bots against max_daily_loss_usd — the paper fleet
+// is the actual trading surface, and its stop-outs are real money decisions
+// even in simulation. All negative realized closes count, including manual
+// ones: money lost is lost.
 func (e *Engine) ValidateDailyLoss(ctx context.Context) error {
 	settings, err := e.LoadSettings(ctx)
 	if err != nil {
@@ -253,10 +317,17 @@ func (e *Engine) ValidateDailyLoss(ctx context.Context) error {
 	}
 	var dailyRealizedLoss decimal.Decimal
 	err = e.db.QueryRow(ctx, `
-		SELECT COALESCE(SUM(CASE WHEN realized_pnl_usdt < 0 THEN -realized_pnl_usdt ELSE 0 END), 0)
-		FROM grid_bots
-		WHERE COALESCE(closed_at, updated_at) > NOW() - INTERVAL '24 hours'
-		  AND status IN ('STOPPED', 'LIQUIDATED', 'FAILED')
+		SELECT COALESCE(SUM(loss), 0) FROM (
+			SELECT CASE WHEN realized_pnl_usdt < 0 THEN -realized_pnl_usdt ELSE 0 END AS loss
+			FROM grid_bots
+			WHERE COALESCE(closed_at, updated_at) > NOW() - INTERVAL '24 hours'
+			  AND status IN ('STOPPED', 'LIQUIDATED', 'FAILED')
+			UNION ALL
+			SELECT CASE WHEN realized_pnl_usdt < 0 THEN -realized_pnl_usdt ELSE 0 END AS loss
+			FROM paper_grid_bots
+			WHERE closed_at > NOW() - INTERVAL '24 hours'
+			  AND status = 'COMPLETED'
+		) all_losses
 	`).Scan(&dailyRealizedLoss)
 	if err != nil {
 		return fmt.Errorf("risk engine: check daily loss: %w", err)

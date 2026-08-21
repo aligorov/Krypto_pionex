@@ -406,11 +406,15 @@ func scoreCandidate(
 	if volume.LessThan(config.MinVolume24h) {
 		reasons = append(reasons, "24h quote turnover below limit")
 	}
+	// v2.0.26 majors priority, scoped by v2.0.27 to the momentum thesis the
+	// feature exists for: in quiet RANGE majors face the same operator
+	// floors as everyone (the waivers used to lower the floors
+	// unconditionally — a risk-floor reduction, not a priority).
+	majorMomentum := isMajorSymbol(symbol.BaseCurrency, symbol.Symbol) &&
+		(recommendedTrend == "long" || regime.Regime == "TREND_UP")
 	minVol := config.MinVolatilityPct
-	if isMajorSymbol(symbol.BaseCurrency, symbol.Symbol) {
-		if minVol > 0.4 {
-			minVol = 0.4
-		}
+	if majorMomentum && minVol > 0.4 {
+		minVol = 0.4
 	}
 	if volatilityPct < minVol {
 		reasons = append(reasons, "volatility below grid threshold")
@@ -419,10 +423,8 @@ func scoreCandidate(
 		reasons = append(reasons, "volatility above risk threshold")
 	}
 	minEV := config.MinExpectedValuePct
-	if isMajorSymbol(symbol.BaseCurrency, symbol.Symbol) {
-		if minEV > 0.0 {
-			minEV = 0.0
-		}
+	if majorMomentum && minEV > 0.0 {
+		minEV = 0.0
 	}
 	if evPct < minEV {
 		reasons = append(reasons, "model EV below limit")
@@ -603,10 +605,13 @@ func scoreCandidate(
 		score = clamp(score*(0.8+0.2*confluence.Strength), 0, 1)
 	}
 
-	// Majors Priority Boost: When BTC, ETH, or SOL are in TREND_UP or trending long,
-	// boost their score so they rank at the top of the accepted fleet.
-	if isMajorSymbol(symbol.BaseCurrency, symbol.Symbol) && (recommendedTrend == "long" || regime.Regime == "TREND_UP") {
-		score = math.Max(score*1.4, 0.88)
+	// Majors Priority Boost (v2.0.26): when a major is actually trending
+	// long, lift its ranking. v2.0.27: multiplicative only and clamped —
+	// the old max(score*1.4, 0.88) could exceed the 0..1 score contract,
+	// and its 0.88 floor let three mediocre majors evict the entire honest
+	// top-K through the MaxSymbols truncation.
+	if majorMomentum {
+		score = clamp(score*1.15, 0, 1)
 	}
 
 	return ScannerCandidate{
@@ -858,11 +863,13 @@ func clamp(value, minimum, maximum float64) float64 {
 	return math.Max(minimum, math.Min(maximum, value))
 }
 
-func isMajorSymbol(baseCurrency, symbol string) bool {
+func isMajorSymbol(baseCurrency, _ string) bool {
+	// Exact base match only (v2.0.27): the old full-symbol prefix fallback
+	// matched SOLVX/ETHW-style tickers as SOL/ETH and handed them the
+	// majors waivers and score boost.
 	switch strings.ToUpper(baseCurrency) {
 	case "BTC", "ETH", "SOL":
 		return true
 	}
-	s := strings.ToUpper(symbol)
-	return strings.HasPrefix(s, "BTC") || strings.HasPrefix(s, "ETH") || strings.HasPrefix(s, "SOL")
+	return false
 }

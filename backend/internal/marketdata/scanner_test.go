@@ -128,3 +128,17 @@ func TestScannerMajorSymbolPriority(t *testing.T) {
 		t.Fatal("expected TUT NOT to be recognized as major symbol")
 	}
 }
+
+// v2.0.27: exact base match only — the old full-symbol prefix fallback
+// matched SOLVX/ETHW-class tickers as SOL/ETH.
+func TestScannerMajorSymbolNoPrefixFalsePositives(t *testing.T) {
+	for _, tc := range [][2]string{
+		{"SOLV", "SOLVX_USDT_PERP"},
+		{"ETHW", "ETHW_USDT_PERP"},
+		{"BTCA", "BTCA_USDT_PERP"},
+	} {
+		if isMajorSymbol(tc[0], tc[1]) {
+			t.Fatalf("isMajorSymbol(%q, %q) must be false — prefix false positive", tc[0], tc[1])
+		}
+	}
+}
