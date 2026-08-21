@@ -60,12 +60,12 @@ func ComputeGridGeometry(forecastVolPct float64, harR2 float64, feeBps float64, 
 	}
 
 	// Leverage inversely proportional to volatility.
-	leverage := 2
-	if dailyVolPct > 5.0 {
-		leverage = 1 // very high vol → 1x
+	leverage := 3
+	if dailyVolPct > 10.0 {
+		leverage = 2 // extreme volatility → 2x floor
 	}
-	if dailyVolPct < 1.0 {
-		leverage = 3 // very low vol → 3x max
+	if dailyVolPct < 3.0 {
+		leverage = 4 // low volatility → 4x
 	}
 
 	// Number of fee-viable steps that fit in the range. floor(range/step)

@@ -1067,31 +1067,28 @@ func (worker *Worker) deployPaper(
 			}
 		}
 
-		// Leverage precedence: HAR vol-inverse cap, then Smart Direction's
-		// conservative cap — either may only scale DOWN from the operator's
-		// setting. Without HAR/smart inputs the ATR adaptive ladder applies.
-		botLev := settings.Leverage
-		levReason := fmt.Sprintf("Фиксированное (%dx)", settings.Leverage)
-		levMode := "FIXED"
-		if harGeo != nil && harGeo.geo.Leverage < botLev {
-			// HAR may only scale DOWN from the operator's setting (same rule
-			// as deployReal; v2.0.8 fix — it used to REPLACE the setting,
-			// letting paper run 3x where REAL would cap to the operator's 2x).
+		// Leverage precedence: Operator base leverage scaled adaptively by volatility (ATR)
+		baseLev := settings.Leverage
+		if baseLev <= 0 {
+			baseLev = 3
+		}
+		botLev := baseLev
+		levReason := fmt.Sprintf("Базовое (%dx)", baseLev)
+		levMode := "BASE"
+		if settings.AdaptiveLeverageEnabled {
+			dyn := ComputeDynamicLeverage(atrPct, baseLev)
+			botLev = dyn.Leverage
+			levReason = dyn.Reason
+			levMode = "ADAPTIVE"
+		} else if smartLev > 0 && smartLev < botLev {
+			botLev = smartLev
+			levReason = fmt.Sprintf("Smart Direction (%dx): %s", smartLev, smartReason)
+			levMode = "SMART"
+		} else if harGeo != nil && harGeo.geo.Leverage < botLev {
 			botLev = harGeo.geo.Leverage
 			levReason = fmt.Sprintf("HAR σ=%.0f%%/год R²=%.2f (%dx)",
 				harGeo.forecastPct, harGeo.geo.Confidence, botLev)
 			levMode = "HAR"
-		}
-		if smartLev > 0 && smartLev < botLev {
-			botLev = smartLev
-			levReason = fmt.Sprintf("Smart Direction (%dx): %s", smartLev, smartReason)
-			levMode = "SMART"
-		}
-		if harGeo == nil && smartLev == 0 && settings.AdaptiveLeverageEnabled {
-			dyn := ComputeDynamicLeverage(atrPct, settings.Leverage)
-			botLev = dyn.Leverage
-			levReason = dyn.Reason
-			levMode = "ADAPTIVE"
 		}
 
 		confluence := EvaluateConfluence(candidate, nil, nil)
@@ -1100,17 +1097,6 @@ func (worker *Worker) deployPaper(
 		meshSpanPct := 0.0
 		if mesh.UpperPrice.GreaterThan(mesh.LowerPrice) && candidate.CurrentPrice.IsPositive() {
 			meshSpanPct, _ = mesh.UpperPrice.Sub(mesh.LowerPrice).Div(candidate.CurrentPrice).Mul(decimal.NewFromInt(100)).Float64()
-		}
-		// v2.0.30: narrow NEUTRAL grids de-gear to 1x. The v2.0.24
-		// range-coupled stop scales with the span, so a 2x bot on a 6-7%
-		// range carries a ~0.45% PRICE-distance stop — market noise, the
-		// deploy-STOP_LOSS churn class of 2026-08-21 (SNXXX deployed and
-		// stopped twice on the same tape). At 1x the price distance doubles
-		// and normal noise survives; wide-span bots are unaffected.
-		if trend == "neutral" && botLev > 1 && meshSpanPct > 0 && meshSpanPct < 10.0 {
-			botLev = 1
-			levReason = fmt.Sprintf("Узкий диапазон %.1f%% — де-гир до 1x (стоп вне шума)", meshSpanPct)
-			levMode = "NARROW_DEGEAR"
 		}
 		target, maxLoss := computeBotTargets(settings, candidate, botLev, meshSpanPct)
 		if trancheOn {
@@ -1676,19 +1662,19 @@ func (worker *Worker) deployReal(
 			}
 		}
 
-		// Leverage precedence: HAR vol-inverse cap, then Smart Direction's
-		// conservative cap — either may only scale DOWN from the operator's
-		// setting. Without HAR/smart inputs the ATR adaptive ladder applies.
-		botLev := settings.Leverage
-		if harGeo != nil && harGeo.geo.Leverage < botLev {
-			botLev = harGeo.geo.Leverage
+		// Leverage precedence: Operator base leverage scaled adaptively by volatility (ATR)
+		baseLev := settings.Leverage
+		if baseLev <= 0 {
+			baseLev = 3
 		}
-		if smartLev > 0 && smartLev < botLev {
-			botLev = smartLev
-		}
-		if harGeo == nil && smartLev == 0 && settings.AdaptiveLeverageEnabled {
-			dyn := ComputeDynamicLeverage(atrPct, settings.Leverage)
+		botLev := baseLev
+		if settings.AdaptiveLeverageEnabled {
+			dyn := ComputeDynamicLeverage(atrPct, baseLev)
 			botLev = dyn.Leverage
+		} else if smartLev > 0 && smartLev < botLev {
+			botLev = smartLev
+		} else if harGeo != nil && harGeo.geo.Leverage < botLev {
+			botLev = harGeo.geo.Leverage
 		}
 
 		if err := worker.risk.ValidateNewGrid(
