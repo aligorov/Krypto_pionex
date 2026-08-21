@@ -112,14 +112,14 @@ func ComputeDynamicTargets(input DynamicTargetsInput) DynamicTargets {
 // clamp keeps the futures contract range (2–500) inside practical bounds.
 func GridLevelsForRange(rangePct, atrPct float64) int {
 	if rangePct <= 0 {
-		return 20
+		return 8
 	}
-	stepTarget := clamp(0.3*atrPct, 0.30, 3.0)
+	stepTarget := clamp(0.65*atrPct, 0.80, 3.5)
 	if stepTarget <= 0 {
-		return 20
+		return 8
 	}
 	levels := math.Round(rangePct / stepTarget)
-	return int(clamp(levels, 10, 60))
+	return int(clamp(levels, 6, 14))
 }
 
 // ValidateMinGridStep checks if the grid step % is large enough to exceed

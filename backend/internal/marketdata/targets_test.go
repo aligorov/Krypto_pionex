@@ -30,9 +30,9 @@ func TestComputeDynamicTargetsPrefersAIKit(t *testing.T) {
 	if result.VolSource != "pionex_ai_kit" || result.DrawdownSource != "pionex_ai_kit" {
 		t.Fatalf("AI Kit readings must win, got %+v", result)
 	}
-	// 0.6 × 8% = 4.8% of 100 → 4.8 USDT.
-	if result.TargetUSDT < 4.79 || result.TargetUSDT > 4.81 {
-		t.Fatalf("expected target 4.8 USDT, got %v", result.TargetUSDT)
+	// 0.85 × 8% = 6.8% of 100 → 6.8 USDT.
+	if result.TargetUSDT < 6.79 || result.TargetUSDT > 6.81 {
+		t.Fatalf("expected target 6.8 USDT, got %v", result.TargetUSDT)
 	}
 }
 
@@ -41,7 +41,7 @@ func TestComputeDynamicTargetsPositiveRRR(t *testing.T) {
 		Budget: 1000, AIVolatilityPct: 2, AIDrawdownPct: 8,
 	})
 	if result.TargetUSDT < result.MaxLossUSDT*minRiskRewardRatio {
-		t.Fatalf("target must be at least 1.35x max loss: target=%f loss=%f", result.TargetUSDT, result.MaxLossUSDT)
+		t.Fatalf("target must be at least 1.50x max loss: target=%f loss=%f", result.TargetUSDT, result.MaxLossUSDT)
 	}
 }
 
@@ -58,7 +58,7 @@ func TestComputeDynamicTargetsClamps(t *testing.T) {
 	if flat.TargetPct != dynamicTargetMinPct || flat.LossPct != dynamicLossMinPct {
 		t.Fatalf("floor clamps must hold: %+v", flat)
 	}
-	if flat.TargetUSDT != 18 || flat.MaxLossUSDT != 10 {
+	if flat.TargetUSDT != 45 || flat.MaxLossUSDT != 20 {
 		t.Fatalf("floored USDT values wrong: %+v", flat)
 	}
 }
@@ -89,7 +89,7 @@ func TestComputeDynamicTargetsRangeCoupledLossFloor(t *testing.T) {
 	manual := ComputeDynamicTargets(DynamicTargetsInput{
 		Budget: 100, ScannerVolatilityPct: 2, ScannerATRPct: 1.5, ScannerDrawdownPct: 2,
 	})
-	if manual.LossPct != 1.0 {
+	if manual.LossPct != dynamicLossMinPct {
 		t.Fatalf("zero span must fall back to the DD floor, got %v", manual.LossPct)
 	}
 }
@@ -148,13 +148,14 @@ func TestGridLevelsForRangeScalesWithATR(t *testing.T) {
 		t.Fatal("levels must differ across volatility regimes")
 	}
 	// Clamps hold for degenerate inputs.
-	if got := GridLevelsForRange(0, 0); got != 20 {
-		t.Fatalf("degenerate input must fall back to 20, got %d", got)
+	if got := GridLevelsForRange(0, 0); got != 8 {
+		t.Fatalf("degenerate input must fall back to 8, got %d", got)
 	}
-	if got := GridLevelsForRange(100, 0.01); got != 60 {
+	if got := GridLevelsForRange(100, 0.01); got != 14 {
 		t.Fatalf("upper clamp must hold, got %d", got)
 	}
-	if got := GridLevelsForRange(2, 20); got != 10 {
+	if got := GridLevelsForRange(2, 20); got != 6 {
 		t.Fatalf("lower clamp must hold, got %d", got)
 	}
 }
+
