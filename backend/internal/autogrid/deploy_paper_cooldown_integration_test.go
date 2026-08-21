@@ -499,3 +499,139 @@ func TestPaperDeployRunsBacktestGate(t *testing.T) {
 		t.Fatalf("passing backtest must allow paper deploy, got %d bots", got)
 	}
 }
+
+// TestDeployPaperCooldownEscalation pins the v2.0.28 doubling window: two
+// protective closes in 24h must block re-entry for 4h from the LATEST close
+// (the old flat 2h window re-armed the same trend signal and the pair died
+// again — prod VIRTUAL/NEAR double stops, CRWVX morning loop).
+func TestDeployPaperCooldownEscalation(t *testing.T) {
+	dbURL := integrationDatabaseURL(t)
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, dbURL)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	t.Cleanup(pool.Close)
+
+	worker, _, settings := newCooldownTestWorker(t, pool)
+	tickers := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"result":    true,
+			"timestamp": time.Now().UnixMilli(),
+			"data": map[string]any{
+				"tickers": []map[string]any{
+					{"symbol": "ESCOOL_USDT_PERP", "close": "100", "open": "100",
+						"high": "101", "low": "99", "volume": "1000"},
+				},
+			},
+		})
+	}))
+	t.Cleanup(tickers.Close)
+	worker.publicClient = pionex.NewClient(tickers.URL, "test-key", "test-secret")
+
+	const symbol = "ESCOOL_USDT_PERP"
+	tradedTF := normalizeBacktestTF(settings.CandleInterval)
+	for _, tf := range append([]string{tradedTF}, neighborBacktestTFs(tradedTF)...) {
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO backtest_jobs (symbol, interval, status, result, finished_at)
+			VALUES ($1, $2, 'DONE',
+			        '{"folds": 4, "oos_return_pct": 1.2, "oos_max_drawdown": 0.05, "round_trips": 100, "stop_hits": 0}'::jsonb,
+			        NOW())
+		`, symbol, tf); err != nil {
+			t.Fatalf("seed backtest job %s: %v", tf, err)
+		}
+	}
+	t.Cleanup(func() {
+		if _, err := pool.Exec(ctx, `DELETE FROM backtest_jobs WHERE symbol = $1`, symbol); err != nil {
+			t.Errorf("cleanup backtest jobs: %v", err)
+		}
+		if _, err := pool.Exec(ctx, `DELETE FROM paper_grid_bots WHERE symbol = $1`, symbol); err != nil {
+			t.Errorf("cleanup paper bots: %v", err)
+		}
+	})
+	// Two protective closes: the newest 3h ago, the older 6h ago. The flat
+	// 2h window would ALLOW re-entry (3h > 2h); the escalated 4h window
+	// (2 closes) must BLOCK.
+	for _, age := range []string{"6 hours", "3 hours"} {
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO paper_grid_bots (
+				settings_id, symbol, status, direction, grid_type,
+				lower_price, upper_price, grid_num, leverage, quote_investment,
+				entry_price, mark_price, closed_reason, closed_at
+			) VALUES (
+				$1, $2, 'COMPLETED', 'NEUTRAL', 'ARITHMETIC',
+				90, 110, 10, 2, 200,
+				100, 95, 'STOP_LOSS', NOW() - ($3)::interval
+			)
+		`, settings.ID, symbol, age); err != nil {
+			t.Fatalf("insert closed bot (%s): %v", age, err)
+		}
+	}
+
+	var scanID string
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO autogrid_scan_runs (status) VALUES ('SUCCEEDED') RETURNING id
+	`).Scan(&scanID); err != nil {
+		t.Fatalf("insert scan run: %v", err)
+	}
+	t.Cleanup(func() {
+		if _, err := pool.Exec(ctx, `DELETE FROM autogrid_scan_runs WHERE id = $1`, scanID); err != nil {
+			t.Errorf("cleanup scan run: %v", err)
+		}
+	})
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO autogrid_candidates (
+			scan_id, symbol, decision, current_price, lower_price, upper_price,
+			grid_num, recommended_trend, model_assumptions
+		) VALUES (
+			$1, $2, 'ACCEPTED', 100, 90, 110,
+			10, 'no_trend', '{"atrPct": 1.0, "regime": "RANGE"}'::jsonb
+		)
+	`, scanID, symbol); err != nil {
+		t.Fatalf("insert candidate: %v", err)
+	}
+
+	// Round 1: 2 closes → 4h window, newest is 3h old → blocked.
+	if err := worker.deployPaper(ctx, settings, scanID, false); err != nil {
+		t.Fatalf("deployPaper round 1: %v", err)
+	}
+	var rejection string
+	if err := pool.QueryRow(ctx, `
+		SELECT COALESCE(rejection_reason, '') FROM autogrid_candidates
+		WHERE scan_id = $1 AND symbol = $2
+	`, scanID, symbol).Scan(&rejection); err != nil {
+		t.Fatalf("load candidate: %v", err)
+	}
+	if !strings.Contains(rejection, "окно 4h") {
+		t.Fatalf("escalated cooldown must reject with a 4h window, got %q", rejection)
+	}
+
+	// Round 2: age the newest close beyond the 4h window → deploy proceeds.
+	if _, err := pool.Exec(ctx, `
+		UPDATE paper_grid_bots
+		SET closed_at = NOW() - INTERVAL '5 hours'
+		WHERE symbol = $1 AND closed_at > NOW() - INTERVAL '4 hours'
+	`, symbol); err != nil {
+		t.Fatalf("age newest close: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		UPDATE autogrid_candidates
+		SET decision = 'ACCEPTED', rejection_reason = NULL
+		WHERE scan_id = $1 AND symbol = $2
+	`, scanID, symbol); err != nil {
+		t.Fatalf("reset candidate: %v", err)
+	}
+	if err := worker.deployPaper(ctx, settings, scanID, false); err != nil {
+		t.Fatalf("deployPaper round 2: %v", err)
+	}
+	var running int
+	if err := pool.QueryRow(ctx, `
+		SELECT COUNT(*) FROM paper_grid_bots WHERE symbol = $1 AND status = 'RUNNING'
+	`, symbol).Scan(&running); err != nil {
+		t.Fatalf("count running: %v", err)
+	}
+	if running != 1 {
+		t.Fatalf("re-entry beyond the escalated window must deploy, got %d bots", running)
+	}
+}

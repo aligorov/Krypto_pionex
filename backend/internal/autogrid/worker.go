@@ -813,23 +813,31 @@ func (worker *Worker) deployPaper(
 		if tag.RowsAffected() > 0 || activeCount >= settings.MaxActiveBots {
 			continue
 		}
-		// Cooldown: do not reopen a symbol within 2 hours of ANY protective
-		// close (stop-loss, structural invalidation, range break) — only
-		// take-profit exits may redeploy immediately.
-		var recentlyStopped bool
+		// Cooldown with escalation (v2.0.28): no re-entry within the window
+		// of ANY protective close (stop-loss, structural invalidation, range
+		// break); each additional protective close in the trailing 24h
+		// DOUBLES the window (2h → 4h → 8h → 24h cap) — a pair that keeps
+		// dying on the same tape must stay out longer than one that died
+		// once. Only take-profit exits redeploy immediately.
+		var protectiveCloses int
+		var lastProtectiveAt *time.Time
 		if err := worker.db.QueryRow(ctx, `
-			SELECT EXISTS (
-				SELECT 1 FROM paper_grid_bots
-				WHERE settings_id = $1 AND symbol = $2
-				  AND status = 'COMPLETED'
-				  AND COALESCE(closed_reason, '') NOT IN (
-				      `+protectiveCloseExemptReasons+`)
-				  AND closed_at > NOW() - INTERVAL '2 hours'
-			)
-		`, settings.ID, candidate.Symbol).Scan(&recentlyStopped); err == nil && recentlyStopped {
-			worker.rejectCandidate(ctx, candidate,
-				"cooldown: защитное закрытие символа менее 2 часов назад — повторный вход отложен", nil)
-			continue
+			SELECT COUNT(*), MAX(closed_at)
+			FROM paper_grid_bots
+			WHERE settings_id = $1 AND symbol = $2
+			  AND status = 'COMPLETED'
+			  AND COALESCE(closed_reason, '') NOT IN (
+			      `+protectiveCloseExemptReasons+`)
+			  AND closed_at > NOW() - INTERVAL '24 hours'
+		`, settings.ID, candidate.Symbol).Scan(&protectiveCloses, &lastProtectiveAt); err == nil &&
+			protectiveCloses > 0 && lastProtectiveAt != nil {
+			window := time.Duration(cooldownHours(protectiveCloses)) * time.Hour
+			if time.Since(*lastProtectiveAt) < window {
+				worker.rejectCandidate(ctx, candidate,
+					fmt.Sprintf("cooldown: %d защитных закрытий за 24ч, окно %s с последнего — повторный вход отложен",
+						protectiveCloses, window), nil)
+				continue
+			}
 		}
 		// v2.0.27 sector cap: correlated clusters stop together — 6 of 10
 		// bots were semis/AI-correlated on 2026-08-21 with no cap anywhere;
@@ -1411,23 +1419,29 @@ func (worker *Worker) deployReal(
 		if exists {
 			continue
 		}
-		// Cooldown: do not reopen a symbol within 2 hours of ANY protective
-		// close (stop-loss, structural invalidation, range break, liquidation);
-		// profit takes and operator/exchange-driven closes are exempt.
-		var recentlyStoppedReal bool
+		// Cooldown with escalation (v2.0.28, paper-parity): each additional
+		// protective close in the trailing 24h doubles the re-entry window
+		// (2h → 4h → 8h → 24h cap); profit takes and operator/exchange-driven
+		// closes are exempt.
+		var protectiveCloses int
+		var lastProtectiveAt *time.Time
 		if err := worker.db.QueryRow(ctx, `
-			SELECT EXISTS (
-				SELECT 1 FROM grid_bots
-				WHERE account_id = $1 AND symbol = $2
-				  AND status IN ('STOPPED', 'LIQUIDATED')
-				  AND COALESCE(closed_reason, '') NOT IN (
-				      `+protectiveCloseExemptReasons+`)
-				  AND COALESCE(closed_at, updated_at) > NOW() - INTERVAL '2 hours'
-			)
-		`, *settings.AccountID, candidate.Symbol).Scan(&recentlyStoppedReal); err == nil && recentlyStoppedReal {
-			worker.rejectCandidate(ctx, candidate,
-				"cooldown: защитное закрытие символа менее 2 часов назад — повторный вход отложен", nil)
-			continue
+			SELECT COUNT(*), MAX(COALESCE(closed_at, updated_at))
+			FROM grid_bots
+			WHERE account_id = $1 AND symbol = $2
+			  AND status IN ('STOPPED', 'LIQUIDATED')
+			  AND COALESCE(closed_reason, '') NOT IN (
+			      `+protectiveCloseExemptReasons+`)
+			  AND COALESCE(closed_at, updated_at) > NOW() - INTERVAL '24 hours'
+		`, *settings.AccountID, candidate.Symbol).Scan(&protectiveCloses, &lastProtectiveAt); err == nil &&
+			protectiveCloses > 0 && lastProtectiveAt != nil {
+			window := time.Duration(cooldownHours(protectiveCloses)) * time.Hour
+			if time.Since(*lastProtectiveAt) < window {
+				worker.rejectCandidate(ctx, candidate,
+					fmt.Sprintf("cooldown: %d защитных закрытий за 24ч, окно %s с последнего — повторный вход отложен",
+						protectiveCloses, window), nil)
+				continue
+			}
 		}
 		atrPct := 2.0
 		if val, ok := candidate.ModelAssumptions["atrPct"].(float64); ok && val > 0 {
