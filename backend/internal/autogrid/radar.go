@@ -62,34 +62,82 @@ func EvaluateConfluence(
 		}
 	}
 
+	// Extract confluence metrics if available
+	fibGoldenPocket := false
+	var fibNearLevel float64
+	var macdCrossedUp, macdCrossedDown, stochCrossedUp, stochCrossedDown bool
+	if confMap, ok := candidate.ModelAssumptions["confluence"].(map[string]any); ok {
+		if v, ok := confMap["fibInGoldenPocket"].(bool); ok {
+			fibGoldenPocket = v
+		}
+		if v, ok := confMap["fibNearLevel"].(float64); ok {
+			fibNearLevel = v
+		}
+		if v, ok := confMap["macdCrossedUp"].(bool); ok {
+			macdCrossedUp = v
+		}
+		if v, ok := confMap["macdCrossedDown"].(bool); ok {
+			macdCrossedDown = v
+		}
+		if v, ok := confMap["stochCrossedUp"].(bool); ok {
+			stochCrossedUp = v
+		}
+		if v, ok := confMap["stochCrossedDown"].(bool); ok {
+			stochCrossedDown = v
+		}
+	}
+
 	// -------------------------------------------------------------
 	// FACTOR 1: CHANNEL LEVEL & FIBONACCI GOLDEN POCKET (Max 35 pts)
 	// -------------------------------------------------------------
 	switch direction {
 	case "long":
-		// Ideal: 10% to 30% channel support
-		if rangePos >= 10.0 && rangePos <= 30.0 {
+		if fibGoldenPocket {
+			// Perfect institutional pullback into 0.618-0.786 Golden Pocket
 			eval.Factor1LevelScore = 35.0
 			eval.TargetEntryPrice = candidate.CurrentPrice
+		} else if rangePos >= 10.0 && rangePos <= 30.0 {
+			// 10% to 30% channel support
+			eval.Factor1LevelScore = 35.0
+			if fibNearLevel > 0 {
+				eval.TargetEntryPrice = decimal.NewFromFloat(fibNearLevel)
+			} else {
+				eval.TargetEntryPrice = candidate.CurrentPrice
+			}
 		} else if rangePos > 30.0 && rangePos <= 45.0 {
 			eval.Factor1LevelScore = 20.0
-			// Target entry is at 20% of channel
-			span := candidate.UpperPrice.Sub(candidate.LowerPrice)
-			eval.TargetEntryPrice = candidate.LowerPrice.Add(span.Mul(decimal.NewFromFloat(0.20)))
+			if fibNearLevel > 0 {
+				eval.TargetEntryPrice = decimal.NewFromFloat(fibNearLevel)
+			} else {
+				span := candidate.UpperPrice.Sub(candidate.LowerPrice)
+				eval.TargetEntryPrice = candidate.LowerPrice.Add(span.Mul(decimal.NewFromFloat(0.20)))
+			}
 		} else {
 			eval.Factor1LevelScore = 5.0
 			span := candidate.UpperPrice.Sub(candidate.LowerPrice)
 			eval.TargetEntryPrice = candidate.LowerPrice.Add(span.Mul(decimal.NewFromFloat(0.20)))
 		}
 	case "short":
-		// Ideal: 70% to 90% channel resistance
-		if rangePos >= 70.0 && rangePos <= 90.0 {
+		if fibGoldenPocket {
+			// Perfect institutional relief rally into 0.618-0.786 Golden Pocket
 			eval.Factor1LevelScore = 35.0
 			eval.TargetEntryPrice = candidate.CurrentPrice
+		} else if rangePos >= 70.0 && rangePos <= 90.0 {
+			// 70% to 90% channel resistance
+			eval.Factor1LevelScore = 35.0
+			if fibNearLevel > 0 {
+				eval.TargetEntryPrice = decimal.NewFromFloat(fibNearLevel)
+			} else {
+				eval.TargetEntryPrice = candidate.CurrentPrice
+			}
 		} else if rangePos >= 55.0 && rangePos < 70.0 {
 			eval.Factor1LevelScore = 20.0
-			span := candidate.UpperPrice.Sub(candidate.LowerPrice)
-			eval.TargetEntryPrice = candidate.LowerPrice.Add(span.Mul(decimal.NewFromFloat(0.80)))
+			if fibNearLevel > 0 {
+				eval.TargetEntryPrice = decimal.NewFromFloat(fibNearLevel)
+			} else {
+				span := candidate.UpperPrice.Sub(candidate.LowerPrice)
+				eval.TargetEntryPrice = candidate.LowerPrice.Add(span.Mul(decimal.NewFromFloat(0.80)))
+			}
 		} else {
 			eval.Factor1LevelScore = 5.0
 			span := candidate.UpperPrice.Sub(candidate.LowerPrice)
@@ -107,7 +155,7 @@ func EvaluateConfluence(
 	}
 
 	// -------------------------------------------------------------
-	// FACTOR 2: MOMENTUM & MFI / RSI DIVERGENCE (Max 35 pts)
+	// FACTOR 2: MOMENTUM & MFI / RSI / MACD REVERSALS (Max 35 pts)
 	// -------------------------------------------------------------
 	var adx float64 = 20.0
 	if v, ok := candidate.ModelAssumptions["adx"].(float64); ok {
@@ -116,11 +164,18 @@ func EvaluateConfluence(
 
 	// ADX filter: Trending killers (> 35) are penalized
 	if adx < 25.0 {
-		eval.Factor2MomentumScore += 20.0 // Healthy consolidation
+		eval.Factor2MomentumScore += 15.0 // Healthy consolidation
 	} else if adx <= 35.0 {
-		eval.Factor2MomentumScore += 10.0
+		eval.Factor2MomentumScore += 8.0
 	} else {
 		eval.RejectionReasons = append(eval.RejectionReasons, "ADX > 35: слишком сильный тренд для сетки")
+	}
+
+	// Reversal indicator confirmation (MACD / StochRSI)
+	if direction == "long" && (macdCrossedUp || stochCrossedUp) {
+		eval.Factor2MomentumScore += 10.0 // Confirmed bullish inflection
+	} else if direction == "short" && (macdCrossedDown || stochCrossedDown) {
+		eval.Factor2MomentumScore += 10.0 // Confirmed bearish inflection
 	}
 
 	// RSI / Choppiness evaluation
@@ -141,10 +196,11 @@ func EvaluateConfluence(
 		chop = v
 	}
 	if chop >= 50.0 {
-		eval.Factor2MomentumScore += 15.0 // Strong mean-reversion
+		eval.Factor2MomentumScore += 10.0 // Strong mean-reversion
 	} else if chop >= 40.0 {
-		eval.Factor2MomentumScore += 10.0
+		eval.Factor2MomentumScore += 5.0
 	}
+	eval.Factor2MomentumScore = math.Min(eval.Factor2MomentumScore, 35.0)
 
 	// -------------------------------------------------------------
 	// FACTOR 3: CANDLE PHYSICS & REVERSAL TRIGGER (Max 30 pts)

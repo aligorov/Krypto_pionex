@@ -49,9 +49,10 @@ type ConfluenceResult struct {
 }
 
 // EvaluateConfluence aggregates the independent indicator classes with the
-// regime context. Weights: flow 0.30, momentum turn 0.25, squeeze release
-// 0.25, fair-price stretch 0.20 for directional support; range support
-// weights volatility phase and mean-reverting regime.
+// regime context. Weights: flow 0.20, momentum turn 0.15, squeeze release
+// 0.15, fair-price stretch 0.10, Fibonacci pocket 0.15, MACD cross 0.15,
+// Stochastic RSI extreme 0.10 for directional support; range support
+// weights volatility phase, mean-reverting regime, and structural S/R bounds.
 func EvaluateConfluence(regime RegimeResult, bundle IndicatorBundle) ConfluenceResult {
 	result := ConfluenceResult{Verdict: ConfluenceNeutral, HurstGate: HurstGateNeutral}
 	switch {
@@ -69,66 +70,130 @@ func EvaluateConfluence(regime RegimeResult, bundle IndicatorBundle) ConfluenceR
 		})
 	}
 
-	// --- Volume flow (0.30): the only component that sees accumulation
-	// before price moves. Never fires without a Hurst gate: divergences
-	// against a strong trend are the documented trap.
-	if bundle.OBVDiv.Direction > 0 && result.HurstGate != HurstGateTrendDanger {
-		vote("obv_bullish_divergence", 1, 0.30*clamp(bundle.OBVDiv.Strength+0.4, 0, 1), true, "price LL, OBV HL")
-		result.LongScore += 0.30 * clamp(bundle.OBVDiv.Strength+0.4, 0, 1)
-	} else if bundle.OBVDiv.Direction < 0 && result.HurstGate != HurstGateTrendDanger {
-		vote("obv_bearish_divergence", -1, 0.30*clamp(bundle.OBVDiv.Strength+0.4, 0, 1), true, "price HH, OBV LH")
-		result.ShortScore += 0.30 * clamp(bundle.OBVDiv.Strength+0.4, 0, 1)
-	}
-
-	// --- Momentum turn (0.25): the single oscillator voice, kept because
-	// IFT-RSI crosses 1-2 bars before classic RSI reads.
-	if bundle.IFT.CrossedUp {
-		vote("ift_rsi_turn_up", 1, 0.25, true, "crossed -0.5 upward")
-		result.LongScore += 0.25
-	} else if bundle.IFT.CrossedDown {
-		vote("ift_rsi_turn_down", -1, 0.25, true, "crossed +0.5 downward")
-		result.ShortScore += 0.25
-	}
-
-	// --- Volatility phase (0.25 directional / 0.30 range): squeeze release
-	// marks the start of expansion; the still-squeezed state is the range
-	// grid's ideal entry window.
-	if bundle.Keltner.JustReleased {
-		dir := bundle.Keltner.ReleaseDir
-		if dir > 0 {
-			vote("squeeze_release_up", 1, 0.25, true, "BB left Keltner upward")
-			result.LongScore += 0.25
-		} else if dir < 0 {
-			vote("squeeze_release_down", -1, 0.25, true, "BB left Keltner downward")
-			result.ShortScore += 0.25
+	// --- Volume flow & Divergence (0.20): sees accumulation/distribution before price moves.
+	// Never fires without a Hurst gate: divergences against a strong trend are the documented trap.
+	if result.HurstGate != HurstGateTrendDanger {
+		if bundle.OBVDiv.Direction > 0 {
+			divWeight := 0.20 * clamp(bundle.OBVDiv.Strength+0.4, 0, 1)
+			if bundle.RSIDiv.Direction > 0 {
+				divWeight = clamp(divWeight*1.25, 0, 0.20) // Dual OBV+RSI bullish divergence confirmation
+				vote("dual_bullish_divergence", 1, divWeight, true, "price LL with OBV HL & RSI HL")
+			} else {
+				vote("obv_bullish_divergence", 1, divWeight, true, "price LL, OBV HL")
+			}
+			result.LongScore += divWeight
+		} else if bundle.OBVDiv.Direction < 0 {
+			divWeight := 0.20 * clamp(bundle.OBVDiv.Strength+0.4, 0, 1)
+			if bundle.RSIDiv.Direction < 0 {
+				divWeight = clamp(divWeight*1.25, 0, 0.20) // Dual OBV+RSI bearish divergence confirmation
+				vote("dual_bearish_divergence", -1, divWeight, true, "price HH with OBV LH & RSI LH")
+			} else {
+				vote("obv_bearish_divergence", -1, divWeight, true, "price HH, OBV LH")
+			}
+			result.ShortScore += divWeight
+		} else if bundle.RSIDiv.Direction > 0 {
+			rsiWeight := 0.15 * bundle.RSIDiv.Strength
+			vote("rsi_bullish_divergence", 1, rsiWeight, true, "price LL, RSI HL")
+			result.LongScore += rsiWeight
+		} else if bundle.RSIDiv.Direction < 0 {
+			rsiWeight := 0.15 * bundle.RSIDiv.Strength
+			vote("rsi_bearish_divergence", -1, rsiWeight, true, "price HH, RSI LH")
+			result.ShortScore += rsiWeight
 		}
 	}
 
-	// --- Fair-price stretch (0.20): price stretched under/over the
-	// volume-weighted anchor tends to mean-revert toward it.
-	if bundle.AVWAP.ZScore <= -1.5 {
-		vote("avwap_stretched_below", 1, 0.20, true, "z<=-1.5 vs anchored fair price")
-		result.LongScore += 0.20
-	} else if bundle.AVWAP.ZScore >= 1.5 {
-		vote("avwap_stretched_above", -1, 0.20, true, "z>=+1.5 vs anchored fair price")
-		result.ShortScore += 0.20
+	// --- Early Momentum Turn (0.15): IFT-RSI crosses 1-2 bars before classic RSI.
+	if bundle.IFT.CrossedUp {
+		vote("ift_rsi_turn_up", 1, 0.15, true, "crossed -0.5 upward")
+		result.LongScore += 0.15
+	} else if bundle.IFT.CrossedDown {
+		vote("ift_rsi_turn_down", -1, 0.15, true, "crossed +0.5 downward")
+		result.ShortScore += 0.15
 	}
 
-	// --- Range support: compression + mean-reverting memory + position
-	// inside the value area. These conditions describe the neutral grid's
-	// native habitat, not a direction.
+	// --- Volatility Phase (0.15 directional / 0.35 range): squeeze release marks start of expansion.
+	if bundle.Keltner.JustReleased {
+		dir := bundle.Keltner.ReleaseDir
+		if dir > 0 {
+			vote("squeeze_release_up", 1, 0.15, true, "BB left Keltner upward")
+			result.LongScore += 0.15
+		} else if dir < 0 {
+			vote("squeeze_release_down", -1, 0.15, true, "BB left Keltner downward")
+			result.ShortScore += 0.15
+		}
+	}
+
+	// --- Fair-Price Stretch (0.10): price stretched under/over the volume-weighted anchor.
+	if bundle.AVWAP.ZScore <= -1.5 {
+		vote("avwap_stretched_below", 1, 0.10, true, "z<=-1.5 vs anchored fair price")
+		result.LongScore += 0.10
+	} else if bundle.AVWAP.ZScore >= 1.5 {
+		vote("avwap_stretched_above", -1, 0.10, true, "z>=+1.5 vs anchored fair price")
+		result.ShortScore += 0.10
+	}
+
+	// --- Fibonacci Retracement & Golden Pocket (0.15): institutional pullback zone.
+	if bundle.Fib.InGoldenPocket {
+		if bundle.Fib.TrendDir == 1 {
+			vote("fib_golden_pocket_long", 1, 0.15, true, "price in 0.618-0.786 pullback golden pocket")
+			result.LongScore += 0.15
+		} else if bundle.Fib.TrendDir == -1 {
+			vote("fib_golden_pocket_short", -1, 0.15, true, "price in 0.618-0.786 relief golden pocket")
+			result.ShortScore += 0.15
+		}
+	} else if bundle.Fib.DistancePct <= 0.6 {
+		if bundle.Fib.TrendDir == 1 && bundle.Fib.NearRatio >= 0.382 {
+			vote("fib_support_shelf", 1, 0.08, true, "price resting on key Fib support")
+			result.LongScore += 0.08
+		} else if bundle.Fib.TrendDir == -1 && bundle.Fib.NearRatio >= 0.382 {
+			vote("fib_resist_shelf", -1, 0.08, true, "price testing key Fib resistance")
+			result.ShortScore += 0.08
+		}
+	}
+
+	// --- MACD Momentum & Crossover (0.15): trend confirmation and inflection detector.
+	if bundle.MACD.CrossedUp {
+		vote("macd_bullish_cross", 1, 0.15, true, "MACD line crossed above signal line")
+		result.LongScore += 0.15
+	} else if bundle.MACD.CrossedDown {
+		vote("macd_bearish_cross", -1, 0.15, true, "MACD line crossed below signal line")
+		result.ShortScore += 0.15
+	} else if bundle.MACD.HistTurning {
+		if bundle.MACD.Histogram < 0 && bundle.MACD.Histogram > bundle.MACD.PrevHist {
+			vote("macd_hist_bullish_turn", 1, 0.08, true, "MACD histogram contracting upward")
+			result.LongScore += 0.08
+		} else if bundle.MACD.Histogram > 0 && bundle.MACD.Histogram < bundle.MACD.PrevHist {
+			vote("macd_hist_bearish_turn", -1, 0.08, true, "MACD histogram contracting downward")
+			result.ShortScore += 0.08
+		}
+	}
+
+	// --- Stochastic RSI Extreme Reversal (0.10): early oversold/overbought hook.
+	if bundle.StochRSI.CrossedUp {
+		vote("stoch_rsi_oversold_cross", 1, 0.10, true, "%K hooked above %D from oversold")
+		result.LongScore += 0.10
+	} else if bundle.StochRSI.CrossedDown {
+		vote("stoch_rsi_overbought_cross", -1, 0.10, true, "%K hooked below %D from overbought")
+		result.ShortScore += 0.10
+	}
+
+	// --- Range Support: compression + mean-reverting memory + position inside the value area.
 	rangeSupport := 0.0
 	if bundle.Keltner.InSqueeze {
-		vote("keltner_squeeze_on", 0, 0.40, true, "compressed volatility")
-		rangeSupport += 0.40
+		vote("keltner_squeeze_on", 0, 0.35, true, "compressed volatility")
+		rangeSupport += 0.35
 	}
 	if result.HurstGate == HurstGateGridFriendly {
-		vote("hurst_mean_reverting", 0, 0.30, true, "H<0.45")
-		rangeSupport += 0.30
+		vote("hurst_mean_reverting", 0, 0.25, true, "H<0.45")
+		rangeSupport += 0.25
 	}
 	if regime.BBWPercentile > 0 && regime.BBWPercentile < 25 {
-		vote("bbw_low_percentile", 0, 0.30, true, "bands tighter than 75% of window")
-		rangeSupport += 0.30
+		vote("bbw_low_percentile", 0, 0.25, true, "bands tighter than 75% of window")
+		rangeSupport += 0.25
+	}
+	if bundle.SR.SupportStrength > 0.6 && bundle.SR.ResistStrength > 0.6 {
+		vote("sr_bracket_confirmed", 0, 0.15, true, "price bounded by dual multi-touch S/R shelves")
+		rangeSupport += 0.15
 	}
 	result.RangeScore = clamp(rangeSupport, 0, 1)
 

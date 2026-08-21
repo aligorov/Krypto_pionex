@@ -574,11 +574,31 @@ func scoreCandidate(
 		} else {
 			entryFit = clamp(1.0-(regime.RangePositionPct-50)/50, 0.5, 1.0)
 		}
+		// Fibonacci Golden Pocket boost for Longs (pullback to 0.618-0.786)
+		if bundle.Fib.InGoldenPocket && bundle.Fib.TrendDir == 1 {
+			entryFit = clamp(entryFit*1.25, 0.5, 1.0)
+		} else if bundle.Fib.DistancePct <= 0.5 && bundle.Fib.NearRatio >= 0.382 {
+			entryFit = clamp(entryFit*1.12, 0.5, 1.0)
+		}
+		// Support safety check: solid support right below entry protects the trade
+		if bundle.SR.NearestSupport > 0 && bundle.SR.SupportDistPct <= 1.5 && bundle.SR.SupportStrength >= 0.6 {
+			entryFit = clamp(entryFit*1.10, 0.5, 1.0)
+		}
 	case "short":
 		if regime.RangePositionPct >= 50.0 {
 			entryFit = clamp((90-regime.RangePositionPct)/40, 0.5, 1.0)
 		} else {
 			entryFit = clamp(1.0-(50-regime.RangePositionPct)/50, 0.5, 1.0)
+		}
+		// Fibonacci Golden Pocket boost for Shorts (relief bounce to 0.618-0.786)
+		if bundle.Fib.InGoldenPocket && bundle.Fib.TrendDir == -1 {
+			entryFit = clamp(entryFit*1.25, 0.5, 1.0)
+		} else if bundle.Fib.DistancePct <= 0.5 && bundle.Fib.NearRatio >= 0.382 {
+			entryFit = clamp(entryFit*1.12, 0.5, 1.0)
+		}
+		// Resistance safety check: solid resistance right above entry protects the trade
+		if bundle.SR.NearestResist > 0 && bundle.SR.ResistDistPct <= 1.5 && bundle.SR.ResistStrength >= 0.6 {
+			entryFit = clamp(entryFit*1.10, 0.5, 1.0)
 		}
 	default:
 		entryFit = clamp(1.0-math.Abs(regime.RangePositionPct-50)/50, 0, 1)
@@ -649,16 +669,29 @@ func scoreCandidate(
 			"volatilityParkinson": volParkinson,
 			"hurst":               bundle.Hurst,
 			"confluence": map[string]any{
-				"verdict":        confluence.Verdict,
-				"strength":       confluence.Strength,
-				"longScore":      confluence.LongScore,
-				"shortScore":     confluence.ShortScore,
-				"rangeScore":     confluence.RangeScore,
-				"hurstGate":      confluence.HurstGate,
-				"obvDivDir":      bundle.OBVDiv.Direction,
-				"iftRsi":         bundle.IFT.Current,
-				"avwapZ":         bundle.AVWAP.ZScore,
-				"keltnerSqueeze": bundle.Keltner.InSqueeze,
+				"verdict":          confluence.Verdict,
+				"strength":         confluence.Strength,
+				"longScore":        confluence.LongScore,
+				"shortScore":       confluence.ShortScore,
+				"rangeScore":       confluence.RangeScore,
+				"hurstGate":        confluence.HurstGate,
+				"obvDivDir":        bundle.OBVDiv.Direction,
+				"rsiDivDir":        bundle.RSIDiv.Direction,
+				"iftRsi":           bundle.IFT.Current,
+				"avwapZ":           bundle.AVWAP.ZScore,
+				"keltnerSqueeze":   bundle.Keltner.InSqueeze,
+				"fibInGoldenPocket": bundle.Fib.InGoldenPocket,
+				"fibNearRatio":     bundle.Fib.NearRatio,
+				"fibNearLevel":     bundle.Fib.NearLevel,
+				"macdCrossedUp":    bundle.MACD.CrossedUp,
+				"macdCrossedDown":  bundle.MACD.CrossedDown,
+				"macdHistogram":    bundle.MACD.Histogram,
+				"stochK":           bundle.StochRSI.K,
+				"stochD":           bundle.StochRSI.D,
+				"stochCrossedUp":   bundle.StochRSI.CrossedUp,
+				"stochCrossedDown": bundle.StochRSI.CrossedDown,
+				"srNearestSupport": bundle.SR.NearestSupport,
+				"srNearestResist":  bundle.SR.NearestResist,
 			},
 			"rangeSource":     "support_resistance_atr_buffered",
 			"fundingIncluded": false,

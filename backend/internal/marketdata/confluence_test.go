@@ -187,3 +187,42 @@ func klinesFromSeries(s *Series) []pionex.KlineCandle {
 	}
 	return candles
 }
+
+func TestConfluenceFibonacciAndMACDLong(t *testing.T) {
+	bundle := IndicatorBundle{
+		Hurst:   0.48,
+		HurstOK: true,
+		OBVDiv:  OBVDivergence{Direction: 1, Strength: 0.8},
+		Fib:     FibonacciRetracement{InGoldenPocket: true, TrendDir: 1},
+		MACD:    MACDResult{CrossedUp: true},
+		StochRSI: StochRSIResult{CrossedUp: true},
+	}
+	regime := RegimeResult{Regime: "TREND_UP"}
+	res := EvaluateConfluence(regime, bundle)
+	if res.Verdict != ConfluenceSupportLong {
+		t.Fatalf("expected SUPPORT_LONG, got %s (longScore=%.2f)", res.Verdict, res.LongScore)
+	}
+	if res.LongScore < 0.50 {
+		t.Fatalf("expected longScore >= 0.50, got %.2f", res.LongScore)
+	}
+}
+
+func TestConfluenceDirectionalConflict(t *testing.T) {
+	bundle := IndicatorBundle{
+		Hurst:    0.48,
+		HurstOK:  true,
+		OBVDiv:   OBVDivergence{Direction: 1, Strength: 0.9}, // long
+		IFT:      IFTRSIResult{CrossedUp: true},              // long
+		Fib:      FibonacciRetracement{InGoldenPocket: true, TrendDir: 1}, // long
+		MACD:     MACDResult{CrossedDown: true},              // short
+		StochRSI: StochRSIResult{CrossedDown: true},          // short
+		AVWAP:    AVWAPResult{ZScore: 2.0},                   // short
+	}
+	regime := RegimeResult{Regime: "RANGE"}
+	res := EvaluateConfluence(regime, bundle)
+	if res.Verdict != ConfluenceConflict {
+		t.Fatalf("expected CONFLICT when both sides strongly supported, got %s (long=%.2f short=%.2f)",
+			res.Verdict, res.LongScore, res.ShortScore)
+	}
+}
+
