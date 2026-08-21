@@ -121,18 +121,11 @@ func SelectDirection(regime RegimeContext, funding FundingContext, events EventC
 		// The 0.60 boundary is aligned with the confluence engine's
 		// HurstHardVetoNeutral.
 		if regime.HurstValue < 0.60 {
-			// v2.0.21 funding-carry: a stable, non-trivial 48h rate pays
-			// the grid to hold a direction it would otherwise not take —
-			// short collects at a stable positive rate, long at negative.
-			// Extreme spot rates still veto (squeeze/flush risk windows).
+			// Funding-carry: negative funding (shorts pay longs) is a true paid-to-hold
+			// edge that justifies a LONG directional grid even inside RANGE.
+			// Positive funding in RANGE stays NEUTRAL (shorting positive funding in crypto
+			// bull moves is a classic short-squeeze trap). Extreme spot rates still veto.
 			if funding.Stable48h && !funding.IsExtreme {
-				if funding.Avg48h >= fundingCarryThreshold {
-					return DirectionDecision{
-						Direction: "SHORT",
-						Leverage:  2,
-						Reason:    fmt.Sprintf("RANGE + carry: фандинг +%.3f%%/8ч стабилен 48ч", funding.Avg48h*100),
-					}
-				}
 				if funding.Avg48h <= -fundingCarryThreshold {
 					return DirectionDecision{
 						Direction: "LONG",

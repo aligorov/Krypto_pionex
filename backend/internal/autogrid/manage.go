@@ -180,14 +180,15 @@ func decideBotAction(input botActionInput) manageDecision {
 			}
 			return adjustDecision(input, ActionAdjustUp, "RANGE_SHIFT_UP")
 		default: // NEUTRAL sits on unsold inventory on an upside break
-			// v2.0.14 trend stop (up): the pre-v2.0.14 path shifted up
-			// UNCONDITIONALLY — a walking rally (PEPE 2026-08-20: 3 shifts
-			// in one hour, each crystallizing short-inventory losses) bled
-			// the bot to the stop through repeated re-entries. Once the
-			// regime is confirmed against the inventory AND the mark has
-			// already reached half the max loss, exit instead of shifting.
-			if input.Regime == "TREND_UP" && input.MaxLoss.GreaterThan(decimal.Zero) &&
-				total.LessThanOrEqual(input.MaxLoss.Div(decimal.NewFromInt(2)).Neg()) {
+			// When a NEUTRAL grid breaks above upper in an uptrend (TREND_UP):
+			// all inventory has been sold into the rally. Shifting up means opening
+			// a new short inventory against a running train (PEPE failure class).
+			// If the bot has positive PnL, lock in profit and exit.
+			// If underwater in a confirmed TREND_UP, cut loss immediately instead of shifting.
+			if input.Regime == "TREND_UP" {
+				if total.GreaterThan(decimal.Zero) {
+					return manageDecision{Action: ActionCloseTakeProfit, Reason: "RANGE_BREAK_UP_PROFIT_TAKE"}
+				}
 				return manageDecision{Action: ActionCloseRangeBreak, Reason: "RANGE_BREAK_UP_TREND_STOP"}
 			}
 			return adjustDecision(input, ActionAdjustUp, "RANGE_SHIFT_UP")

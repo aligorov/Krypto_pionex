@@ -389,10 +389,10 @@ func TestSelectDirectionCascadeShortWindow(t *testing.T) {
 
 func TestSelectDirectionFundingCarry(t *testing.T) {
 	rng := RegimeContext{Regime: "RANGE", HurstValue: 0.45}
-	// Stable positive carry → paid to hold short.
+	// Stable positive carry in RANGE stays NEUTRAL (never short positive funding blindly).
 	got := SelectDirection(rng, FundingContext{Avg48h: 0.0005, Stable48h: true}, EventContext{})
-	if got.Direction != "SHORT" {
-		t.Fatalf("stable positive carry must pick SHORT, got %q (%s)", got.Direction, got.Reason)
+	if got.Direction != "NEUTRAL" {
+		t.Fatalf("stable positive carry in RANGE must stay NEUTRAL, got %q (%s)", got.Direction, got.Reason)
 	}
 	// Stable negative carry → paid to hold long.
 	got = SelectDirection(rng, FundingContext{Avg48h: -0.0005, Stable48h: true}, EventContext{})
@@ -423,11 +423,11 @@ func TestBetaGateTrend(t *testing.T) {
 		t.Fatalf("BTC uptrend must gate up-only, got down=%v up=%v", down, up)
 	}
 	// Below the stricter activation band the gate stays off (DetectRegime
-	// calls a trend at ADX≥22; the gate needs ≥25 plus a real slope).
-	if down, up := betaGateTrend("TREND_DOWN", 23, -1.2); down || up {
-		t.Fatalf("ADX 23 must not activate the beta gate, got down=%v up=%v", down, up)
+	// calls a trend at ADX≥22; the gate needs ≥20 plus a real slope).
+	if down, up := betaGateTrend("TREND_DOWN", 18, -1.2); down || up {
+		t.Fatalf("ADX 18 must not activate the beta gate, got down=%v up=%v", down, up)
 	}
-	if down, up := betaGateTrend("TREND_DOWN", 30, -0.2); down || up {
+	if down, up := betaGateTrend("TREND_DOWN", 30, -0.1); down || up {
 		t.Fatalf("flat slope must not activate the beta gate, got down=%v up=%v", down, up)
 	}
 	if down, up := betaGateTrend("RANGE", 40, 2.0); down || up {

@@ -144,6 +144,41 @@ func TestDecideBotActionLongUpsideBreakFollowsWithShift(t *testing.T) {
 	}
 }
 
+func TestDecideBotActionNeutralUpsideBreakTakesProfitInUptrend(t *testing.T) {
+	input := baseActionInput()
+	input.Direction = "NEUTRAL"
+	input.CurrentPrice = mustDecimal("122")
+	input.Regime = "TREND_UP"
+	input.RealizedPNL = mustDecimal("4.5")
+	decision := decideBotAction(input)
+	if decision.Action != ActionCloseTakeProfit || decision.Reason != "RANGE_BREAK_UP_PROFIT_TAKE" {
+		t.Fatalf("expected profit take on upside break in uptrend, got %+v", decision)
+	}
+}
+
+func TestDecideBotActionNeutralUpsideBreakTrendStopInUptrend(t *testing.T) {
+	input := baseActionInput()
+	input.Direction = "NEUTRAL"
+	input.CurrentPrice = mustDecimal("122")
+	input.Regime = "TREND_UP"
+	input.RealizedPNL = mustDecimal("-1.5")
+	decision := decideBotAction(input)
+	if decision.Action != ActionCloseRangeBreak || decision.Reason != "RANGE_BREAK_UP_TREND_STOP" {
+		t.Fatalf("expected trend stop on upside break in uptrend, got %+v", decision)
+	}
+}
+
+func TestDecideBotActionNeutralUpsideBreakRangeShifts(t *testing.T) {
+	input := baseActionInput()
+	input.Direction = "NEUTRAL"
+	input.CurrentPrice = mustDecimal("122")
+	input.Regime = "RANGE"
+	decision := decideBotAction(input)
+	if decision.Action != ActionAdjustUp || decision.Reason != "RANGE_SHIFT_UP" {
+		t.Fatalf("expected range shift up in RANGE regime, got %+v", decision)
+	}
+}
+
 func TestDecideBotActionTargetsDisabled(t *testing.T) {
 	input := baseActionInput()
 	input.PnLTarget = decimal.Zero

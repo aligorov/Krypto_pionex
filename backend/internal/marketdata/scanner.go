@@ -444,17 +444,17 @@ func scoreCandidate(
 	// at ADX ≥ 22, and the 22–30 dead zone left directionals unreachable
 	// for the entire duration of every moderate trend (prod: PRL/SNXXX
 	// SHORT rejections at RSI 39/pos 43 in confirmed TREND_DOWN).
-	strongTrend := regime.ADX > 25.0
+	strongTrend := regime.ADX > 22.0 || math.Abs(regime.EMASlopePct) > 0.5
 	if recommendedTrend == "long" {
-		rsiCap, posCap := 58.0, 40.0
+		rsiCap, posCap := 70.0, 75.0
 		if strongTrend {
-			rsiCap, posCap = 65.0, 60.0
+			rsiCap, posCap = 78.0, 88.0
 		}
 		if regime.RSI > rsiCap {
-			reasons = append(reasons, fmt.Sprintf("Anti-FOMO: RSI (%.1f) > %.0f - пара перекуплена, вход в LONG на локальном хае заблокирован", regime.RSI, rsiCap))
+			reasons = append(reasons, fmt.Sprintf("Anti-FOMO: RSI (%.1f) > %.0f - пара перекуплена на экстремуме, вход в LONG заблокирован", regime.RSI, rsiCap))
 		}
 		if regime.RangePositionPct > posCap {
-			reasons = append(reasons, fmt.Sprintf("Anti-FOMO: положение в канале (%.1f%%) > %.0f%% - вход в LONG выше середины заблокирован", regime.RangePositionPct, posCap))
+			reasons = append(reasons, fmt.Sprintf("Anti-FOMO: положение в канале (%.1f%%) > %.0f%% - вход в LONG выше предела заблокирован", regime.RangePositionPct, posCap))
 		}
 	} else if recommendedTrend == "short" {
 		if config.CascadeShortMode {
@@ -462,15 +462,15 @@ func scoreCandidate(
 			// shorts (see ScanConfig.CascadeShortMode) — the oversold
 			// reading IS the signal during a forced unwind.
 		} else {
-			rsiFloor, posFloor := 42.0, 60.0
+			rsiFloor, posFloor := 30.0, 25.0
 			if strongTrend {
-				rsiFloor, posFloor = 35.0, 40.0
+				rsiFloor, posFloor = 22.0, 12.0
 			}
 			if regime.RSI < rsiFloor {
-				reasons = append(reasons, fmt.Sprintf("Anti-FOMO: RSI (%.1f) < %.0f - пара перепродана, вход в SHORT на локальном дне заблокирован", regime.RSI, rsiFloor))
+				reasons = append(reasons, fmt.Sprintf("Anti-FOMO: RSI (%.1f) < %.0f - пара перепродана на экстремуме, вход в SHORT заблокирован", regime.RSI, rsiFloor))
 			}
 			if regime.RangePositionPct < posFloor {
-				reasons = append(reasons, fmt.Sprintf("Anti-FOMO: положение в канале (%.1f%%) < %.0f%% - вход в SHORT ниже середины заблокирован", regime.RangePositionPct, posFloor))
+				reasons = append(reasons, fmt.Sprintf("Anti-FOMO: положение в канале (%.1f%%) < %.0f%% - вход в SHORT ниже предела заблокирован", regime.RangePositionPct, posFloor))
 			}
 		}
 	} else {

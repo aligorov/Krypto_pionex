@@ -39,6 +39,7 @@ func trancheFlag(on bool) int {
 // turns a routine fleet stop into N "protective closes" that freeze deploys
 // for an hour plus 2h per-symbol cooldowns.
 const protectiveCloseExemptReasons = `'TAKE_PROFIT', 'TAKE_PROFIT_NATIVE', 'TRAILING_TAKE_PROFIT', 'BREAKEVEN_LOCK',
+	'RANGE_BREAK_UP_PROFIT_TAKE',
 	'MANUAL_CLOSE', 'MCP_MANUAL_CLOSE', 'USER_CANCEL', 'ALREADY_CLOSED', 'EXTERNAL_CLOSE', 'REMOTE_FAILED',
 	'STOPPED', 'EMERGENCY_STOPPED', 'AUTOGRID_STOP', 'EMERGENCY_STOP',
 	'DELISTED_NO_PRICE'`
@@ -607,11 +608,11 @@ func isEntryTimingFavorable(candidate Candidate) bool {
 
 	switch candidate.RecommendedTrend {
 	case "long":
-		// Accumulation / Dip buying: enter from lower bounce (10%) up to channel median (65%)
-		return rangePos >= 10.0 && rangePos <= 65.0
+		// Accumulation, Dip buying & Momentum continuation: enter from lower bounce (10%) up to channel breakout (88%)
+		return rangePos >= 10.0 && rangePos <= 88.0
 	case "short":
-		// Distribution / Rip selling: enter from channel median (35%) up to upper resistance (90%)
-		return rangePos >= 35.0 && rangePos <= 90.0
+		// Distribution, Rip selling & Breakdown continuation: enter from channel breakdown (12%) up to upper resistance (90%)
+		return rangePos >= 12.0 && rangePos <= 90.0
 	default:
 		// Neutral range: trade healthy channel (20% to 80%), avoiding extreme 20% boundary traps
 		return rangePos >= 20.0 && rangePos <= 80.0
@@ -3203,14 +3204,14 @@ func (worker *Worker) regimeForSymbol(ctx context.Context, symbol string) string
 // long inventory against BTC's trend. Activation is deliberately stricter
 // than DetectRegime's ADX≥22: ADX≥25 plus a real slope.
 func betaGateTrend(regime string, adx, emaSlopePct float64) (down, up bool) {
-	if adx < 25 {
+	if adx < 20 {
 		return false, false
 	}
 	switch regime {
 	case "TREND_DOWN":
-		return emaSlopePct < -0.5, false
+		return emaSlopePct < -0.3, false
 	case "TREND_UP":
-		return false, emaSlopePct > 0.5
+		return false, emaSlopePct > 0.3
 	}
 	return false, false
 }
