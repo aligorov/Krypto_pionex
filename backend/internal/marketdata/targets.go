@@ -16,14 +16,16 @@ import (
 // sigma/ATR blend; drawdown prefers the AI Kit maxDrawDown and falls back to
 // the scanner model drawdown.
 const (
-	dynamicTargetVolFraction = 0.75
+	dynamicTargetVolFraction = 0.85
 	dynamicLossDDFraction    = 0.50
-	dynamicTargetMinPct      = 2.5
-	dynamicTargetMaxPct      = 7.5
-	dynamicLossMinPct        = 1.2
-	dynamicLossMaxPct        = 4.5
+	// 4.5 - 10.0%: 5% base target on $200 budget ($10.00 profit per bot cycle)
+	// scaling up to 10% ($20.00) on high-momentum trends.
+	dynamicTargetMinPct      = 4.5
+	dynamicTargetMaxPct      = 10.0
+	dynamicLossMinPct        = 2.0
+	dynamicLossMaxPct        = 5.0
 	dynamicLossRangeFloorK   = 0.15
-	minRiskRewardRatio       = 1.40
+	minRiskRewardRatio       = 1.50
 )
 
 type DynamicTargetsInput struct {

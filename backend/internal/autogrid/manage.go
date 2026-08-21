@@ -70,26 +70,26 @@ func decideBotAction(input botActionInput) manageDecision {
 
 	// 2. Trailing Take-Profit & Early Profit Lock
 	if input.PnLTarget.GreaterThan(decimal.Zero) {
-		// Early Profit Locking: arm trailing as soon as bot reaches 30% of target
-		// (or >= $1.50 USDT profit). This ensures that every winning move is banked
+		// Early Profit Locking: arm trailing as soon as bot reaches 35% of target
+		// (or >= $3.50 USDT profit on a $10 target). This ensures that every winning move is banked
 		// and never allowed to reverse into a losing stop-loss.
-		targetArmThreshold := input.PnLTarget.Mul(decimal.NewFromFloat(0.30))
-		minArmDollar := decimal.NewFromFloat(1.50)
+		targetArmThreshold := input.PnLTarget.Mul(decimal.NewFromFloat(0.35))
+		minArmDollar := decimal.NewFromFloat(3.50)
 		if targetArmThreshold.GreaterThan(minArmDollar) {
 			targetArmThreshold = minArmDollar
 		}
 
 		if input.PeakPNL.GreaterThanOrEqual(targetArmThreshold) {
-			// Breakeven Lock: if peak was >= $1.50 but profit decays near zero, lock profit (+0.2% budget)
+			// Breakeven Lock: if peak was >= $3.50 but profit decays near zero, lock profit (+0.2% budget)
 			breakevenFloor := input.Budget.Mul(decimal.NewFromFloat(0.002))
 			if total.LessThanOrEqual(breakevenFloor) {
 				return manageDecision{Action: ActionCloseTakeProfit, Reason: "BREAKEVEN_LOCK"}
 			}
 
-			// Trailing Floor: Allow 20% pullback from peak, but guarantee floor >= 25% of target or $1.00
+			// Trailing Floor: Allow 20% pullback from peak, but guarantee floor >= 30% of target (min $3.00)
 			pullbackTolerance := input.PeakPNL.Mul(decimal.NewFromFloat(0.20))
 			trailingFloor := input.PeakPNL.Sub(pullbackTolerance)
-			minGuaranteedFloor := input.PnLTarget.Mul(decimal.NewFromFloat(0.25))
+			minGuaranteedFloor := input.PnLTarget.Mul(decimal.NewFromFloat(0.30))
 			if minGuaranteedFloor.GreaterThan(trailingFloor) {
 				trailingFloor = minGuaranteedFloor
 			}
