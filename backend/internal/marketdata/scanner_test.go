@@ -142,3 +142,24 @@ func TestScannerMajorSymbolNoPrefixFalsePositives(t *testing.T) {
 		}
 	}
 }
+
+// v2.0.29 regression: profit factor must stay inside the persistence bound —
+// a near-zero negative-return sum used to explode positive/negative past
+// NUMERIC(12,6) and kill the whole scan persist (prod COHRX 12:40Z
+// 2026-08-21, SQLSTATE 22003, two scheduled scans FAILED).
+func TestWinRateProfitFactorClamped(t *testing.T) {
+	// Two winning candles and one epsilon-loser: PF would be ~1e9 unclamped.
+	values := []float64{0.01, 0.02, -1e-12}
+	_, pf := winRateAndProfitFactor(values)
+	if pf > 99 || pf < 0 {
+		t.Fatalf("profit factor must clamp to [0,99], got %v", pf)
+	}
+	if pf != 99 {
+		t.Fatalf("epsilon-loser should saturate PF at 99, got %v", pf)
+	}
+	// Normal case unaffected.
+	_, pf = winRateAndProfitFactor([]float64{0.02, -0.01, 0.03, -0.02})
+	if pf < 1.66 || pf > 1.67 {
+		t.Fatalf("normal PF must be 0.05/0.03 ≈ 1.667, got %v", pf)
+	}
+}

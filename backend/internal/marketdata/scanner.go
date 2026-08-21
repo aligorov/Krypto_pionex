@@ -831,7 +831,15 @@ func winRateAndProfitFactor(values []float64) (float64, float64) {
 		}
 		return winRate, 0
 	}
-	return winRate, positive / negative
+	// v2.0.29: profit factor is persisted into autogrid_candidates.profit_factor
+	// NUMERIC(12,6) (max 999999.999999). When the negative-return sum shrinks to
+	// a single marginal candle's epsilon, positive/negative explodes past any
+	// fixed precision (prod COHRX 2026-08-21 12:40Z: scan persist died with
+	// SQLSTATE 22003 and every scheduled scan failed while the razor window
+	// lasted). Cap at 99 like the zero-negative branch above: PF >= 99 already
+	// means "no meaningful losing candles" and every consumer (MinProfitFactor
+	// gate ~1.05, scannerScore clamp at 2) saturates far below it.
+	return winRate, clamp(positive/negative, 0, 99)
 }
 
 func scannerScore(
