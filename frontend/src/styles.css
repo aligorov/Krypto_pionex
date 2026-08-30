@@ -706,3 +706,105 @@ input:disabled, select:disabled { opacity: .65; }
 @keyframes spin { to { transform: rotate(360deg); } }
 .alert.warning { color: var(--warning); border-color: rgba(255, 200, 87, .35); background: rgba(255, 200, 87, .08); }
 .alert.info { color: var(--blue); border-color: rgba(112, 168, 255, .35); background: rgba(112, 168, 255, .08); }
+
+/* ==========================================================================
+   Mobile friendliness pass (v2.0.40): bottom tab bar, thumb-sized targets,
+   no iOS focus-zoom, sticky topbar with hamburger, safe-area insets.
+   ========================================================================== */
+
+.mobile-tabbar {
+  display: none;
+}
+
+/* iOS/Android browsers zoom the viewport when a control's font-size is
+   < 16px at focus — every input/select/textarea gets 16px on touch
+   screens regardless of the 13px desktop sizing. */
+@media (pointer: coarse) {
+  input, select, textarea { font-size: 16px !important; }
+  .button { min-height: 44px; }
+  .nav-item { min-height: 48px; }
+  td .button, .row-actions .button { min-height: 38px; padding: 8px 12px !important; }
+}
+
+@media (max-width: 768px) {
+  /* Sticky topbar on phones: the hamburger must stay reachable after
+     scrolling (the 780px rule above made it static). */
+  .topbar { position: sticky !important; top: 0; z-index: 20; }
+
+  /* Bottom tab bar: the primary phone navigation. */
+  .mobile-tabbar {
+    display: grid;
+    grid-auto-flow: column;
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 30;
+    background: color-mix(in srgb, #081814 96%, transparent);
+    backdrop-filter: blur(14px);
+    border-top: 1px solid var(--border);
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+
+  .mobile-tab {
+    display: grid;
+    justify-items: center;
+    gap: 2px;
+    padding: 8px 4px 6px;
+    min-height: 54px;
+    background: transparent;
+    border: 0;
+    border-radius: 0;
+    color: var(--muted);
+    font-size: 10px;
+    font-weight: 650;
+    cursor: pointer;
+  }
+
+  .mobile-tab.active { color: var(--accent); }
+
+  .mobile-tab-icon { font-size: 19px; line-height: 1; }
+
+  /* Content must clear the fixed bar (plus the notched inset). */
+  main { padding-bottom: calc(78px + env(safe-area-inset-bottom, 0px)) !important; }
+
+  /* Drawer sits above the tab bar; its swipe area respects the notch. */
+  .sidebar { padding-bottom: calc(16px + env(safe-area-inset-bottom, 0px)) !important; }
+
+  /* Comfortable hit distance for table row actions on touch. */
+  .toggle-row { padding: 17px 0; }
+  .toggle-row input { width: 48px; min-height: 26px; }
+
+  /* Tables: keep the horizontal scroll but make it obvious + tighter. */
+  .table-wrap {
+    position: relative;
+    -webkit-mask-image: linear-gradient(to right, #000 0, #000 calc(100% - 18px), transparent 100%);
+    mask-image: linear-gradient(to right, #000 0, #000 calc(100% - 18px), transparent 100%);
+  }
+  table { min-width: 520px; }
+  th { position: sticky; top: 0; z-index: 1; }
+
+  /* Badges and metric numbers breathe a little more on narrow screens. */
+  .metric-card strong { font-size: 1.45rem !important; }
+  .badge { font-size: 9.5px; padding: 3px 7px; }
+
+  /* Modal dialogs become near-fullscreen sheets on phones. */
+  .modal-backdrop { padding: 10px; align-items: flex-end; }
+  .modal-dialog {
+    width: 100%;
+    max-height: 92vh;
+    border-radius: 16px 16px 0 0;
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+  .modal-tabs { overflow-x: auto; }
+  .modal-body { padding: 16px 14px; }
+  .modal-actions { flex-wrap: wrap; }
+  .modal-actions .button { flex: 1 1 auto; min-height: 44px; }
+}
+
+@media (max-width: 420px) {
+  .mobile-tab-label { font-size: 9px; }
+  .metric-grid { grid-template-columns: 1fr 1fr !important; }
+  .metric-card strong { font-size: 1.3rem !important; }
+  .topbar h1 { font-size: 1.05rem !important; }
+}

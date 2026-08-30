@@ -245,17 +245,26 @@ export default function App() {
   }
 
   const sidebarLinks: { id: Tab; label: string; icon?: string }[] = [
-    { id: 'overview', label: 'Обзор' },
-    { id: 'autogrid', label: 'Автопилот' },
-    { id: 'candidates', label: 'Кандидаты' },
-    { id: 'bots', label: 'Боты · PnL' },
-    { id: 'backtest', label: 'Бэктест-лаб' },
-    { id: 'accounts', label: 'Pionex API' },
-    { id: 'risk', label: 'Риск' },
-    { id: 'llm', label: 'AI Мозг' },
-    { id: 'telegram', label: 'Telegram' },
-    { id: 'audit', label: 'Аудит' },
-    { id: 'mcp', label: 'MCP' },
+    { id: 'overview', label: 'Обзор', icon: '📊' },
+    { id: 'autogrid', label: 'Автопилот', icon: '🤖' },
+    { id: 'candidates', label: 'Кандидаты', icon: '🎯' },
+    { id: 'bots', label: 'Боты · PnL', icon: '📈' },
+    { id: 'backtest', label: 'Бэктест-лаб', icon: '🧪' },
+    { id: 'accounts', label: 'Pionex API', icon: '🔑' },
+    { id: 'risk', label: 'Риск', icon: '🛡' },
+    { id: 'llm', label: 'AI Мозг', icon: '🧠' },
+    { id: 'telegram', label: 'Telegram', icon: '✈️' },
+    { id: 'audit', label: 'Аудит', icon: '🔍' },
+    { id: 'mcp', label: 'MCP', icon: '🔌' },
+  ];
+
+  // Mobile bottom tab bar: the 4 screens that matter on a phone + "more"
+  // (opens the drawer). Rendered only under 768px via CSS.
+  const mobileTabs: { id: Tab; label: string; icon: string }[] = [
+    { id: 'overview', label: 'Обзор', icon: '📊' },
+    { id: 'autogrid', label: 'Пилот', icon: '🤖' },
+    { id: 'candidates', label: 'Радар', icon: '🎯' },
+    { id: 'bots', label: 'Боты', icon: '📈' },
   ];
 
   const killSwitchOn = overview?.killSwitchEnabled ?? false;
@@ -392,6 +401,28 @@ export default function App() {
         {activeTab === 'audit' && <AuditLogs />}
         {activeTab === 'mcp' && <MCPServer canManage={canManage(user.role)} />}
       </main>
+
+      {/* Mobile bottom tab bar: thumb navigation between the core screens;
+          the ★ button opens the full drawer for everything else. */}
+      <nav className="mobile-tabbar" aria-label="Быстрая навигация">
+        {mobileTabs.map((item) => (
+          <button
+            key={item.id}
+            className={`mobile-tab ${activeTab === item.id ? 'active' : ''}`}
+            onClick={() => setActiveTab(item.id)}
+          >
+            <span className="mobile-tab-icon">{item.icon}</span>
+            <span className="mobile-tab-label">{item.label}</span>
+          </button>
+        ))}
+        <button
+          className={`mobile-tab ${!mobileTabs.some((t) => t.id === activeTab) ? 'active' : ''}`}
+          onClick={() => setMobileMenuOpen(true)}
+        >
+          <span className="mobile-tab-icon">☰</span>
+          <span className="mobile-tab-label">Ещё</span>
+        </button>
+      </nav>
 
       {(showSecurityModal || user.mustChangePassword) && (
         <SecurityModal
