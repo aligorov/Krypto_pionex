@@ -163,3 +163,23 @@ func TestWinRateProfitFactorClamped(t *testing.T) {
 		t.Fatalf("normal PF must be 0.05/0.03 ≈ 1.667, got %v", pf)
 	}
 }
+
+func TestLedgerAuditedEntryZones(t *testing.T) {
+	// Semi-trend dead zone: neutral blocked at ADX 24-32 only.
+	if !neutralSemiTrendBlocked("no_trend", 28) {
+		t.Fatal("ADX 28 neutral must be blocked")
+	}
+	if neutralSemiTrendBlocked("no_trend", 23) || neutralSemiTrendBlocked("no_trend", 33) {
+		t.Fatal("below 24 and above 32 belong to the classic vetoes")
+	}
+	if neutralSemiTrendBlocked("long", 28) || neutralSemiTrendBlocked("short", 28) {
+		t.Fatal("semi-trend veto is NEUTRAL-only")
+	}
+	// Mature-trend LONG demotion at ADX ≥28 (GRAM 28.8/LIT 31.4/RGTIX 34.4).
+	if !matureTrendLongDemoted("long", 28.8) || matureTrendLongDemoted("long", 13.8) {
+		t.Fatal("long demotion must fire at ADX ≥28 and spare fresh trends")
+	}
+	if matureTrendLongDemoted("no_trend", 34) {
+		t.Fatal("demotion is LONG-only")
+	}
+}

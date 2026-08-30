@@ -594,23 +594,33 @@ func TestNeutralUpTrendStop(t *testing.T) {
 	}
 }
 
-// v2.0.30: the 50-70% dead zone is closed — trailing arms at 50% of target.
-// Under the old 70% arm this bot (peak exactly 50% of target, small
-// pullback) held with NO floor; now it banks near the peak. This is the
-// prod CRWVX #366 shape: +$3.59 peak, $0.035 below the old lock arm, whole
-// mark later donated to a STOP_LOSS.
+// v2.0.30→v2.0.38 evolution: trailing arms at min(35% of target, $3.50),
+// floor = max(0.8·peak, 30% of target) — the CRWVX dead zone stays closed
+// under the current arm formula.
 func TestDecideBotActionTrailingArmsAtHalfTarget(t *testing.T) {
 	input := baseActionInput() // Target 12, Budget 200
-	input.PeakPNL = mustDecimal("6")   // exactly 50% of target
-	input.RealizedPNL = mustDecimal("5.5") // below floor max(0.8*6, 6) = 6
+	// Arm threshold = min(0.35×12, 3.50) = 3.50. Peak 6 well above it.
+	input.PeakPNL = mustDecimal("6")
+	// Floor = max(0.8×6=4.8, 0.30×12=3.6) = 4.8 → 4.5 trails out.
+	input.RealizedPNL = mustDecimal("4.5")
 	decision := decideBotAction(input)
 	if decision.Action != ActionCloseTakeProfit || decision.Reason != "TRAILING_TAKE_PROFIT" {
-		t.Fatalf("peak at 50%% of target with pullback must trail out (v2.0.30), got %+v", decision)
+		t.Fatalf("armed peak with pullback below floor must trail out, got %+v", decision)
 	}
 	// And while ABOVE the floor it keeps running (no premature exit).
-	input.RealizedPNL = mustDecimal("6.05")
+	input.RealizedPNL = mustDecimal("4.95")
 	decision = decideBotAction(input)
 	if decision.Action != ActionHold {
 		t.Fatalf("above the trailing floor must hold, got %+v", decision)
+	}
+	// v2.0.38 arm: a $10 target arms at $3.50 — peak 3.6 with pullback
+	// below max(0.8×3.6, 3.0)=3.0 exits; the pre-v2.0.30 dead-zone shape
+	// can no longer exist.
+	input.PnLTarget = mustDecimal("10")
+	input.PeakPNL = mustDecimal("3.6")
+	input.RealizedPNL = mustDecimal("2.9")
+	decision = decideBotAction(input)
+	if decision.Action != ActionCloseTakeProfit || decision.Reason != "TRAILING_TAKE_PROFIT" {
+		t.Fatalf("min($3.50) arm must protect early peaks, got %+v", decision)
 	}
 }

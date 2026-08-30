@@ -921,6 +921,28 @@ func (worker *Worker) deployPaper(
 				"entry gate: цена кандидата устарела (дрейф > 0.5 ATR с момента скана)", nil)
 			continue
 		}
+		// Order-book (DOM) gate (v2.0.39): a one-sided book against the
+		// entry direction vetoes the deploy — the tape's own inventory is
+		// the cheapest real-time confirmation available. Fail-open on
+		// transport errors (advisory signal); the reading is recorded in
+		// the rejection/acceptance telemetry so the closed ledger can
+		// validate the threshold like every other gate.
+		if bids, asks, derr := worker.publicClient.GetDepth(ctx, candidate.Symbol, 50); derr == nil &&
+			len(bids) > 0 && len(asks) > 0 && candidate.CurrentPrice.IsPositive() {
+			imbalance := depthImbalance(bids, asks, candidate.CurrentPrice, 1.5)
+			scannerTrend := strings.ToLower(strings.TrimSpace(candidate.RecommendedTrend))
+			againstEntry := (scannerTrend != "short" && imbalance < 0.25) || (scannerTrend == "short" && imbalance > 0.75)
+			if againstEntry && !cascadeShort {
+				side := "аски доминируют (продавцы)"
+				if scannerTrend == "short" {
+					side = "биды доминируют (покупатели)"
+				}
+				worker.rejectCandidate(ctx, candidate,
+					fmt.Sprintf("стакан: дисбаланс %.2f против направления — %s, вход отложен", imbalance, side),
+					map[string]any{"depthGate": map[string]any{"imbalance": imbalance, "vetoed": true}})
+				continue
+			}
+		}
 		// Walk-forward backtest gate — PAPER runs the same exam as REAL
 		// capital: otherwise paper statistics prove a pipeline that REAL
 		// would have gated (prod: TUT walked into paper while its 30M

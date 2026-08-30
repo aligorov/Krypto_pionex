@@ -398,6 +398,13 @@ func scoreCandidate(
 	} else if change24hPct <= -3.0 && recommendedTrend == "long" {
 		recommendedTrend = "no_trend"
 	}
+	// Mature-trend LONG demotion (v2.0.39, closed-ledger audit): longs
+	// entering ADX ≥28 tapes went 1W/3L (GRAM 28.8/LIT 31.4/RGTIX 34.4 =
+	// −$18.9; the lone winner DOGE entered at ADX 13.8) — by the time ADX
+	// reads 28 the move is aged and the entry is a chase.
+	if matureTrendLongDemoted(recommendedTrend, regime.ADX) {
+		recommendedTrend = "no_trend"
+	}
 	if rangeFraction < 0.005 {
 		recommendedTrend = "no_trend"
 	}
@@ -449,6 +456,17 @@ func scoreCandidate(
 		reasons = append(reasons, fmt.Sprintf(
 			"trend too strong for neutral grid (ADX: %.1f, EMA slope: %.2f%%, 24h: %+.1f%%, 6h: %+.1f%%)",
 			regime.ADX, regime.EMASlopePct, change24hPct, change6hPct))
+	}
+	// Semi-trend dead zone (v2.0.39, closed-ledger audit 2026-08-23..30):
+	// NEUTRAL grids deployed with ADX 24-32 lost −$61.4 against +$9.0 won
+	// below 24 (13 stop-outs: NEAR/SNXXX/ZAMA/LAB/BMNRX/ZRO/DOS/MSTRX/
+	// SOXLX×2/BAND/GALA/PUMP). The pair is already trending while the >32
+	// veto above still calls it a range — the single worst entry zone of
+	// the week.
+	if neutralSemiTrendBlocked(recommendedTrend, regime.ADX) {
+		reasons = append(reasons, fmt.Sprintf(
+			"полутренд: ADX %.1f в мёртвой зоне нейтрала 24-32 (недельный аудит: −$61 против +$9) — вход отложен",
+			regime.ADX))
 	}
 
 	// Anti-FOMO Overbought / Oversold protection. v2.0.14: the LONG/SHORT
@@ -545,12 +563,13 @@ func scoreCandidate(
 			confluence.ShortScore, confluence.LongScore))
 		recommendedTrend = "no_trend"
 	}
-	// Hard regime veto: a persistently trending memory (Hurst > 0.60)
+	// Hard regime veto: a persistently trending memory (Hurst > 0.55,
+	// lowered from 0.60 in v2.0.39 — the 0.55-0.60 band already bled)
 	// loads one-sided inventory into a fresh neutral grid — the exact
 	// failure the daily-loss breaker only sees after the damage.
 	if recommendedTrend == "no_trend" && HurstHardVetoNeutral(bundle) {
 		reasons = append(reasons, fmt.Sprintf(
-			"confluence veto: Hurst %.2f > 0.60 — persistent trend regime, neutral grid would load one-sided inventory",
+			"confluence veto: Hurst %.2f > 0.55 — persistent trend regime, neutral grid would load one-sided inventory",
 			bundle.Hurst))
 	}
 
@@ -913,4 +932,17 @@ func isMajorSymbol(baseCurrency, _ string) bool {
 		return true
 	}
 	return false
+}
+
+// neutralSemiTrendBlocked is the closed-ledger-audited dead zone: NEUTRAL
+// candidates whose tape already reads ADX 24-32 (v2.0.39). The pair trends
+// while the classic >32 veto still calls it a range.
+func neutralSemiTrendBlocked(trend string, adx float64) bool {
+	return trend == "no_trend" && adx >= 24.0 && adx <= 32.0
+}
+
+// matureTrendLongDemoted drops LONG when the trend is aged (ADX ≥28,
+// v2.0.39): entering after the move is a chase — 1W/3L in the ledger.
+func matureTrendLongDemoted(trend string, adx float64) bool {
+	return trend == "long" && adx >= 28.0
 }

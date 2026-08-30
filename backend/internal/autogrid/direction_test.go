@@ -190,14 +190,14 @@ func TestSelectDirectionRange(t *testing.T) {
 		t.Errorf("expected WAIT, got %s (reason: %s)", decision.Direction, decision.Reason)
 	}
 
-	// RANGE + Hurst just below the boundary (0.599) -> NEUTRAL; at 0.60 -> WAIT
+	// RANGE + Hurst just below the boundary (0.549) -> NEUTRAL; at 0.60 -> WAIT (v2.0.39: boundary 0.55)
 	decision = SelectDirection(
-		RegimeContext{Regime: "RANGE", Confidence: 0.7, HurstValue: 0.599},
+		RegimeContext{Regime: "RANGE", Confidence: 0.7, HurstValue: 0.549},
 		FundingContext{AverageRate: 0.0},
 		EventContext{},
 	)
 	if decision.Direction != "NEUTRAL" {
-		t.Errorf("expected NEUTRAL at Hurst 0.599, got %s (reason: %s)", decision.Direction, decision.Reason)
+		t.Errorf("expected NEUTRAL below the 0.55 boundary (was 0.599 pin pre-v2.0.39), got %s (reason: %s)", decision.Direction, decision.Reason)
 	}
 	decision = SelectDirection(
 		RegimeContext{Regime: "RANGE", Confidence: 0.7, HurstValue: 0.60},

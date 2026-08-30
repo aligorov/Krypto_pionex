@@ -211,8 +211,8 @@ func TestGridGeometryLowVol(t *testing.T) {
 	if g.RangePct != 3.0 {
 		t.Fatalf("range must clamp to the 3%% floor, got %.2f", g.RangePct)
 	}
-	if g.Leverage != 3 {
-		t.Fatalf("sub-1%% daily vol allows 3x leverage, got %d", g.Leverage)
+	if g.Leverage != 4 {
+		t.Fatalf("sub-3%% daily vol allows 4x leverage (v2.0.38 ladder), got %d", g.Leverage)
 	}
 	if g.GridCount != 20 { // 3% / 0.15% minimum step
 		t.Fatalf("grid count = %d, want 20", g.GridCount)
@@ -239,8 +239,8 @@ func TestGridGeometryHighVol(t *testing.T) {
 	if math.Abs(g.RangePct-wantRange) > 1e-9 {
 		t.Fatalf("range = %.4f, want %.4f (2.5 × daily vol)", g.RangePct, wantRange)
 	}
-	if g.Leverage != 1 {
-		t.Fatalf("above 5%% daily vol requires 1x leverage, got %d", g.Leverage)
+	if g.Leverage != 3 {
+		t.Fatalf("5.2%% daily vol must be 3x (v2.0.38 ladder), got %d", g.Leverage)
 	}
 	if math.Abs(g.StopPct-wantRange*0.5) > 1e-9 {
 		t.Fatalf("stop = %.4f, want %.4f", g.StopPct, wantRange*0.5)
@@ -253,15 +253,17 @@ func TestGridGeometryHighVol(t *testing.T) {
 	}
 }
 
-// Leverage bands: 3x below 1% daily, 2x in between, 1x above 5% daily.
+// Leverage bands (v2.0.38 ladder): 4x below 3% daily, 3x in between,
+// 2x above 10% daily.
 func TestGridGeometryLeverageBands(t *testing.T) {
 	cases := []struct {
 		annualVolPct float64
 		wantLeverage int
 	}{
-		{10, 3},  // 0.52% daily
-		{35, 2},  // 1.83% daily
-		{100, 1}, // 5.23% daily
+		{10, 4},  // 0.52% daily
+		{35, 4},  // 1.83% daily
+		{100, 3}, // 5.23% daily
+		{214, 2}, // 11.2% daily
 	}
 	for _, tc := range cases {
 		g := ComputeGridGeometry(tc.annualVolPct, 0.3, 5, 0)
@@ -299,32 +301,33 @@ func TestGridGeometryStepCoversFees(t *testing.T) {
 }
 
 func TestComputeGridGeometryBudgetCap(t *testing.T) {
-	// BANK-кейс (prod #304): σ=214%/год → 25% range, 1x leverage. Без капа
-	// бюджет даёт 166 уровней → клэмп 100 → $2/уровень — в REAL это ниже
-	// минимального размера ордера. С бюджетом $200 и этажом $5/уровень:
-	// maxByBudget = 200×1/5 = 40 уровней, шаг 0.625%.
+	// BANK-кейс (prod #304): σ=214%/год → daily 11.2% → 2x under the
+	// v2.0.38 leverage ladder (was 1x pre-v2.0.38; the overnight session
+	// rewrote the ladder without updating this pin — fixed v2.0.39).
+	// С бюджетом $200 и этажом $5/уровень: maxByBudget = 200×2/5 = 80.
 	g := ComputeGridGeometry(214, 0.12, 7, 200)
-	if g.Leverage != 1 {
-		t.Fatalf("σ=214%% must be 1x, got %d", g.Leverage)
-	}
-	if g.GridCount != 40 {
-		t.Fatalf("budget cap must limit to 40 levels (200×1/5), got %d", g.GridCount)
-	}
-	if g.StepPct < 0.5 {
-		t.Fatalf("step must widen to ~0.625%%, got %.3f", g.StepPct)
-	}
-
-	// 2x-плечо удваивает допустимые уровни: 200×2/5 = 80.
-	g = ComputeGridGeometry(56, 0.11, 7, 200)
 	if g.Leverage != 2 {
-		t.Fatalf("σ=56%% must be 2x, got %d", g.Leverage)
+		t.Fatalf("σ=214%% must be 2x (v2.0.38 ladder), got %d", g.Leverage)
 	}
-	if g.GridCount > 80 {
-		t.Fatalf("2x budget cap is 80 levels, got %d", g.GridCount)
+	if g.GridCount != 80 {
+		t.Fatalf("budget cap must limit to 80 levels (200×2/5), got %d", g.GridCount)
+	}
+	if g.StepPct < 0.3 {
+		t.Fatalf("step must stay wide enough, got %.3f", g.StepPct)
 	}
 
-	// Высокая вола + большой бюджет: 166 → клэмп 100 остаётся связывающим
-	// (бюджетный кап 1000×1/5 = 200 его не касается).
+	// Средняя вола: 56%/год → daily 2.93% → 4x, уровни 200×4/5 = 160 →
+	// клэмп 100 связывающий.
+	g = ComputeGridGeometry(56, 0.11, 7, 200)
+	if g.Leverage != 4 {
+		t.Fatalf("σ=56%% must be 4x (v2.0.38 ladder), got %d", g.Leverage)
+	}
+	if g.GridCount > 100 {
+		t.Fatalf("100-level clamp must bind at 4x, got %d", g.GridCount)
+	}
+
+	// Высокая вола + большой бюджет: клэмп 100 остаётся связывающим
+	// (бюджетный кап 1000×2/5 = 400 его не касается).
 	g = ComputeGridGeometry(214, 0.12, 7, 1000)
 	if g.GridCount != 100 {
 		t.Fatalf("high vol with big budget stays at 100-level clamp, got %d", g.GridCount)

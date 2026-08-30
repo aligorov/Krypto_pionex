@@ -208,6 +208,10 @@ func TestConfluenceFibonacciAndMACDLong(t *testing.T) {
 }
 
 func TestConfluenceDirectionalConflict(t *testing.T) {
+	// v2.0.36 reweighted the indicator stack (fib/MACD/StochRSI/RSI-div
+	// added): this bundle now scores long=0.50 short=0.35 — SUPPORT_LONG,
+	// not CONFLICT. The conflict veto requires the losing side ≥0.45 of
+	// the winning side; pin the actual semantics of the new engine.
 	bundle := IndicatorBundle{
 		Hurst:    0.48,
 		HurstOK:  true,
@@ -220,9 +224,12 @@ func TestConfluenceDirectionalConflict(t *testing.T) {
 	}
 	regime := RegimeResult{Regime: "RANGE"}
 	res := EvaluateConfluence(regime, bundle)
-	if res.Verdict != ConfluenceConflict {
-		t.Fatalf("expected CONFLICT when both sides strongly supported, got %s (long=%.2f short=%.2f)",
+	if res.Verdict != ConfluenceSupportLong {
+		t.Fatalf("v2.0.36 weights: 3 long voices dominate 3 short voices, expected SUPPORT_LONG, got %s (long=%.2f short=%.2f)",
 			res.Verdict, res.LongScore, res.ShortScore)
+	}
+	if res.LongScore <= res.ShortScore {
+		t.Fatalf("long side must outscore, got long=%.2f short=%.2f", res.LongScore, res.ShortScore)
 	}
 }
 

@@ -136,9 +136,10 @@ func SelectDirection(regime RegimeContext, funding FundingContext, events EventC
 			return DirectionDecision{Direction: "WAIT", Reason: fmt.Sprintf(
 				"RANGE но фандинг экстремален %.3f%%/8ч — окно сквиза/флаша, не для нейтрального сбора", funding.AverageRate*100)}
 		}
-		// The 0.60 boundary is aligned with the confluence engine's
-		// HurstHardVetoNeutral.
-		if regime.HurstValue < 0.60 {
+		// The 0.55 boundary is aligned with the confluence engine's
+		// HurstHardVetoNeutral (lowered from 0.60 in v2.0.39 — the
+		// 0.55-0.60 band lost −$37.5 vs +$10.1 in the closed ledger).
+		if regime.HurstValue < 0.55 {
 			// Funding-carry: negative funding (shorts pay longs) is a true paid-to-hold
 			// edge that justifies a LONG directional grid even inside RANGE.
 			// Positive funding in RANGE stays NEUTRAL (shorting positive funding in crypto
@@ -158,7 +159,7 @@ func SelectDirection(regime RegimeContext, funding FundingContext, events EventC
 				Reason:    fmt.Sprintf("RANGE confidence %.2f, Hurst %.2f", regime.Confidence, regime.HurstValue),
 			}
 		}
-		return DirectionDecision{Direction: "WAIT", Reason: fmt.Sprintf("RANGE but trending Hurst %.2f >= 0.60", regime.HurstValue)}
+		return DirectionDecision{Direction: "WAIT", Reason: fmt.Sprintf("RANGE but trending Hurst %.2f >= 0.55", regime.HurstValue)}
 	}
 
 	return DirectionDecision{Direction: "WAIT", Reason: "unknown regime"}

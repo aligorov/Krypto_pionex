@@ -118,3 +118,33 @@ func (c *Client) GetKlines(
 	}
 	return data.Klines, nil
 }
+
+// DepthLevel is one aggregated order-book level (public depth endpoint).
+type DepthLevel struct {
+	Price  decimal.Decimal `json:"price"`
+	Amount decimal.Decimal `json:"amount"`
+}
+
+// GetDepth fetches the public aggregated order book via the official
+// /api/v1/market/depth endpoint. No authentication.
+func (c *Client) GetDepth(ctx context.Context, symbol string, limit int) ([]DepthLevel, []DepthLevel, error) {
+	query := url.Values{"symbol": []string{symbol}}
+	if limit > 0 {
+		query.Set("limit", strconv.Itoa(limit))
+	}
+	var data struct {
+		Bids [][2]decimal.Decimal `json:"bids"`
+		Asks [][2]decimal.Decimal `json:"asks"`
+	}
+	if err := c.do(ctx, http.MethodGet, "/api/v1/market/depth", query, nil, false, 5, &data); err != nil {
+		return nil, nil, err
+	}
+	toLevels := func(rows [][2]decimal.Decimal) []DepthLevel {
+		levels := make([]DepthLevel, 0, len(rows))
+		for _, row := range rows {
+			levels = append(levels, DepthLevel{Price: row[0], Amount: row[1]})
+		}
+		return levels
+	}
+	return toLevels(data.Bids), toLevels(data.Asks), nil
+}

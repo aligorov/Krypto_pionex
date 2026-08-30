@@ -195,3 +195,34 @@ func (worker *Worker) revalidateFreshPrice(ctx context.Context, candidate *Candi
 	}
 	return fresh, true
 }
+
+// depthImbalance returns the bid share of total order-book notional within
+// ±bandPct of the reference price (v2.0.39 DOM gate): 0.5 = balanced,
+// <0.25 = asks dominate (sell pressure against LONG/NEUTRAL entries),
+// >0.75 = bids dominate (buy pressure against SHORT entries). Levels
+// outside the band do not count — far-book depth says nothing about the
+// next move.
+func depthImbalance(bids, asks []pionex.DepthLevel, price decimal.Decimal, bandPct float64) float64 {
+	if !price.IsPositive() || len(bids) == 0 || len(asks) == 0 {
+		return 0.5
+	}
+	ref, _ := price.Float64()
+	band := bandPct / 100.0
+	notional := func(levels []pionex.DepthLevel) float64 {
+		sum := 0.0
+		for _, level := range levels {
+			levelPrice, _ := level.Price.Float64()
+			amount, _ := level.Amount.Float64()
+			if levelPrice <= 0 || math.Abs(levelPrice/ref-1) > band {
+				continue
+			}
+			sum += levelPrice * amount
+		}
+		return sum
+	}
+	bid, ask := notional(bids), notional(asks)
+	if bid+ask <= 0 {
+		return 0.5
+	}
+	return bid / (bid + ask)
+}

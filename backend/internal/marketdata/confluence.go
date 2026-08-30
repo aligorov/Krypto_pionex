@@ -24,7 +24,11 @@ const (
 const (
 	hurstGridFriendly = 0.45
 	hurstTrendDanger  = 0.58
-	hurstHardVeto     = 0.60
+	// hurstHardVeto 0.55 (was 0.60, v2.0.39): closed-ledger audit of
+	// 2026-08-23..30 — NEUTRAL entries with Hurst ≥0.55 lost −$37.5 vs
+	// +$10.1 won below (XLM 0.59 −12.69, EDEN 0.58 −6.89, BICO 0.58 −5.20,
+	// DOS 0.59 −4.08). The 0.55-0.60 band was already dying.
+	hurstHardVeto     = 0.55
 
 	confluenceSupportThreshold = 0.50
 	confluenceConflictFloor    = 0.45
