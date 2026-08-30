@@ -62,7 +62,7 @@ export default function Overview({ onRefresh, canOperate }: Props) {
       {clearError && <div className="alert danger"><span>Очистка не удалась: {clearError}</span></div>}
       <SmartDataBadge />
       <div className="metric-grid">
-        <Metric label="Автопилот" value={state?.settings.status ?? '—'} />
+        <Metric label="Автопилот" value={state?.settings?.status ?? '—'} />
         <Metric label="Активных ботов" value={String(state?.activeBots.length ?? 0)} />
         <Metric
           label="PnL СИМУЛЯЦИЯ"
@@ -190,7 +190,7 @@ export default function Overview({ onRefresh, canOperate }: Props) {
           <div className="definition"><span>4. Открытие</span><strong>futuresGrid/create + profit_amount TP</strong></div>
           <div className="definition"><span>5. Ведение</span><strong>reconcile · PnL · adjustParams</strong></div>
           <div className="definition"><span>6. Закрытие</span><strong>цель PnL / стоп / пробой → cancel</strong></div>
-          {state?.settings.pnlTargetUsdt !== '0' && (
+          {state?.settings?.pnlTargetUsdt && state.settings.pnlTargetUsdt !== '0' && (
             <p className="muted compact">
               Цель каждого бота: +{state?.settings.pnlTargetUsdt} USDT — исполняется нативно на Pionex
               и дублируется циклом ведения.

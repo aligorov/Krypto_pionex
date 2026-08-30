@@ -82,6 +82,9 @@ main { padding: 28px 32px 60px; max-width: 1540px; width: 100%; margin: 0 auto; 
 .metric-card span { color: var(--muted); font-size: 12px; }
 .metric-card strong { font-size: 29px; letter-spacing: -.04em; }
 .two-column { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+/* Grid items default to min-width:auto — a wide table inside a 1fr track
+   inflates the track past the viewport instead of scrolling. */
+.two-column > *, .metric-grid > * { min-width: 0; }
 .definition { display: flex; justify-content: space-between; align-items: center; padding: 13px 0; border-top: 1px solid var(--border); }
 .definition span { color: var(--muted); }
 
@@ -740,6 +743,7 @@ input:disabled, select:disabled { opacity: .65; }
     right: 0;
     bottom: 0;
     z-index: 30;
+    background: #081814; /* solid fallback: color-mix unsupported → transparent bar */
     background: color-mix(in srgb, #081814 96%, transparent);
     backdrop-filter: blur(14px);
     border-top: 1px solid var(--border);
@@ -775,14 +779,10 @@ input:disabled, select:disabled { opacity: .65; }
   .toggle-row { padding: 17px 0; }
   .toggle-row input { width: 48px; min-height: 26px; }
 
-  /* Tables: keep the horizontal scroll but make it obvious + tighter. */
-  .table-wrap {
-    position: relative;
-    -webkit-mask-image: linear-gradient(to right, #000 0, #000 calc(100% - 18px), transparent 100%);
-    mask-image: linear-gradient(to right, #000 0, #000 calc(100% - 18px), transparent 100%);
-  }
-  table { min-width: 520px; }
-  th { position: sticky; top: 0; z-index: 1; }
+  /* Tables scroll inside .table-wrap; no forced min-width (it burst the
+     1fr grid tracks past the viewport) and no fade mask (read as clipping). */
+  .table-wrap { position: relative; }
+  th, td { white-space: nowrap; }
 
   /* Badges and metric numbers breathe a little more on narrow screens. */
   .metric-card strong { font-size: 1.45rem !important; }
