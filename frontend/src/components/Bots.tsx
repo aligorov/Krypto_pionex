@@ -561,6 +561,35 @@ function BotHistoryModal({
     void fetchEvents();
   }, [bot.id]);
 
+// v2.0.50: human-readable event payload — raw JSON.stringify in the events
+// log read as machine noise ("что за хуйня а не лог").
+const EVENT_DETAIL_LABELS: Record<string, string> = {
+  reason: 'причина', budget: 'бюджет', investment: 'инвестиция',
+  gridNum: 'уровней', leverage: 'плечо', lower: 'низ', upper: 'верх',
+  pnlPct: 'PnL %', price: 'цена', direction: 'направление',
+  target: 'цель', maxLoss: 'макс. убыток', score: 'скор',
+  mode: 'режим', trigger: 'триггер', note: 'заметка', pct: '%',
+};
+const EVENT_REASON_LABELS: Record<string, string> = {
+  AUTOGRID_STOP: 'остановка автопилота',
+  STOPPED: 'остановка автопилота',
+  EMERGENCY_STOP: 'аварийная остановка',
+  MANUAL_CLOSE: 'ручное закрытие',
+  STOP_LOSS: 'стоп-лосс',
+  TAKE_PROFIT: 'тейк-профит',
+  TRAILING: 'трейлинг',
+};
+const formatEventDetails = (details: Record<string, any> | null | undefined): string => {
+  if (!details) return '';
+  return Object.entries(details)
+    .map(([k, v]) => {
+      const key = EVENT_DETAIL_LABELS[k] || k;
+      const val = typeof v === 'string' ? (EVENT_REASON_LABELS[v] || v) : String(v);
+      return `${key}: ${val}`;
+    })
+    .join(' · ');
+};
+
   const eventBadge = (type: string) => {
     switch (type) {
       case 'CREATED': return <span className="badge success">🚀 ЗАПУСК</span>;
@@ -647,8 +676,11 @@ function BotHistoryModal({
                     </div>
                   )}
                   {ev.details && Object.keys(ev.details).length > 0 && (
-                    <div style={{ fontSize: '0.78rem', marginTop: '0.3rem', color: 'var(--muted)', background: 'rgba(0,0,0,0.2)', padding: '0.4rem', borderRadius: '4px' }}>
-                      {JSON.stringify(ev.details)}
+                    <div
+                      style={{ fontSize: '0.78rem', marginTop: '0.3rem', color: 'var(--muted)', background: 'rgba(0,0,0,0.2)', padding: '0.4rem', borderRadius: '4px' }}
+                      title={JSON.stringify(ev.details)}
+                    >
+                      {formatEventDetails(ev.details)}
                     </div>
                   )}
                 </div>

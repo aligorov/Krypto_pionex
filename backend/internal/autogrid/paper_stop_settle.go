@@ -61,8 +61,6 @@ func (worker *Worker) settleAndStopPaperBots(ctx context.Context, settings Setti
 	}
 	rows.Close()
 
-	feeRate := settings.FeeBps.Add(settings.SlippageBps).Div(decimal.NewFromInt(10000))
-	pairFeeBps := decimal.NewFromFloat(pionexMakerFeeBps)
 	settled, frozen := 0, 0
 	for _, bot := range bots {
 		price, ok := paperPriceFor(priceBySymbol, bot.symbol)
@@ -70,35 +68,11 @@ func (worker *Worker) settleAndStopPaperBots(ctx context.Context, settings Setti
 			frozen++
 			continue
 		}
-		unrealized := decimal.Zero
-		exitNotional := decimal.Zero
-		if bot.direction == "NEUTRAL" {
-			currentLevel := gridLevelForPrice(bot.lower, bot.upper, bot.gridNum, price)
-			previousLevel := currentLevel
-			if bot.lastLevel != nil {
-				previousLevel = *bot.lastLevel
-			}
-			var _, inventoryNotional decimal.Decimal
-			_, unrealized, inventoryNotional = neutralGridPaperPNL(
-				bot.lower, bot.upper, bot.gridNum, bot.investment, bot.leverage,
-				previousLevel, currentLevel, price, pairFeeBps,
-			)
-			exitNotional = inventoryNotional
-		} else if bot.entry.GreaterThan(decimal.Zero) {
-			notional := bot.investment.Mul(decimal.NewFromInt(int64(bot.leverage)))
-			entryCost := notional.Mul(feeRate)
-			exitNotional = notional
-			switch bot.direction {
-			case "LONG":
-				unrealized = notional.Mul(price.Div(bot.entry).Sub(decimal.NewFromInt(1))).Sub(entryCost)
-			case "SHORT":
-				unrealized = notional.Mul(decimal.NewFromInt(1).Sub(price.Div(bot.entry))).Sub(entryCost)
-			}
-		}
-		if exitNotional.IsPositive() {
-			unrealized = unrealized.Sub(exitNotional.Mul(feeRate))
-		}
-		total := bot.realized.Add(unrealized)
+		total := paperCloseSettleTotal(paperSettleBot{
+			direction: bot.direction, entry: bot.entry, investment: bot.investment,
+			lower: bot.lower, upper: bot.upper, leverage: bot.leverage,
+			gridNum: bot.gridNum, lastLevel: bot.lastLevel, realized: bot.realized,
+		}, price, settings)
 		if _, err := worker.db.Exec(ctx, `
 			UPDATE paper_grid_bots
 			SET status = $5, closed_reason = $2,
@@ -146,4 +120,55 @@ func paperPriceFor(prices map[string]decimal.Decimal, symbol string) (decimal.De
 	}
 	p, ok := prices[trimmed+".PERP"]
 	return p, ok
+}
+
+// paperSettleBot is the row subset paperCloseSettleTotal needs; both the
+// fleet-stop settle (live price) and the service-level closes (last mark
+// price) feed it, so no close path can freeze an unrealized loss out of
+// realized history again (JUP #568: closed table showed 0, truth was -8.02).
+type paperSettleBot struct {
+	direction                string
+	entry                    decimal.Decimal
+	investment, lower, upper decimal.Decimal
+	leverage                 int
+	gridNum                  int
+	lastLevel                *int
+	realized                 decimal.Decimal
+}
+
+// paperCloseSettleTotal returns the final settled PnL at the given price:
+// inventory/notional mark plus entry/exit fees, mirroring the manage loop.
+// Funding is deliberately not accrued here — the exchange charges funding
+// only at 8h boundaries (see settleAndStopPaperBots).
+func paperCloseSettleTotal(bot paperSettleBot, price decimal.Decimal, settings Settings) decimal.Decimal {
+	feeRate := settings.FeeBps.Add(settings.SlippageBps).Div(decimal.NewFromInt(10000))
+	unrealized := decimal.Zero
+	exitNotional := decimal.Zero
+	if bot.direction == "NEUTRAL" {
+		currentLevel := gridLevelForPrice(bot.lower, bot.upper, bot.gridNum, price)
+		previousLevel := currentLevel
+		if bot.lastLevel != nil {
+			previousLevel = *bot.lastLevel
+		}
+		var inventoryNotional decimal.Decimal
+		_, unrealized, inventoryNotional = neutralGridPaperPNL(
+			bot.lower, bot.upper, bot.gridNum, bot.investment, bot.leverage,
+			previousLevel, currentLevel, price, decimal.NewFromFloat(pionexMakerFeeBps),
+		)
+		exitNotional = inventoryNotional
+	} else if bot.entry.GreaterThan(decimal.Zero) {
+		notional := bot.investment.Mul(decimal.NewFromInt(int64(bot.leverage)))
+		entryCost := notional.Mul(feeRate)
+		exitNotional = notional
+		switch bot.direction {
+		case "LONG":
+			unrealized = notional.Mul(price.Div(bot.entry).Sub(decimal.NewFromInt(1))).Sub(entryCost)
+		case "SHORT":
+			unrealized = notional.Mul(decimal.NewFromInt(1).Sub(price.Div(bot.entry))).Sub(entryCost)
+		}
+	}
+	if exitNotional.IsPositive() {
+		unrealized = unrealized.Sub(exitNotional.Mul(feeRate))
+	}
+	return bot.realized.Add(unrealized)
 }

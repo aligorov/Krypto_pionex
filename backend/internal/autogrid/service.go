@@ -572,8 +572,9 @@ type closedTotals struct {
 func (s *Service) closedTotalsPaper(ctx context.Context, settingsID string) (closedTotals, error) {
 	var totals closedTotals
 	err := s.db.QueryRow(ctx, `
-		SELECT COUNT(*), COALESCE(SUM(realized_pnl_usdt), 0),
-		       COUNT(*) FILTER (WHERE realized_pnl_usdt > 0)
+		SELECT COUNT(*),
+		       COALESCE(SUM(COALESCE(realized_pnl_usdt, 0) + COALESCE(unrealized_pnl_usdt, 0)), 0),
+		       COUNT(*) FILTER (WHERE COALESCE(realized_pnl_usdt, 0) + COALESCE(unrealized_pnl_usdt, 0) > 0)
 		FROM paper_grid_bots
 		WHERE settings_id = $1
 		  AND status IN ('STOPPED', 'COMPLETED', 'EMERGENCY_STOPPED')
@@ -773,35 +774,84 @@ func (s *Service) CloseAllActiveBots(ctx context.Context, reason string) error {
 		reason = "AUTOGRID_STOP"
 	}
 
-	// Record close events for active paper bots
+	// Settled per-bot closes (v2.0.50). The old blind bulk UPDATE froze each
+	// bot's unrealized mark out of realized — the closed table and the PnL
+	// card then showed 0 for bots whose whole result sat in unrealized
+	// inventory (JUP #568: row 0, truth -8.02, only the event was honest).
 	rows, err := s.db.Query(ctx, `
-		SELECT id, COALESCE(bot_number, 0), symbol, mark_price, realized_pnl_usdt + unrealized_pnl_usdt
+		SELECT id, COALESCE(bot_number, 0), symbol, direction, entry_price, leverage,
+		       quote_investment, lower_price, upper_price, grid_num, last_grid_level,
+		       realized_pnl_usdt, COALESCE(mark_price, 0)
 		FROM paper_grid_bots
 		WHERE settings_id = $1 AND status = 'RUNNING'
 	`, settings.ID)
-	if err == nil {
-		for rows.Next() {
-			var bID string
-			var bNum int
-			var sym string
-			var mPrice, pnl decimal.Decimal
-			if err := rows.Scan(&bID, &bNum, &sym, &mPrice, &pnl); err == nil {
-				_ = LogBotEvent(ctx, s.db, bID, bNum, "PAPER", sym, "MANUAL_STOP", &mPrice, &pnl, map[string]any{"reason": reason})
-			}
+	if err != nil {
+		return fmt.Errorf("close all paper bots: %w", err)
+	}
+	type closeBot struct {
+		id                       string
+		bNum                     int
+		symbol, direction        string
+		entry                    decimal.Decimal
+		leverage                 int
+		investment, lower, upper decimal.Decimal
+		gridNum                  int
+		lastLevel                *int
+		realized, mark           decimal.Decimal
+	}
+	bots := make([]closeBot, 0)
+	for rows.Next() {
+		var b closeBot
+		if err := rows.Scan(
+			&b.id, &b.bNum, &b.symbol, &b.direction, &b.entry, &b.leverage,
+			&b.investment, &b.lower, &b.upper, &b.gridNum, &b.lastLevel,
+			&b.realized, &b.mark,
+		); err != nil {
+			rows.Close()
+			return fmt.Errorf("close all paper bots: %w", err)
 		}
-		rows.Close()
+		bots = append(bots, b)
+	}
+	rows.Close()
+
+	for _, b := range bots {
+		total := b.realized
+		if b.mark.GreaterThan(decimal.Zero) {
+			total = paperCloseSettleTotal(paperSettleBot{
+				direction: b.direction, entry: b.entry, investment: b.investment,
+				lower: b.lower, upper: b.upper, leverage: b.leverage,
+				gridNum: b.gridNum, lastLevel: b.lastLevel, realized: b.realized,
+			}, b.mark, *settings)
+		}
+		if _, err := s.db.Exec(ctx, `
+			UPDATE paper_grid_bots
+			SET status = 'COMPLETED',
+			    closed_reason = $3,
+			    realized_pnl_usdt = $4, unrealized_pnl_usdt = 0,
+			    peak_pnl_usdt = GREATEST(COALESCE(peak_pnl_usdt, 0), $4),
+			    closed_at = NOW(), updated_at = NOW()
+			WHERE id = $1 AND settings_id = $2 AND status = 'RUNNING'
+		`, b.id, settings.ID, reason, total); err != nil {
+			return fmt.Errorf("close paper bot %s: %w", b.symbol, err)
+		}
+		var evPrice *decimal.Decimal
+		if b.mark.GreaterThan(decimal.Zero) {
+			evPrice = &b.mark
+		}
+		_ = LogBotEvent(ctx, s.db, b.id, b.bNum, "PAPER", b.symbol, "MANUAL_STOP", evPrice, &total, map[string]any{"reason": reason})
 	}
 
-	// 1. Close all running paper bots immediately
-	_, err = s.db.Exec(ctx, `
+	// Rows still RUNNING (no usable mark or a failed settle) must not
+	// survive a stop; their unrealized stays frozen but every aggregate
+	// sums realized+unrealized, so nothing hides.
+	if _, err := s.db.Exec(ctx, `
 		UPDATE paper_grid_bots
 		SET status = 'COMPLETED',
 		    closed_reason = $2,
 		    closed_at = NOW(),
 		    updated_at = NOW()
 		WHERE settings_id = $1 AND status = 'RUNNING'
-	`, settings.ID, reason)
-	if err != nil {
+	`, settings.ID, reason); err != nil {
 		return fmt.Errorf("close all paper bots: %w", err)
 	}
 
@@ -1158,7 +1208,7 @@ func (s *Service) listClosedBots(ctx context.Context, settingsID string) ([]Clos
 
 	rows, err = s.db.Query(ctx, `
 		SELECT id, COALESCE(bot_number, 0), symbol, direction, quote_investment,
-		       COALESCE(realized_pnl_usdt, 0), closed_reason, status, COALESCE(closed_at, updated_at)
+		       COALESCE(realized_pnl_usdt, 0) + COALESCE(unrealized_pnl_usdt, 0), closed_reason, status, COALESCE(closed_at, updated_at)
 		FROM paper_grid_bots
 		WHERE settings_id = $1
 		  AND status IN ('STOPPED', 'COMPLETED', 'EMERGENCY_STOPPED')
@@ -1222,12 +1272,41 @@ func (s *Service) RequestBotClose(ctx context.Context, settingsID, botID, reason
 	}
 
 	var bNum int
-	var sym string
-	var mPrice, pnl decimal.Decimal
-	_ = s.db.QueryRow(ctx, `
-		SELECT COALESCE(bot_number, 0), symbol, mark_price, realized_pnl_usdt + unrealized_pnl_usdt
+	var sym, direction string
+	var entry, investment, lower, upper, realized, mPrice decimal.Decimal
+	var leverage, gridNum int
+	var lastLevel *int
+	if err := s.db.QueryRow(ctx, `
+		SELECT COALESCE(bot_number, 0), symbol, direction, entry_price, leverage,
+		       quote_investment, lower_price, upper_price, grid_num, last_grid_level,
+		       realized_pnl_usdt, COALESCE(mark_price, 0)
 		FROM paper_grid_bots WHERE id = $1
-	`, botID).Scan(&bNum, &sym, &mPrice, &pnl)
+	`, botID).Scan(&bNum, &sym, &direction, &entry, &leverage, &investment, &lower,
+		&upper, &gridNum, &lastLevel, &realized, &mPrice); err == nil && mPrice.GreaterThan(decimal.Zero) {
+		settings, settingsErr := s.GetSettings(ctx)
+		if settingsErr == nil {
+			total := paperCloseSettleTotal(paperSettleBot{
+				direction: direction, entry: entry, investment: investment,
+				lower: lower, upper: upper, leverage: leverage,
+				gridNum: gridNum, lastLevel: lastLevel, realized: realized,
+			}, mPrice, *settings)
+			tag, err = s.db.Exec(ctx, `
+				UPDATE paper_grid_bots
+				SET status = 'COMPLETED', closed_reason = $3,
+				    realized_pnl_usdt = $4, unrealized_pnl_usdt = 0,
+				    peak_pnl_usdt = GREATEST(COALESCE(peak_pnl_usdt, 0), $4),
+				    closed_at = NOW(), updated_at = NOW()
+				WHERE id = $1 AND settings_id = $2 AND status = 'RUNNING'
+			`, botID, settingsID, reason, total)
+			if err != nil {
+				return "", fmt.Errorf("close paper bot: %w", err)
+			}
+			if tag.RowsAffected() == 1 {
+				_ = LogBotEvent(ctx, s.db, botID, bNum, "PAPER", sym, "MANUAL_STOP", &mPrice, &total, map[string]any{"reason": reason})
+				return "PAPER", nil
+			}
+		}
+	}
 
 	tag, err = s.db.Exec(ctx, `
 		UPDATE paper_grid_bots
@@ -1239,7 +1318,12 @@ func (s *Service) RequestBotClose(ctx context.Context, settingsID, botID, reason
 		return "", fmt.Errorf("close paper bot: %w", err)
 	}
 	if tag.RowsAffected() == 1 {
-		_ = LogBotEvent(ctx, s.db, botID, bNum, "PAPER", sym, "MANUAL_STOP", &mPrice, &pnl, map[string]any{"reason": reason})
+		var pnlFallback decimal.Decimal
+		_ = s.db.QueryRow(ctx, `
+			SELECT COALESCE(bot_number, 0), symbol, mark_price, realized_pnl_usdt + unrealized_pnl_usdt
+			FROM paper_grid_bots WHERE id = $1
+		`, botID).Scan(&bNum, &sym, &mPrice, &pnlFallback)
+		_ = LogBotEvent(ctx, s.db, botID, bNum, "PAPER", sym, "MANUAL_STOP", &mPrice, &pnlFallback, map[string]any{"reason": reason})
 		return "PAPER", nil
 	}
 	return "", errors.New("bot not found or already terminal")
