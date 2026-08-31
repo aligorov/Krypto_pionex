@@ -53,6 +53,7 @@ type CollectorConfig struct {
 	OIInterval        time.Duration // default 5m
 	SentimentInterval time.Duration // default 1h
 	EventsInterval    time.Duration // default 1h
+	CoinGeckoInterval time.Duration // default 10m
 
 	HTTPTimeout        time.Duration // default 10s per request
 	MinRequestInterval time.Duration // default 1s per host (rate limit)
@@ -62,6 +63,7 @@ type CollectorConfig struct {
 	OKXBaseURL           string
 	FNGEndpoint          string
 	ForexFactoryEndpoint string
+	CoinGeckoBaseURL     string
 }
 
 // DefaultCollectorConfig returns the production configuration for a symbol list.
@@ -72,6 +74,7 @@ func DefaultCollectorConfig(symbols []string) CollectorConfig {
 		OIInterval:           5 * time.Minute,
 		SentimentInterval:    time.Hour,
 		EventsInterval:       time.Hour,
+		CoinGeckoInterval:    10 * time.Minute,
 		HTTPTimeout:          10 * time.Second,
 		MinRequestInterval:   time.Second,
 		BinanceBaseURL:       DefaultBinanceBaseURL,
@@ -95,6 +98,9 @@ func (cfg CollectorConfig) withDefaults() CollectorConfig {
 	if cfg.EventsInterval <= 0 {
 		cfg.EventsInterval = time.Hour
 	}
+	if cfg.CoinGeckoInterval <= 0 {
+		cfg.CoinGeckoInterval = 10 * time.Minute
+	}
 	if cfg.HTTPTimeout <= 0 {
 		cfg.HTTPTimeout = 10 * time.Second
 	}
@@ -115,6 +121,9 @@ func (cfg CollectorConfig) withDefaults() CollectorConfig {
 	}
 	if cfg.ForexFactoryEndpoint == "" {
 		cfg.ForexFactoryEndpoint = DefaultForexFactoryEndpoint
+	}
+	if cfg.CoinGeckoBaseURL == "" {
+		cfg.CoinGeckoBaseURL = DefaultCoinGeckoBaseURL
 	}
 	return cfg
 }
@@ -259,6 +268,7 @@ func NewCollectorWithConfig(db *pgxpool.Pool, cfg CollectorConfig) *Collector {
 			ExchangeOKX:         {interval: cfg.MinRequestInterval},
 			limiterKeySentiment: {interval: cfg.MinRequestInterval},
 			limiterKeyEvents:    {interval: cfg.MinRequestInterval},
+			limiterKeyCoinGecko: {interval: cfg.MinRequestInterval},
 		},
 	}
 }
@@ -276,6 +286,7 @@ func (c *Collector) Run(ctx context.Context) {
 		{"open_interest", c.cfg.OIInterval, c.collectOpenInterest},
 		{"sentiment", c.cfg.SentimentInterval, c.collectSentiment},
 		{"economic_events", c.cfg.EventsInterval, c.collectEconomicEvents},
+		{"coingecko", c.cfg.CoinGeckoInterval, c.collectCoinGecko},
 		{"retention", time.Hour, c.collectRetention},
 	}
 

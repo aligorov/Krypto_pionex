@@ -2179,8 +2179,11 @@ func normalizePercent(value float64) float64 {
 }
 
 // ClearPaperHistory removes simulated paper bots history from PostgreSQL.
+// All terminal rows must go — the «всего» card aggregates the FULL history
+// since v2.0.43, so leaving STOPPED/EMERGENCY_STOPPED behind would keep the
+// card from resetting after a clear.
 func (s *Service) ClearPaperHistory(ctx context.Context, includeRunning bool) (int64, error) {
-	query := `DELETE FROM paper_grid_bots WHERE status = 'COMPLETED'`
+	query := `DELETE FROM paper_grid_bots WHERE status IN ('STOPPED', 'COMPLETED', 'EMERGENCY_STOPPED')`
 	if includeRunning {
 		query = `DELETE FROM paper_grid_bots`
 	}

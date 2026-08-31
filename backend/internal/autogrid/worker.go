@@ -688,6 +688,9 @@ func (worker *Worker) deployPaper(
 	if err != nil {
 		return err
 	}
+	// Macro context (CoinGecko): loaded once per deploy round — the beta /
+	// alt-drain vetoes below share the same reading.
+	macroCtx := worker.loadMacroContext(ctx)
 	var activeCount int
 	if err := worker.db.QueryRow(ctx, `
 		SELECT COUNT(*) FROM paper_grid_bots
@@ -942,6 +945,16 @@ func (worker *Worker) deployPaper(
 					map[string]any{"depthGate": map[string]any{"imbalance": imbalance, "vetoed": true}})
 				continue
 			}
+		}
+		// Macro gate (v2.0.44, CoinGecko): beta-drift (BTC 24h ≤ −3%) and
+		// alt-drain (dominance +0.35pp over 24h on flat BTC) veto non-short
+		// entries. Pair-level ADX/Hurst cannot see market-wide rotation —
+		// the 2026-08-30 night (BTC flat, alts −8..−37%) killed 8 NEUTRAL
+		// bots for −$56.71 with every scanner-level gate green. Shorts and
+		// cascade are exempt; fail-open until ~24h of snapshots exist.
+		if veto, reason, macroTel := macroVeto(strings.ToLower(strings.TrimSpace(candidate.RecommendedTrend)), cascadeShort, macroCtx); veto {
+			worker.rejectCandidate(ctx, candidate, reason, macroTel)
+			continue
 		}
 		// Walk-forward backtest gate — PAPER runs the same exam as REAL
 		// capital: otherwise paper statistics prove a pipeline that REAL
