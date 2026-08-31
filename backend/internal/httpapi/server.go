@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aligorov/pionex-bot/backend/internal/accounts"
@@ -39,6 +40,7 @@ const (
 )
 
 type Server struct {
+	candleMu     sync.Mutex
 	candleCache  map[string]cachedCandles
 	auth         *auth.Service
 	accounts     *accounts.Service
@@ -1548,8 +1550,11 @@ func (s *Server) getMarketCandles(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	cacheKey := symbol + "|" + interval + "|" + string(rune('0'+limit%10))
-	if cached, ok := s.candleCache[cacheKey]; ok && time.Since(cached.fetchedAt) < 30*time.Second {
+	cacheKey := symbol + "|" + interval + "|" + strconv.Itoa(limit)
+	s.candleMu.Lock()
+	cached, cacheHit := s.candleCache[cacheKey]
+	s.candleMu.Unlock()
+	if cacheHit && time.Since(cached.fetchedAt) < 30*time.Second {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"symbol": symbol, "interval": interval, "candles": cached.data,
 		})
@@ -1592,10 +1597,12 @@ func (s *Server) getMarketCandles(w http.ResponseWriter, r *http.Request) {
 			Volume: v,
 		}
 	}
+	s.candleMu.Lock()
 	if len(s.candleCache) > 100 {
 		s.candleCache = make(map[string]cachedCandles)
 	}
 	s.candleCache[cacheKey] = cachedCandles{data: out, fetchedAt: time.Now()}
+	s.candleMu.Unlock()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"symbol":   symbol,
 		"interval": interval,

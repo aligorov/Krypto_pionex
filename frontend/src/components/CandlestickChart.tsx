@@ -41,18 +41,32 @@ export const CandlestickChart: React.FC<CandlestickChartProps> = ({
   const [error, setError] = useState<string | null>(null);
   const [lastCandle, setLastCandle] = useState<{ open: number; high: number; low: number; close: number } | null>(null);
 
+  // Стабильный ключ уровней сетки: массив-проп от родителя меняет идентичность
+  // на каждом поллинге и без ключа рвал бы график (teardown + refetch).
+  const gridLevelsRef = useRef(gridLevels);
+  gridLevelsRef.current = gridLevels;
+  const levelsKey = (gridLevels ?? []).map(l => `${l.price}@${l.side}`).join(',');
+
   useEffect(() => {
     let isMounted = true;
+    const controller = new AbortController();
 
-    async function loadCandles() {
+    async function loadCandles(attempt = 0): Promise<void> {
       setLoading(true);
       setError(null);
       try {
         const resp = await fetch(`/api/market/candles?symbol=${encodeURIComponent(symbol)}&interval=${interval}&limit=150`, {
           credentials: 'include',
+          signal: controller.signal,
         });
         if (!resp.ok) {
-          throw new Error(`HTTP ${resp.status}`);
+          // Один повтор: 502/503 чаще всего окно перезапуска бэкенда, проходит само.
+          if (attempt < 1 && (resp.status >= 500 || resp.status === 429)) {
+            await new Promise(res => setTimeout(res, 1200));
+            if (!isMounted) return;
+            return loadCandles(attempt + 1);
+          }
+          throw new Error(resp.status >= 500 ? `HTTP ${resp.status} — сервер перезапускается, попробуйте ещё раз` : `HTTP ${resp.status}`);
         }
         const data = await resp.json();
         if (!isMounted) return;
@@ -74,11 +88,21 @@ export const CandlestickChart: React.FC<CandlestickChartProps> = ({
             const last = chartData[chartData.length - 1];
             setLastCandle({ open: last.open, high: last.high, low: last.low, close: last.close });
           }
-        } else if (data.error) {
-          setError(data.error);
+        } else {
+          // Пустые свечи без ошибки — тоже ошибка, а не молчаливый пустой график.
+          setError(data.error || `Нет данных по паре ${symbol} (${interval})`);
         }
       } catch (err: any) {
-        if (isMounted) setError(err.message || 'Ошибка загрузки свечей');
+        if (err?.name === 'AbortError') return; // эффект перезапущен, запрос заменён
+        if (isMounted) {
+          // Сетевой сбой тоже заслуживает один повтор.
+          if (attempt < 1) {
+            await new Promise(res => setTimeout(res, 1200));
+            if (isMounted) return loadCandles(attempt + 1);
+            return;
+          }
+          setError(err.message || 'Ошибка загрузки свечей');
+        }
       } finally {
         if (isMounted) setLoading(false);
       }
@@ -198,8 +222,8 @@ export const CandlestickChart: React.FC<CandlestickChartProps> = ({
     const effectiveGridCount = gridCount && gridCount >= 2 ? gridCount : 20;
     const computedLevels: GridLevel[] = [];
 
-    if (gridLevels && gridLevels.length > 0) {
-      computedLevels.push(...gridLevels);
+    if (gridLevelsRef.current && gridLevelsRef.current.length > 0) {
+      computedLevels.push(...gridLevelsRef.current);
     } else if (lowerPrice && upperPrice && upperPrice > lowerPrice) {
       const ratio = Math.pow(upperPrice / lowerPrice, 1 / effectiveGridCount);
       const mid = currentPrice && currentPrice > 0 ? currentPrice : (lowerPrice + upperPrice) / 2;
@@ -239,10 +263,11 @@ export const CandlestickChart: React.FC<CandlestickChartProps> = ({
 
     return () => {
       isMounted = false;
+      controller.abort();
       window.removeEventListener('resize', handleResize);
       chart.remove();
     };
-  }, [symbol, interval, lowerPrice, upperPrice, stopLoss, currentPrice, entryPrice, antiHuntStop, gridCount, gridLevels]);
+  }, [symbol, interval, lowerPrice, upperPrice, stopLoss, currentPrice, entryPrice, antiHuntStop, gridCount, levelsKey]);
 
   return (
     <div style={{
