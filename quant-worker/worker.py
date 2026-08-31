@@ -76,7 +76,13 @@ def run_job(conn, job):
         maker_fee=0.0002,
         taker_fee=0.0005,
         slippage=0.0002,
+        # Conservative baseline funding (1 bp / 8h on held notional): the
+        # live paper loop feeds real cross-exchange rates, but the deploy
+        # gate must price SOME funding drag — ignoring it overstated OOS
+        # returns by ~40-60 bps per 14d window (2026-08-31 fee audit).
+        funding_rate_8h=0.0001,
     )
+    interval_hours = {"5M": 5 / 60, "15M": 0.25, "30M": 0.5, "60M": 1.0, "1H": 1.0, "4H": 4.0, "1D": 24.0}
     report = walk_forward(
         engine,
         candles,
@@ -85,6 +91,7 @@ def run_job(conn, job):
         purge_bars=int(params.get("purge_bars", 6)),
         investment=float(params.get("investment", 100.0)),
         stop_loss_pct=float(params.get("stop_loss_pct", 8.0)),
+        bar_hours=interval_hours.get(str(interval).upper(), 1.0),
     )
     report["symbol"] = symbol
     report["interval"] = interval

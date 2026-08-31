@@ -8,10 +8,12 @@ class QuantBacktestEngine:
     maker/taker fee modeling, funding rate accounting, and Purged Walk-Forward OOS evaluation.
     """
 
-    def __init__(self, maker_fee: float = 0.0005, taker_fee: float = 0.0005, slippage: float = 0.0002):
+    def __init__(self, maker_fee: float = 0.0005, taker_fee: float = 0.0005, slippage: float = 0.0002,
+                 funding_rate_8h: float = 0.0):
         self.maker_fee = maker_fee
         self.taker_fee = taker_fee
         self.slippage = slippage
+        self.funding_rate_8h = funding_rate_8h
 
     def calculate_metrics(self, equity_curve: List[float], trades: List[Dict[str, Any]]) -> Dict[str, Any]:
         if not trades or len(equity_curve) < 2:
@@ -74,10 +76,18 @@ class GridSimulator:
     paper/live accounting agree on what a grid earns between two prices.
     """
 
-    def __init__(self, maker_fee: float = 0.0002, taker_fee: float = 0.0005, slippage: float = 0.0002):
+    def __init__(self, maker_fee: float = 0.0002, taker_fee: float = 0.0005, slippage: float = 0.0002,
+                 funding_rate_8h: float = 0.0, bar_hours: float = 1.0):
         self.maker_fee = maker_fee
         self.taker_fee = taker_fee
         self.slippage = slippage
+        # Perpetual funding (v2.0.45): the deploy gate used to ignore funding
+        # entirely — on a leveraged neutral grid holding inventory roughly
+        # half the time that is ~40-60 bps of missing drag over a 14d OOS
+        # window (2026-08-31 fee audit). rate is per 8h on held notional;
+        # bar_hours converts it to the candle interval in use.
+        self.funding_rate_8h = funding_rate_8h
+        self.bar_hours = bar_hours
 
     def _candle_path(self, candle):
         open_, high, low, close = candle["open"], candle["high"], candle["low"], candle["close"]
@@ -101,6 +111,7 @@ class GridSimulator:
         realized = 0.0
         round_trips = 0
         fees_paid = 0.0
+        funding_paid = 0.0
         equity_curve = []
         end_reason = "COMPLETED"
         stop_price = lower * (1 - stop_loss_pct / 100.0) if stop_loss_pct else None
@@ -155,11 +166,15 @@ class GridSimulator:
                 if stop_price is not None and point <= stop_price and not stop_hit:
                     stop_hit = True
                     end_reason = "STOP_LOSS"
-                    # Liquidate everything at the stopped price (taker).
+                    # Liquidate everything at the stopped price (taker),
+                    # crossing a thin book under stress: slippage applies to
+                    # the exit price itself (v2.0.45 — the simulator carried
+                    # a slippage field but never charged it on stops).
                     if base_held > 0:
                         avg_entry = quote_spent / base_held if base_held > 0 else 0
-                        gross = base_held * (point - avg_entry)
-                        fee = base_held * point * self.taker_fee
+                        liq_price = point * (1 - self.slippage)
+                        gross = base_held * (liq_price - avg_entry)
+                        fee = base_held * liq_price * self.taker_fee
                         realized += gross - fee
                         fees_paid += fee
                         base_held = 0.0
@@ -171,6 +186,13 @@ class GridSimulator:
                 last_price = point
             if stop_hit:
                 break
+            # Funding accrues per bar on held inventory (long inventory pays
+            # the positive rate — the neutral grid convention the live paper
+            # loop applies at 8h boundaries).
+            if self.funding_rate_8h and base_held > 0:
+                payment = base_held * last_price * self.funding_rate_8h * (self.bar_hours / 8.0)
+                realized -= payment
+                funding_paid += payment
             avg_entry = quote_spent / base_held if base_held > 0 else 0.0
             unrealized = base_held * (last_price - avg_entry) if base_held > 0 else 0.0
             equity_curve.append(investment + realized + unrealized)
@@ -188,6 +210,7 @@ class GridSimulator:
             "round_trips": round_trips,
             "realized_pnl": round(realized, 6),
             "fees_paid": round(fees_paid, 6),
+            "funding_paid": round(funding_paid, 6),
             "final_equity": round(final_equity, 6),
             "return_pct": round((final_equity / investment - 1) * 100, 4),
             "max_drawdown": round(max_dd, 6),
@@ -218,7 +241,8 @@ def derive_grid_params(candles, fee_bps=7.0, min_step_pct=0.6):
     return {"lower": lower, "upper": upper, "levels": levels}
 
 
-def walk_forward(engine, candles, train_bars=240, test_bars=60, purge_bars=6, investment=100.0, stop_loss_pct=8.0):
+def walk_forward(engine, candles, train_bars=240, test_bars=60, purge_bars=6, investment=100.0, stop_loss_pct=8.0,
+                 bar_hours=1.0):
     """
     Purged walk-forward: fit grid parameters on a training window, evaluate
     strictly out-of-sample on the following window after a purge gap that
@@ -231,7 +255,8 @@ def walk_forward(engine, candles, train_bars=240, test_bars=60, purge_bars=6, in
         test = candles[start + train_bars + purge_bars : start + train_bars + purge_bars + test_bars]
         params = derive_grid_params(train)
         if params:
-            sim = GridSimulator(maker_fee=engine.maker_fee, taker_fee=engine.taker_fee, slippage=engine.slippage)
+            sim = GridSimulator(maker_fee=engine.maker_fee, taker_fee=engine.taker_fee, slippage=engine.slippage,
+                                funding_rate_8h=engine.funding_rate_8h, bar_hours=bar_hours)
             result = sim.simulate(test, params["lower"], params["upper"], params["levels"], investment, stop_loss_pct)
             folds.append({
                 "train_start": start,

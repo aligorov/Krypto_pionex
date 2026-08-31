@@ -86,10 +86,20 @@ func decideBotAction(input botActionInput) manageDecision {
 				return manageDecision{Action: ActionCloseTakeProfit, Reason: "BREAKEVEN_LOCK"}
 			}
 
-			// Trailing Floor: Allow 20% pullback from peak, but guarantee floor >= 30% of target (min $3.00)
+			// Trailing Floor: allow a 20% pullback from peak, guaranteed at
+			// 30% of target. v2.0.45: the guarantee is CAPPED at 80% of the
+			// arm level — since v2.0.19 made targets leverage-consistent
+			// ($36 on 4x), 0.30×target ($10.80) exceeded every plausible
+			// peak, inverting the "guarantee" into an instant exit on the
+			// arming tick: the trailing branch was dead code and every win
+			// banked at ~$3.50 (2026-08-30 ledger: 7/7 wins at the arm).
 			pullbackTolerance := input.PeakPNL.Mul(decimal.NewFromFloat(0.20))
 			trailingFloor := input.PeakPNL.Sub(pullbackTolerance)
+			guaranteedFloorCap := targetArmThreshold.Mul(decimal.NewFromFloat(0.80))
 			minGuaranteedFloor := input.PnLTarget.Mul(decimal.NewFromFloat(0.30))
+			if minGuaranteedFloor.GreaterThan(guaranteedFloorCap) {
+				minGuaranteedFloor = guaranteedFloorCap
+			}
 			if minGuaranteedFloor.GreaterThan(trailingFloor) {
 				trailingFloor = minGuaranteedFloor
 			}

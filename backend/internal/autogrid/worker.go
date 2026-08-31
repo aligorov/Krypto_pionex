@@ -1039,6 +1039,20 @@ func (worker *Worker) deployPaper(
 				"component", "autogrid_worker", "symbol", candidate.Symbol,
 				"scanner_trend", trend, "smart_direction", smartTrend,
 				"reason", smartReason)
+			// v2.0.45: the override re-reads the regime AFTER the scanner's
+			// direction vetoes already ran — an override INTO neutral used to
+			// skip every neutral-specific guard (2026-08-30: SPX entered
+			// NEUTRAL via override at scan ADX 34.1 while the scanner itself
+			// said short; it died −$16.32). Re-apply the scanner's neutral
+			// trend-strength ceiling to overridden entries.
+			if smartTrend == "neutral" && trend != "neutral" && trend != "no_trend" && trend != "" {
+				if adxVal, ok := candidate.ModelAssumptions["adx"].(float64); ok && adxVal > 32.0 {
+					worker.rejectCandidate(ctx, candidate,
+						fmt.Sprintf("smart override → NEUTRAL при ADX сканера %.1f > 32 — тренд слишком силён для нейтральной сетки, вето сканера восстановлено", adxVal),
+						map[string]any{"overrideNeutralHole": map[string]any{"scanAdx": adxVal, "scannerTrend": trend}})
+					continue
+				}
+			}
 			trend = smartTrend
 		}
 		if cascadeLong && trend != "short" {
@@ -1868,12 +1882,20 @@ func (worker *Worker) stop(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if _, err := worker.db.Exec(ctx, `
-		UPDATE paper_grid_bots
-		SET status = 'STOPPED', closed_reason = 'AUTOGRID_STOP', closed_at = NOW(), updated_at = NOW()
-		WHERE settings_id = $1 AND status = 'RUNNING'
-	`, settings.ID); err != nil {
-		return fmt.Errorf("stop paper AutoGrid bots: %w", err)
+	// v2.0.45: fleet stops now SETTLE paper bots at the live price (inventory
+	// mark − taker+slippage exit fee) instead of freezing their last unrealized
+	// mark — a real Pionex cancel settles exactly like any close, and the
+	// full-history PnL card sums these rows as final.
+	if err := worker.settleAndStopPaperBots(ctx, *settings, "STOPPED", "AUTOGRID_STOP"); err != nil {
+		worker.logger.Warn("fleet stop: settle pass failed, falling back to bulk close",
+			"component", "autogrid_worker", "error", err)
+		if _, err := worker.db.Exec(ctx, `
+			UPDATE paper_grid_bots
+			SET status = 'STOPPED', closed_reason = 'AUTOGRID_STOP', closed_at = NOW(), updated_at = NOW()
+			WHERE settings_id = $1 AND status = 'RUNNING'
+		`, settings.ID); err != nil {
+			return fmt.Errorf("stop paper AutoGrid bots: %w", err)
+		}
 	}
 	// Real grids get a durable stop intent; reconcileAndManage submits the
 	// native Pionex cancel and verifies the terminal state remotely.
@@ -1896,11 +1918,13 @@ func (worker *Worker) emergencyStop(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	_, _ = worker.db.Exec(ctx, `
-		UPDATE paper_grid_bots
-		SET status = 'EMERGENCY_STOPPED', closed_reason = 'EMERGENCY_STOP', closed_at = NOW(), updated_at = NOW()
-		WHERE settings_id = $1 AND status = 'RUNNING'
-	`, settings.ID)
+	if err := worker.settleAndStopPaperBots(ctx, *settings, "EMERGENCY_STOPPED", "EMERGENCY_STOP"); err != nil {
+		_, _ = worker.db.Exec(ctx, `
+			UPDATE paper_grid_bots
+			SET status = 'EMERGENCY_STOPPED', closed_reason = 'EMERGENCY_STOP', closed_at = NOW(), updated_at = NOW()
+			WHERE settings_id = $1 AND status = 'RUNNING'
+		`, settings.ID)
+	}
 	// Real bots may live under an implicitly resolved account (settings
 	// account never selected); cancel them regardless of the settings value.
 	if err := worker.cancelRealBots(ctx, settings); err != nil {
@@ -2344,6 +2368,7 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 			    last_remote_status = $4, realized_pnl_usdt = $5,
 			    unrealized_pnl_usdt = $6,
 			    peak_pnl_usdt = GREATEST(COALESCE(peak_pnl_usdt, 0), $5::NUMERIC + $6::NUMERIC),
+			    trough_pnl_usdt = LEAST(COALESCE(trough_pnl_usdt, 0), $5::NUMERIC + $6::NUMERIC),
 			    last_reconciled_at = NOW(),
 			    last_error = NULL, updated_at = NOW()
 			WHERE id = $1
@@ -3086,6 +3111,7 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 				UPDATE paper_grid_bots
 				SET status = 'COMPLETED', closed_reason = $2,
 				    realized_pnl_usdt = $3, unrealized_pnl_usdt = 0,
+				    peak_pnl_usdt = GREATEST(peak_pnl_usdt, $3),
 				    mark_price = $4, last_grid_level = $5,
 				    closed_at = NOW(), updated_at = NOW()
 				WHERE id = $1 AND status = 'RUNNING'
@@ -3186,6 +3212,7 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 			SET mark_price = $2, unrealized_pnl_usdt = $3,
 			    realized_pnl_usdt = $4, last_grid_level = $5,
 			    peak_pnl_usdt = GREATEST(peak_pnl_usdt, $3::NUMERIC + $4::NUMERIC),
+			    trough_pnl_usdt = LEAST(trough_pnl_usdt, $3::NUMERIC + $4::NUMERIC),
 			    updated_at = NOW()
 			WHERE id = $1
 		`, bot.id, price, unrealized, realized, currentLevel); mErr != nil {

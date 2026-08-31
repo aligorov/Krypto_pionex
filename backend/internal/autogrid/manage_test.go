@@ -613,14 +613,39 @@ func TestDecideBotActionTrailingArmsAtHalfTarget(t *testing.T) {
 	if decision.Action != ActionHold {
 		t.Fatalf("above the trailing floor must hold, got %+v", decision)
 	}
-	// v2.0.38 arm: a $10 target arms at $3.50 — peak 3.6 with pullback
-	// below max(0.8×3.6, 3.0)=3.0 exits; the pre-v2.0.30 dead-zone shape
-	// can no longer exist.
+	// v2.0.45: the guaranteed floor is capped at 0.8×arm ($2.80) — the
+	// 0.30×target guarantee used to exceed every plausible peak once targets
+	// became leverage-consistent ($36 on 4x → $10.80 floor), converting the
+	// trail into an instant exit on the arming tick. A $10 target now trails
+	// for real: peak 3.6, total 2.9 is a 19.4% pullback — tolerated.
 	input.PnLTarget = mustDecimal("10")
 	input.PeakPNL = mustDecimal("3.6")
 	input.RealizedPNL = mustDecimal("2.9")
 	decision = decideBotAction(input)
+	if decision.Action != ActionHold {
+		t.Fatalf("pullback inside the 20%% tolerance must hold, got %+v", decision)
+	}
+	// Deeper pullback (2.7 < 0.8×3.6=2.88) trails out.
+	input.RealizedPNL = mustDecimal("2.7")
+	decision = decideBotAction(input)
 	if decision.Action != ActionCloseTakeProfit || decision.Reason != "TRAILING_TAKE_PROFIT" {
-		t.Fatalf("min($3.50) arm must protect early peaks, got %+v", decision)
+		t.Fatalf("pullback past the floor must trail out, got %+v", decision)
+	}
+	// The v2.0.19 inversion itself: a $36 target armed at peak 3.6 must NOT
+	// instantly exit — the pre-v2.0.45 code closed on the arming tick
+	// because 0.30×36 = $10.80 exceeded the peak.
+	input.PnLTarget = mustDecimal("36")
+	input.PeakPNL = mustDecimal("3.6")
+	input.RealizedPNL = mustDecimal("3.4")
+	decision = decideBotAction(input)
+	if decision.Action != ActionHold {
+		t.Fatalf("armed peak with small pullback must keep trailing, got %+v", decision)
+	}
+	// And a developed peak still banks on a 20% pullback: 0.8×4.5 = 3.6.
+	input.PeakPNL = mustDecimal("4.5")
+	input.RealizedPNL = mustDecimal("3.5")
+	decision = decideBotAction(input)
+	if decision.Action != ActionCloseTakeProfit || decision.Reason != "TRAILING_TAKE_PROFIT" {
+		t.Fatalf("20%% pullback from a developed peak must trail out, got %+v", decision)
 	}
 }
