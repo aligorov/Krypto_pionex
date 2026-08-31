@@ -2934,6 +2934,10 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 
 	effectiveFeeBps := settings.FeeBps.Add(settings.SlippageBps)
 	feeRate := effectiveFeeBps.Div(decimal.NewFromInt(10000))
+	// Stop-radar (v2.0.47, SHADOW): collect per-bot state while the loop
+	// already holds it, score once after the pass — the radar itself is
+	// throttled per bot and never touches the exit ladder.
+	radarInputs := make([]radarInput, 0, len(bots))
 	// Completed grid pairs pay MAKER on both legs (Pionex futures grid quotes
 	// passive limit orders: 0.02% maker vs 0.05% taker — pionex.com/en/fees);
 	// the taker+slippage composite stays reserved for exits, which cross the
@@ -3069,6 +3073,12 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 			botMaxLoss = *bot.maxLoss
 		}
 		total := realized.Add(unrealized)
+		radarInputs = append(radarInputs, radarInput{
+			botID: bot.id, botNumber: bot.botNumber, symbol: bot.symbol, direction: bot.direction,
+			price: price, antiHunt: bot.antiHuntStop, lower: bot.lower, upper: bot.upper,
+			atrEntryPct: bot.atrEntry, total: total,
+			inventorySide: inventorySideOf(bot.direction, price, bot.lower, bot.upper),
+		})
 		// v2.0.13: persisted peak makes TRAILING_TAKE_PROFIT / BREAKEVEN_LOCK
 		// stateful — the old in-memory approximation reset with every cycle,
 		// so a bot that touched 90% of target and rolled over never trailed.
@@ -3278,6 +3288,7 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 			}
 		}
 	}
+	worker.radarPass(ctx, settings, radarInputs)
 	return nil
 }
 

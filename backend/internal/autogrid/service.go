@@ -57,6 +57,7 @@ type Settings struct {
 	RangeBreakBufferPct     decimal.Decimal `json:"rangeBreakBufferPct"`
 	MaxAdjustmentsPerBot    int             `json:"maxAdjustmentsPerBot"`
 	TrancheDeployEnabled    bool            `json:"trancheDeployEnabled"`
+	StopForecastMode        string          `json:"stopForecastMode"` // OFF / SHADOW / ACTIVE (Phase-2)
 	AIKitEnabled            bool            `json:"aiKitEnabled"`
 	AIAutotuneEnabled       bool            `json:"aiAutotuneEnabled"`
 	AIAutotuneInterval      int             `json:"aiAutotuneIntervalSeconds"`
@@ -99,6 +100,7 @@ type UpdateSettingsInput struct {
 	ManageIntervalSeconds   int             `json:"manageIntervalSeconds"`
 	RangeBreakBufferPct     decimal.Decimal `json:"rangeBreakBufferPct"`
 	MaxAdjustmentsPerBot    int             `json:"maxAdjustmentsPerBot"`
+	StopForecastMode        string          `json:"stopForecastMode"`
 	AIKitEnabled            bool            `json:"aiKitEnabled"`
 	AIAutotuneEnabled       bool            `json:"aiAutotuneEnabled"`
 	AIAutotuneInterval      int             `json:"aiAutotuneIntervalSeconds"`
@@ -298,7 +300,7 @@ func (s *Service) GetSettings(ctx context.Context) (*Settings, error) {
 		       min_profit_factor, fee_bps, slippage_bps, paper_funding_rate_bps,
 		       pnl_target_mode, pnl_target_usdt, max_loss_usdt, manage_interval_seconds,
 		       range_break_buffer_pct, max_adjustments_per_bot,
-		       tranche_deploy_enabled, ai_kit_enabled,
+		       tranche_deploy_enabled, stop_forecast_mode, ai_kit_enabled,
 		       ai_autotune_enabled, ai_autotune_interval_seconds,
 		       last_autotune_at, last_autotune_notes,
 		       last_error,
@@ -341,6 +343,16 @@ func (s *Service) UpdateSettings(
 			input.PnLTargetMode = "DYNAMIC" // sane default for a blank column
 		}
 	}
+	// Stop-radar switch (v2.0.47): omitted/invalid values preserve the
+	// stored mode — the v2.0.16 pnl_target_mode blanking lesson.
+	switch input.StopForecastMode {
+	case "OFF", "SHADOW", "ACTIVE":
+	default:
+		input.StopForecastMode = current.StopForecastMode
+		if input.StopForecastMode == "" {
+			input.StopForecastMode = "OFF"
+		}
+	}
 	if err := s.validateSettings(ctx, input); err != nil {
 		return nil, err
 	}
@@ -363,7 +375,7 @@ func (s *Service) UpdateSettings(
 		    manage_interval_seconds = $27, range_break_buffer_pct = $28,
 		    max_adjustments_per_bot = $29, ai_kit_enabled = $30,
 		    ai_autotune_enabled = $31, ai_autotune_interval_seconds = $32,
-		    tranche_deploy_enabled = $34,
+		    tranche_deploy_enabled = $34, stop_forecast_mode = $35,
 		    last_error = NULL, updated_at = NOW()
 		WHERE scope_key = $1
 	`, DefaultScope, accountID, input.ExecutionMode, input.BudgetUSDT,
@@ -377,7 +389,7 @@ func (s *Service) UpdateSettings(
 		input.PnLTargetUSDT, input.MaxLossUSDT, input.ManageIntervalSeconds,
 		input.RangeBreakBufferPct, input.MaxAdjustmentsPerBot, input.AIKitEnabled,
 		input.AIAutotuneEnabled, input.AIAutotuneInterval, input.ScanMode,
-		current.TrancheDeployEnabled)
+		current.TrancheDeployEnabled, input.StopForecastMode)
 	if err != nil {
 		return nil, fmt.Errorf("update AutoGrid settings: %w", err)
 	}
@@ -1096,7 +1108,7 @@ func settingsScanTargets(item *Settings) []any {
 		&item.SlippageBps, &item.PaperFundingRateBps,
 		&item.PnLTargetMode, &item.PnLTargetUSDT, &item.MaxLossUSDT,
 		&item.ManageIntervalSeconds, &item.RangeBreakBufferPct,
-		&item.MaxAdjustmentsPerBot, &item.TrancheDeployEnabled, &item.AIKitEnabled,
+		&item.MaxAdjustmentsPerBot, &item.TrancheDeployEnabled, &item.StopForecastMode, &item.AIKitEnabled,
 		&item.AIAutotuneEnabled, &item.AIAutotuneInterval,
 		&item.LastAutotuneAt, &item.LastAutotuneNotes,
 		&item.LastError, &item.LastStartedAt,

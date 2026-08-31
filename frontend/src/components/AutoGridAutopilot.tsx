@@ -474,6 +474,7 @@ function SettingsSummary({ settings }: { settings: AutoGridSettings }) {
     ['Волатильность (мин–макс)', `${settings.minVolatilityPct}% – ${settings.maxVolatilityPct}%`],
     ['Мин. объём 24ч', `${settings.minVolume24h} USDT`],
     ['Стоп-лосс', settings.stopLossMode],
+    ['Стоп-радар', settings.stopForecastMode === 'OFF' ? 'выключен' : settings.stopForecastMode],
     ['Плотная сетка (geometric)', settings.densityGridEnabled ? 'да' : 'нет'],
     ['Адаптивное плечо', settings.adaptiveLeverageEnabled ? 'да' : 'нет'],
   ];
@@ -569,6 +570,7 @@ function SettingsForm({
           smartPnlEnabled: !!form.smartPnlEnabled,
           adaptiveLeverageEnabled: !!form.adaptiveLeverageEnabled,
           densityGridEnabled: !!form.densityGridEnabled,
+          stopForecastMode: form.stopForecastMode || 'OFF',
           aiKitEnabled: !!form.aiKitEnabled,
           aiAutotuneEnabled: !!form.aiAutotuneEnabled,
           maxActiveBots: numberField(String(form.maxActiveBots), 3),
@@ -776,6 +778,26 @@ function SettingsForm({
             checked={form.densityGridEnabled}
             onChange={(event) => setForm((current) => ({ ...current, densityGridEnabled: event.target.checked }))}
           />
+        </div>
+
+        <div className="toggle-row">
+          <div>
+            <strong>Стоп-радар (прогноз стопа)</strong>
+            <span>
+              Скор риска 0–1 для каждого живого бота: дистанция до стопа, расширение
+              волы, дрен альтов по флоту, каскад фандинг/OI/ликвидации.
+              SHADOW — только телеметрия и Telegram-предупреждения, выходы не
+              трогает; ACTIVE откроется после калибровки.
+            </span>
+          </div>
+          <select
+            value={form.stopForecastMode || 'OFF'}
+            onChange={(event) => setForm((current) => ({ ...current, stopForecastMode: event.target.value as AutoGridSettings['stopForecastMode'] }))}
+          >
+            <option value="OFF">Выключен</option>
+            <option value="SHADOW">SHADOW — наблюдение</option>
+            <option value="ACTIVE" disabled title="Откроется после калибровки SHADOW">ACTIVE — действия</option>
+          </select>
         </div>
       </div>
 

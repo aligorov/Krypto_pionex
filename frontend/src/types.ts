@@ -292,6 +292,7 @@ export interface AutoGridSettings {
   smartPnlEnabled: boolean;
   adaptiveLeverageEnabled: boolean;
   densityGridEnabled: boolean;
+  stopForecastMode: 'OFF' | 'SHADOW' | 'ACTIVE';
   candleInterval: string;
   scanMode?: string;
   lookbackCandles: number;
