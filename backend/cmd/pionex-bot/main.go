@@ -140,6 +140,7 @@ func main() {
 		// The MCP streamable HTTP endpoint is mounted at /mcp and authenticated
 		// with scoped Bearer API tokens (same tokens as the stdio binary).
 		mcpHandler := mcpserver.NewHTTPHandler(mcpserver.Services{
+			DB:       dbPool,
 			Auth:     authService,
 			Control:  controlService,
 			AutoGrid: autoService,

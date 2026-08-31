@@ -79,6 +79,7 @@ func main() {
 	)
 	server := mcpserver.NewServer(mcpserver.Services{
 		Auth:     authService,
+		DB:       db,
 		Control:  controlService,
 		AutoGrid: autogrid.NewService(db, riskEngine),
 		Accounts: accounts.NewService(db),

@@ -14,6 +14,7 @@ import (
 	"github.com/aligorov/pionex-bot/backend/internal/autogrid"
 	"github.com/aligorov/pionex-bot/backend/internal/controlplane"
 	"github.com/aligorov/pionex-bot/backend/internal/observability"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/shopspring/decimal"
 )
@@ -27,6 +28,7 @@ type Services struct {
 	Control  *controlplane.Service
 	AutoGrid *autogrid.Service
 	Accounts *accounts.Service
+	DB       *pgxpool.Pool
 	Version  string
 }
 
@@ -466,6 +468,8 @@ func NewServer(services Services, principal auth.Principal) *mcp.Server {
 	})
 
 	registerAutoGridTools(server, services, principal, readOnly, writeHint)
+
+	registerSQLTool(server, services, principal)
 
 	return server
 }
