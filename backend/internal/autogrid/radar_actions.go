@@ -2,6 +2,7 @@ package autogrid
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/shopspring/decimal"
@@ -128,15 +129,19 @@ func (worker *Worker) radarMaybeRecenter(ctx context.Context, settings Settings,
 
 	// v2.0.15 re-anchors: directional grids re-anchor entry (their mark is
 	// derived from entry each tick); the anti-hunt travels with the range.
+	// Placeholders are numbered dynamically — a NEUTRAL bot skips the entry
+	// clause, and a hardcoded $8 on the stop would send pgx a parameter
+	// mismatch (the exact bug that ate every v2.0.52 re-center on this
+	// all-NEUTRAL fleet).
 	setClauses := ""
 	var extraArgs []any
 	if bot.direction != "NEUTRAL" {
-		setClauses += ", entry_price = $7"
+		setClauses += fmt.Sprintf(", entry_price = $%d", 7+len(extraArgs))
 		extraArgs = append(extraArgs, b.price)
 	}
 	if bot.antiHunt != nil && bot.antiHunt.GreaterThan(decimal.Zero) {
 		newStop := recenterStop(bot.direction, bot.lower, bot.upper, newLower, newUpper, *bot.antiHunt)
-		setClauses += ", anti_hunt_stop_price = $8"
+		setClauses += fmt.Sprintf(", anti_hunt_stop_price = $%d", 7+len(extraArgs))
 		extraArgs = append(extraArgs, newStop)
 	}
 
