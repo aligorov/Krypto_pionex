@@ -94,7 +94,7 @@ func (c *Collector) collectCoinGecko(ctx context.Context) {
 	if _, err := c.db.Exec(ctx, `
 		INSERT INTO coingecko_snapshots
 			(btc_usd, btc_24h_pct, btc_dominance_pct, total_mcap_usd, mcap_24h_pct)
-		VALUES ($1, $2, NULLIF($3, 0), NULLIF($4, 0), $5)
+		VALUES ($1::numeric, $2::numeric, NULLIF($3::numeric, 0), NULLIF($4::numeric, 0), $5::numeric)
 	`,
 		decimal.NewFromFloat(snap.BTCUSD).Round(4),
 		decimal.NewFromFloat(snap.BTC24hPct).Round(6),
