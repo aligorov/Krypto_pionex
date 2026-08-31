@@ -154,9 +154,13 @@ func (e *Engine) ValidateNewPaperGrid(
 	if err := e.ValidateNewOrder(ctx, requestedLeverage, slotBudgetUSD); err != nil {
 		return err
 	}
-	if err := e.ValidateDailyLoss(ctx); err != nil {
-		return err
-	}
+	// v2.0.46: PAPER is exempt from max_daily_loss_usd (operator decision
+	// 2026-08-31). The simulation exists to keep collecting gate statistics —
+	// a losing paper day used to freeze every entry for the rest of the UTC
+	// day exactly when the data mattered most. Runaway loops stay covered by
+	// the portfolio circuit breaker (3 protective closes/hour) and the
+	// escalating per-symbol cooldown; the daily-loss brake protects REAL
+	// capital only.
 	settings, err := e.LoadSettings(ctx)
 	if err != nil {
 		return err
@@ -302,11 +306,10 @@ func (e *Engine) SetKillSwitch(ctx context.Context, enabled bool) error {
 	return nil
 }
 
-// ValidateDailyLoss checks the last 24h cumulative realized loss across REAL
-// and (since v2.0.27) PAPER bots against max_daily_loss_usd — the paper fleet
-// is the actual trading surface, and its stop-outs are real money decisions
-// even in simulation. All negative realized closes count, including manual
-// ones: money lost is lost.
+// ValidateDailyLoss checks the last 24h cumulative REALIZED REAL-bot loss
+// against max_daily_loss_usd. Since v2.0.46 it counts REAL closes only:
+// PAPER results are simulation statistics, not capital — a bad paper day
+// must not freeze the experiment (and must not gate REAL capital either).
 func (e *Engine) ValidateDailyLoss(ctx context.Context) error {
 	settings, err := e.LoadSettings(ctx)
 	if err != nil {
@@ -317,17 +320,10 @@ func (e *Engine) ValidateDailyLoss(ctx context.Context) error {
 	}
 	var dailyRealizedLoss decimal.Decimal
 	err = e.db.QueryRow(ctx, `
-		SELECT COALESCE(SUM(loss), 0) FROM (
-			SELECT CASE WHEN realized_pnl_usdt < 0 THEN -realized_pnl_usdt ELSE 0 END AS loss
-			FROM grid_bots
-			WHERE COALESCE(closed_at, updated_at) > NOW() - INTERVAL '24 hours'
-			  AND status IN ('STOPPED', 'LIQUIDATED', 'FAILED')
-			UNION ALL
-			SELECT CASE WHEN realized_pnl_usdt < 0 THEN -realized_pnl_usdt ELSE 0 END AS loss
-			FROM paper_grid_bots
-			WHERE closed_at > NOW() - INTERVAL '24 hours'
-			  AND status = 'COMPLETED'
-		) all_losses
+		SELECT COALESCE(SUM(CASE WHEN realized_pnl_usdt < 0 THEN -realized_pnl_usdt ELSE 0 END), 0)
+		FROM grid_bots
+		WHERE COALESCE(closed_at, updated_at) > NOW() - INTERVAL '24 hours'
+		  AND status IN ('STOPPED', 'LIQUIDATED', 'FAILED')
 	`).Scan(&dailyRealizedLoss)
 	if err != nil {
 		return fmt.Errorf("risk engine: check daily loss: %w", err)
