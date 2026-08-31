@@ -23,10 +23,10 @@ import (
 // and passes (fail-open), mirroring how depthGate ramped up.
 
 const (
-	macroBetaDriftPct  = -3.0              // BTC 24h return at/below → veto
-	macroAltDrainDelta = 0.35              // dominance delta (pp) over ≥20h → veto
-	macroAltDrainFloor = -2.0              // ...only while BTC is flatter than this
-	macroHistoryAge    = 20 * time.Hour    // minimum window before domDelta arms
+	macroBetaDriftPct  = -3.0           // BTC 24h return at/below → veto
+	macroAltDrainDelta = 0.35           // dominance delta (pp) over ≥20h → veto
+	macroAltDrainFloor = -2.0           // ...only while BTC is flatter than this
+	macroHistoryAge    = 20 * time.Hour // minimum window before domDelta arms
 )
 
 type macroContext struct {

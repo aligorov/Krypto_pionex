@@ -126,12 +126,26 @@ type DynamicLeverageResult struct {
 func ComputeDynamicLeverage(
 	atrPct float64,
 	baseLev int,
+	spanPct float64,
 ) DynamicLeverageResult {
 	if baseLev < 1 {
 		baseLev = 1
 	}
 	if baseLev > 10 {
 		baseLev = 10
+	}
+
+	// v2.0.52 narrow-span de-gear: on a span <7% the maxLoss cap sits a
+	// fixed ~2% from entry at 4x (audit 2026-08-31: 6/10 live bots,
+	// sigma24h >= stop distance, P(stop/24h) 41-78%, -8.02 JUP class).
+	// A 2x cap moves the stop outside the one-day noise band; the same
+	// audit showed the wide AI-kit grids (11-17%) keep full leverage.
+	if spanPct > 0 && spanPct < 7.0 && baseLev > 2 {
+		return DynamicLeverageResult{
+			Leverage:    2,
+			Reason:      fmt.Sprintf("Узкий спан %.1f%% — де-гир 2x (стоп вне зоны шума)", spanPct),
+			IsScaleDown: true,
+		}
 	}
 
 	// Normal Volatility (ATR <= 4.0%): Keep full base leverage

@@ -613,19 +613,19 @@ func TestDecideBotActionTrailingArmsAtHalfTarget(t *testing.T) {
 	if decision.Action != ActionHold {
 		t.Fatalf("above the trailing floor must hold, got %+v", decision)
 	}
-	// v2.0.45: the guaranteed floor is capped at 0.8×arm ($2.80) — the
+	// v2.0.52: the guaranteed floor is capped at 0.85×arm ($2.975) — the
 	// 0.30×target guarantee used to exceed every plausible peak once targets
 	// became leverage-consistent ($36 on 4x → $10.80 floor), converting the
-	// trail into an instant exit on the arming tick. A $10 target now trails
-	// for real: peak 3.6, total 2.9 is a 19.4% pullback — tolerated.
+	// trail into an instant exit on the arming tick. A $10 target still
+	// trails for real: peak 3.6, total 3.1 is a 13.9% pullback — tolerated.
 	input.PnLTarget = mustDecimal("10")
 	input.PeakPNL = mustDecimal("3.6")
-	input.RealizedPNL = mustDecimal("2.9")
+	input.RealizedPNL = mustDecimal("3.1")
 	decision = decideBotAction(input)
 	if decision.Action != ActionHold {
 		t.Fatalf("pullback inside the 20%% tolerance must hold, got %+v", decision)
 	}
-	// Deeper pullback (2.7 < 0.8×3.6=2.88) trails out.
+	// Deeper pullback (2.7 < 0.85×arm=2.975) trails out.
 	input.RealizedPNL = mustDecimal("2.7")
 	decision = decideBotAction(input)
 	if decision.Action != ActionCloseTakeProfit || decision.Reason != "TRAILING_TAKE_PROFIT" {

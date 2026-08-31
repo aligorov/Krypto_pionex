@@ -34,7 +34,7 @@ func TestIsEntryTimingFavorable(t *testing.T) {
 			"rangePositionPct": 78.0,
 			"confluence": map[string]any{
 				"fibInGoldenPocket": false,
-				"macdCrossedUp":    false,
+				"macdCrossedUp":     false,
 			},
 		},
 	}
@@ -103,7 +103,7 @@ func TestIsEntryTimingFavorable(t *testing.T) {
 			"rangePositionPct": 22.0,
 			"confluence": map[string]any{
 				"fibInGoldenPocket": false,
-				"macdCrossedDown":  false,
+				"macdCrossedDown":   false,
 			},
 		},
 	}

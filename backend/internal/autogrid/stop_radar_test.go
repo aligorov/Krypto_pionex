@@ -137,3 +137,43 @@ func TestInventorySideOf(t *testing.T) {
 		t.Fatalf("SHORT must be -1, got %.0f", s)
 	}
 }
+
+// v2.0.52 re-center geometry: same width, price at mid — the anti-hunt
+// distance beyond the bound survives the shift.
+func TestRecenterBounds(t *testing.T) {
+	lower := decimal.NewFromFloat(100)
+	upper := decimal.NewFromFloat(110)
+	price := decimal.NewFromFloat(103.5)
+	nl, nu := recenterBounds(lower, upper, price)
+	if !nl.Equal(decimal.NewFromFloat(98.5)) || !nu.Equal(decimal.NewFromFloat(108.5)) {
+		t.Fatalf("recenter must keep width centered on price, got [%s, %s]", nl, nu)
+	}
+	if !nu.Sub(nl).Equal(upper.Sub(lower)) {
+		t.Fatalf("width must be preserved")
+	}
+}
+
+func TestRecenterStopPreservesDistance(t *testing.T) {
+	// long side: stop sat 2 below the old lower bound
+	oldLower, oldUpper := decimal.NewFromFloat(100), decimal.NewFromFloat(110)
+	oldStop := decimal.NewFromFloat(98)
+	nl, nu := decimal.NewFromFloat(98.5), decimal.NewFromFloat(108.5)
+	ns := recenterStop("NEUTRAL", oldLower, oldUpper, nl, nu, oldStop)
+	if !ns.Equal(decimal.NewFromFloat(96.5)) {
+		t.Fatalf("long-side stop must move to newLower-2, got %s", ns)
+	}
+	// short side: stop sat 2 above the old upper bound
+	ss := recenterStop("SHORT", oldLower, oldUpper, nl, nu, decimal.NewFromFloat(112))
+	if !ss.Equal(decimal.NewFromFloat(110.5)) {
+		t.Fatalf("short-side stop must move to newUpper+2, got %s", ss)
+	}
+}
+
+func TestCandidateSpanPct(t *testing.T) {
+	if s := candidateSpanPct(decimal.NewFromFloat(100), decimal.NewFromFloat(102.8)); s < 2.79 || s > 2.81 {
+		t.Fatalf("span pct = %f, want 2.8", s)
+	}
+	if s := candidateSpanPct(decimal.Zero, decimal.NewFromFloat(110)); s != 0 {
+		t.Fatalf("zero lower must yield 0, got %f", s)
+	}
+}

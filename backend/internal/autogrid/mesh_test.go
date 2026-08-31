@@ -25,19 +25,19 @@ func TestComputeAdaptiveMeshBreakEvenFloor(t *testing.T) {
 
 func TestComputeDynamicLeverage(t *testing.T) {
 	// Normal volatility (ATR 1.5%) -> full base leverage 4x
-	resNormal := ComputeDynamicLeverage(1.5, 4)
+	resNormal := ComputeDynamicLeverage(1.5, 4, 8.0)
 	if resNormal.Leverage != 4 || resNormal.IsScaleDown {
 		t.Errorf("expected leverage 4 with no scale down, got %d (scale down: %v)", resNormal.Leverage, resNormal.IsScaleDown)
 	}
 
 	// Elevated volatility (ATR 5.5%) -> 3x
-	resElevated := ComputeDynamicLeverage(5.5, 4)
+	resElevated := ComputeDynamicLeverage(5.5, 4, 8.0)
 	if resElevated.Leverage != 3 || !resElevated.IsScaleDown {
 		t.Errorf("expected leverage 3 with scale down, got %d (scale down: %v)", resElevated.Leverage, resElevated.IsScaleDown)
 	}
 
 	// Extreme volatility (ATR 12.0%) -> 2x
-	resExtreme := ComputeDynamicLeverage(12.0, 4)
+	resExtreme := ComputeDynamicLeverage(12.0, 4, 8.0)
 	if resExtreme.Leverage != 2 || !resExtreme.IsScaleDown {
 		t.Errorf("expected leverage 2 with scale down, got %d (scale down: %v)", resExtreme.Leverage, resExtreme.IsScaleDown)
 	}
@@ -61,5 +61,35 @@ func TestComputeAntiHuntStop(t *testing.T) {
 	expectedShort := decimal.NewFromFloat(12.30)
 	if !stopShort.Equal(expectedShort) {
 		t.Errorf("expected anti hunt stop short %s, got %s", expectedShort, stopShort)
+	}
+}
+
+// v2.0.52 narrow-span de-gear: spans <7% cap leverage at 2x — the audit
+// showed a 4x maxLoss stop 2% from entry inside one daily sigma.
+func TestComputeDynamicLeverageNarrowSpan(t *testing.T) {
+	res := ComputeDynamicLeverage(1.0, 4, 2.8) // LINK-class span
+	if res.Leverage != 2 || !res.IsScaleDown {
+		t.Fatalf("2.8%% span at base 4x must de-gear to 2x, got %dx (%s)", res.Leverage, res.Reason)
+	}
+	res = ComputeDynamicLeverage(1.0, 2, 3.5)
+	if res.Leverage != 2 || res.IsScaleDown {
+		t.Fatalf("base 2x stays 2x without a scale-down flag, got %dx", res.Leverage)
+	}
+	res = ComputeDynamicLeverage(1.0, 4, 6.9)
+	if res.Leverage != 2 {
+		t.Fatalf("6.9%% span must de-gear to 2x, got %dx", res.Leverage)
+	}
+	res = ComputeDynamicLeverage(1.0, 4, 7.0)
+	if res.Leverage != 4 {
+		t.Fatalf("7.0%% span boundary keeps base leverage, got %dx", res.Leverage)
+	}
+	res = ComputeDynamicLeverage(1.0, 4, 0) // span unknown
+	if res.Leverage != 4 {
+		t.Fatalf("unknown span (0) must not de-gear, got %dx", res.Leverage)
+	}
+	// ATR de-gear still stacks correctly on wide spans.
+	res = ComputeDynamicLeverage(12.0, 4, 18.0)
+	if res.Leverage != 2 {
+		t.Fatalf("extreme ATR on wide span must scale to 2x, got %dx", res.Leverage)
 	}
 }

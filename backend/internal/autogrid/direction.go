@@ -19,8 +19,8 @@ type FundingContext struct {
 	// stable non-trivial rate is a paid-to-hold edge that deserves a
 	// directional grid even inside RANGE (short collects carry at a stable
 	// positive rate, long at a stable negative one).
-	Avg48h     float64
-	Stable48h  bool
+	Avg48h    float64
+	Stable48h bool
 }
 
 // fundingCarryThreshold is the minimum stable 48h average rate (per 8h)

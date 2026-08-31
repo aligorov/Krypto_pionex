@@ -786,8 +786,8 @@ function SettingsForm({
             <span>
               Скор риска 0–1 для каждого живого бота: дистанция до стопа, расширение
               волы, дрен альтов по флоту, каскад фандинг/OI/ликвидации.
-              SHADOW — только телеметрия и Telegram-предупреждения, выходы не
-              трогает; ACTIVE откроется после калибровки.
+              SHADOW — только телеметрия и Telegram-предупреждения; ACTIVE —
+              превентивные ре-центры сетки при B3/B4 (только PAPER, 1 действие/бот/час).
             </span>
           </div>
           <select
@@ -796,7 +796,7 @@ function SettingsForm({
           >
             <option value="OFF">Выключен</option>
             <option value="SHADOW">SHADOW — наблюдение</option>
-            <option value="ACTIVE" disabled title="Откроется после калибровки SHADOW">ACTIVE — действия</option>
+            <option value="ACTIVE">ACTIVE — авто-ре-центры (PAPER)</option>
           </select>
         </div>
       </div>

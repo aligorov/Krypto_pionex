@@ -141,9 +141,19 @@ type paperSettleBot struct {
 // Funding is deliberately not accrued here — the exchange charges funding
 // only at 8h boundaries (see settleAndStopPaperBots).
 func paperCloseSettleTotal(bot paperSettleBot, price decimal.Decimal, settings Settings) decimal.Decimal {
+	unrealized, _ := paperMarkAtPrice(bot, price, settings)
+	return bot.realized.Add(unrealized)
+}
+
+// paperMarkAtPrice returns the bot's mark PnL at the given price with the
+// taker+slippage exit fee included (as a CLOSE would pay it), plus the
+// exit notional the fee was charged on. Grid SHIFTS use the second return
+// to add the fee back — a re-center keeps the position, so it must not pay
+// an exit (v2.0.13 audit rule, now shared by settle + radar re-centers).
+func paperMarkAtPrice(bot paperSettleBot, price decimal.Decimal, settings Settings) (unrealized, exitNotional decimal.Decimal) {
 	feeRate := settings.FeeBps.Add(settings.SlippageBps).Div(decimal.NewFromInt(10000))
-	unrealized := decimal.Zero
-	exitNotional := decimal.Zero
+	unrealized = decimal.Zero
+	exitNotional = decimal.Zero
 	if bot.direction == "NEUTRAL" {
 		currentLevel := gridLevelForPrice(bot.lower, bot.upper, bot.gridNum, price)
 		previousLevel := currentLevel
@@ -170,5 +180,5 @@ func paperCloseSettleTotal(bot paperSettleBot, price decimal.Decimal, settings S
 	if exitNotional.IsPositive() {
 		unrealized = unrealized.Sub(exitNotional.Mul(feeRate))
 	}
-	return bot.realized.Add(unrealized)
+	return unrealized, exitNotional
 }

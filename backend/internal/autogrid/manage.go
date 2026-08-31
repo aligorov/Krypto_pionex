@@ -93,9 +93,11 @@ func decideBotAction(input botActionInput) manageDecision {
 			// peak, inverting the "guarantee" into an instant exit on the
 			// arming tick: the trailing branch was dead code and every win
 			// banked at ~$3.50 (2026-08-30 ledger: 7/7 wins at the arm).
+			// v2.0.52: cap raised to 85% of arm — winners on the 08-31
+			// tape kept surrendering the last 15% above the floor.
 			pullbackTolerance := input.PeakPNL.Mul(decimal.NewFromFloat(0.20))
 			trailingFloor := input.PeakPNL.Sub(pullbackTolerance)
-			guaranteedFloorCap := targetArmThreshold.Mul(decimal.NewFromFloat(0.80))
+			guaranteedFloorCap := targetArmThreshold.Mul(decimal.NewFromFloat(0.85))
 			minGuaranteedFloor := input.PnLTarget.Mul(decimal.NewFromFloat(0.30))
 			if minGuaranteedFloor.GreaterThan(guaranteedFloorCap) {
 				minGuaranteedFloor = guaranteedFloorCap

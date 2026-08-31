@@ -9,6 +9,7 @@ import (
 	"runtime/debug"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aligorov/pionex-bot/backend/internal/accounts"
@@ -55,6 +56,10 @@ type Worker struct {
 	llm          *llm.Service
 	logger       *slog.Logger
 	owner        string
+	// radarActionAt gates Phase-B radar re-centers to one per bot per
+	// cooldown window; guarded by radarActionMu.
+	radarActionMu sync.Mutex
+	radarActionAt map[string]time.Time
 	// trancheTBRegime throttles the trend check behind the tranche-2
 	// time-box: without it every pending bot older than 24h re-fetches a
 	// 60M klines batch per manage tick for as long as the tape trends.
@@ -101,6 +106,7 @@ func NewWorker(
 		logger:          logger,
 		owner:           fmt.Sprintf("autogrid-%d", time.Now().UnixNano()),
 		trancheTBRegime: make(map[string]trancheTBTrend),
+		radarActionAt:   make(map[string]time.Time),
 	}
 }
 
@@ -1125,7 +1131,8 @@ func (worker *Worker) deployPaper(
 		levReason := fmt.Sprintf("Базовое (%dx)", baseLev)
 		levMode := "BASE"
 		if settings.AdaptiveLeverageEnabled {
-			dyn := ComputeDynamicLeverage(atrPct, baseLev)
+			spanPct := candidateSpanPct(candidate.LowerPrice, candidate.UpperPrice)
+			dyn := ComputeDynamicLeverage(atrPct, baseLev, spanPct)
 			botLev = dyn.Leverage
 			levReason = dyn.Reason
 			levMode = "ADAPTIVE"
@@ -1718,7 +1725,8 @@ func (worker *Worker) deployReal(
 		}
 		botLev := baseLev
 		if settings.AdaptiveLeverageEnabled {
-			dyn := ComputeDynamicLeverage(atrPct, baseLev)
+			spanPct := candidateSpanPct(candidate.LowerPrice, candidate.UpperPrice)
+			dyn := ComputeDynamicLeverage(atrPct, baseLev, spanPct)
 			botLev = dyn.Leverage
 		} else if smartLev > 0 && smartLev < botLev {
 			botLev = smartLev
@@ -2430,59 +2438,59 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 						entry = e
 					}
 				}
-			topUp := ""
-			if time.Since(bot.createdAt) >= trancheTimeBox {
-				// v2.0.14: the unconditional top-up must not fire into a
-				// confirmed trend either way — adding margin at stretched
-				// highs (or into a falling knife) is exactly what the
-				// signal path exists to gate. Defer until the tape is
-				// not strongly trending; the confirmed-adverse path and
-				// the next cycles stay available.
-				if worker.trancheTimeBoxTrending(ctx, bot.symbol) {
-					topUp = ""
-				} else {
-					topUp = "time-box 24h"
+				topUp := ""
+				if time.Since(bot.createdAt) >= trancheTimeBox {
+					// v2.0.14: the unconditional top-up must not fire into a
+					// confirmed trend either way — adding margin at stretched
+					// highs (or into a falling knife) is exactly what the
+					// signal path exists to gate. Defer until the tape is
+					// not strongly trending; the confirmed-adverse path and
+					// the next cycles stay available.
+					if worker.trancheTimeBoxTrending(ctx, bot.symbol) {
+						topUp = ""
+					} else {
+						topUp = "time-box 24h"
+					}
+				} else if bot.atrEntry > 0 {
+					// v2.0.19: the excursion must be adverse FOR THE DIRECTION —
+					// |price−entry| also fired on a directional bot's PROFIT
+					// excursion (LONG rallying 0.75 ATR, two red candles →
+					// top-up at the local top). The regime gate mirrors the
+					// time-box: no second tranche into a confirmed trend.
+					adverse := trancheAdversePct(bot.direction, price, entry)
+					limit := bot.atrEntry * 2.0 * 0.75 / 100.0
+					if adverse >= limit &&
+						!worker.trancheTimeBoxTrending(ctx, bot.symbol) &&
+						worker.trancheTurnConfirmed(ctx, bot.symbol, price, entry) {
+						topUp = "подтверждённый adverse 0.75×ATR(1h)"
+					}
 				}
-			} else if bot.atrEntry > 0 {
-				// v2.0.19: the excursion must be adverse FOR THE DIRECTION —
-				// |price−entry| also fired on a directional bot's PROFIT
-				// excursion (LONG rallying 0.75 ATR, two red candles →
-				// top-up at the local top). The regime gate mirrors the
-				// time-box: no second tranche into a confirmed trend.
-				adverse := trancheAdversePct(bot.direction, price, entry)
-				limit := bot.atrEntry * 2.0 * 0.75 / 100.0
-				if adverse >= limit &&
-					!worker.trancheTimeBoxTrending(ctx, bot.symbol) &&
-					worker.trancheTurnConfirmed(ctx, bot.symbol, price, entry) {
-					topUp = "подтверждённый adverse 0.75×ATR(1h)"
-				}
-			}
-			if topUp != "" {
-				pending := base.Sub(bot.investment)
-				if _, err := worker.service.AdjustBot(ctx, worker.accounts, settings.ID, bot.id, AdjustBotInput{
-					Mode:            "invest_in",
-					QuoteInvestment: pending.Round(2),
-				}); err != nil {
-					worker.logger.Error("tranche 2 invest_in failed",
-						"component", "autogrid_worker", "bot_id", bot.id, "error", err)
-					if _, markErr := worker.db.Exec(ctx, `
+				if topUp != "" {
+					pending := base.Sub(bot.investment)
+					if _, err := worker.service.AdjustBot(ctx, worker.accounts, settings.ID, bot.id, AdjustBotInput{
+						Mode:            "invest_in",
+						QuoteInvestment: pending.Round(2),
+					}); err != nil {
+						worker.logger.Error("tranche 2 invest_in failed",
+							"component", "autogrid_worker", "bot_id", bot.id, "error", err)
+						if _, markErr := worker.db.Exec(ctx, `
 						UPDATE grid_bots
 						SET model_state = jsonb_set(model_state, '{trancheFailAt}', to_jsonb(to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'))),
 						    updated_at = NOW()
 						WHERE id = $1
 					`, bot.id); markErr != nil {
-						worker.logger.Error("tranche 2 fail-marker write failed",
-							"component", "autogrid_worker", "bot_id", bot.id, "error", markErr)
-					}
-				} else {
-					// v2.0.19: peak_pnl_usdt must NOT double here. The
-					// freshly injected margin starts at ~0 PnL, so doubling
-					// the stored peak armed the trailing floor
-					// max(0.8·2P, 0.5·2T) against total ≈ P on the very next
-					// manage tick — an instant false TRAILING_TAKE_PROFIT on
-					// exactly the most successful bots. Paper never doubled
-					// it; this aligns REAL with the paper semantics.
-					if _, err := worker.db.Exec(ctx, `
+							worker.logger.Error("tranche 2 fail-marker write failed",
+								"component", "autogrid_worker", "bot_id", bot.id, "error", markErr)
+						}
+					} else {
+						// v2.0.19: peak_pnl_usdt must NOT double here. The
+						// freshly injected margin starts at ~0 PnL, so doubling
+						// the stored peak armed the trailing floor
+						// max(0.8·2P, 0.5·2T) against total ≈ P on the very next
+						// manage tick — an instant false TRAILING_TAKE_PROFIT on
+						// exactly the most successful bots. Paper never doubled
+						// it; this aligns REAL with the paper semantics.
+						if _, err := worker.db.Exec(ctx, `
 						UPDATE grid_bots
 						SET pnl_target_usdt = pnl_target_usdt * 2,
 						    max_loss_usdt = max_loss_usdt * 2,
@@ -2490,33 +2498,33 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 						    updated_at = NOW()
 						WHERE id = $1
 					`, bot.id); err != nil {
-						worker.logger.Error("tranche 2 target doubling failed (invest_in already committed)",
-							"component", "autogrid_worker", "bot_id", bot.id, "error", err)
-					} else {
-						// Same-tick decision safety: decideBotAction below
-						// reads the LOCAL copies taken before the tranche
-						// block, not the struct fields — refresh BOTH, or
-						// the top-up tick can fire a half-size TP/SL against
-						// the doubled position.
-						bot.investment = base
-						if bot.pnlTarget != nil {
-							doubled := bot.pnlTarget.Mul(decimal.NewFromInt(2))
-							bot.pnlTarget = &doubled
-							botTarget = doubled
+							worker.logger.Error("tranche 2 target doubling failed (invest_in already committed)",
+								"component", "autogrid_worker", "bot_id", bot.id, "error", err)
+						} else {
+							// Same-tick decision safety: decideBotAction below
+							// reads the LOCAL copies taken before the tranche
+							// block, not the struct fields — refresh BOTH, or
+							// the top-up tick can fire a half-size TP/SL against
+							// the doubled position.
+							bot.investment = base
+							if bot.pnlTarget != nil {
+								doubled := bot.pnlTarget.Mul(decimal.NewFromInt(2))
+								bot.pnlTarget = &doubled
+								botTarget = doubled
+							}
+							if bot.maxLoss != nil {
+								doubled := bot.maxLoss.Mul(decimal.NewFromInt(2))
+								bot.maxLoss = &doubled
+								botMaxLoss = doubled
+							}
 						}
-						if bot.maxLoss != nil {
-							doubled := bot.maxLoss.Mul(decimal.NewFromInt(2))
-							bot.maxLoss = &doubled
-							botMaxLoss = doubled
-						}
+						worker.logger.Info("tranche 2 deployed (REAL invest_in)",
+							"component", "autogrid_worker", "symbol", bot.symbol, "reason", topUp)
+						_ = QueueTelegramEvent(ctx, worker.db, "TRANCHE_2", map[string]any{
+							"bot_number": bot.botNumber, "symbol": bot.symbol, "reason": topUp,
+						})
 					}
-					worker.logger.Info("tranche 2 deployed (REAL invest_in)",
-						"component", "autogrid_worker", "symbol", bot.symbol, "reason", topUp)
-					_ = QueueTelegramEvent(ctx, worker.db, "TRANCHE_2", map[string]any{
-						"bot_number": bot.botNumber, "symbol": bot.symbol, "reason": topUp,
-					})
 				}
-			}
 			}
 		}
 
@@ -3249,20 +3257,20 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 					if !worker.trancheTimeBoxTrending(ctx, bot.symbol) {
 						trancheReason = "time-box 24h"
 					}
-			} else if bot.atrEntry > 0 && price.IsPositive() {
-				// v2.0.19: direction-signed adverse (profit excursions of
-				// directional bots no longer count) + the same regime gate
-				// as the time-box — no second tranche into a confirmed
-				// trend (mirror of the REAL path).
-				adverse := trancheAdversePct(bot.direction, price, bot.entry)
-				// ATR(1h) ≈ 2 × ATR(15m) — the entry-time scanner figure.
-				limit := bot.atrEntry * 2.0 * 0.75 / 100.0
-				if adverse >= limit &&
-					!worker.trancheTimeBoxTrending(ctx, bot.symbol) &&
-					worker.trancheTurnConfirmed(ctx, bot.symbol, price, bot.entry) {
-					trancheReason = "подтверждённый adverse 0.75×ATR(1h)"
+				} else if bot.atrEntry > 0 && price.IsPositive() {
+					// v2.0.19: direction-signed adverse (profit excursions of
+					// directional bots no longer count) + the same regime gate
+					// as the time-box — no second tranche into a confirmed
+					// trend (mirror of the REAL path).
+					adverse := trancheAdversePct(bot.direction, price, bot.entry)
+					// ATR(1h) ≈ 2 × ATR(15m) — the entry-time scanner figure.
+					limit := bot.atrEntry * 2.0 * 0.75 / 100.0
+					if adverse >= limit &&
+						!worker.trancheTimeBoxTrending(ctx, bot.symbol) &&
+						worker.trancheTurnConfirmed(ctx, bot.symbol, price, bot.entry) {
+						trancheReason = "подтверждённый adverse 0.75×ATR(1h)"
+					}
 				}
-			}
 				if trancheReason != "" {
 					tag, tErr := worker.db.Exec(ctx, `
 						UPDATE paper_grid_bots

@@ -49,11 +49,11 @@ type radarInput struct {
 	symbol    string
 	direction string
 
-	price       decimal.Decimal
-	antiHunt    *decimal.Decimal // nil = no stop anchored
+	price        decimal.Decimal
+	antiHunt     *decimal.Decimal // nil = no stop anchored
 	lower, upper decimal.Decimal
-	atrEntryPct float64 // model_state.atrPctEntry, % per 15m bar
-	total       decimal.Decimal
+	atrEntryPct  float64 // model_state.atrPctEntry, % per 15m bar
+	total        decimal.Decimal
 
 	// inventorySide: +1 long inventory (price below mid / LONG bot),
 	// −1 short inventory, 0 flat.
@@ -230,6 +230,13 @@ func (worker *Worker) radarPass(ctx context.Context, settings Settings, bots []r
 	// Cascade legs (once per pass, market-wide).
 	legs, maxLeg := worker.cascadeLegs(ctx)
 
+	// ACTIVE re-scores fast (the action matrix is only as early as its
+	// slowest input); SHADOW keeps the calm 5-minute observational cadence.
+	scoreThrottle := radarScoreEvery
+	if settings.StopForecastMode == "ACTIVE" {
+		scoreThrottle = 90 * time.Second
+	}
+
 	now := time.Now().UTC()
 	for _, b := range bots {
 		parkNow, parkMed, hurst := worker.symbolScanStats(ctx, b.symbol)
@@ -238,7 +245,7 @@ func (worker *Worker) radarPass(ctx context.Context, settings Settings, bots []r
 		// Band state from model_state via the last snapshot band stored
 		// in-bot (read through a tiny query, throttled by insert time).
 		prevBand, lastAt, ok := worker.lastRadarSnapshot(ctx, b.botID)
-		if ok && now.Sub(lastAt) < radarScoreEvery {
+		if ok && now.Sub(lastAt) < scoreThrottle {
 			continue
 		}
 
@@ -275,6 +282,11 @@ func (worker *Worker) radarPass(ctx context.Context, settings Settings, bots []r
 				"score": decimal.NewFromFloat(rs.Score).Round(3).String(), "total": b.total.Round(2).String(),
 			})
 		}
+
+		// Phase B (v2.0.52): ACTIVE executes the matrix — a B3/B4 score
+		// re-centers the grid instead of donating the stop; in SHADOW the
+		// call below no-ops (mode gate inside).
+		worker.radarMaybeRecenter(ctx, settings, b, rs)
 	}
 
 	// Bounded retention, batched like every other smart-data table.
@@ -322,7 +334,7 @@ func (worker *Worker) dominanceSlope(ctx context.Context) (slopeBps, btc24h floa
 	if den == 0 {
 		return 0, btc24h
 	}
-	slope := (n*sxy - sx*sy) / den // dominance % per second
+	slope := (n*sxy - sx*sy) / den    // dominance % per second
 	return slope * 3600 * 100, btc24h // → bps per hour (1% dominance = 100 bps)
 }
 
