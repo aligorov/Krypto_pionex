@@ -781,7 +781,7 @@ func (s *Service) CloseAllActiveBots(ctx context.Context, reason string) error {
 	rows, err := s.db.Query(ctx, `
 		SELECT id, COALESCE(bot_number, 0), symbol, direction, entry_price, leverage,
 		       quote_investment, lower_price, upper_price, grid_num, last_grid_level,
-		       realized_pnl_usdt, COALESCE(mark_price, 0)
+		       realized_pnl_usdt, COALESCE(mark_price, 0), candidate_id
 		FROM paper_grid_bots
 		WHERE settings_id = $1 AND status = 'RUNNING'
 	`, settings.ID)
@@ -798,6 +798,7 @@ func (s *Service) CloseAllActiveBots(ctx context.Context, reason string) error {
 		gridNum                  int
 		lastLevel                *int
 		realized, mark           decimal.Decimal
+		candidateID              *string
 	}
 	bots := make([]closeBot, 0)
 	for rows.Next() {
@@ -805,7 +806,7 @@ func (s *Service) CloseAllActiveBots(ctx context.Context, reason string) error {
 		if err := rows.Scan(
 			&b.id, &b.bNum, &b.symbol, &b.direction, &b.entry, &b.leverage,
 			&b.investment, &b.lower, &b.upper, &b.gridNum, &b.lastLevel,
-			&b.realized, &b.mark,
+			&b.realized, &b.mark, &b.candidateID,
 		); err != nil {
 			rows.Close()
 			return fmt.Errorf("close all paper bots: %w", err)
@@ -834,6 +835,7 @@ func (s *Service) CloseAllActiveBots(ctx context.Context, reason string) error {
 		`, b.id, settings.ID, reason, total); err != nil {
 			return fmt.Errorf("close paper bot %s: %w", b.symbol, err)
 		}
+		recordCandidateOutcome(ctx, s.db, b.candidateID, total, reason)
 		var evPrice *decimal.Decimal
 		if b.mark.GreaterThan(decimal.Zero) {
 			evPrice = &b.mark
@@ -1276,13 +1278,14 @@ func (s *Service) RequestBotClose(ctx context.Context, settingsID, botID, reason
 	var entry, investment, lower, upper, realized, mPrice decimal.Decimal
 	var leverage, gridNum int
 	var lastLevel *int
+	var candidateID *string
 	if err := s.db.QueryRow(ctx, `
 		SELECT COALESCE(bot_number, 0), symbol, direction, entry_price, leverage,
 		       quote_investment, lower_price, upper_price, grid_num, last_grid_level,
-		       realized_pnl_usdt, COALESCE(mark_price, 0)
+		       realized_pnl_usdt, COALESCE(mark_price, 0), candidate_id
 		FROM paper_grid_bots WHERE id = $1
 	`, botID).Scan(&bNum, &sym, &direction, &entry, &leverage, &investment, &lower,
-		&upper, &gridNum, &lastLevel, &realized, &mPrice); err == nil && mPrice.GreaterThan(decimal.Zero) {
+		&upper, &gridNum, &lastLevel, &realized, &mPrice, &candidateID); err == nil && mPrice.GreaterThan(decimal.Zero) {
 		settings, settingsErr := s.GetSettings(ctx)
 		if settingsErr == nil {
 			total := paperCloseSettleTotal(paperSettleBot{
@@ -1302,6 +1305,7 @@ func (s *Service) RequestBotClose(ctx context.Context, settingsID, botID, reason
 				return "", fmt.Errorf("close paper bot: %w", err)
 			}
 			if tag.RowsAffected() == 1 {
+				recordCandidateOutcome(ctx, s.db, candidateID, total, reason)
 				_ = LogBotEvent(ctx, s.db, botID, bNum, "PAPER", sym, "MANUAL_STOP", &mPrice, &total, map[string]any{"reason": reason})
 				return "PAPER", nil
 			}

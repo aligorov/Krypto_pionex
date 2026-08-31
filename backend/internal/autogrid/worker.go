@@ -1203,6 +1203,7 @@ func (worker *Worker) deployPaper(
 					'trancheDeployed', $22::INT,
 					'trancheBase', $23::TEXT,
 					'atrPctEntry', $24::FLOAT8,
+					'entryFeatures', $25::JSONB,
 					'warning', 'paper PnL is not a native Pionex grid backtest'
 				),
 				$13, $14,
@@ -1218,7 +1219,7 @@ func (worker *Worker) deployPaper(
 			candidate.CurrentPrice, settings.PnLTargetMode, target, maxLoss,
 			confluence.Status, mesh.GridStepPct, confluence.Score, antiHuntStop,
 			levReason, levMode, settings.Leverage,
-			trancheFlag(trancheOn), settings.BudgetUSDT.String(), atrPct).Scan(&botID, &botNumber)
+			trancheFlag(trancheOn), settings.BudgetUSDT.String(), atrPct, entryFeaturesJSON(candidate)).Scan(&botID, &botNumber)
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				continue
@@ -2889,7 +2890,8 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 		       COALESCE(peak_pnl_usdt, 0),
 		       COALESCE(NULLIF(model_state->>'trancheDeployed','')::INT, 0),
 		       NULLIF(model_state->>'trancheBase',''),
-		       COALESCE(NULLIF(model_state->>'atrPctEntry','')::FLOAT8, 0)
+		       COALESCE(NULLIF(model_state->>'atrPctEntry','')::FLOAT8, 0),
+		       candidate_id, COALESCE(pairs_completed, 0), COALESCE(funding_paid_usdt, 0)
 		FROM paper_grid_bots
 		WHERE settings_id = $1 AND status = 'RUNNING'
 	`, settings.ID)
@@ -2915,6 +2917,9 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 		trancheDeployed          int
 		trancheBase              *string
 		atrEntry                 float64
+		candidateID              *string
+		pairsCompleted           int
+		fundingPaid              decimal.Decimal
 	}
 	bots := make([]paperBot, 0)
 	for rows.Next() {
@@ -2926,6 +2931,7 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 			&item.realized, &item.adjustmentsCount, &item.antiHuntStop,
 			&item.openedAt, &item.lastFundingAt,
 			&item.peak, &item.trancheDeployed, &item.trancheBase, &item.atrEntry,
+			&item.candidateID, &item.pairsCompleted, &item.fundingPaid,
 		); err != nil {
 			rows.Close()
 			return err
@@ -2997,6 +3003,8 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 		}
 		realized := bot.realized
 		unrealized := decimal.Zero
+		pairsDelta := 0
+		fundingPaid := bot.fundingPaid
 		currentLevel := 0
 		// Funding exposure: leveraged notional that funding settles on. Long
 		// inventory/positions pay the (positive) rate, short ones receive it —
@@ -3028,6 +3036,16 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 			realized = realized.Add(pairProfit)
 			fundingExposure = inventoryNotional
 			fundingPays = price.LessThan(bot.lower.Add(bot.upper).Div(decimal.NewFromInt(2)))
+			// Each level crossing completes one grid pair in the stateless
+			// ladder — the activity counter the harvest-vs-bleed analytics
+			// split needs (v2.0.54).
+			if bot.lastLevel != nil && currentLevel != previousLevel {
+				d := currentLevel - previousLevel
+				if d < 0 {
+					d = -d
+				}
+				pairsDelta = d
+			}
 			exitNotional = inventoryNotional
 		} else {
 			// Directional grid: account for entry taker fee and slippage
@@ -3060,15 +3078,20 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 		); fundingDelta != nil {
 			if fundingPays {
 				realized = realized.Sub(*fundingDelta)
+				fundingPaid = fundingPaid.Add(*fundingDelta)
 			} else {
 				realized = realized.Add(*fundingDelta)
+				fundingPaid = fundingPaid.Sub(*fundingDelta)
 			}
 			// Persist the accrual anchor separately: realized itself flows to
 			// the mark/close/adjust UPDATE below, and a crash in between can
 			// lose at most one 8h accrual — never double-count.
 			_, _ = worker.db.Exec(ctx, `
-				UPDATE paper_grid_bots SET last_funding_at = $2, updated_at = NOW() WHERE id = $1
-			`, bot.id, *nextFundingAt)
+				UPDATE paper_grid_bots SET last_funding_at = $2,
+				    funding_paid_usdt = funding_paid_usdt + $3,
+				    updated_at = NOW()
+				WHERE id = $1
+			`, bot.id, *nextFundingAt, fundingDeltaSigned(fundingPays, *fundingDelta))
 			_ = LogBotEvent(ctx, worker.db, bot.id, bot.botNumber, "PAPER", bot.symbol, "FUNDING", &price, fundingDelta, map[string]any{
 				"pays": fundingPays, "funding_usdt": fundingDelta.StringFixed(6),
 			})
@@ -3140,6 +3163,7 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 			worker.logger.Info("paper bot closed by management",
 				"component", "autogrid_worker", "symbol", bot.symbol,
 				"reason", decision.Reason, "pnl", total.String())
+			recordCandidateOutcome(ctx, worker.db, bot.candidateID, total, decision.Reason)
 
 			eventType := "STOP_LOSS"
 			if decision.Action == ActionCloseTakeProfit {
@@ -3229,15 +3253,28 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 			UPDATE paper_grid_bots
 			SET mark_price = $2, unrealized_pnl_usdt = $3,
 			    realized_pnl_usdt = $4, last_grid_level = $5,
+			    pairs_completed = pairs_completed + $6,
+			    funding_paid_usdt = $7,
 			    peak_pnl_usdt = GREATEST(peak_pnl_usdt, $3::NUMERIC + $4::NUMERIC),
 			    trough_pnl_usdt = LEAST(trough_pnl_usdt, $3::NUMERIC + $4::NUMERIC),
 			    updated_at = NOW()
 			WHERE id = $1
-		`, bot.id, price, unrealized, realized, currentLevel); mErr != nil {
+		`, bot.id, price, unrealized, realized, currentLevel, pairsDelta, fundingPaid); mErr != nil {
 			worker.logger.Error("paper bot mark UPDATE failed",
 				"component", "autogrid_worker", "bot_id", bot.id, "symbol", bot.symbol, "error", mErr)
 		} else {
 			passMarked++
+			// Behavior trace (v2.0.54): the underwater-duration and
+			// recovery-shape analytics read this series, not the scalar
+			// peak/trough columns.
+			_, _ = worker.db.Exec(ctx, `
+				INSERT INTO bot_telemetry
+					(bot_id, bot_number, symbol, price, realized_pnl, unrealized_pnl,
+					 total_pnl, grid_level, inventory_notional, adjustments_count, funding_paid_usdt)
+				VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+			`, bot.id, bot.botNumber, bot.symbol, price, realized, unrealized,
+				realized.Add(unrealized), currentLevel, fundingExposure,
+				bot.adjustmentsCount, fundingPaid)
 		}
 
 		// v2.0.13 tranche 2 (paper): top the bot up to its full base after a
@@ -3297,6 +3334,9 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 		}
 	}
 	worker.radarPass(ctx, settings, radarInputs)
+
+	// Telemetry retention, batched like the radar snapshots.
+	_, _ = worker.db.Exec(ctx, `DELETE FROM bot_telemetry WHERE captured_at < NOW() - INTERVAL '14 days' AND id % 1000 = 0`)
 	return nil
 }
 

@@ -174,3 +174,42 @@ func QueueTelegramEvent(
 	`, eventType, string(payloadBytes))
 	return err
 }
+
+// recordCandidateOutcome back-fills the deployed candidate's row with the
+// bot's final result (v2.0.54): entry features and outcomes then live in
+// one table, and score calibration no longer depends on a fragile
+// candidate_id JOIN through bot rows. First outcome wins (outcome_at IS
+// NULL guard) — a re-entered symbol writes its own new candidate row.
+func recordCandidateOutcome(ctx context.Context, db *pgxpool.Pool, candidateID *string, total decimal.Decimal, reason string) {
+	if candidateID == nil || strings.TrimSpace(*candidateID) == "" {
+		return
+	}
+	_, _ = db.Exec(ctx, `
+		UPDATE autogrid_candidates
+		SET outcome_pnl_usdt = $2, outcome_closed_reason = $3, outcome_at = NOW()
+		WHERE id = $1 AND outcome_at IS NULL
+	`, *candidateID, total, reason)
+}
+
+// entryFeaturesJSON snapshots the candidate's full feature set into the
+// bot row at deploy (v2.0.54): analytics then survive candidate turnover,
+// and the entry-vs-outcome dataset no longer depends on a JOIN.
+func entryFeaturesJSON(candidate Candidate) []byte {
+	if len(candidate.ModelAssumptions) == 0 {
+		return []byte(`{}`)
+	}
+	raw, err := json.Marshal(candidate.ModelAssumptions)
+	if err != nil {
+		return []byte(`{}`)
+	}
+	return raw
+}
+
+// fundingDeltaSigned returns the accrual as a signed PAID amount: positive
+// when the bot pays funding, negative when it receives.
+func fundingDeltaSigned(pays bool, delta decimal.Decimal) decimal.Decimal {
+	if pays {
+		return delta
+	}
+	return delta.Neg()
+}

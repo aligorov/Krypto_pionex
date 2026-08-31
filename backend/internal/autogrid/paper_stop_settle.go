@@ -30,7 +30,7 @@ func (worker *Worker) settleAndStopPaperBots(ctx context.Context, settings Setti
 	rows, err := worker.db.Query(ctx, `
 		SELECT id, symbol, direction, entry_price, leverage, quote_investment,
 		       lower_price, upper_price, grid_num, last_grid_level,
-		       realized_pnl_usdt, COALESCE(peak_pnl_usdt, 0)
+		       realized_pnl_usdt, COALESCE(peak_pnl_usdt, 0), candidate_id
 		FROM paper_grid_bots
 		WHERE settings_id = $1 AND status = 'RUNNING'
 	`, settings.ID)
@@ -46,6 +46,7 @@ func (worker *Worker) settleAndStopPaperBots(ctx context.Context, settings Setti
 		gridNum                  int
 		lastLevel                *int
 		realized, peak           decimal.Decimal
+		candidateID              *string
 	}
 	bots := make([]stopBot, 0)
 	for rows.Next() {
@@ -53,6 +54,7 @@ func (worker *Worker) settleAndStopPaperBots(ctx context.Context, settings Setti
 		if err := rows.Scan(
 			&b.id, &b.symbol, &b.direction, &b.entry, &b.leverage, &b.investment,
 			&b.lower, &b.upper, &b.gridNum, &b.lastLevel, &b.realized, &b.peak,
+			&b.candidateID,
 		); err != nil {
 			rows.Close()
 			return err
@@ -86,6 +88,7 @@ func (worker *Worker) settleAndStopPaperBots(ctx context.Context, settings Setti
 				"component", "autogrid_worker", "symbol", bot.symbol, "error", err)
 			continue
 		}
+		recordCandidateOutcome(ctx, worker.db, bot.candidateID, total, reason)
 		settled++
 	}
 	// Anything left RUNNING (no price, or a failed settle) gets the legacy
