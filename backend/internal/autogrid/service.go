@@ -449,7 +449,10 @@ func (s *Service) State(ctx context.Context) (*State, error) {
 	if err != nil {
 		return nil, err
 	}
-	state.PnL = breakdownPnL(state.ActiveBots, state.ClosedBots)
+	state.PnL, err = s.breakdownPnL(ctx, settings.ID, state.ActiveBots)
+	if err != nil {
+		return nil, err
+	}
 	return state, nil
 }
 
@@ -543,13 +546,81 @@ func (s *Service) fetchAndCacheExchangeSnapshot(
 	return snapshot
 }
 
-func breakdownPnL(active []ActiveBot, closed []ClosedBot) PnLBreakdown {
-	paperActive, realActive := splitActiveBySource(active)
-	paperClosed, realClosed := splitClosedBySource(closed)
-	return PnLBreakdown{
-		Paper: summarizePnL(paperActive, paperClosed),
-		Real:  summarizePnL(realActive, realClosed),
+// closedTotals aggregates the FULL closed history for one source. The UI
+// closed-bots list is capped at LIMIT 100 for display; summing over that
+// window silently dropped older PnL from the «всего» card (2026-08-31: UI
+// showed −15.29 while the table summed +50.40 — 204 rows outside the cap
+// carried +65.69).
+type closedTotals struct {
+	realized   decimal.Decimal
+	closed     int
+	profitable int
+}
+
+func (s *Service) closedTotalsPaper(ctx context.Context, settingsID string) (closedTotals, error) {
+	var totals closedTotals
+	err := s.db.QueryRow(ctx, `
+		SELECT COUNT(*), COALESCE(SUM(realized_pnl_usdt), 0),
+		       COUNT(*) FILTER (WHERE realized_pnl_usdt > 0)
+		FROM paper_grid_bots
+		WHERE settings_id = $1
+		  AND status IN ('STOPPED', 'COMPLETED', 'EMERGENCY_STOPPED')
+	`, settingsID).Scan(&totals.closed, &totals.realized, &totals.profitable)
+	if err != nil {
+		return closedTotals{}, fmt.Errorf("paper closed pnl totals: %w", err)
 	}
+	return totals, nil
+}
+
+func (s *Service) closedTotalsReal(ctx context.Context, settingsID string) (closedTotals, error) {
+	var totals closedTotals
+	err := s.db.QueryRow(ctx, `
+		SELECT COUNT(*), COALESCE(SUM(realized_pnl_usdt), 0),
+		       COUNT(*) FILTER (WHERE realized_pnl_usdt > 0)
+		FROM grid_bots
+		WHERE autogrid_settings_id = $1
+		  AND status IN ('STOPPED', 'CANCELLED', 'COMPLETED', 'LIQUIDATED', 'FAILED')
+	`, settingsID).Scan(&totals.closed, &totals.realized, &totals.profitable)
+	if err != nil {
+		return closedTotals{}, fmt.Errorf("real closed pnl totals: %w", err)
+	}
+	return totals, nil
+}
+
+// breakdownPnL builds the «всего» summary from full-history aggregates plus
+// the live marks of running bots — never from the display-truncated list.
+func (s *Service) breakdownPnL(ctx context.Context, settingsID string, active []ActiveBot) (PnLBreakdown, error) {
+	paperActive, realActive := splitActiveBySource(active)
+	paperTotals, err := s.closedTotalsPaper(ctx, settingsID)
+	if err != nil {
+		return PnLBreakdown{}, err
+	}
+	realTotals, err := s.closedTotalsReal(ctx, settingsID)
+	if err != nil {
+		return PnLBreakdown{}, err
+	}
+	return PnLBreakdown{
+		Paper: summarizePnL(paperActive, paperTotals),
+		Real:  summarizePnL(realActive, realTotals),
+	}, nil
+}
+
+func summarizePnL(active []ActiveBot, totals closedTotals) PnLSummary {
+	summary := PnLSummary{
+		RealizedUSDT: totals.realized,
+		ClosedBots:   totals.closed,
+		Profitable:   totals.profitable,
+	}
+	for _, bot := range active {
+		if bot.RealizedPNLUSDT != nil {
+			summary.RealizedUSDT = summary.RealizedUSDT.Add(*bot.RealizedPNLUSDT)
+		}
+		if bot.UnrealizedPNLUSDT != nil {
+			summary.UnrealizedUSDT = summary.UnrealizedUSDT.Add(*bot.UnrealizedPNLUSDT)
+		}
+	}
+	summary.TotalUSDT = summary.RealizedUSDT.Add(summary.UnrealizedUSDT)
+	return summary
 }
 
 func splitActiveBySource(bots []ActiveBot) ([]ActiveBot, []ActiveBot) {
@@ -574,29 +645,6 @@ func splitClosedBySource(bots []ClosedBot) ([]ClosedBot, []ClosedBot) {
 		}
 	}
 	return paper, real
-}
-
-func summarizePnL(active []ActiveBot, closed []ClosedBot) PnLSummary {
-	summary := PnLSummary{}
-	for _, bot := range active {
-		if bot.RealizedPNLUSDT != nil {
-			summary.RealizedUSDT = summary.RealizedUSDT.Add(*bot.RealizedPNLUSDT)
-		}
-		if bot.UnrealizedPNLUSDT != nil {
-			summary.UnrealizedUSDT = summary.UnrealizedUSDT.Add(*bot.UnrealizedPNLUSDT)
-		}
-	}
-	for _, bot := range closed {
-		summary.ClosedBots++
-		if bot.RealizedPNLUSDT != nil {
-			summary.RealizedUSDT = summary.RealizedUSDT.Add(*bot.RealizedPNLUSDT)
-			if bot.RealizedPNLUSDT.GreaterThan(decimal.Zero) {
-				summary.Profitable++
-			}
-		}
-	}
-	summary.TotalUSDT = summary.RealizedUSDT.Add(summary.UnrealizedUSDT)
-	return summary
 }
 
 func (s *Service) BeginScan(
