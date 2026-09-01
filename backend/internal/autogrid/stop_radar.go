@@ -10,9 +10,10 @@ import (
 )
 
 // Stop-radar (Phase 1, SHADOW) — anticipate each running bot's stop before
-// it fires. Four-agent design 2026-08-31:
+// it fires. Four-agent design 2026-08-31, recalibrated v2.0.56 (F5) against
+// 5336 bot_risk_snapshots rows of the 2026-09-01 adverse day:
 //
-//	S = m5 · (0.40·s1 + 0.25·s2 + 0.15·s3 + 0.20·s4)
+//	S = m5 · (0.80·s1 + 0.10·s2 + 0.10·s4) + 0.30·s3
 //
 //	s1 first-passage probability of touching the anti-hunt stop within 6h,
 //	   distance measured in hourly-vol units, weighted by inventory side;
@@ -24,8 +25,15 @@ import (
 //	   armed when at least two of three legs are hot;
 //	m5 regime multiplier: latest-scan Hurst against the inventory side.
 //
+// Calibration facts that drove V4: s1 saturates (p50 0.55, ≥0.9 in 17.8% of
+// rows) while s2/s3/s4 never armed on the adverse day — the old 0.40 weight
+// capped the composite at 0.62, making B3 mathematically unreachable and the
+// whole matrix inert (1 action/21h). 0.80·s1 catches the HEMI/AXTIX class
+// 55-67 minutes before the event; the action-side dwell/cooldown gates in
+// radar_actions.go keep s1-saturation from becoming a fee machine.
+//
 // SHADOW mode computes and persists only — it never touches the exit
-// ladder. Bands (B1 ≥0.30, B2 ≥0.60, B3 ≥0.85, B4 ≥0.95) are recorded so
+// ladder. Bands (B1 ≥0.30, B2 ≥0.60, B3 ≥0.75, B4 ≥0.90) are recorded so
 // the closed ledger can price each band's would-have-saved separately.
 
 const (
@@ -36,8 +44,8 @@ const (
 
 	bandB1 = 0.30
 	bandB2 = 0.60
-	bandB3 = 0.85
-	bandB4 = 0.95
+	bandB3 = 0.75
+	bandB4 = 0.90
 )
 
 // radarInput is one running bot's per-tick state, assembled by the manage
@@ -182,7 +190,13 @@ func scoreBot(in radarInput, parkNow, parkMedian24h, latestHurst float64, fleet 
 	// every non-BTC bot regardless of local state) — a full alt-drain arm
 	// (s3 ≈ 0.9) lifts the whole fleet into B1 on its own, without which a
 	// systemic night with individually-safe distances stays invisible.
-	rs.Score = clamp01(rs.M5*(0.40*rs.S1+0.25*rs.S2+0.20*rs.S4) + 0.30*rs.S3)
+	// v2.0.56 (F5) V4 weights: S1 carries the signal (saturates at p50 0.55),
+	// S2/S4 never armed on the calibration day — the old 0.40·S1 ceiling
+	// kept the composite ≤0.62 and B3 unreachable. S3 keeps its full 0.30:
+	// it never fired in the calibration window, so its weight changes none
+	// of the V4 frequency/precision numbers while preserving the systemic
+	// alt-drain early warning.
+	rs.Score = clamp01(rs.M5*(0.80*rs.S1+0.10*rs.S2+0.10*rs.S4) + 0.30*rs.S3)
 	rs.Band = radarBand(rs.Score)
 	return rs
 }

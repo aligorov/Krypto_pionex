@@ -866,9 +866,9 @@ func (worker *Worker) deployPaper(
 			SET candidate_id = $3, mark_price = $4,
 			    unrealized_pnl_usdt = CASE
 					WHEN direction = 'LONG' THEN
-						quote_investment * leverage * ($4 / entry_price - 1)
+						quote_investment * leverage * ($4::NUMERIC / entry_price - 1)
 					WHEN direction = 'SHORT' THEN
-						quote_investment * leverage * (1 - $4 / entry_price)
+						quote_investment * leverage * (1 - $4::NUMERIC / entry_price)
 					ELSE 0
 				END,
 			    updated_at = NOW()
@@ -1131,7 +1131,19 @@ func (worker *Worker) deployPaper(
 		levReason := fmt.Sprintf("Базовое (%dx)", baseLev)
 		levMode := "BASE"
 		if settings.AdaptiveLeverageEnabled {
-			spanPct := candidateSpanPct(candidate.LowerPrice, candidate.UpperPrice)
+			// v2.0.56 (F1): judge the span the bot actually trades. HAR's
+			// applyToMesh has already rewritten the bounds by here, so the
+			// candidate S/R span is stale: scanner-narrow candidates widened
+			// to 16-25% meshes were de-geared like narrow grids (checkpoint
+			// 2026-09-01: SKYAI/GIGGLE 2x on wide meshes) while targets below
+			// already scale off the post-HAR span.
+			spanPct := 0.0
+			if mesh.UpperPrice.GreaterThan(mesh.LowerPrice) && candidate.CurrentPrice.IsPositive() {
+				spanPct, _ = mesh.UpperPrice.Sub(mesh.LowerPrice).Div(candidate.CurrentPrice).Mul(decimal.NewFromInt(100)).Float64()
+			}
+			if spanPct <= 0 {
+				spanPct = candidateSpanPct(candidate.LowerPrice, candidate.UpperPrice)
+			}
 			dyn := ComputeDynamicLeverage(atrPct, baseLev, spanPct)
 			botLev = dyn.Leverage
 			levReason = dyn.Reason
@@ -1145,6 +1157,16 @@ func (worker *Worker) deployPaper(
 			levReason = fmt.Sprintf("HAR σ=%.0f%%/год R²=%.2f (%dx)",
 				harGeo.forecastPct, harGeo.geo.Confidence, botLev)
 			levMode = "HAR"
+		}
+
+		// v2.0.56 (F9): block directional flip-entries on a symbol that ran
+		// another direction <12h ago. The cascade-short window is the
+		// designed escape valve and stays exempt.
+		if (trend == "long" || trend == "short") && !(cascadeShort && trend == "short") &&
+			worker.directionalFlipBlocked(ctx, candidate.Symbol, strings.ToUpper(trend), true) {
+			worker.rejectCandidate(ctx, candidate,
+				"флип направления: символ закрыл бота другого направления ≤12ч назад — направленный вход отложен", nil)
+			continue
 		}
 
 		confluence := EvaluateConfluence(candidate, nil, nil)
@@ -1247,6 +1269,9 @@ func (worker *Worker) deployPaper(
 			WHERE id = $1
 		`, settings.ID)
 	}
+	// F10: capture the scan's top-scored rejections for the shadow
+	// portfolio — after the deploy loop, off the hot path, fail-open.
+	worker.captureShadowCandidates(ctx, settings, scanID)
 	return nil
 }
 
@@ -1659,6 +1684,14 @@ func (worker *Worker) deployReal(
 				"каскад-триггер: внеочередной скан деплоит только SHORT-кандидаты", nil)
 			continue
 		}
+		// v2.0.56 (F9, REAL mirror): block directional flip-entries on a
+		// symbol that ran another direction <12h ago; cascade-shorts exempt.
+		if (trend == "long" || trend == "short") && !(cascadeShort && trend == "short") &&
+			worker.directionalFlipBlocked(ctx, candidate.Symbol, strings.ToUpper(trend), false) {
+			worker.rejectCandidate(ctx, candidate,
+				"флип направления: символ закрыл бота другого направления ≤12ч назад — направленный вход отложен", nil)
+			continue
+		}
 		// v2.0.21 beta gate (REAL mirror).
 		if betaDownReal && trend != "short" {
 			worker.rejectCandidate(ctx, candidate,
@@ -1726,7 +1759,16 @@ func (worker *Worker) deployReal(
 		}
 		botLev := baseLev
 		if settings.AdaptiveLeverageEnabled {
-			spanPct := candidateSpanPct(candidate.LowerPrice, candidate.UpperPrice)
+			// v2.0.56 (F1): mirror of the paper path — the de-gear span must
+			// come from the final mesh (HAR applyToMesh ran above), not the
+			// stale candidate S/R bounds.
+			spanPct := 0.0
+			if mesh.UpperPrice.GreaterThan(mesh.LowerPrice) && candidate.CurrentPrice.IsPositive() {
+				spanPct, _ = mesh.UpperPrice.Sub(mesh.LowerPrice).Div(candidate.CurrentPrice).Mul(decimal.NewFromInt(100)).Float64()
+			}
+			if spanPct <= 0 {
+				spanPct = candidateSpanPct(candidate.LowerPrice, candidate.UpperPrice)
+			}
 			dyn := ComputeDynamicLeverage(atrPct, baseLev, spanPct)
 			botLev = dyn.Leverage
 		} else if smartLev > 0 && smartLev < botLev {
@@ -2167,6 +2209,8 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 		worker.logger.Error("manage paper bots", "component", "autogrid_worker", "error", err)
 	}
 	worker.autotuneIfDue(ctx, *settings)
+	// F10: replay matured shadow rows in bounded batches (own due-anchor).
+	worker.shadowSimIfDue(ctx, *settings)
 	worker.maybeQueueCascadeShortScan(ctx, *settings)
 	// Pin the implicitly resolved account into settings when possible so
 	// deploys and supervision stay on the same account. Supervision itself
@@ -2467,6 +2511,31 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 					}
 				}
 				if topUp != "" {
+					// v2.0.56 (F2): the doubling below doubles max_loss with the
+					// injected margin — same risk gate as the paper path. The
+					// skip writes a 1h backoff marker so an armed 24h time-box
+					// cannot re-log every manage pass.
+					if skip := worker.tranche2RiskGate(ctx, settings.ID, bot.id, botMaxLoss.Mul(decimal.NewFromInt(2)), false); skip != "" {
+						tag, tErr2 := worker.db.Exec(ctx, `
+						UPDATE grid_bots
+						SET model_state = jsonb_set(model_state, '{tranche2SkipAt}',
+							to_jsonb(to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'))),
+						    updated_at = NOW()
+						WHERE id = $1
+						  AND COALESCE(NULLIF(model_state->>'trancheDeployed','')::INT, 0) = 1
+						  AND COALESCE((model_state->>'tranche2SkipAt')::TIMESTAMPTZ, '1970-01-01') < NOW() - INTERVAL '1 hour'
+					`, bot.id)
+						if tErr2 == nil && tag.RowsAffected() == 1 {
+							_ = LogBotEvent(ctx, worker.db, bot.id, bot.botNumber, "REAL", bot.symbol, "TRANCHE_2_SKIPPED", &price, nil, map[string]any{
+								"reason": skip, "effective_max_loss": botMaxLoss.Mul(decimal.NewFromInt(2)).StringFixed(2),
+							})
+							worker.logger.Info("tranche 2 (REAL) skipped by risk gate",
+								"component", "autogrid_worker", "bot_id", bot.id, "reason", skip)
+						}
+						topUp = ""
+					}
+				}
+				if topUp != "" {
 					pending := base.Sub(bot.investment)
 					if _, err := worker.service.AdjustBot(ctx, worker.accounts, settings.ID, bot.id, AdjustBotInput{
 						Mode:            "invest_in",
@@ -2527,6 +2596,25 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 					}
 				}
 			}
+		}
+
+		// Behavior trace (v2.0.56 F7): REAL bots join the bot_telemetry
+		// series so underwater/recovery analytics cover the real fleet too.
+		// inventory_notional comes from the exchange-reported position;
+		// grid_level/funding stay 0 — the real loop tracks neither per pass.
+		// Best-effort insert, same contract as the paper path.
+		if bot.localStatus == "RUNNING" {
+			inventoryNotional := decimal.Zero
+			if !remote.BUOrderData.Position.IsZero() && price.GreaterThan(decimal.Zero) {
+				inventoryNotional = remote.BUOrderData.Position.Abs().Mul(price)
+			}
+			_, _ = worker.db.Exec(ctx, `
+				INSERT INTO bot_telemetry
+					(bot_id, bot_number, symbol, price, realized_pnl, unrealized_pnl,
+					 total_pnl, grid_level, inventory_notional, adjustments_count, funding_paid_usdt)
+				VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+			`, bot.id, bot.botNumber, bot.symbol, price, realized, unrealized,
+				realized.Add(unrealized), 0, inventoryNotional, bot.adjustments, decimal.Zero)
 		}
 
 		peakNow := bot.peak
@@ -2841,6 +2929,91 @@ func (worker *Worker) reconcileUnknownSubmissions(ctx context.Context, client *p
 // managePaperBots marks paper bots to market and closes them when the same
 // PnL rules that govern real bots are hit, so PAPER mode exercises the whole
 // lifecycle.
+// tranche2MaxLossCapUSDT caps the per-bot effective stop after a tranche-2
+// top-up: the doubling below doubles max_loss along with the capital, and a
+// σ-scaled target on a wide 4x mesh can authorize outsized stops (checkpoint
+// 2026-09-01: HEMI quietly carried $29.51 under an "$8" desk).
+const tranche2MaxLossCapUSDT = 12.0
+
+// tranche2RiskGate (v2.0.56 F2) guards the tranche-2 top-up: the doubled
+// stop must stay under the per-bot cap AND the resulting fleet stop envelope
+// under 0.8× the risk engine's daily-loss breaker (a synchronized stop wave
+// must not outrun the breaker that is supposed to catch it). Returns "" when
+// the top-up is allowed, otherwise a human-readable skip reason. Envelope
+// query failure fails OPEN: deploy-time gates stay fail-closed, but starving
+// a healthy bot of its second half over a read failure is the worse trade.
+func (worker *Worker) tranche2RiskGate(ctx context.Context, settingsID, botID string, effMaxLoss decimal.Decimal, paper bool) string {
+	capUSDT := decimal.NewFromFloat(tranche2MaxLossCapUSDT)
+	if effMaxLoss.GreaterThan(capUSDT) {
+		return fmt.Sprintf("кап эффективного стопа: %s > %s USDT", effMaxLoss.StringFixed(2), capUSDT.StringFixed(2))
+	}
+	rs, err := worker.risk.LoadSettings(ctx)
+	if err != nil || rs == nil || !rs.MaxDailyLossUSD.GreaterThan(decimal.Zero) {
+		return ""
+	}
+	envelopeLimit := rs.MaxDailyLossUSD.Mul(decimal.NewFromFloat(0.8))
+	var envelope decimal.Decimal
+	var qErr error
+	if paper {
+		qErr = worker.db.QueryRow(ctx, `
+			SELECT COALESCE(SUM(max_loss_usdt), 0) + $2::NUMERIC
+			FROM paper_grid_bots
+			WHERE settings_id = $1 AND status = 'RUNNING' AND id <> $3
+		`, settingsID, effMaxLoss, botID).Scan(&envelope)
+	} else {
+		qErr = worker.db.QueryRow(ctx, `
+			SELECT COALESCE(SUM(max_loss_usdt), 0) + $2::NUMERIC
+			FROM grid_bots
+			WHERE autogrid_settings_id = $1 AND bu_order_id IS NOT NULL
+			  AND status IN ('RUNNING', 'STOP_REQUESTED', 'STOPPING') AND id <> $3
+		`, settingsID, effMaxLoss, botID).Scan(&envelope)
+	}
+	if qErr != nil {
+		return ""
+	}
+	if envelope.GreaterThan(envelopeLimit) {
+		return fmt.Sprintf("конверт стопов флота %s > 0.8× дневного брейкера %s",
+			envelope.StringFixed(2), envelopeLimit.StringFixed(2))
+	}
+	return ""
+}
+
+// directionalFlipBlocked (v2.0.56 F9): a DIRECTIONAL entry into a symbol
+// that ran a bot of a different direction within the last 12 hours is a
+// flip-trade on stale structure (2026-09-01: WLD ran NEUTRAL to a 03:34
+// close, a LONG deployed 05:16 and donated −8.09 = 91% of the day's
+// losses). NEUTRAL re-entries stay free. The 14d ledger shows directional
+// entries at 1W/3L for 69% of all losses — the flip window is where they
+// concentrate.
+func (worker *Worker) directionalFlipBlocked(ctx context.Context, symbol, upperTrend string, paper bool) bool {
+	var flipped bool
+	if paper {
+		if err := worker.db.QueryRow(ctx, `
+			SELECT EXISTS (
+				SELECT 1 FROM paper_grid_bots
+				WHERE symbol = $1 AND status = 'COMPLETED'
+				  AND direction <> $2
+				  AND COALESCE(closed_at, updated_at) > NOW() - INTERVAL '12 hours'
+			)
+		`, symbol, upperTrend).Scan(&flipped); err != nil {
+			return false
+		}
+		return flipped
+	}
+	if err := worker.db.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM grid_bots
+			WHERE symbol = $1
+			  AND status IN ('STOPPED', 'LIQUIDATED', 'COMPLETED', 'FAILED')
+			  AND direction <> $2
+			  AND COALESCE(closed_at, updated_at) > NOW() - INTERVAL '12 hours'
+		)
+	`, symbol, upperTrend).Scan(&flipped); err != nil {
+		return false
+	}
+	return flipped
+}
+
 func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) error {
 	priceBySymbol, err := worker.priceMap(ctx)
 	if err != nil {
@@ -3309,7 +3482,40 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 					}
 				}
 				if trancheReason != "" {
-					tag, tErr := worker.db.Exec(ctx, `
+					// v2.0.56 (F2): gate the doubling — per-bot effective stop
+					// cap + fleet envelope ≤ 0.8× daily breaker. The event
+					// payload now carries the effective target/stop so the
+					// risk desk no longer shows "$8" over a $16 stop.
+					effMaxLoss, effTarget := decimal.Zero, decimal.Zero
+					if bot.maxLoss != nil {
+						effMaxLoss = bot.maxLoss.Mul(decimal.NewFromInt(2))
+					}
+					if bot.pnlTarget != nil {
+						effTarget = bot.pnlTarget.Mul(decimal.NewFromInt(2))
+					}
+					if skip := worker.tranche2RiskGate(ctx, settings.ID, bot.id, effMaxLoss, true); skip != "" {
+						// Backoff marker: the 24h time-box keeps the trigger
+						// armed forever, so a gated skip must not re-log on
+						// every manage pass — one event per hour max.
+						tag, tErr2 := worker.db.Exec(ctx, `
+						UPDATE paper_grid_bots
+						SET model_state = jsonb_set(model_state, '{tranche2SkipAt}',
+							to_jsonb(to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'))),
+						    updated_at = NOW()
+						WHERE id = $1 AND status = 'RUNNING'
+						  AND COALESCE(NULLIF(model_state->>'trancheDeployed','')::INT, 0) = 1
+						  AND COALESCE((model_state->>'tranche2SkipAt')::TIMESTAMPTZ, '1970-01-01') < NOW() - INTERVAL '1 hour'
+					`, bot.id)
+						if tErr2 == nil && tag.RowsAffected() == 1 {
+							_ = LogBotEvent(ctx, worker.db, bot.id, bot.botNumber, "PAPER", bot.symbol, "TRANCHE_2_SKIPPED", &price, nil, map[string]any{
+								"reason": skip, "investment": base.String(),
+								"effective_max_loss": effMaxLoss.StringFixed(2),
+							})
+							worker.logger.Info("tranche 2 skipped by risk gate",
+								"component", "autogrid_worker", "symbol", bot.symbol, "reason", skip)
+						}
+					} else {
+						tag, tErr := worker.db.Exec(ctx, `
 						UPDATE paper_grid_bots
 						SET quote_investment = $2,
 						    pnl_target_usdt = pnl_target_usdt * 2,
@@ -3319,15 +3525,18 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 						WHERE id = $1 AND status = 'RUNNING'
 						  AND COALESCE(NULLIF(model_state->>'trancheDeployed','')::INT, 0) = 1
 					`, bot.id, base)
-					if tErr == nil && tag.RowsAffected() == 1 {
-						worker.logger.Info("tranche 2 deployed",
-							"component", "autogrid_worker", "symbol", bot.symbol, "reason", trancheReason)
-						_ = LogBotEvent(ctx, worker.db, bot.id, bot.botNumber, "PAPER", bot.symbol, "TRANCHE_2", &price, nil, map[string]any{
-							"reason": trancheReason, "investment": base.String(),
-						})
-						_ = QueueTelegramEvent(ctx, worker.db, "TRANCHE_2", map[string]any{
-							"bot_number": bot.botNumber, "symbol": bot.symbol, "reason": trancheReason,
-						})
+						if tErr == nil && tag.RowsAffected() == 1 {
+							worker.logger.Info("tranche 2 deployed",
+								"component", "autogrid_worker", "symbol", bot.symbol, "reason", trancheReason)
+							_ = LogBotEvent(ctx, worker.db, bot.id, bot.botNumber, "PAPER", bot.symbol, "TRANCHE_2", &price, nil, map[string]any{
+								"reason": trancheReason, "investment": base.String(),
+								"effective_target": effTarget.StringFixed(2), "effective_max_loss": effMaxLoss.StringFixed(2),
+							})
+							_ = QueueTelegramEvent(ctx, worker.db, "TRANCHE_2", map[string]any{
+								"bot_number": bot.botNumber, "symbol": bot.symbol, "reason": trancheReason,
+								"effective_max_loss": effMaxLoss.StringFixed(2),
+							})
+						}
 					}
 				}
 			}

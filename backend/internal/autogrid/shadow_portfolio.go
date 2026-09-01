@@ -1,0 +1,374 @@
+package autogrid
+
+import (
+	"context"
+	"encoding/json"
+	"strings"
+	"time"
+
+	"github.com/shopspring/decimal"
+)
+
+// Shadow portfolio of rejected candidates (v2.0.56 F10). The 2026-09-01
+// checkpoint left two questions unanswerable: does the score rank entries
+// (r = −0.01 on outcomes said no, but n was 10), and do the entry gates add
+// alpha or only turnover (no counterfactual exists). This module captures
+// the top-scored REJECTED candidates per scan and replays them through the
+// same pure paper-model core the live fleet runs on (neutralGridPaperPNL +
+// decideBotAction) over public 5-minute klines — gate/score alpha becomes
+// measurable instead of assumed.
+//
+// Deliberate simplifications (recorded per-row in sim_notes): no tranche-2,
+// no radar re-centers, regime unknown (adverse-close on break), scanner
+// geometry instead of the post-HAR deploy mesh. Shadow therefore measures
+// the ENTRY SIGNAL under the exit policy — comparisons against real bots
+// are ranking-level, not absolute-PnL-level.
+
+const (
+	shadowFlagKey  = "shadow_portfolio"
+	shadowTopZ     = 5               // top-scored rejected candidates captured per scan
+	shadowOpenCap  = 200             // max unsimulated rows before capture pauses
+	shadowSimBatch = 50              // rows per simulation run
+	shadowSimDue   = 20 * time.Hour  // min spacing between simulation runs
+	shadowSimAge   = 24 * time.Hour  // row must mature (tranche time-box horizon)
+	shadowKlines   = 600             // 5M candles ≈ 50h of coverage
+)
+
+func (worker *Worker) shadowPortfolioEnabled(ctx context.Context) bool {
+	enabled := true
+	_ = worker.db.QueryRow(ctx, `
+		SELECT COALESCE((SELECT enabled FROM feature_flags WHERE name = $1), true)
+	`, shadowFlagKey).Scan(&enabled)
+	return enabled
+}
+
+// captureShadowCandidates runs once per completed paper deploy round: one
+// INSERT..SELECT over that scan's rejected candidates. The hot gate gauntlet
+// and rejectCandidate are untouched — zero latency added to the scan; the
+// partial unique index on (symbol) WHERE NOT simulated dedups repeats
+// without code.
+func (worker *Worker) captureShadowCandidates(ctx context.Context, settings Settings, scanID string) {
+	if !worker.shadowPortfolioEnabled(ctx) {
+		return
+	}
+	var open int
+	if err := worker.db.QueryRow(ctx,
+		`SELECT COUNT(*) FROM shadow_candidates WHERE NOT simulated`,
+	).Scan(&open); err != nil || open >= shadowOpenCap {
+		return
+	}
+	tag, err := worker.db.Exec(ctx, `
+		WITH ranked AS (
+			SELECT c.id, c.score, c.rejection_reason, c.recommended_trend,
+			       c.lower_price, c.upper_price, c.grid_num, c.current_price, c.scan_id,
+			       ROW_NUMBER() OVER (ORDER BY c.score DESC NULLS LAST) AS rn
+			FROM autogrid_candidates c
+			WHERE c.scan_id = $1 AND c.decision = 'REJECTED'
+			  AND NOT EXISTS (SELECT 1 FROM shadow_candidates s
+			                  WHERE s.symbol = c.symbol AND s.simulated = FALSE)
+		)
+		INSERT INTO shadow_candidates
+			(candidate_id, scan_id, symbol, score, rejection_reason, direction,
+			 mesh_lower, mesh_upper, grid_num, entry_price, leverage, investment, fee_bps)
+		SELECT id, scan_id, symbol, score, rejection_reason,
+		       UPPER(CASE COALESCE(NULLIF(recommended_trend, ''), 'no_trend')
+		             WHEN 'no_trend' THEN 'NEUTRAL'
+		             ELSE recommended_trend END),
+		       lower_price, upper_price, grid_num, current_price, $2, $3, $4
+		FROM ranked WHERE rn <= $5
+	`, scanID, settings.Leverage, settings.BudgetUSDT,
+		settings.FeeBps.Add(settings.SlippageBps), shadowTopZ)
+	if err != nil {
+		worker.logger.Warn("shadow capture failed",
+			"component", "autogrid_worker", "scan", scanID, "error", err)
+		return
+	}
+	if n := tag.RowsAffected(); n > 0 {
+		worker.logger.Info("shadow candidates captured",
+			"component", "autogrid_worker", "scan", scanID, "rows", n)
+	}
+}
+
+// shadowSimIfDue replays matured shadow rows in bounded batches. The anchor
+// is MAX(simulated_at) itself — no marker row needed.
+func (worker *Worker) shadowSimIfDue(ctx context.Context, settings Settings) {
+	if !worker.shadowPortfolioEnabled(ctx) {
+		return
+	}
+	// Due-anchor via the pending index (WHERE simulated ORDER BY captured_at
+	// DESC) — the newest simulated row is always a safe lower bound for the
+	// last run, and MAX(simulated_at) has no index to lean on.
+	var lastSim *time.Time
+	if err := worker.db.QueryRow(ctx, `
+		SELECT simulated_at FROM shadow_candidates
+		WHERE simulated ORDER BY captured_at DESC LIMIT 1
+	`).Scan(&lastSim); err != nil {
+		return
+	}
+	if lastSim != nil && time.Since(*lastSim) < shadowSimDue {
+		return
+	}
+
+	type shadowRow struct {
+		id           string
+		candidateID  string
+		symbol       string
+		direction    string
+		meshLower    decimal.Decimal
+		meshUpper    decimal.Decimal
+		gridNum      int
+		entry        decimal.Decimal
+		leverage     int
+		investment   decimal.Decimal
+		feeBps       decimal.Decimal
+		capturedAt   time.Time
+	}
+	rows, err := worker.db.Query(ctx, `
+		SELECT id, candidate_id::TEXT, symbol, direction,
+		       mesh_lower, mesh_upper, grid_num, entry_price,
+		       leverage, investment, fee_bps, captured_at
+		FROM shadow_candidates
+		WHERE NOT simulated AND captured_at < NOW() - INTERVAL '24 hours'
+		ORDER BY captured_at
+		LIMIT $1
+	`, shadowSimBatch)
+	if err != nil {
+		worker.logger.Warn("shadow sim select failed",
+			"component", "autogrid_worker", "error", err)
+		return
+	}
+	pending := make([]shadowRow, 0, shadowSimBatch)
+	for rows.Next() {
+		var r shadowRow
+		if err := rows.Scan(
+			&r.id, &r.candidateID, &r.symbol, &r.direction,
+			&r.meshLower, &r.meshUpper, &r.gridNum, &r.entry,
+			&r.leverage, &r.investment, &r.feeBps, &r.capturedAt,
+		); err != nil {
+			rows.Close()
+			return
+		}
+		pending = append(pending, r)
+	}
+	rows.Close()
+
+	for _, r := range pending {
+		worker.simulateShadowRow(ctx, settings, r.id, r.candidateID, r.symbol, r.direction,
+			r.meshLower, r.meshUpper, r.gridNum, r.entry, r.leverage, r.investment,
+			r.feeBps, r.capturedAt)
+	}
+
+	// Bounded retention, batched like every other smart-data table.
+	_, _ = worker.db.Exec(ctx, `
+		DELETE FROM shadow_candidates
+		WHERE simulated AND simulated_at < NOW() - INTERVAL '90 days' AND id % 100 = 0
+	`)
+}
+
+// simulateShadowRow replays one captured rejection through the paper-model
+// core. Best-effort per row: a failure marks the row simulated with the
+// error note so one bad row cannot wedge the batch.
+func (worker *Worker) simulateShadowRow(
+	ctx context.Context, settings Settings,
+	id, candidateID, symbol, direction string,
+	lower, upper decimal.Decimal, gridNum int,
+	entry decimal.Decimal, leverage int,
+	investment, feeBps decimal.Decimal, capturedAt time.Time,
+) {
+	fail := func(note string) {
+		nb, _ := json.Marshal(map[string]string{"error": note})
+		_, _ = worker.db.Exec(ctx, `
+			UPDATE shadow_candidates
+			SET simulated = TRUE, simulated_at = NOW(), sim_notes = $2::JSONB
+			WHERE id = $1 AND NOT simulated
+		`, id, string(nb))
+	}
+
+	// Division guard: a zero entry price would panic the directional replay
+	// and wedge the rest of the manage pass.
+	if !entry.GreaterThan(decimal.Zero) || !upper.GreaterThan(lower) || gridNum < 2 {
+		fail("degenerate geometry")
+		return
+	}
+
+	// Candidate features for the dynamic target computation.
+	var volD, ddD decimal.Decimal
+	var maRaw []byte
+	if err := worker.db.QueryRow(ctx, `
+		SELECT COALESCE(volatility, 0), COALESCE(max_drawdown_pct, 0), model_assumptions
+		FROM autogrid_candidates WHERE id = $1
+	`, candidateID).Scan(&volD, &ddD, &maRaw); err != nil {
+		fail("candidate load: " + err.Error())
+		return
+	}
+	assumptions := map[string]any{}
+	_ = json.Unmarshal(maRaw, &assumptions)
+	cand := Candidate{
+		ModelAssumptions: assumptions,
+		VolatilityPct:    volD,
+		MaxDrawdownPct:   ddD,
+		LowerPrice:       lower,
+		UpperPrice:       upper,
+		CurrentPrice:     entry,
+	}
+	spanPct := 0.0
+	if upper.GreaterThan(lower) && entry.GreaterThan(decimal.Zero) {
+		spanPct, _ = upper.Sub(lower).Div(entry).Mul(decimal.NewFromInt(100)).Float64()
+	}
+	target, maxLoss := computeBotTargets(settings, cand, leverage, spanPct)
+	pnlTarget, maxLossUSDT := decimal.Zero, decimal.Zero
+	if target != nil {
+		pnlTarget = *target
+	}
+	if maxLoss != nil {
+		maxLossUSDT = *maxLoss
+	}
+
+	atrPct := 2.0
+	if v, ok := assumptions["atrPct"].(float64); ok && v > 0 {
+		atrPct = v
+	}
+	atrPrice := entry.Mul(decimal.NewFromFloat(atrPct / 100.0))
+	antiHunt := ComputeAntiHuntStop(direction, lower, upper, entry, atrPrice, 1.5)
+
+	candles, err := worker.publicClient.GetKlines(ctx, symbol, "5M", shadowKlines)
+	if err != nil {
+		fail("klines: " + err.Error())
+		return
+	}
+	windowEnd := capturedAt.Add(24 * time.Hour)
+	started := false
+	windowStart := time.Time{}
+	used := 0
+
+	// Replay state (mirrors the manage loop's paper bot).
+	realized := decimal.Zero
+	lastLevel := gridLevelForPrice(lower, upper, gridNum, entry)
+	peak, trough := decimal.Zero, decimal.Zero
+	var fundingLast *time.Time
+
+	// Average snapshot funding rate for the symbol (fraction → bps).
+	var fundingAvg decimal.Decimal
+	_ = worker.db.QueryRow(ctx, `
+		SELECT COALESCE(AVG(funding_rate), 0) FROM funding_snapshots
+		WHERE symbol = $1 AND captured_at > NOW() - INTERVAL '24 hours'
+	`, symbol).Scan(&fundingAvg)
+	rateBps := fundingAvg.Mul(decimal.NewFromInt(10000))
+
+	outcome, outcomeReason := "", "WINDOW_END"
+	total := decimal.Zero
+
+	candleTime := time.Time{}
+	for _, c := range candles {
+		candleTime = time.UnixMilli(c.Time)
+		if candleTime.Before(capturedAt) {
+			continue
+		}
+		if candleTime.After(windowEnd) {
+			break
+		}
+		if !started {
+			started = true
+			windowStart = candleTime
+		}
+		used++
+
+		// Intrabar anti-hunt breach (pessimistic SL-first: checked on the
+		// candle extremes before the close-based decision).
+		breached := false
+		if direction == "SHORT" {
+			breached = antiHunt.GreaterThan(decimal.Zero) && c.High.GreaterThanOrEqual(antiHunt)
+		} else {
+			breached = antiHunt.GreaterThan(decimal.Zero) && c.Low.LessThanOrEqual(antiHunt)
+		}
+
+		unrealized := decimal.Zero
+		exposure := decimal.Zero
+		switch {
+		case breached:
+			// fall through to decision below with breach price
+			c.Close = antiHunt
+		case direction == "LONG" || direction == "SHORT":
+			unrealized = investment.Mul(decimal.NewFromInt(int64(leverage)))
+			if direction == "LONG" {
+				unrealized = unrealized.Mul(c.Close.Div(entry).Sub(decimal.NewFromInt(1)))
+			} else {
+				unrealized = unrealized.Mul(decimal.NewFromInt(1).Sub(c.Close.Div(entry)))
+			}
+			exposure = investment.Mul(decimal.NewFromInt(int64(leverage)))
+		default:
+			level := gridLevelForPrice(lower, upper, gridNum, c.Close)
+			// Pairs pay the maker fee (the live loop's ladder contract), not
+			// the captured taker+slippage composite — otherwise every shadow
+			// NEUTRAL row is ~26 bps pessimistic per pair and gate/score
+			// alpha drowns in a systematic fee error.
+			pairProfit, uninv, invNotional := neutralGridPaperPNL(
+				lower, upper, gridNum, investment, leverage, lastLevel, level, c.Close,
+				decimal.NewFromFloat(pionexMakerFeeBps))
+			realized = realized.Add(pairProfit)
+			unrealized = uninv
+			lastLevel = level
+			exposure = invNotional
+		}
+
+		if delta, anchor := fundingAccrual(exposure, rateBps, capturedAt, fundingLast, candleTime); delta != nil {
+			realized = realized.Sub(*delta)
+			fundingLast = anchor
+		} else if anchor != nil {
+			fundingLast = anchor
+		}
+
+		total = realized.Add(unrealized)
+		if total.GreaterThan(peak) {
+			peak = total
+		}
+		if total.LessThan(trough) {
+			trough = total
+		}
+
+		decision := decideBotAction(botActionInput{
+			Direction:        direction,
+			Lower:            lower,
+			Upper:            upper,
+			CurrentPrice:     c.Close,
+			RealizedPNL:      realized,
+			UnrealizedPNL:    unrealized,
+			PeakPNL:          peak,
+			Budget:           investment,
+			PnLTarget:        pnlTarget,
+			MaxLoss:          maxLossUSDT,
+			RangeBreakBuffer: settings.RangeBreakBufferPct,
+			AdjustmentsLeft:  0, // shadow = no-skill baseline: breaks close, never re-center
+			Regime:           "",
+			AntiHuntStop:     &antiHunt,
+		})
+		if strings.HasPrefix(decision.Action, "CLOSE") || breached {
+			if breached {
+				outcomeReason = "STRUCT_INVALID_ANTI_HUNT"
+			} else {
+				outcomeReason = decision.Reason
+			}
+			outcome = total.StringFixed(4)
+			break
+		}
+	}
+	if outcome == "" {
+		outcome = total.StringFixed(4)
+	}
+
+	notes, _ := json.Marshal(map[string]any{
+		"model":            "klines_5m_replay_v1",
+		"simplifications":  []string{"no_tranche2", "no_recenter", "regime_unknown", "scanner_mesh"},
+		"window_clipped":   started && windowStart.Sub(capturedAt) > 15*time.Minute,
+	})
+	_, _ = worker.db.Exec(ctx, `
+		UPDATE shadow_candidates
+		SET simulated = TRUE, simulated_at = NOW(),
+		    pnl_target_usdt = $2, max_loss_usdt = $3,
+		    sim_window_start = $4, sim_window_end = $5, candles_used = $6,
+		    outcome_pnl_usdt = $7::NUMERIC, outcome_reason = $8,
+		    mfe_usdt = $9, mae_usdt = $10, sim_notes = $11::JSONB
+		WHERE id = $1 AND NOT simulated
+	`, id, pnlTarget, maxLossUSDT, windowStart, candleTime, used,
+		outcome, outcomeReason, peak, trough, string(notes))
+}

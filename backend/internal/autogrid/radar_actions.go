@@ -25,11 +25,46 @@ import (
 //	B4     escape re-center, may exceed the budget by one — it replaces a
 //	       stop-loss, and a stop never asked the budget's permission
 //
-// Churn guard: one radar action per bot per radarActionCooldown. Acting on
-// every indicator twitch is how an active manager becomes a fee machine
-// (2026-08-31 audit: even manual operator churn cost $3-8/day).
+// Churn guard (v2.0.56 F5 calibration): one radar action per bot per 2h plus
+// a dwell requirement — the signal must sit over B3 for ≥3 consecutive
+// snapshots before acting. On the calibration day s1≥0.9 sat in 17.8% of all
+// rows; without dwell+cooldown that saturation becomes a fee machine, with
+// them the ~20 signals/adverse-day collapse to ~22 re-centers of which ~64%
+// precede an adverse confirmation (2026-08-31 audit: even manual operator
+// churn cost $3-8/day).
+const (
+	radarActionCooldown = 2 * time.Hour
+	radarDwellTicks     = 3
+	radarMinBotAge      = 30 * time.Minute
+)
 
-const radarActionCooldown = 60 * time.Minute
+// radarDwellAtOrAbove counts the trailing consecutive snapshots of the bot at
+// or above the threshold (current snapshot included — it is persisted before
+// the action matrix runs).
+func (worker *Worker) radarDwellAtOrAbove(ctx context.Context, botID string, threshold float64) int {
+	rows, err := worker.db.Query(ctx, `
+		SELECT score FROM bot_risk_snapshots
+		WHERE bot_id = $1 ORDER BY captured_at DESC LIMIT 6
+	`, botID)
+	if err != nil {
+		return 0
+	}
+	defer rows.Close()
+	n := 0
+	for rows.Next() {
+		var score decimal.Decimal
+		if err := rows.Scan(&score); err != nil {
+			break
+		}
+		f, _ := score.Float64()
+		if f >= threshold {
+			n++
+		} else {
+			break
+		}
+	}
+	return n
+}
 
 // recenterBounds mirrors adjustDecision's geometry: same width, centered
 // on the live price.
@@ -71,6 +106,14 @@ func (worker *Worker) radarMaybeRecenter(ctx context.Context, settings Settings,
 	}
 	worker.radarActionMu.Unlock()
 
+	// v2.0.56 (F5) dwell gate: act only on a signal that has persisted for
+	// ≥3 consecutive snapshots over B3 — a single spike is noise. Checked
+	// after the in-memory cooldown so the snapshot query only runs for
+	// cooldown-eligible bots.
+	if worker.radarDwellAtOrAbove(ctx, b.botID, bandB3) < radarDwellTicks {
+		return
+	}
+
 	type actBot struct {
 		direction            string
 		entry, investment    decimal.Decimal
@@ -80,23 +123,29 @@ func (worker *Worker) radarMaybeRecenter(ctx context.Context, settings Settings,
 		lastLevel            *int
 		antiHunt             *decimal.Decimal
 		adjustments          int
+		openedAt             time.Time
 	}
 	var bot actBot
 	err := worker.db.QueryRow(ctx, `
 		SELECT direction, entry_price, quote_investment,
 		       lower_price, upper_price, realized_pnl_usdt, unrealized_pnl_usdt,
 		       leverage, grid_num, last_grid_level, anti_hunt_stop_price,
-		       COALESCE(adjustments_count, 0)
+		       COALESCE(adjustments_count, 0), opened_at
 		FROM paper_grid_bots
 		WHERE id = $1 AND status = 'RUNNING'
 	`, b.botID).Scan(
 		&bot.direction, &bot.entry, &bot.investment,
 		&bot.lower, &bot.upper, &bot.realized, &bot.unrealized,
 		&bot.leverage, &bot.gridNum, &bot.lastLevel, &bot.antiHunt,
-		&bot.adjustments,
+		&bot.adjustments, &bot.openedAt,
 	)
 	if err != nil {
 		return // not RUNNING (a close won the race) or already gone
+	}
+	// v2.0.56 (F5): a bot younger than 30 minutes has no radar history worth
+	// trusting — its distance-to-stop picture is entry noise, not regime.
+	if time.Since(bot.openedAt) < radarMinBotAge {
+		return
 	}
 	if rs.Band < 4 && bot.adjustments >= settings.MaxAdjustmentsPerBot {
 		return // budget spent; B4 below still gets its escape slot

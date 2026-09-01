@@ -112,10 +112,11 @@ func TestScoreBotCascadeNeedsTwoLegs(t *testing.T) {
 }
 
 func TestRadarBandBoundaries(t *testing.T) {
+	// v2.0.56 (F5): B3 0.85→0.75, B4 0.95→0.90 (V4 calibration).
 	cases := []struct {
 		score float64
 		band  int
-	}{{0.29, 0}, {0.30, 1}, {0.59, 1}, {0.60, 2}, {0.84, 2}, {0.85, 3}, {0.94, 3}, {0.95, 4}, {1.0, 4}}
+	}{{0.29, 0}, {0.30, 1}, {0.59, 1}, {0.60, 2}, {0.74, 2}, {0.75, 3}, {0.89, 3}, {0.90, 4}, {1.0, 4}}
 	for _, c := range cases {
 		if got := radarBand(c.score); got != c.band {
 			t.Fatalf("radarBand(%.2f) = %d, want %d", c.score, got, c.band)

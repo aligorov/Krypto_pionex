@@ -46,8 +46,8 @@ type manageDecision struct {
 
 // decideBotAction is the pure supervision policy for a running bot:
 //  1. take the money when the per-bot PnL target is reached;
-//  2. lock in profit on trailing pullback when peak profit reached >= 70% of target;
-//  3. protect breakeven when peak profit reached >= 50% of target;
+//  2. lock in profit on trailing pullback once peak profit arms at >= 50% of target;
+//  3. protect breakeven when an armed peak decays back near flat;
 //  4. cut the loss at the configured maximum;
 //  5. when price escapes the grid range, follow the break with a native range
 //     shift when the regime allows, otherwise close to avoid trend damage.
@@ -70,17 +70,17 @@ func decideBotAction(input botActionInput) manageDecision {
 
 	// 2. Trailing Take-Profit & Early Profit Lock
 	if input.PnLTarget.GreaterThan(decimal.Zero) {
-		// Early Profit Locking: arm trailing as soon as bot reaches 35% of target
-		// (or >= $3.50 USDT profit on a $10 target). This ensures that every winning move is banked
-		// and never allowed to reverse into a losing stop-loss.
-		targetArmThreshold := input.PnLTarget.Mul(decimal.NewFromFloat(0.35))
-		minArmDollar := decimal.NewFromFloat(3.50)
-		if targetArmThreshold.GreaterThan(minArmDollar) {
-			targetArmThreshold = minArmDollar
-		}
+		// Early Profit Locking: arm trailing once peak profit reaches 50% of
+		// target. v2.0.56: the arm is a pure fraction of the target with NO
+		// dollar cap — the retired min(0.35×target, $3.50) form cut all 5/5
+		// trailing exits of the 24h checkpoint at 0.68–0.79×peak ($3.1–6.6
+		// banked against an $18 target): the fixed $3.50 cap armed the trail
+		// far too early and never let σ-scaled targets mature their peaks.
+		// Checkpoint convergence for v2.0.56: capture 0.76×peak, goal ≥0.85.
+		targetArmThreshold := input.PnLTarget.Mul(decimal.NewFromFloat(0.5))
 
 		if input.PeakPNL.GreaterThanOrEqual(targetArmThreshold) {
-			// Breakeven Lock: if peak was >= $3.50 but profit decays near zero, lock profit (+0.2% budget)
+			// Breakeven Lock: if an armed peak decays back near zero, lock profit (+0.2% budget)
 			breakevenFloor := input.Budget.Mul(decimal.NewFromFloat(0.002))
 			if total.LessThanOrEqual(breakevenFloor) {
 				return manageDecision{Action: ActionCloseTakeProfit, Reason: "BREAKEVEN_LOCK"}
@@ -95,6 +95,10 @@ func decideBotAction(input botActionInput) manageDecision {
 			// banked at ~$3.50 (2026-08-30 ledger: 7/7 wins at the arm).
 			// v2.0.52: cap raised to 85% of arm — winners on the 08-31
 			// tape kept surrendering the last 15% above the floor.
+			// v2.0.56: with the arm at 50% of target the 0.85×arm cap
+			// (0.425×target) sits above the 0.30×target guarantee, so the
+			// plain 20% trail governs; the cap stays as a guard against
+			// future arm retuning reintroducing the arming-tick inversion.
 			pullbackTolerance := input.PeakPNL.Mul(decimal.NewFromFloat(0.20))
 			trailingFloor := input.PeakPNL.Sub(pullbackTolerance)
 			guaranteedFloorCap := targetArmThreshold.Mul(decimal.NewFromFloat(0.85))
