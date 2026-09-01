@@ -52,7 +52,7 @@ type CollectorConfig struct {
 	FundingInterval   time.Duration // default 60s
 	OIInterval        time.Duration // default 5m
 	SentimentInterval time.Duration // default 1h
-	EventsInterval    time.Duration // default 1h
+	EventsInterval    time.Duration // default 6h (weekly feed)
 	CoinGeckoInterval time.Duration // default 10m
 
 	HTTPTimeout        time.Duration // default 10s per request
@@ -73,7 +73,7 @@ func DefaultCollectorConfig(symbols []string) CollectorConfig {
 		FundingInterval:      60 * time.Second,
 		OIInterval:           5 * time.Minute,
 		SentimentInterval:    time.Hour,
-		EventsInterval:       time.Hour,
+		EventsInterval:       6 * time.Hour,
 		CoinGeckoInterval:    10 * time.Minute,
 		HTTPTimeout:          10 * time.Second,
 		MinRequestInterval:   time.Second,
@@ -96,7 +96,7 @@ func (cfg CollectorConfig) withDefaults() CollectorConfig {
 		cfg.SentimentInterval = time.Hour
 	}
 	if cfg.EventsInterval <= 0 {
-		cfg.EventsInterval = time.Hour
+		cfg.EventsInterval = 6 * time.Hour
 	}
 	if cfg.CoinGeckoInterval <= 0 {
 		cfg.CoinGeckoInterval = 10 * time.Minute
@@ -185,6 +185,13 @@ type Collector struct {
 	cfg        CollectorConfig
 	httpClient *http.Client
 	limiters   map[string]*exchangeLimiter
+
+	// Economic-feed backoff (v2.0.58): faireconomy rate-limits aggressively
+	// (prod: 429 since 2026-08-30, ingestion dead, the gate went blind once
+	// the week buffer expired). Only collectEconomicEvents touches these —
+	// its loop goroutine is single-threaded, no lock needed.
+	econFailures int
+	econRetryAt  time.Time
 
 	// Dynamic universe (v2.0.3): when a UniverseSource is configured the
 	// funding/OI loops switch from the static watch list to bulk endpoints
@@ -531,11 +538,29 @@ func (c *Collector) collectSentiment(ctx context.Context) {
 // ---------------------------------------------------------------------------
 
 func (c *Collector) collectEconomicEvents(ctx context.Context) {
-	var feed []forexFactoryEvent
-	if err := c.getJSON(ctx, limiterKeyEvents, c.cfg.ForexFactoryEndpoint, &feed); err != nil {
-		slog.Warn("economic events collector: fetch failed", "error", err)
+	// 429-aware backoff: each failure doubles the wait (6h→12h→24h→48h cap);
+	// a success resets. Hammering a rate-limited feed hourly only extends
+	// the ban and gave the operator zero signal that the gate was blind.
+	if time.Now().Before(c.econRetryAt) {
 		return
 	}
+	var feed []forexFactoryEvent
+	if err := c.getJSON(ctx, limiterKeyEvents, c.cfg.ForexFactoryEndpoint, &feed); err != nil {
+		c.econFailures++
+		shift := c.econFailures
+		if shift > 3 {
+			shift = 3
+		}
+		backoff := c.cfg.EventsInterval * time.Duration(1<<shift)
+		if backoff > 48*time.Hour {
+			backoff = 48 * time.Hour
+		}
+		c.econRetryAt = time.Now().Add(backoff)
+		slog.Warn("economic events collector: fetch failed, backing off",
+			"error", err, "failures", c.econFailures, "retry_in", backoff.String())
+		return
+	}
+	c.econFailures = 0
 
 	inserted := 0
 	for _, event := range filterHighImpactEvents(feed) {
@@ -603,6 +628,7 @@ func (c *Collector) getJSON(ctx context.Context, limiterKey, endpoint string, ou
 		return fmt.Errorf("build request %s: %w", endpoint, err)
 	}
 	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", "pionex-autogrid-collector/2.0 (+marketdata)")
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {

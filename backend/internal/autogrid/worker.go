@@ -68,6 +68,9 @@ type Worker struct {
 	// betaRegime caches the BTC market regime behind the v2.0.21 beta
 	// gate (same single-goroutine argument as trancheTBRegime).
 	betaRegime betaRegimeCache
+	// dataAlarmAt dedups data-health alarms to one per feed per 24h
+	// (same single-goroutine argument as trancheTBRegime).
+	dataAlarmAt map[string]time.Time
 }
 
 type trancheTBTrend struct {
@@ -106,6 +109,7 @@ func NewWorker(
 		logger:          logger,
 		owner:           fmt.Sprintf("autogrid-%d", time.Now().UnixNano()),
 		trancheTBRegime: make(map[string]trancheTBTrend),
+		dataAlarmAt:    make(map[string]time.Time),
 		radarActionAt:   make(map[string]time.Time),
 	}
 }
@@ -386,11 +390,13 @@ func (worker *Worker) scanAndDeploy(
 	return scanID, nil
 }
 
-// hydrateCandidatesFunding stamps the latest cross-exchange funding rate on
-// every scanned candidate in one batched query, so the UI column, the
-// persisted audit trail and the deploy gates all see the same number.
-// Symbols without collector coverage (Pionex-exclusive listings) keep a nil
-// rate — the funding column stays empty for them.
+// hydrateCandidatesFunding stamps the latest funding rate on every scanned
+// candidate in one batched query, so the UI column, the persisted audit
+// trail and the deploy gates all see the same number. Cross-exchange
+// average first, then the Pionex-native rate overlays it (v2.0.58 F6) —
+// Pionex-exclusive listings the collector can never cover finally get a
+// real number instead of a nil that silently disarms the flush gate and
+// the smart-direction funding context.
 func (worker *Worker) hydrateCandidatesFunding(ctx context.Context, candidates []marketdata.ScannerCandidate) {
 	if len(candidates) == 0 || worker.market == nil {
 		return
@@ -403,19 +409,30 @@ func (worker *Worker) hydrateCandidatesFunding(ctx context.Context, candidates [
 	if err != nil {
 		worker.logger.Warn("funding hydration skipped",
 			"component", "autogrid_worker", "error", err)
-		return
+		funding = map[string]*marketdata.FundingInfo{}
 	}
+	native := worker.nativeFundingRates(ctx)
 	hydrated := 0
 	for i := range candidates {
-		info := funding[candidates[i].Symbol]
-		if info == nil {
+		sym := candidates[i].Symbol
+		var rate *decimal.Decimal
+		extreme := false
+		if n, ok := native[sym]; ok {
+			r := n
+			rate = &r
+			extreme = n.Abs().GreaterThan(decimal.NewFromFloat(0.001))
+		} else if info := funding[sym]; info != nil {
+			r := decimal.NewFromFloat(info.AverageRate)
+			rate = &r
+			extreme = info.IsExtreme
+		}
+		if rate == nil {
 			continue
 		}
-		rate := decimal.NewFromFloat(info.AverageRate)
-		candidates[i].FundingRate = &rate
+		candidates[i].FundingRate = rate
 		if candidates[i].ModelAssumptions != nil {
 			candidates[i].ModelAssumptions["fundingIncluded"] = true
-			candidates[i].ModelAssumptions["fundingExtreme"] = info.IsExtreme
+			candidates[i].ModelAssumptions["fundingExtreme"] = extreme
 		}
 		hydrated++
 	}
@@ -423,6 +440,24 @@ func (worker *Worker) hydrateCandidatesFunding(ctx context.Context, candidates [
 		worker.logger.Info("funding hydrated on candidates",
 			"component", "autogrid_worker", "hydrated", hydrated, "total", len(candidates))
 	}
+}
+
+// nativeFundingRates returns the venue-authoritative next 8h funding rate
+// per symbol (fraction) from Pionex's public /market/indexes — one call for
+// the whole universe, covering Pionex-exclusive listings the cross-exchange
+// collector can never see. Best-effort: an empty map keeps prior behavior.
+func (worker *Worker) nativeFundingRates(ctx context.Context) map[string]decimal.Decimal {
+	rates := make(map[string]decimal.Decimal, 512)
+	indexes, err := worker.publicClient.GetIndexes(ctx, "")
+	if err != nil {
+		return rates
+	}
+	for _, idx := range indexes {
+		if !idx.NextFundingRate.IsZero() {
+			rates[strings.ToUpper(strings.TrimSpace(idx.Symbol))] = idx.NextFundingRate
+		}
+	}
+	return rates
 }
 
 // noteDeployBlock persists a deployment-freeze reason into
@@ -1422,8 +1457,18 @@ func (worker *Worker) deployReal(
 	if llmSettings, err := worker.llm.GetSettings(ctx); err == nil {
 		llmBrainEnabled = llmSettings.Enabled && strings.TrimSpace(llmSettings.APIKey) != ""
 	}
+	// v2.0.58 (audit 2026-09-01): deployReal never ran the macro gate —
+	// beta-drift/alt-drain vetoes protected paper only, the exact paths
+	// REAL capital would ride. Same context load as the paper round.
+	macroCtx := worker.loadMacroContext(ctx)
 	for _, candidate := range candidates {
 		if candidate.Decision != "ACCEPTED" || activeCount >= settings.MaxActiveBots {
+			continue
+		}
+		// Macro gate (REAL mirror of the paper path): market-wide rotation
+		// is invisible to pair-level ADX/Hurst — the 2026-08-30 night class.
+		if veto, reason, macroTel := macroVeto(strings.ToLower(strings.TrimSpace(candidate.RecommendedTrend)), cascadeShort, macroCtx); veto {
+			worker.rejectCandidate(ctx, candidate, reason, macroTel)
 			continue
 		}
 		if !isEntryTimingFavorable(candidate) {
@@ -2200,6 +2245,41 @@ func (worker *Worker) pinManagedAccount(ctx context.Context, settings *Settings)
 	settings.AccountID = resolved
 }
 
+// dataHealthCheck (v2.0.58) watches the two feeds whose silent death costs
+// the most: the economic calendar (the deploy gate goes blind with no
+// future events in the table — the faireconomy feed 429'd unnoticed from
+// 2026-08-30) and the liquidation stream (the Binance WS topic was
+// misnamed for the system's entire history, zero rows ever, cascade gate
+// inert). One alarm per feed per 24h; recovered feeds clear silently.
+func (worker *Worker) dataHealthCheck(ctx context.Context) {
+	alarm := func(key, message string) {
+		if last, ok := worker.dataAlarmAt[key]; ok && time.Since(last) < 24*time.Hour {
+			return
+		}
+		worker.dataAlarmAt[key] = time.Now().UTC()
+		worker.logger.Warn("data feed stale", "component", "autogrid_worker", "feed", key, "detail", message)
+		_ = QueueTelegramEvent(ctx, worker.db, "EMERGENCY", map[string]any{
+			"message": message,
+		})
+	}
+	var futureEvents int
+	if err := worker.db.QueryRow(ctx, `
+		SELECT COUNT(*) FROM economic_events
+		WHERE event_time > NOW() AND (country = 'USD' OR country IS NULL OR country = '')
+	`).Scan(&futureEvents); err == nil && futureEvents == 0 {
+		alarm("economic_events",
+			"Календарь USD пуст: нет будущих событий — эконом-гейт деплоя слеп (фетч ForexFactory мёртв?)")
+	}
+	var lastLiq *time.Time
+	if err := worker.db.QueryRow(ctx, `
+		SELECT MAX(captured_at) FROM liquidation_events
+	`).Scan(&lastLiq); err == nil &&
+		(lastLiq == nil || time.Since(*lastLiq) > 3*time.Hour) {
+		alarm("liquidation_events",
+			"Ликвидации не пишутся >3ч — каскад-гейт слеп (Binance WS поток мёртв?)")
+	}
+}
+
 func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 	settings, err := worker.service.GetSettings(ctx)
 	if err != nil {
@@ -2211,6 +2291,9 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 	worker.autotuneIfDue(ctx, *settings)
 	// F10: replay matured shadow rows in bounded batches (own due-anchor).
 	worker.shadowSimIfDue(ctx, *settings)
+	// v2.0.58: data-feed health — a silently dead collector must announce
+	// itself instead of fail-opening every gate that leans on it.
+	worker.dataHealthCheck(ctx)
 	worker.maybeQueueCascadeShortScan(ctx, *settings)
 	// Pin the implicitly resolved account into settings when possible so
 	// deploys and supervision stay on the same account. Supervision itself
@@ -3149,6 +3232,13 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 				}
 			}
 		}
+		// v2.0.58 (F6): the venue-native rate overlays the cross average —
+		// it is what our perps actually settle, and the only source for
+		// Pionex-exclusive listings (2026-09-01 audit: 30% of the fleet
+		// accrued a flat 10bps while AAOIX's live rate was ~19bps).
+		for symbol, fraction := range worker.nativeFundingRates(ctx) {
+			fundingRateBySymbol[symbol] = fraction.Mul(decimal.NewFromInt(10000))
+		}
 	}
 
 	for _, bot := range bots {
@@ -3550,11 +3640,30 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 }
 
 func (worker *Worker) priceMap(ctx context.Context) (map[string]decimal.Decimal, error) {
+	// v2.0.58 (F8): mark decisions on the exchange's own markPrice — the
+	// official PnL reference per Pionex docs — fetched for the whole PERP
+	// universe in one public call. Last-trade tickers stay as the fallback:
+	// an indexes outage must not wedge supervision.
+	prices := make(map[string]decimal.Decimal, 512)
+	if indexes, err := worker.publicClient.GetIndexes(ctx, ""); err == nil {
+		for _, idx := range indexes {
+			if idx.MarkPrice.GreaterThan(decimal.Zero) {
+				sym := strings.ToUpper(strings.TrimSpace(idx.Symbol))
+				prices[sym] = idx.MarkPrice
+				trimmed := strings.TrimSuffix(strings.TrimSuffix(sym, "_PERP"), ".PERP")
+				prices[trimmed] = idx.MarkPrice
+				prices[trimmed+"_PERP"] = idx.MarkPrice
+				prices[trimmed+".PERP"] = idx.MarkPrice
+			}
+		}
+		if len(prices) > 0 {
+			return prices, nil
+		}
+	}
 	tickers, err := worker.publicClient.GetTickers(ctx, "", "PERP")
 	if err != nil {
 		return nil, err
 	}
-	prices := make(map[string]decimal.Decimal, len(tickers)*4)
 	for _, ticker := range tickers {
 		if ticker.Close.GreaterThan(decimal.Zero) {
 			sym := strings.ToUpper(strings.TrimSpace(ticker.Symbol))

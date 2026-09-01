@@ -85,6 +85,36 @@ func (c *Client) GetMarketSymbols(ctx context.Context, symbolType string) ([]Sym
 	return data.Symbols, nil
 }
 
+// IndexInfo is one symbol's index/mark/funding snapshot from the public
+// /api/v1/market/indexes endpoint. With an empty symbol it returns the whole
+// PERP universe in ONE weight-5 call — markPrice (the official PnL reference)
+// and nextFundingRate included, which makes it the authoritative source for
+// manage-loop marking and for Pionex-exclusive listings the cross-exchange
+// funding collector can never cover (found by the 2026-09-01 data-gap audit:
+// 30% of the fleet lived on a flat 10bps funding default).
+type IndexInfo struct {
+	Symbol          string          `json:"symbol"`
+	IndexPrice      decimal.Decimal `json:"indexPrice"`
+	MarkPrice       decimal.Decimal `json:"markPrice"`
+	NextFundingRate decimal.Decimal `json:"nextFundingRate"`
+	NextFundingTime int64           `json:"nextFundingTime"`
+}
+
+// GetIndexes returns index/mark/funding snapshots; empty symbol = all symbols.
+func (c *Client) GetIndexes(ctx context.Context, symbol string) ([]IndexInfo, error) {
+	query := url.Values{}
+	if symbol != "" {
+		query.Set("symbol", symbol)
+	}
+	var data struct {
+		Indexes []IndexInfo `json:"indexes"`
+	}
+	if err := c.do(ctx, http.MethodGet, "/api/v1/market/indexes", query, nil, false, 5, &data); err != nil {
+		return nil, err
+	}
+	return data.Indexes, nil
+}
+
 func (c *Client) GetTickers(ctx context.Context, symbol, symbolType string) ([]TickerInfo, error) {
 	query := url.Values{}
 	if symbol != "" {

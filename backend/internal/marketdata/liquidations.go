@@ -15,8 +15,12 @@ import (
 
 // DefaultBinanceLiquidationWS is Binance's public all-market forced-order
 // stream. No authentication is required; this is a read-only market-data
-// reference (Pionex remains the sole trading venue).
-const DefaultBinanceLiquidationWS = "wss://fstream.binance.com/ws/!forceOrders@arr"
+// reference (Pionex remains the sole trading venue). The topic name is
+// !forceOrder@arr — SINGULAR "forceOrder". The v1.3.x constant said
+// "forceOrders@arr", which Binance accepts as a connection but never pushes
+// to: the table stayed at zero rows for the system's entire history and the
+// cascade gate never fired once (found by the 2026-09-01 data-gap audit).
+const DefaultBinanceLiquidationWS = "wss://fstream.binance.com/ws/!forceOrder@arr"
 
 // liquidationFlushInterval balances two needs: the gate reads the trailing
 // HOUR (GetLiquidationSummary), and rows carry the flush timestamp as
