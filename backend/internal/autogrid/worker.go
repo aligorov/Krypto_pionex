@@ -4011,6 +4011,76 @@ func terminalOutcome(reasonBy string) (string, string) {
 
 // enrichAndAuditCandidatesWithLLM executes pre-flight evaluation on ACCEPTED
 // candidates through the configured LLM provider (Gemini / Anthropic / OpenRouter).
+// buildLLMMarketContext assembles the free-source regime block for the
+// candidate prompt: next USD high event / FOMC window, Fear&Greed, BTC 24h,
+// intraday VIX/DXY from the v2.0.59 collectors. Best-effort per leg — a dead
+// feed thins the block, never blocks the audit.
+func (worker *Worker) buildLLMMarketContext(ctx context.Context) *llm.MarketContext {
+	mc := &llm.MarketContext{}
+	var evTitle string
+	var evInMinutes int
+	if err := worker.db.QueryRow(ctx, `
+		SELECT title, FLOOR(EXTRACT(EPOCH FROM (event_time - NOW())) / 60)
+		FROM economic_events
+		WHERE impact = 'High' AND (country = 'USD' OR country IS NULL OR country = '')
+		  AND event_time > NOW() AND event_time < NOW() + INTERVAL '24 hours'
+		ORDER BY event_time LIMIT 1
+	`).Scan(&evTitle, &evInMinutes); err == nil {
+		mc.NextEventTitle = evTitle
+		mc.NextEventInMin = evInMinutes
+	}
+	if err := worker.db.QueryRow(ctx, `
+		SELECT FLOOR(EXTRACT(EPOCH FROM (decision_at - NOW())) / 60)
+		FROM fomc_meetings
+		WHERE decision_at > NOW() AND decision_at < NOW() + INTERVAL '7 days'
+		ORDER BY decision_at LIMIT 1
+	`).Scan(&mc.FomcInMin); err != nil {
+		mc.FomcInMin = 0
+	}
+	var fng int
+	if err := worker.db.QueryRow(ctx, `
+		SELECT value FROM sentiment_snapshots
+		WHERE source = 'fng' AND captured_at > NOW() - INTERVAL '36 hours'
+		ORDER BY captured_at DESC LIMIT 1
+	`).Scan(&fng); err == nil {
+		mc.FearGreed = &fng
+	}
+	if latest, _, err := marketdata.LatestCoinGeckoWindow(ctx, worker.db, time.Hour); err == nil && latest != nil {
+		btc := latest.BTC24hPct
+		mc.BTC24hPct = &btc
+	}
+	var vix, dxy float64
+	if err := worker.db.QueryRow(ctx, `
+		SELECT value::FLOAT8 FROM macro_snapshots
+		WHERE metric = 'VIX' AND captured_at > NOW() - INTERVAL '3 hours'
+		ORDER BY captured_at DESC LIMIT 1
+	`).Scan(&vix); err == nil {
+		mc.VIX = &vix
+	}
+	if err := worker.db.QueryRow(ctx, `
+		SELECT value::FLOAT8 FROM macro_snapshots
+		WHERE metric = 'DXY' AND captured_at > NOW() - INTERVAL '3 hours'
+		ORDER BY captured_at DESC LIMIT 1
+	`).Scan(&dxy); err == nil {
+		mc.DXY = &dxy
+	}
+	rows, err := worker.db.Query(ctx, `
+		SELECT title FROM news_headlines
+		WHERE captured_at > NOW() - INTERVAL '6 hours'
+		ORDER BY captured_at DESC LIMIT 3
+	`)
+	if err == nil {
+		for rows.Next() {
+			var title string
+			if rows.Scan(&title) == nil {
+				mc.Headlines = append(mc.Headlines, title)
+			}
+		}
+		rows.Close()
+	}
+	return mc
+}
+
 func (worker *Worker) enrichAndAuditCandidatesWithLLM(
 	ctx context.Context,
 	settings Settings,
@@ -4032,6 +4102,9 @@ func (worker *Worker) enrichAndAuditCandidatesWithLLM(
 	sort.SliceStable(candidates, func(i, j int) bool {
 		return candidates[i].Score.GreaterThan(candidates[j].Score)
 	})
+	// v2.0.59: one market-context build per scan — the auditor used to see
+	// only the technical matrix and its own live search.
+	marketCtx := worker.buildLLMMarketContext(ctx)
 	auditedCount := 0
 	// v2.0.19: the audit cap must never be the reason free slots stay empty.
 	// deployReal hard-fails unaudited candidates, so with N free slots the
@@ -4092,6 +4165,7 @@ func (worker *Worker) enrichAndAuditCandidatesWithLLM(
 			ProposedGridCount:   candidate.GridNum,
 			ProposedLeverage:    candidate.RecommendedLeverage,
 			RecentCandles15m:    candleSummaries,
+			MarketContext:       marketCtx,
 		}
 		if candidate.ModelAssumptions != nil {
 			if v, ok := candidate.ModelAssumptions["adx"].(float64); ok {

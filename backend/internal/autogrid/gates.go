@@ -24,18 +24,28 @@ func (worker *Worker) CheckEconomicEvents(ctx context.Context, hoursAhead int) (
 	err := worker.db.QueryRow(ctx, `
         SELECT COUNT(*) FROM economic_events`+whereClause,
 		fmt.Sprintf("%d", hoursAhead)).Scan(&count)
-	if err != nil || count == 0 {
-		return false, ""
-	}
-
-	// Get the event title
-	var title string
-	_ = worker.db.QueryRow(ctx, `
+	if err == nil && count > 0 {
+		// Get the event title
+		var title string
+		_ = worker.db.QueryRow(ctx, `
         SELECT title FROM economic_events`+whereClause+`
         ORDER BY ABS(EXTRACT(EPOCH FROM (event_time - NOW()))) LIMIT 1`,
-		fmt.Sprintf("%d", hoursAhead)).Scan(&title)
+			fmt.Sprintf("%d", hoursAhead)).Scan(&title)
+		return true, title
+	}
 
-	return true, title
+	// v2.0.59: FOMC decision windows (hard-coded 2026-2027 calendar,
+	// migration 0032). ForexFactory covers statistical releases but not the
+	// meeting calendar — a 14:00 ET rate decision moves crypto harder than
+	// most CPI prints. Window: decision-30min already passed … +3h ahead.
+	var fomcCount int
+	if err := worker.db.QueryRow(ctx, `
+		SELECT COUNT(*) FROM fomc_meetings
+		WHERE decision_at BETWEEN NOW() - INTERVAL '30 minutes' AND NOW() + INTERVAL '3 hours'
+	`).Scan(&fomcCount); err == nil && fomcCount > 0 {
+		return true, "FOMC decision window"
+	}
+	return false, ""
 }
 
 // CheckLiquidationCascade checks if there were major liquidations recently.

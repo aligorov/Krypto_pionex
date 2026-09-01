@@ -39,6 +39,9 @@ const (
 const (
 	limiterKeySentiment = "sentiment"
 	limiterKeyEvents    = "events"
+	limiterKeyFred      = "fred"
+	limiterKeyYahoo     = "yahoo"
+	limiterKeyGNews     = "gnews"
 
 	maxResponseBytes = 4 << 20 // 4 MiB safety cap per response
 )
@@ -275,6 +278,9 @@ func NewCollectorWithConfig(db *pgxpool.Pool, cfg CollectorConfig) *Collector {
 			ExchangeOKX:         {interval: cfg.MinRequestInterval},
 			limiterKeySentiment: {interval: cfg.MinRequestInterval},
 			limiterKeyEvents:    {interval: cfg.MinRequestInterval},
+			limiterKeyFred:      {interval: cfg.MinRequestInterval},
+			limiterKeyYahoo:     {interval: cfg.MinRequestInterval},
+			limiterKeyGNews:     {interval: cfg.MinRequestInterval},
 			limiterKeyCoinGecko: {interval: cfg.MinRequestInterval},
 		},
 	}
@@ -294,6 +300,9 @@ func (c *Collector) Run(ctx context.Context) {
 		{"sentiment", c.cfg.SentimentInterval, c.collectSentiment},
 		{"economic_events", c.cfg.EventsInterval, c.collectEconomicEvents},
 		{"coingecko", c.cfg.CoinGeckoInterval, c.collectCoinGecko},
+		{"macro_fred", time.Hour, c.collectFRED},
+		{"macro_yahoo", time.Hour, c.collectYahoo},
+		{"macro_gnews", time.Hour, c.collectGNews},
 		{"retention", time.Hour, c.collectRetention},
 	}
 

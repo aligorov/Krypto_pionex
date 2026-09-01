@@ -120,6 +120,22 @@ type CandidateInput struct {
 	ProposedGridCount  int             `json:"proposed_grid_count"`
 	ProposedLeverage   int             `json:"proposed_leverage"`
 	RecentCandles15m   []CandleSummary `json:"recent_candles_15m"`
+	// MarketContext (v2.0.59) gives the auditor the regime picture the
+	// technical matrix cannot show: event windows, sentiment, dollar/vol.
+	// Nil keeps the legacy prompt shape.
+	MarketContext *MarketContext `json:"market_context,omitempty"`
+}
+
+// MarketContext is the free-source macro block for the candidate prompt.
+type MarketContext struct {
+	NextEventTitle string   `json:"next_event_title,omitempty"`
+	NextEventInMin int      `json:"next_event_in_minutes,omitempty"`
+	FomcInMin      int      `json:"fomc_in_minutes,omitempty"` // 0 = none within window
+	FearGreed      *int     `json:"fear_greed_index,omitempty"`
+	BTC24hPct      *float64 `json:"btc_24h_pct,omitempty"`
+	VIX            *float64 `json:"vix,omitempty"`
+	DXY            *float64 `json:"dxy,omitempty"`
+	Headlines      []string `json:"recent_macro_headlines,omitempty"`
 }
 
 // ScannerFloor carries the operator's quantitative scanner settings into

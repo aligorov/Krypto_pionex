@@ -128,6 +128,33 @@ func BuildCandidatePrompt(input CandidateInput) (string, error) {
 		"recent_15m_candles_count": len(input.RecentCandles15m),
 		"recent_candles_15m":       input.RecentCandles15m,
 	}
+	if mc := input.MarketContext; mc != nil {
+		block := map[string]any{
+			"note": "Regime context as of the scan — factor into risk assessment (event windows, sentiment extremes, dollar/vol regime); do not treat as candidate-specific signals.",
+		}
+		if mc.NextEventTitle != "" {
+			block["next_us_high_event"] = map[string]any{"title": mc.NextEventTitle, "in_minutes": mc.NextEventInMin}
+		}
+		if mc.FomcInMin > 0 {
+			block["fomc_decision_in_minutes"] = mc.FomcInMin
+		}
+		if mc.FearGreed != nil {
+			block["fear_greed_index"] = *mc.FearGreed
+		}
+		if mc.BTC24hPct != nil {
+			block["btc_24h_pct"] = *mc.BTC24hPct
+		}
+		if mc.VIX != nil {
+			block["vix"] = *mc.VIX
+		}
+		if mc.DXY != nil {
+			block["dxy"] = *mc.DXY
+		}
+		if len(mc.Headlines) > 0 {
+			block["recent_macro_headlines"] = mc.Headlines
+		}
+		promptPayload["market_context"] = block
+	}
 
 	bytes, err := json.MarshalIndent(promptPayload, "", "  ")
 	if err != nil {
