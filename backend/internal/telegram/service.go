@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -238,6 +239,17 @@ func (s *Service) EnqueueNotification(ctx context.Context, eventType string, var
 	}
 
 	rendered := RenderTemplate(tmpl, vars)
+	// Fallback hardening (prod 2026-09-01: generic branch shipped literal
+	// {{message}}): an uncovered placeholder composes a readable line
+	// instead of reaching the operator as raw template syntax.
+	if strings.Contains(rendered, "{{") {
+		parts := make([]string, 0, len(vars))
+		for k, v := range vars {
+			parts = append(parts, fmt.Sprintf("%s=%v", k, v))
+		}
+		sort.Strings(parts)
+		rendered = fmt.Sprintf("🔔 <b>%s:</b> %s", eventType, strings.Join(parts, ", "))
+	}
 	payload := map[string]any{
 		"text":       rendered,
 		"event_type": eventType,

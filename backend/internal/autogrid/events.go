@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -137,6 +138,18 @@ func QueueTelegramEvent(
 		// closed "by themselves".
 		shouldSend = notifyAdjust
 		tmpl = tmplAdjust // same rendering slot as range shifts; vars overlap
+	case "TRANCHE_2_SKIPPED":
+		// v2.0.56 F2: risk-gated top-up skip — operator must see WHY a bot
+		// stays on its first tranche (cap $12 / fleet envelope).
+		shouldSend = notifyAdjust
+		tmpl = "⛔ <b>Транш-2 отложен:</b> бот #{{bot_number}} {{symbol}} — {{reason}}"
+	case "STOP_FORECAST_SHADOW":
+		// v2.0.57: the radar's band transitions used to fall into the
+		// generic {{message}} fallback and shipped literal placeholders
+		// (prod 2026-09-01: XLM band 2/3 twice) — they became frequent the
+		// moment the V4 calibration made band 3 reachable.
+		shouldSend = notifyAdjust
+		tmpl = "🛡 <b>Стоп-радар:</b> бот #{{bot_number}} {{symbol}} — band {{band}} (score {{score}}), total {{total}}"
 	case "RANGE_ADJUST", "ADJUST_RANGE":
 		shouldSend = notifyAdjust
 		tmpl = tmplAdjust
@@ -159,6 +172,18 @@ func QueueTelegramEvent(
 	rendered := tmpl
 	for k, v := range vars {
 		rendered = strings.ReplaceAll(rendered, fmt.Sprintf("{{%s}}", k), fmt.Sprintf("%v", v))
+	}
+	// Fallback hardening: an event whose vars don't cover the template's
+	// placeholders must never ship a literal {{...}} to the operator (prod
+	// 2026-09-01: the generic fallback rendered "Уведомление: {{message}}"
+	// twice on radar band transitions). Compose a readable line instead.
+	if strings.Contains(rendered, "{{") {
+		parts := make([]string, 0, len(vars))
+		for k, v := range vars {
+			parts = append(parts, fmt.Sprintf("%s=%v", k, v))
+		}
+		sort.Strings(parts)
+		rendered = fmt.Sprintf("🔔 <b>%s:</b> %s", eventType, strings.Join(parts, ", "))
 	}
 
 	payload := map[string]any{
