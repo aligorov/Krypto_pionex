@@ -147,8 +147,12 @@ func (l *LiquidationListener) bybitStream(ctx context.Context) error {
 	for _, sym := range symbols {
 		args = append(args, "allLiquidation."+sym)
 	}
+	// Bybit ops are JSON DATA frames — gorilla's WriteControl only accepts
+	// control frames (Close/Ping/Pong) and rejects Text with "bad write
+	// message type". WriteMessage is fine here: the ping goroutine below is
+	// the only other writer and it starts after this call returns.
 	sub, _ := json.Marshal(map[string]any{"op": "subscribe", "args": args})
-	if err := conn.WriteControl(websocket.TextMessage, sub, time.Now().Add(5*time.Second)); err != nil {
+	if err := conn.WriteMessage(websocket.TextMessage, sub); err != nil {
 		return err
 	}
 	pingStop := make(chan struct{})
@@ -163,8 +167,10 @@ func (l *LiquidationListener) bybitStream(ctx context.Context) error {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
+				// Bybit expects an application-level JSON ping (a data
+				// frame), not a WS protocol ping.
 				ping, _ := json.Marshal(map[string]string{"op": "ping"})
-				_ = conn.WriteControl(websocket.TextMessage, ping, time.Now().Add(5*time.Second))
+				_ = conn.WriteMessage(websocket.TextMessage, ping)
 			}
 		}
 	}()

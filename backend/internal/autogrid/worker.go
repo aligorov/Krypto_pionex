@@ -2323,7 +2323,7 @@ func (worker *Worker) dataHealthCheck(ctx context.Context) {
 	`).Scan(&lastLiq); err == nil &&
 		(lastLiq == nil || time.Since(*lastLiq) > 3*time.Hour) {
 		alarm("liquidation_events",
-			"Ликвидации не пишутся >3ч — каскад-гейт слеп (Binance WS поток мёртв?)")
+			"Ликвидации не пишутся >3ч — каскад-гейт слеп (WS-источник мёртв; см. app_config.liquidation_source)")
 	}
 }
 
