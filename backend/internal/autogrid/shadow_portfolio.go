@@ -3,6 +3,7 @@ package autogrid
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"time"
 
@@ -57,9 +58,24 @@ func (worker *Worker) captureShadowCandidates(ctx context.Context, settings Sett
 	).Scan(&open); err != nil || open >= shadowOpenCap {
 		return
 	}
+	// v2.0.65 observability: 13h of zero shadow rows with SUCCEEDED scans
+	// proved a silent capture failure is undiagnosable from the outside.
+	// The eligible set uses the exact WHERE of the insert below, so
+	// eligible>0 with inserted=0 is a visible red flag in every run's log.
+	eligible := -1
+	if err := worker.db.QueryRow(ctx, `
+		SELECT COUNT(*) FROM autogrid_candidates c
+		WHERE c.scan_id = $1 AND c.decision = 'REJECTED'
+		  AND NOT EXISTS (SELECT 1 FROM shadow_candidates s
+		                  WHERE s.symbol = c.symbol AND s.simulated = FALSE)
+	`, scanID).Scan(&eligible); err != nil {
+		worker.logger.Warn("shadow capture: eligible count failed",
+			"component", "autogrid_worker", "scan", scanID, "error", err)
+		eligible = -1
+	}
 	tag, err := worker.db.Exec(ctx, `
 		WITH ranked AS (
-			SELECT c.id, c.score, c.rejection_reason, c.recommended_trend,
+			SELECT c.id, c.symbol, c.score, c.rejection_reason, c.recommended_trend,
 			       c.lower_price, c.upper_price, c.grid_num, c.current_price, c.scan_id,
 			       ROW_NUMBER() OVER (ORDER BY c.score DESC NULLS LAST) AS rn
 			FROM autogrid_candidates c
@@ -74,19 +90,49 @@ func (worker *Worker) captureShadowCandidates(ctx context.Context, settings Sett
 		       UPPER(CASE COALESCE(NULLIF(recommended_trend, ''), 'no_trend')
 		             WHEN 'no_trend' THEN 'NEUTRAL'
 		             ELSE recommended_trend END),
-		       lower_price, upper_price, grid_num, current_price, $2, $3, $4
+		       lower_price, upper_price, grid_num, current_price,
+		       $2::INT, $3::NUMERIC, $4::NUMERIC
 		FROM ranked WHERE rn <= $5
 	`, scanID, settings.Leverage, settings.BudgetUSDT,
 		settings.FeeBps.Add(settings.SlippageBps), shadowTopZ)
 	if err != nil {
 		worker.logger.Warn("shadow capture failed",
-			"component", "autogrid_worker", "scan", scanID, "error", err)
+			"component", "autogrid_worker", "scan", scanID,
+			"eligible", eligible, "error", err)
+		worker.alertShadowCaptureFailure(ctx, scanID, eligible, err)
 		return
 	}
-	if n := tag.RowsAffected(); n > 0 {
-		worker.logger.Info("shadow candidates captured",
-			"component", "autogrid_worker", "scan", scanID, "rows", n)
+	worker.logger.Info(fmt.Sprintf("shadow capture: eligible=%d inserted=%d", eligible, tag.RowsAffected()),
+		"component", "autogrid_worker", "scan", scanID)
+}
+
+// alertShadowCaptureFailure makes a failing capture visible outside docker
+// logs: one durable bot_execution_events marker plus a queued Telegram
+// event, deduped to at most one per hour — the scan cycle is ~150s, so an
+// undeduped alert would flood the event stream with hundreds of copies of
+// the same error per day.
+func (worker *Worker) alertShadowCaptureFailure(ctx context.Context, scanID string, eligible int, cause error) {
+	var recentlyAlerted bool
+	if err := worker.db.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM bot_execution_events
+			WHERE event_type = 'SHADOW_CAPTURE_FAILED'
+			  AND bot_id = 'shadow-capture'
+			  AND created_at > NOW() - INTERVAL '1 hour'
+		)
+	`).Scan(&recentlyAlerted); err == nil && recentlyAlerted {
+		return
 	}
+	if err := LogBotEvent(ctx, worker.db, "shadow-capture", 0, "SYSTEM", "", "SHADOW_CAPTURE_FAILED", nil, nil, map[string]any{
+		"scan_id": scanID, "eligible": eligible, "error": cause.Error(),
+	}); err != nil {
+		worker.logger.Warn("shadow capture: failure marker write failed",
+			"component", "autogrid_worker", "error", err)
+	}
+	_ = QueueTelegramEvent(ctx, worker.db, "SHADOW_CAPTURE_FAILED", map[string]any{
+		"message": fmt.Sprintf("shadow-портфель: захват REJECTED-кандидатов падает (eligible=%d, scan=%s): %v",
+			eligible, scanID, cause),
+	})
 }
 
 // shadowSimIfDue replays matured shadow rows in bounded batches. The anchor

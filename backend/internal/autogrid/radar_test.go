@@ -70,3 +70,28 @@ func TestEvaluateConfluenceAntiFOMORejection(t *testing.T) {
 		t.Errorf("expected rejection reasons to be present")
 	}
 }
+
+// TestRadarRecenterBudgetAllows pins the header contract "B4 may exceed the
+// budget by one": B3 is capped at the normal per-bot budget, B4 keeps exactly
+// ONE escape slot beyond it (allowed at count == max, blocked at count ==
+// max+1), and higher bands share that same single slot.
+func TestRadarRecenterBudgetAllows(t *testing.T) {
+	const max = 2
+	// B3: the normal budget governs.
+	if !radarRecenterBudgetAllows(3, max-1, max) {
+		t.Fatalf("B3 below the budget must be allowed")
+	}
+	if radarRecenterBudgetAllows(3, max, max) {
+		t.Fatalf("B3 at the budget ceiling must be blocked")
+	}
+	// B4: one escape slot beyond the budget.
+	if !radarRecenterBudgetAllows(4, max, max) {
+		t.Fatalf("B4 at count == max must still be allowed (the single over-budget escape)")
+	}
+	if radarRecenterBudgetAllows(4, max+1, max) {
+		t.Fatalf("B4 at count == max+1 must be blocked — the escape slot is spent")
+	}
+	if radarRecenterBudgetAllows(5, max+1, max) {
+		t.Fatalf("higher bands share the single escape slot, not a fresh one")
+	}
+}

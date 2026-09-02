@@ -93,6 +93,18 @@ func candidateSpanPct(lower, upper decimal.Decimal) float64 {
 	return span
 }
 
+// radarRecenterBudgetAllows reports whether a re-center at the given band is
+// still within budget. B3 consumes the normal per-bot adjustment budget;
+// B4 (escape) may exceed it by exactly ONE shift — the header contract
+// "may exceed the budget by one" — and never more: an unbounded B4 lane
+// under the 2h cooldown is a fee machine wearing a stop-loss costume.
+func radarRecenterBudgetAllows(band, adjustments, maxAdjustmentsPerBot int) bool {
+	if band >= 4 {
+		return adjustments < maxAdjustmentsPerBot+1
+	}
+	return adjustments < maxAdjustmentsPerBot
+}
+
 // radarMaybeRecenter executes the B3/B4 action matrix for one bot.
 func (worker *Worker) radarMaybeRecenter(ctx context.Context, settings Settings, b radarInput, rs radarScores) {
 	if settings.StopForecastMode != "ACTIVE" || rs.Band < 3 {
@@ -147,8 +159,8 @@ func (worker *Worker) radarMaybeRecenter(ctx context.Context, settings Settings,
 	if time.Since(bot.openedAt) < radarMinBotAge {
 		return
 	}
-	if rs.Band < 4 && bot.adjustments >= settings.MaxAdjustmentsPerBot {
-		return // budget spent; B4 below still gets its escape slot
+	if !radarRecenterBudgetAllows(rs.Band, bot.adjustments, settings.MaxAdjustmentsPerBot) {
+		return // budget spent: B3 at max; B4 after its single escape slot
 	}
 	if !b.price.GreaterThan(decimal.Zero) || !bot.upper.GreaterThan(bot.lower) {
 		return

@@ -138,3 +138,28 @@ func TestIsEntryTimingFavorable(t *testing.T) {
 		t.Fatalf("expected neutral at 85%% to be rejected")
 	}
 }
+
+// TestStopEnvelopeExceeded pins the envelope verdict's boundary: a fleet
+// sitting exactly at 0.8× the breaker still deploys (the live 10×$4 paper
+// fleet on a $50 breaker must keep rotating), a cent above it is refused.
+func TestStopEnvelopeExceeded(t *testing.T) {
+	if stopEnvelopeExceeded(decimal.NewFromInt(40), decimal.NewFromInt(50)) {
+		t.Fatalf("envelope exactly at 0.8×breaker must pass")
+	}
+	if !stopEnvelopeExceeded(decimal.NewFromFloat(40.01), decimal.NewFromInt(50)) {
+		t.Fatalf("envelope above 0.8×breaker must block")
+	}
+}
+
+// TestScheduledScanArguments pins the scheduled scan's command arguments:
+// quiet window queues a plain scan, an active cascade window queues
+// cascadeShort semantics so the SCHEDULED scan's shorts keep the R1/F9
+// exemption the out-of-turn cascade scan already has.
+func TestScheduledScanArguments(t *testing.T) {
+	if got := scheduledScanArguments(false); got != `'{}'::jsonb` {
+		t.Fatalf("quiet window must queue a plain scan, got %s", got)
+	}
+	if got := scheduledScanArguments(true); got != `'{"cascadeShort": true}'::jsonb` {
+		t.Fatalf("active cascade window must queue cascadeShort semantics, got %s", got)
+	}
+}

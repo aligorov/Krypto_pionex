@@ -1269,6 +1269,20 @@ func (worker *Worker) deployPaper(
 			continue
 		}
 
+		// Fleet stop envelope: the RUNNING fleet's stops plus this
+		// candidate's tranche-1 stop must stay under 0.8× the daily-loss
+		// breaker (deploy mirror of the tranche-2 gate). A nil stop
+		// contributes nothing to the envelope either way, so the gate only
+		// arms when the candidate carries one.
+		if maxLoss != nil {
+			if reason := worker.deployStopEnvelopeGate(ctx, settings.ID, *maxLoss); reason != "" {
+				worker.rejectCandidate(ctx, candidate, reason, nil)
+				worker.logger.Info("paper deploy blocked by fleet stop envelope",
+					"component", "autogrid_worker", "symbol", candidate.Symbol)
+				continue
+			}
+		}
+
 		var botID string
 		var botNumber int
 		err = worker.db.QueryRow(ctx, `
@@ -3081,7 +3095,7 @@ func (worker *Worker) tranche2RiskGate(ctx context.Context, settingsID, botID st
 	if err != nil || rs == nil || !rs.MaxDailyLossUSD.GreaterThan(decimal.Zero) {
 		return ""
 	}
-	envelopeLimit := rs.MaxDailyLossUSD.Mul(decimal.NewFromFloat(0.8))
+	envelopeLimit := rs.MaxDailyLossUSD.Mul(decimal.NewFromFloat(riskStopEnvelopeFraction))
 	var envelope decimal.Decimal
 	var qErr error
 	if paper {
@@ -3104,6 +3118,49 @@ func (worker *Worker) tranche2RiskGate(ctx context.Context, settingsID, botID st
 	if envelope.GreaterThan(envelopeLimit) {
 		return fmt.Sprintf("конверт стопов флота %s > 0.8× дневного брейкера %s",
 			envelope.StringFixed(2), envelopeLimit.StringFixed(2))
+	}
+	return ""
+}
+
+// riskStopEnvelopeFraction is the fleet stop-envelope ceiling as a fraction
+// of the risk engine's daily-loss breaker — one source shared by the
+// tranche-2 top-up gate and the deploy gate so the two can never drift apart.
+const riskStopEnvelopeFraction = 0.8
+
+// stopEnvelopeExceeded is the shared envelope verdict. Strict inequality: a
+// fleet sitting exactly at the ceiling still deploys (the live 10×$4 paper
+// fleet against a $50 breaker must keep rotating).
+func stopEnvelopeExceeded(envelope, breaker decimal.Decimal) bool {
+	return envelope.GreaterThan(breaker.Mul(decimal.NewFromFloat(riskStopEnvelopeFraction)))
+}
+
+// deployStopEnvelopeGate is the deploy path's mirror of the tranche-2
+// envelope check: the fleet's RUNNING stop envelope plus the candidate's
+// tranche-1 stop (the same half-stop tranche2RiskGate re-doubles on the
+// top-up) must stay under the breaker — a synchronized stop wave must not
+// outrun the breaker that exists to catch it. Returns "" when the deploy may
+// proceed, otherwise a human-readable rejection reason. Read failures fail
+// OPEN with a logged warning (the same trade tranche2RiskGate makes); the
+// durable risk exam above stays the fail-closed line.
+func (worker *Worker) deployStopEnvelopeGate(ctx context.Context, settingsID string, candidateStop decimal.Decimal) string {
+	rs, err := worker.risk.LoadSettings(ctx)
+	if err != nil || rs == nil || !rs.MaxDailyLossUSD.GreaterThan(decimal.Zero) {
+		return ""
+	}
+	var envelope decimal.Decimal
+	if err := worker.db.QueryRow(ctx, `
+		SELECT COALESCE(SUM(max_loss_usdt), 0) + $2::NUMERIC
+		FROM paper_grid_bots
+		WHERE settings_id = $1 AND status = 'RUNNING'
+	`, settingsID, candidateStop).Scan(&envelope); err != nil {
+		worker.logger.Warn("deploy stop-envelope read failed; gate disarmed for this candidate",
+			"component", "autogrid_worker", "error", err)
+		return ""
+	}
+	if stopEnvelopeExceeded(envelope, rs.MaxDailyLossUSD) {
+		return fmt.Sprintf("конверт стопов флота %s > 0.8× дневного брейкера %s",
+			envelope.StringFixed(2),
+			rs.MaxDailyLossUSD.Mul(decimal.NewFromFloat(riskStopEnvelopeFraction)).StringFixed(2))
 	}
 	return ""
 }
@@ -3913,6 +3970,16 @@ func (worker *Worker) maybeQueueCascadeShortScan(ctx context.Context, settings S
 	}
 }
 
+// scheduledScanArguments builds the queued scheduled-scan command's
+// arguments literal. Both variants are compile-time constants — the value
+// never interpolates operator input, only which literal is selected.
+func scheduledScanArguments(cascadeActive bool) string {
+	if cascadeActive {
+		return `'{"cascadeShort": true}'::jsonb`
+	}
+	return `'{}'::jsonb`
+}
+
 func (worker *Worker) scheduleDueScan(ctx context.Context) error {
 	settings, err := worker.service.GetSettings(ctx)
 	if err != nil || settings.Status != "RUNNING" {
@@ -3938,13 +4005,19 @@ func (worker *Worker) scheduleDueScan(ctx context.Context) error {
 		return err
 	}
 	bucket := time.Now().Unix() / int64(settings.ScanIntervalSeconds)
+	// While the same long-liquidation cascade window that triggers the
+	// out-of-turn scan is open, the SCHEDULED scan must carry cascadeShort
+	// semantics too — otherwise its shorts are cut by R1/F9, the very gates
+	// the cascade window is the designed exemption for. Same detector call
+	// and threshold as maybeQueueCascadeShortScan.
+	cascadeActive, _ := worker.CheckLiquidationCascade(ctx, 50_000_000)
 	_, err = worker.db.Exec(ctx, `
 		INSERT INTO control_commands (
 			actor_type, command_type, resource_type, resource_id,
 			arguments, sanitized_arguments, idempotency_key, status
 		) VALUES (
 			'SYSTEM', 'autogrid.scan', 'autogrid', $1,
-			'{}'::jsonb, '{}'::jsonb, $2, 'QUEUED'
+			`+scheduledScanArguments(cascadeActive)+`, '{}'::jsonb, $2, 'QUEUED'
 		)
 		ON CONFLICT (idempotency_key) DO NOTHING
 	`, settings.ID, fmt.Sprintf("autogrid-scheduled-%s-%d", settings.ID, bucket))

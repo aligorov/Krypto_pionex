@@ -3,6 +3,7 @@ package autogrid
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -203,6 +204,202 @@ func TestDeployPaperCooldownAfterProtectiveClose(t *testing.T) {
 		if round1Decision != "REJECTED" || round1Reason == "" {
 			t.Fatalf("cooldown skip must persist a rejection reason, got %q / %q", round1Decision, round1Reason)
 		}
+	}
+}
+
+// TestDeployPaperStopEnvelopeGate pins the deploy-path fleet stop envelope:
+// when the RUNNING fleet's max_loss sum plus the candidate's tranche-1 stop
+// would exceed 0.8× the daily-loss breaker, the deploy must be refused with
+// an honest rejection reason — until now only the tranche-2 top-up was
+// gated, so a fresh deploy could widen the synchronized stop wave unchecked.
+func TestDeployPaperStopEnvelopeGate(t *testing.T) {
+	dbURL := integrationDatabaseURL(t)
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, dbURL)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	t.Cleanup(pool.Close)
+
+	worker, service, liveSettings := newCooldownTestWorker(t, pool)
+	// Pin the numbers the gate reads. Breakers are chosen for determinism
+	// against whatever the shared DB fleet carries: round 1 uses 1 USDT
+	// (limit 0.8 — any candidate stop overflows it), round 2 uses 100000
+	// (the envelope can never reach it). The bot-count caps rise so the two
+	// filler bots cannot trip the portfolio cap or the risk engine's active
+	// limit (defaults 1 and 3 — both silently consume this test's slots).
+	var savedMode, savedTarget, savedStop, savedBreaker string
+	var savedTranche bool
+	var savedMaxBots, savedMaxGridBots int
+	if err := pool.QueryRow(ctx, `
+		SELECT pnl_target_mode, pnl_target_usdt::TEXT, max_loss_usdt::TEXT, tranche_deploy_enabled,
+		       max_active_bots
+		FROM autogrid_settings WHERE id = $1
+	`, liveSettings.ID).Scan(&savedMode, &savedTarget, &savedStop, &savedTranche, &savedMaxBots); err != nil {
+		t.Fatalf("snapshot autogrid_settings: %v", err)
+	}
+	if err := pool.QueryRow(ctx, `
+		SELECT max_daily_loss_usd::TEXT, max_active_grid_bots FROM risk_settings WHERE id = 1
+	`).Scan(&savedBreaker, &savedMaxGridBots); err != nil {
+		t.Fatalf("snapshot risk_settings: %v", err)
+	}
+	t.Cleanup(func() {
+		if _, err := pool.Exec(ctx, `
+			UPDATE autogrid_settings
+			SET pnl_target_mode = $1, pnl_target_usdt = $2::NUMERIC, max_loss_usdt = $3::NUMERIC,
+			    tranche_deploy_enabled = $4, max_active_bots = $5
+			WHERE id = $6
+		`, savedMode, savedTarget, savedStop, savedTranche, savedMaxBots, liveSettings.ID); err != nil {
+			t.Errorf("restore autogrid_settings: %v", err)
+		}
+		if _, err := pool.Exec(ctx, `
+			UPDATE risk_settings
+			SET max_daily_loss_usd = $1::NUMERIC, max_active_grid_bots = $2 WHERE id = 1
+		`, savedBreaker, savedMaxGridBots); err != nil {
+			t.Errorf("restore risk_settings: %v", err)
+		}
+	})
+	if _, err := pool.Exec(ctx, `
+		UPDATE autogrid_settings
+		SET pnl_target_mode = 'STATIC', pnl_target_usdt = 6, max_loss_usdt = 8, max_active_bots = 10
+		WHERE id = $1
+	`, liveSettings.ID); err != nil {
+		t.Fatalf("pin autogrid_settings stops: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		UPDATE risk_settings SET max_daily_loss_usd = 1, max_active_grid_bots = 10 WHERE id = 1
+	`); err != nil {
+		t.Fatalf("pin round-1 breaker: %v", err)
+	}
+	settings, err := service.GetSettings(ctx)
+	if err != nil {
+		t.Fatalf("reload pinned settings: %v", err)
+	}
+
+	tickers := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"result":    true,
+			"timestamp": time.Now().UnixMilli(),
+			"data": map[string]any{
+				"tickers": []map[string]any{
+					{"symbol": "ENVEL_USDT_PERP", "close": "100", "open": "100",
+						"high": "101", "low": "99", "volume": "1000"},
+				},
+			},
+		})
+	}))
+	t.Cleanup(tickers.Close)
+	worker.publicClient = pionex.NewClient(tickers.URL, "test-key", "test-secret")
+
+	const symbol = "ENVEL_USDT_PERP"
+	tradedTF := normalizeBacktestTF(settings.CandleInterval)
+	for _, tf := range append([]string{tradedTF}, neighborBacktestTFs(tradedTF)...) {
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO backtest_jobs (symbol, interval, status, result, finished_at)
+			VALUES ($1, $2, 'DONE',
+			        '{"folds": 4, "oos_return_pct": 1.2, "oos_max_drawdown": 0.05, "round_trips": 100, "stop_hits": 0}'::jsonb,
+			        NOW())
+		`, symbol, tf); err != nil {
+			t.Fatalf("seed backtest job %s: %v", tf, err)
+		}
+	}
+	// Filler fleet: two RUNNING bots carrying a $4 stop each — the envelope
+	// is a fleet sum, so fillers on other symbols must count.
+	for i := 0; i < 2; i++ {
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO paper_grid_bots (
+				settings_id, symbol, status, direction, grid_type,
+				lower_price, upper_price, grid_num, leverage, quote_investment,
+				entry_price, mark_price, max_loss_usdt
+			) VALUES (
+				$1, $2, 'RUNNING', 'NEUTRAL', 'ARITHMETIC',
+				90, 110, 10, 2, 200,
+				100, 100, 4
+			)
+		`, settings.ID, fmt.Sprintf("ENVELFILL%d_USDT_PERP", i)); err != nil {
+			t.Fatalf("insert filler bot %d: %v", i, err)
+		}
+	}
+	t.Cleanup(func() {
+		if _, err := pool.Exec(ctx, `DELETE FROM backtest_jobs WHERE symbol = $1`, symbol); err != nil {
+			t.Errorf("cleanup backtest jobs: %v", err)
+		}
+		if _, err := pool.Exec(ctx, `DELETE FROM paper_grid_bots WHERE symbol LIKE 'ENVEL%_USDT_PERP'`); err != nil {
+			t.Errorf("cleanup paper bots: %v", err)
+		}
+	})
+
+	var scanID string
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO autogrid_scan_runs (status) VALUES ('SUCCEEDED') RETURNING id
+	`).Scan(&scanID); err != nil {
+		t.Fatalf("insert scan run: %v", err)
+	}
+	t.Cleanup(func() {
+		if _, err := pool.Exec(ctx, `DELETE FROM autogrid_scan_runs WHERE id = $1`, scanID); err != nil {
+			t.Errorf("cleanup scan run: %v", err)
+		}
+	})
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO autogrid_candidates (
+			scan_id, symbol, decision, current_price, lower_price, upper_price,
+			grid_num, recommended_trend, model_assumptions
+		) VALUES (
+			$1, $2, 'ACCEPTED', 100, 90, 110,
+			10, 'no_trend', '{"atrPct": 1.0, "regime": "RANGE"}'::jsonb
+		)
+	`, scanID, symbol); err != nil {
+		t.Fatalf("insert candidate: %v", err)
+	}
+
+	// Round 1: breaker 1 → limit 0.8; fleet 8 + candidate stop (8 full or 4
+	// tranche-1) overflows it — the deploy must be refused, with the
+	// envelope as the visible reason.
+	if err := worker.deployPaper(ctx, *settings, scanID, false); err != nil {
+		t.Fatalf("deployPaper round 1: %v", err)
+	}
+	var running int
+	if err := pool.QueryRow(ctx, `
+		SELECT COUNT(*) FROM paper_grid_bots WHERE symbol = $1 AND status = 'RUNNING'
+	`, symbol).Scan(&running); err != nil {
+		t.Fatalf("count running round 1: %v", err)
+	}
+	if running != 0 {
+		t.Fatalf("filled stop envelope must refuse the deploy, got %d running bots", running)
+	}
+	var rejection string
+	if err := pool.QueryRow(ctx, `
+		SELECT COALESCE(rejection_reason, '') FROM autogrid_candidates
+		WHERE scan_id = $1 AND symbol = $2
+	`, scanID, symbol).Scan(&rejection); err != nil {
+		t.Fatalf("load candidate round 1: %v", err)
+	}
+	if !strings.Contains(rejection, "конверт стопов флота") {
+		t.Fatalf("rejection must name the fleet stop envelope, got %q", rejection)
+	}
+
+	// Round 2: breaker 100000 → the same deploy passes and the bot lands.
+	if _, err := pool.Exec(ctx, `UPDATE risk_settings SET max_daily_loss_usd = 100000 WHERE id = 1`); err != nil {
+		t.Fatalf("raise breaker: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		UPDATE autogrid_candidates
+		SET decision = 'ACCEPTED', rejection_reason = NULL
+		WHERE scan_id = $1 AND symbol = $2
+	`, scanID, symbol); err != nil {
+		t.Fatalf("reset candidate: %v", err)
+	}
+	if err := worker.deployPaper(ctx, *settings, scanID, false); err != nil {
+		t.Fatalf("deployPaper round 2: %v", err)
+	}
+	if err := pool.QueryRow(ctx, `
+		SELECT COUNT(*) FROM paper_grid_bots WHERE symbol = $1 AND status = 'RUNNING'
+	`, symbol).Scan(&running); err != nil {
+		t.Fatalf("count running round 2: %v", err)
+	}
+	if running != 1 {
+		t.Fatalf("deploy under the envelope cap must proceed, got %d running bots", running)
 	}
 }
 
