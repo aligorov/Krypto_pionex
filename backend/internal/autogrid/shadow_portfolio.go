@@ -3,10 +3,14 @@ package autogrid
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 	"time"
 
+	"github.com/aligorov/pionex-bot/backend/internal/pionex"
+	"github.com/jackc/pgx/v5"
 	"github.com/shopspring/decimal"
 )
 
@@ -143,15 +147,24 @@ func (worker *Worker) shadowSimIfDue(ctx context.Context, settings Settings) {
 	}
 	// Due-anchor via the pending index (WHERE simulated ORDER BY captured_at
 	// DESC) — the newest simulated row is always a safe lower bound for the
-	// last run, and MAX(simulated_at) has no index to lean on.
-	var lastSim *time.Time
+	// last run, and MAX(simulated_at) has no index to lean on. The scalar
+	// subquery is COALESCEd to epoch: on an empty table the bare query
+	// returned ErrNoRows and the early return below meant the FIRST batch
+	// could never start (prod: 147 pending / 0 simulated for 13h). The
+	// anchor advances only through rows actually marked simulated — an empty
+	// batch (nothing matured yet, or all-transient failures) leaves it where
+	// it was, so the first matured candidate is picked up by the very next
+	// pass instead of waiting out the 20h spacing.
+	var lastSim time.Time
 	if err := worker.db.QueryRow(ctx, `
-		SELECT simulated_at FROM shadow_candidates
-		WHERE simulated ORDER BY captured_at DESC LIMIT 1
+		SELECT COALESCE((
+			SELECT simulated_at FROM shadow_candidates
+			WHERE simulated ORDER BY captured_at DESC LIMIT 1
+		), TIMESTAMPTZ '1970-01-01')
 	`).Scan(&lastSim); err != nil {
 		return
 	}
-	if lastSim != nil && time.Since(*lastSim) < shadowSimDue {
+	if time.Since(lastSim) < shadowSimDue {
 		return
 	}
 
@@ -211,9 +224,38 @@ func (worker *Worker) shadowSimIfDue(ctx context.Context, settings Settings) {
 	`)
 }
 
+// transientSimFailure reports whether a simulation error is retryable:
+// context cancellation/deadline (a worker restart or shutdown mid-batch)
+// and transport blips (5xx, 429 cooldown, dial/read failures) must leave
+// the row pending — marking it simulated on a restart silently ate the
+// counterfactual this module exists to collect. Permanent failures
+// (degenerate geometry, a gone source candidate, 4xx rejections) consume
+// the row so one bad row cannot wedge the batch.
+func transientSimFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false
+	}
+	var apiErr *pionex.APIError
+	if errors.As(err, &apiErr) {
+		return apiErr.StatusCode >= 500 || apiErr.StatusCode == http.StatusTooManyRequests
+	}
+	// Non-API errors off the public client are transport-level (dial, read,
+	// decode blips) — retryable by nature; a permanently broken feed shows
+	// up as a growing pending backlog (capture pauses at shadowOpenCap),
+	// which is visible rather than silent.
+	return true
+}
+
 // simulateShadowRow replays one captured rejection through the paper-model
-// core. Best-effort per row: a failure marks the row simulated with the
-// error note so one bad row cannot wedge the batch.
+// core. Best-effort per row: a PERMANENT failure marks the row simulated
+// with the error note so one bad row cannot wedge the batch; a TRANSIENT
+// one leaves it pending for the next run (see transientSimFailure).
 func (worker *Worker) simulateShadowRow(
 	ctx context.Context, settings Settings,
 	id, candidateID, symbol, direction string,
@@ -221,19 +263,27 @@ func (worker *Worker) simulateShadowRow(
 	entry decimal.Decimal, leverage int,
 	investment, feeBps decimal.Decimal, capturedAt time.Time,
 ) {
-	fail := func(note string) {
+	fail := func(note string, cause error) {
+		if transientSimFailure(cause) {
+			worker.logger.Warn("shadow sim transient failure; row stays pending",
+				"component", "autogrid_worker", "row", id, "error", cause)
+			return
+		}
 		nb, _ := json.Marshal(map[string]string{"error": note})
-		_, _ = worker.db.Exec(ctx, `
+		if _, err := worker.db.Exec(ctx, `
 			UPDATE shadow_candidates
 			SET simulated = TRUE, simulated_at = NOW(), sim_notes = $2::JSONB
 			WHERE id = $1 AND NOT simulated
-		`, id, string(nb))
+		`, id, string(nb)); err != nil {
+			worker.logger.Warn("shadow sim failure note write failed",
+				"component", "autogrid_worker", "row", id, "error", err)
+		}
 	}
 
 	// Division guard: a zero entry price would panic the directional replay
 	// and wedge the rest of the manage pass.
 	if !entry.GreaterThan(decimal.Zero) || !upper.GreaterThan(lower) || gridNum < 2 {
-		fail("degenerate geometry")
+		fail("degenerate geometry", nil)
 		return
 	}
 
@@ -244,7 +294,9 @@ func (worker *Worker) simulateShadowRow(
 		SELECT COALESCE(volatility, 0), COALESCE(max_drawdown_pct, 0), model_assumptions
 		FROM autogrid_candidates WHERE id = $1
 	`, candidateID).Scan(&volD, &ddD, &maRaw); err != nil {
-		fail("candidate load: " + err.Error())
+		// A missing source row is permanent (the FK cascade already removed
+		// this row in practice); any other DB error is transient.
+		fail("candidate load: "+err.Error(), err)
 		return
 	}
 	assumptions := map[string]any{}
@@ -279,7 +331,7 @@ func (worker *Worker) simulateShadowRow(
 
 	candles, err := worker.publicClient.GetKlines(ctx, symbol, "5M", shadowKlines)
 	if err != nil {
-		fail("klines: " + err.Error())
+		fail("klines: "+err.Error(), err)
 		return
 	}
 	windowEnd := capturedAt.Add(24 * time.Hour)
@@ -403,11 +455,11 @@ func (worker *Worker) simulateShadowRow(
 	}
 
 	notes, _ := json.Marshal(map[string]any{
-		"model":            "klines_5m_replay_v1",
-		"simplifications":  []string{"no_tranche2", "no_recenter", "regime_unknown", "scanner_mesh"},
-		"window_clipped":   started && windowStart.Sub(capturedAt) > 15*time.Minute,
+		"model":           "klines_5m_replay_v1",
+		"simplifications": []string{"no_tranche2", "no_recenter", "regime_unknown", "scanner_mesh"},
+		"window_clipped":  started && windowStart.Sub(capturedAt) > 15*time.Minute,
 	})
-	_, _ = worker.db.Exec(ctx, `
+	if _, err := worker.db.Exec(ctx, `
 		UPDATE shadow_candidates
 		SET simulated = TRUE, simulated_at = NOW(),
 		    pnl_target_usdt = $2, max_loss_usdt = $3,
@@ -416,5 +468,10 @@ func (worker *Worker) simulateShadowRow(
 		    mfe_usdt = $9, mae_usdt = $10, sim_notes = $11::JSONB
 		WHERE id = $1 AND NOT simulated
 	`, id, pnlTarget, maxLossUSDT, windowStart, candleTime, used,
-		outcome, outcomeReason, peak, trough, string(notes))
+		outcome, outcomeReason, peak, trough, string(notes)); err != nil {
+		// The replay result is gone if this write fails, but the row stays
+		// pending and the next run redoes it — visible in logs either way.
+		worker.logger.Warn("shadow sim result write failed; row stays pending",
+			"component", "autogrid_worker", "row", id, "error", err)
+	}
 }

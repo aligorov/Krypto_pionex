@@ -923,7 +923,19 @@ func (worker *Worker) deployPaper(
 		if err != nil {
 			return fmt.Errorf("mark paper grid %s: %w", candidate.Symbol, err)
 		}
-		if tag.RowsAffected() > 0 || activeCount >= settings.MaxActiveBots {
+		// A skip here used to be silent: the candidate stayed ACCEPTED with
+		// no reason, invisible to telemetry and to the shadow portfolio. Both
+		// branches now leave an honest rejection — which also feeds the shadow
+		// capture the counterfactual "what the candidate would have done had
+		// the fleet not been full / the symbol not been taken".
+		if tag.RowsAffected() > 0 {
+			worker.rejectCandidate(ctx, candidate,
+				fmt.Sprintf("символ уже в работе: RUNNING-бот по %s обновлён (mark), повторный деплой не нужен", candidate.Symbol), nil)
+			continue
+		}
+		if activeCount >= settings.MaxActiveBots {
+			worker.rejectCandidate(ctx, candidate,
+				fmt.Sprintf("портфель полон (%d/%d) — слот занят, вход отложен до освобождения", activeCount, settings.MaxActiveBots), nil)
 			continue
 		}
 		// Cooldown with escalation (v2.0.28): no re-entry within the window
@@ -965,8 +977,16 @@ func (worker *Worker) deployPaper(
 		// captured at scan start and ages through AI Kit calls, LLM audits
 		// and backtest waits; deploying a grid centered minutes in the past
 		// is how bots open already outside their range (ENSO class). A drift
-		// beyond half an ATR means the candidate itself is stale.
-		if freshPrice, ok := worker.revalidateFreshPrice(ctx, &candidate, atrPct); ok {
+		// beyond half an ATR means the candidate itself is stale — except in
+		// the cascade-short window, where a price flying >0.5 ATR between
+		// scan and deploy is the very move the cascade scan exists to short:
+		// the DOM, funding-flush and macro gates are already cascade-exempt,
+		// and this one would void every candidate precisely in that window.
+		// The live price still re-anchors the candidate (fresh > 0); only an
+		// UNREADABLE price (fresh zero) stays fail-closed even in cascade —
+		// a grid centered on an unreadable tape is the stale-anchor bug
+		// itself.
+		if freshPrice, ok := worker.revalidateFreshPrice(ctx, &candidate, atrPct); ok || (cascadeShort && freshPrice.IsPositive()) {
 			candidate.CurrentPrice = freshPrice
 		} else {
 			worker.logger.Info("entry gate: stale candidate price, skip",
@@ -1243,6 +1263,17 @@ func (worker *Worker) deployPaper(
 			meshSpanPct, _ = mesh.UpperPrice.Sub(mesh.LowerPrice).Div(candidate.CurrentPrice).Mul(decimal.NewFromInt(100)).Float64()
 		}
 		target, maxLoss := computeBotTargets(settings, candidate, botLev, meshSpanPct)
+		// The envelope gate below reserves the candidate's FULL
+		// (post-tranche-2) stop — the exact amount tranche2RiskGate later
+		// re-doubles the stored half to — so it must be captured BEFORE the
+		// tranche-1 halving. Reserving only the half admitted fleets that
+		// converge to the envelope ceiling where every newborn's tranche-2 is
+		// skipped until some bot dies (prod 2026-09-02: OP skip 15:02, ASTER
+		// dead 15:13, OP tranche 15:14).
+		candidateFullStop := decimal.Zero
+		if maxLoss != nil {
+			candidateFullStop = *maxLoss
+		}
 		if trancheOn {
 			// TP/SL govern the bot as deployed: half capital → half target
 			// and half max loss for tranche 1 (tranche 2's top-up doubles
@@ -1269,13 +1300,15 @@ func (worker *Worker) deployPaper(
 			continue
 		}
 
-		// Fleet stop envelope: the RUNNING fleet's stops plus this
-		// candidate's tranche-1 stop must stay under 0.8× the daily-loss
-		// breaker (deploy mirror of the tranche-2 gate). A nil stop
-		// contributes nothing to the envelope either way, so the gate only
-		// arms when the candidate carries one.
+		// Fleet stop envelope: the RUNNING fleet's stored stops plus this
+		// candidate's FULL (post-tranche-2) stop must stay under 0.8× the
+		// daily-loss breaker. The reservation equals the amount tranche-2
+		// will later double the stored half to, so a bot is never born into
+		// a fleet that cannot fit its own doubling. A nil stop contributes
+		// nothing to the envelope either way, so the gate only arms when
+		// the candidate carries one.
 		if maxLoss != nil {
-			if reason := worker.deployStopEnvelopeGate(ctx, settings.ID, *maxLoss); reason != "" {
+			if reason := worker.deployStopEnvelopeGate(ctx, settings.ID, candidateFullStop); reason != "" {
 				worker.rejectCandidate(ctx, candidate, reason, nil)
 				worker.logger.Info("paper deploy blocked by fleet stop envelope",
 					"component", "autogrid_worker", "symbol", candidate.Symbol)
@@ -3136,11 +3169,13 @@ func stopEnvelopeExceeded(envelope, breaker decimal.Decimal) bool {
 
 // deployStopEnvelopeGate is the deploy path's mirror of the tranche-2
 // envelope check: the fleet's RUNNING stop envelope plus the candidate's
-// tranche-1 stop (the same half-stop tranche2RiskGate re-doubles on the
-// top-up) must stay under the breaker — a synchronized stop wave must not
-// outrun the breaker that exists to catch it. Returns "" when the deploy may
-// proceed, otherwise a human-readable rejection reason. Read failures fail
-// OPEN with a logged warning (the same trade tranche2RiskGate makes); the
+// FULL stop — the exact amount tranche2RiskGate re-doubles the stored
+// tranche-1 half to on the top-up — must stay under the breaker, so a
+// synchronized stop wave can never outrun the breaker that exists to catch
+// it, and no bot is born already stranded (its tranche-2 fitting only
+// after some other bot dies). Returns "" when the deploy may proceed,
+// otherwise a human-readable rejection reason. Read failures fail OPEN
+// with a logged warning (the same trade tranche2RiskGate makes); the
 // durable risk exam above stays the fail-closed line.
 func (worker *Worker) deployStopEnvelopeGate(ctx context.Context, settingsID string, candidateStop decimal.Decimal) string {
 	rs, err := worker.risk.LoadSettings(ctx)
@@ -3158,7 +3193,7 @@ func (worker *Worker) deployStopEnvelopeGate(ctx context.Context, settingsID str
 		return ""
 	}
 	if stopEnvelopeExceeded(envelope, rs.MaxDailyLossUSD) {
-		return fmt.Sprintf("конверт стопов флота %s > 0.8× дневного брейкера %s",
+		return fmt.Sprintf("конверт стопов флота %s + полный стоп кандидата > 0.8× дневного брейкера %s",
 			envelope.StringFixed(2),
 			rs.MaxDailyLossUSD.Mul(decimal.NewFromFloat(riskStopEnvelopeFraction)).StringFixed(2))
 	}
