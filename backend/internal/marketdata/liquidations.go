@@ -3,7 +3,10 @@ package marketdata
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"log/slog"
+	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -134,7 +137,17 @@ func (l *LiquidationListener) bybitStream(ctx context.Context) error {
 	}
 	defer conn.Close()
 
-	sub, _ := json.Marshal(map[string]any{"op": "subscribe", "args": []string{"allLiquidation"}})
+	// The docs topic is PER-SYMBOL: allLiquidation.BTCUSDT — a bare
+	// "allLiquidation" arg is rejected with handler-not-found (verified live
+	// 2026-09-02). Subscribe across the top liquid linear symbols by 24h
+	// turnover; cascades concentrate in the majors, the long tail adds noise
+	// without moving the hourly USD sums the gate reads.
+	symbols := bybitTopLiquidSymbols(ctx)
+	args := make([]string, 0, len(symbols))
+	for _, sym := range symbols {
+		args = append(args, "allLiquidation."+sym)
+	}
+	sub, _ := json.Marshal(map[string]any{"op": "subscribe", "args": args})
 	if err := conn.WriteControl(websocket.TextMessage, sub, time.Now().Add(5*time.Second)); err != nil {
 		return err
 	}
@@ -171,6 +184,67 @@ func (l *LiquidationListener) bybitStream(ctx context.Context) error {
 	}
 }
 
+// bybitTopLiquidSymbols returns the top USDT-linear tickers by 24h turnover
+// (public REST, same host the funding/OI collectors already use) with a
+// hardcoded major-set fallback when the catalog fetch fails.
+var bybitLiquidFallback = []string{
+	"BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT", "BNBUSDT",
+	"LTCUSDT", "AVAXUSDT", "LINKUSDT", "SUIUSDT", "ADAUSDT", "PEPEUSDT",
+}
+
+func bybitTopLiquidSymbols(ctx context.Context) []string {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		"https://api.bybit.com/v5/market/tickers?category=linear", nil)
+	if err != nil {
+		return bybitLiquidFallback
+	}
+	req.Header.Set("User-Agent", "pionex-autogrid-collector/2.0 (+liquidations)")
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return bybitLiquidFallback
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return bybitLiquidFallback
+	}
+	var payload struct {
+		Result struct {
+			List []struct {
+				Symbol      string `json:"symbol"`
+				Turnover24h string `json:"turnover24h"`
+			} `json:"list"`
+		} `json:"result"`
+	}
+	if json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&payload) != nil {
+		return bybitLiquidFallback
+	}
+	type row struct {
+		symbol string
+		turn   float64
+	}
+	rows := make([]row, 0, len(payload.Result.List))
+	for _, item := range payload.Result.List {
+		if !strings.HasSuffix(item.Symbol, "USDT") {
+			continue
+		}
+		turn, _ := strconv.ParseFloat(item.Turnover24h, 64)
+		rows = append(rows, row{item.Symbol, turn})
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].turn > rows[j].turn })
+	if len(rows) > 40 {
+		rows = rows[:40]
+	}
+	out := make([]string, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, r.symbol)
+	}
+	if len(out) == 0 {
+		return bybitLiquidFallback
+	}
+	return out
+}
+
 // bybitLiquidationEvent is one element of an allLiquidation push.
 type bybitLiquidationEvent struct {
 	Symbol string `json:"s"`
@@ -186,7 +260,8 @@ func (l *LiquidationListener) ingestBybit(payload []byte) {
 		Topic string          `json:"topic"`
 		Data  json.RawMessage `json:"data"`
 	}
-	if err := json.Unmarshal(payload, &envelope); err != nil || envelope.Topic != "allLiquidation" {
+	if err := json.Unmarshal(payload, &envelope); err != nil ||
+		!strings.HasPrefix(envelope.Topic, "allLiquidation.") {
 		return
 	}
 	events := make([]bybitLiquidationEvent, 0, 2)
@@ -208,9 +283,12 @@ func (l *LiquidationListener) ingestBybit(payload []byte) {
 		if err1 != nil || err2 != nil || qty <= 0 || px <= 0 {
 			continue
 		}
-		side := "long"
+		// Bybit reports the POSITION side: a Buy update means a LONG was
+		// liquidated (the closing order itself is a sell) — the inverse of
+		// Binance's order-side encoding.
+		side := "short"
 		if e.Side == "Buy" {
-			side = "short"
+			side = "long"
 		}
 		l.buffer = append(l.buffer, liquidationRecord{
 			Symbol:   bybitToPionexSymbol(e.Symbol),
