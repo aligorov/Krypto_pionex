@@ -207,3 +207,112 @@ func (c *Collector) collectGNews(ctx context.Context) {
 	c.retentionDelete(ctx, "macro_snapshots", macroRetention)
 	c.retentionDelete(ctx, "news_headlines", newsRetention)
 }
+
+// ---------------------------------------------------------------------------
+// Operator-facing macro settings (v2.0.60): the FRED key is managed from the
+// web UI exactly like the LLM/Telegram keys — stored in PostgreSQL, never in
+// env, never returned to the client.
+// ---------------------------------------------------------------------------
+
+// MacroSeriesPoint is the latest snapshot of one FRED/Yahoo metric.
+type MacroSeriesPoint struct {
+	Metric     string    `json:"metric"`
+	Value      float64   `json:"value"`
+	CapturedAt time.Time `json:"capturedAt"`
+}
+
+// MacroSourcesStatus is the GET /api/macro/sources payload: whether a key is
+// configured (length only — the key itself never leaves the server) and what
+// the collectors have actually persisted, so the operator sees the feed
+// working without waiting an hour.
+type MacroSourcesStatus struct {
+	HasKey     bool               `json:"hasKey"`
+	KeyLength  int                `json:"keyLength"`
+	UpdatedAt  *time.Time         `json:"updatedAt,omitempty"`
+	Series     []MacroSeriesPoint `json:"series"`
+}
+
+func (s *Service) GetMacroSources(ctx context.Context) (MacroSourcesStatus, error) {
+	var status MacroSourcesStatus
+	var key string
+	if err := s.db.QueryRow(ctx,
+		`SELECT fred_api_key, updated_at FROM macro_sources WHERE id = 1`,
+	).Scan(&key, &status.UpdatedAt); err != nil {
+		return status, err
+	}
+	status.KeyLength = len(strings.TrimSpace(key))
+	status.HasKey = status.KeyLength > 0
+	rows, err := s.db.Query(ctx, `
+		SELECT DISTINCT ON (metric) metric, value::FLOAT8, captured_at
+		FROM macro_snapshots ORDER BY metric, captured_at DESC
+	`)
+	if err == nil {
+		for rows.Next() {
+			var p MacroSeriesPoint
+			if rows.Scan(&p.Metric, &p.Value, &p.CapturedAt) == nil {
+				status.Series = append(status.Series, p)
+			}
+		}
+		rows.Close()
+	}
+	return status, nil
+}
+
+// UpdateFREDKey stores (or, with an empty value, removes) the FRED api key.
+func (s *Service) UpdateFREDKey(ctx context.Context, key string) error {
+	key = strings.TrimSpace(key)
+	if key != "" && len(key) != 32 {
+		return fmt.Errorf("FRED-ключ — 32 символа, получено %d", len(key))
+	}
+	_, err := s.db.Exec(ctx, `
+		UPDATE macro_sources SET fred_api_key = $2, updated_at = NOW() WHERE id = 1
+	`, key)
+	return err
+}
+
+// FREDKey returns the stored key (empty when unset).
+func (s *Service) FREDKey(ctx context.Context) (string, error) {
+	var key string
+	err := s.db.QueryRow(ctx,
+		`SELECT fred_api_key FROM macro_sources WHERE id = 1`).Scan(&key)
+	return strings.TrimSpace(key), err
+}
+
+// TestFREDKey validates a key with one lightweight call (DGS10, limit 1).
+func (s *Service) TestFREDKey(ctx context.Context, key string) (int64, error) {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return 0, fmt.Errorf("ключ не задан")
+	}
+	start := time.Now()
+	endpoint := fredBaseURL + "?" + url.Values{
+		"series_id": []string{"DGS10"}, "api_key": []string{key},
+		"file_type": []string{"json"}, "sort_order": []string{"desc"}, "limit": []string{"1"},
+	}.Encode()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("User-Agent", macroCollectorUA)
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return time.Since(start).Milliseconds(), err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return time.Since(start).Milliseconds(), fmt.Errorf("FRED вернул HTTP %d", resp.StatusCode)
+	}
+	var payload struct {
+		Observations []struct {
+			Value string `json:"value"`
+		} `json:"observations"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&payload); err != nil {
+		return time.Since(start).Milliseconds(), err
+	}
+	if len(payload.Observations) == 0 {
+		return time.Since(start).Milliseconds(), fmt.Errorf("FRED не вернул наблюдений")
+	}
+	return time.Since(start).Milliseconds(), nil
+}

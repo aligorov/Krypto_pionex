@@ -132,6 +132,9 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /api/llm/test", s.withRole(auth.RoleAdmin, http.HandlerFunc(s.testLLMConnection)))
 	mux.Handle("POST /api/llm/models", s.withRole(auth.RoleAdmin, http.HandlerFunc(s.listLLMModels)))
 	mux.Handle("GET /api/llm/audits", s.withSession(http.HandlerFunc(s.listLLMAudits)))
+	mux.Handle("GET /api/macro/sources", s.withSession(http.HandlerFunc(s.getMacroSources)))
+	mux.Handle("PUT /api/macro/sources", s.withRole(auth.RoleAdmin, http.HandlerFunc(s.updateMacroSources)))
+	mux.Handle("POST /api/macro/test", s.withRole(auth.RoleAdmin, http.HandlerFunc(s.testMacroFRED)))
 
 	mux.Handle("GET /api/dashboard", s.withSession(http.HandlerFunc(s.dashboard)))
 	mux.Handle("GET /api/users", s.withRole(auth.RoleAdmin, http.HandlerFunc(s.listUsers)))
@@ -1465,6 +1468,80 @@ func (s *Server) updateLLMSettings(w http.ResponseWriter, r *http.Request) {
 		"model":    settings.Model,
 	})
 	writeJSON(w, http.StatusOK, settings)
+}
+
+// getMacroSources reports whether the FRED key is configured (length only —
+// the key never leaves the server) plus the latest collector snapshots, so
+// the operator sees the macro feed working from the same settings page.
+func (s *Server) getMacroSources(w http.ResponseWriter, r *http.Request) {
+	if s.market == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "market service is not initialized"})
+		return
+	}
+	status, err := s.market.GetMacroSources(r.Context())
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, status)
+}
+
+func (s *Server) updateMacroSources(w http.ResponseWriter, r *http.Request) {
+	if s.market == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "market service is not initialized"})
+		return
+	}
+	var input struct {
+		FredAPIKey string `json:"fredApiKey"`
+	}
+	if !decodeJSON(w, r, &input) {
+		return
+	}
+	if err := s.market.UpdateFREDKey(r.Context(), input.FredAPIKey); err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	s.auditMutation(r, "macro.sources.update", "macro_sources", "1", map[string]any{
+		"keySet": strings.TrimSpace(input.FredAPIKey) != "",
+	})
+	status, err := s.market.GetMacroSources(r.Context())
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, status)
+}
+
+// testMacroFRED validates a FRED key: the typed value when present, the
+// stored one otherwise — verify before waiting for the hourly collector.
+func (s *Server) testMacroFRED(w http.ResponseWriter, r *http.Request) {
+	if s.market == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "market service is not initialized"})
+		return
+	}
+	var input struct {
+		FredAPIKey string `json:"fredApiKey"`
+	}
+	if r.Body != nil && r.ContentLength > 0 {
+		if !decodeJSON(w, r, &input) {
+			return
+		}
+	}
+	key := strings.TrimSpace(input.FredAPIKey)
+	if key == "" {
+		stored, err := s.market.FREDKey(r.Context())
+		if err != nil || stored == "" {
+			writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": "ключ не задан"})
+			return
+		}
+		key = stored
+	}
+	latencyMs, err := s.market.TestFREDKey(r.Context(), key)
+	if err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": err.Error(), "latencyMs": latencyMs})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "latencyMs": latencyMs})
 }
 
 func (s *Server) testLLMConnection(w http.ResponseWriter, r *http.Request) {

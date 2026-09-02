@@ -815,3 +815,8 @@ input:disabled, select:disabled { opacity: .65; }
   .metric-card strong { font-size: 1.3rem !important; }
   .topbar h1 { font-size: 1.05rem !important; }
 }
+
+/* MacroSettings (v2.0.60): key form actions + collector series list */
+.button-row { display: flex; gap: 10px; margin-top: 6px; }
+.metric-list { list-style: none; margin: 10px 0 0; padding: 0; display: flex; flex-wrap: wrap; gap: 8px; }
+.metric-list li { border: 1px solid var(--border); border-radius: 8px; padding: 6px 10px; font-size: 12px; }

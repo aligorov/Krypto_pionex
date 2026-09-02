@@ -11,6 +11,7 @@ import AuditLogs from './components/AuditLogs';
 import MCPServer from './components/MCPServer';
 import SecurityModal from './components/SecurityModal';
 import LLMSettings from './components/LLMSettings';
+import MacroSettings from './components/MacroSettings';
 import { TelegramSettings } from './components/TelegramSettings';
 import BacktestLab from './components/BacktestLab';
 
@@ -396,7 +397,12 @@ export default function App() {
         {activeTab === 'backtest' && <BacktestLab canOperate={canOperate(user.role)} />}
         {activeTab === 'accounts' && <PionexAccounts canManage={canManage(user.role)} />}
         {activeTab === 'risk' && <RiskSettings canManage={canManage(user.role)} />}
-        {activeTab === 'llm' && <LLMSettings canManage={canManage(user.role)} />}
+        {activeTab === 'llm' && (
+          <div className="section-stack">
+            <LLMSettings canManage={canManage(user.role)} />
+            <MacroSettings canManage={canManage(user.role)} />
+          </div>
+        )}
         {activeTab === 'telegram' && <TelegramSettings canManage={canManage(user.role)} />}
         {activeTab === 'audit' && <AuditLogs />}
         {activeTab === 'mcp' && <MCPServer canManage={canManage(user.role)} />}

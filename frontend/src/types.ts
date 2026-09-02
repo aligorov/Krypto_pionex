@@ -555,3 +555,16 @@ export interface LLMAuditRecord {
   latencyMs: number;
   createdAt: string;
 }
+
+export interface MacroSeriesPoint {
+  metric: string;
+  value: number;
+  capturedAt: string;
+}
+
+export interface MacroSources {
+  hasKey: boolean;
+  keyLength: number;
+  updatedAt?: string;
+  series: MacroSeriesPoint[] | null;
+}
