@@ -265,7 +265,7 @@ func (s *Service) UpdateFREDKey(ctx context.Context, key string) error {
 		return fmt.Errorf("FRED-ключ — 32 символа, получено %d", len(key))
 	}
 	_, err := s.db.Exec(ctx, `
-		UPDATE macro_sources SET fred_api_key = $2, updated_at = NOW() WHERE id = 1
+		UPDATE macro_sources SET fred_api_key = $1, updated_at = NOW() WHERE id = 1
 	`, key)
 	return err
 }
