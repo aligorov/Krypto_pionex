@@ -15,6 +15,15 @@ var (
 	ErrLeverageExceeded      = errors.New("risk engine: leverage exceeds maximum allowed limit")
 )
 
+// Breaker ownership modes for risk_settings.breaker_mode (migration 0034):
+// AUTO lets the autopilot re-derive max_daily_loss_usd from the fleet design
+// (N × budget × leverage × stop floor × 1.25); MANUAL is an operator pin the
+// derivation must never overwrite.
+const (
+	BreakerModeAuto   = "AUTO"
+	BreakerModeManual = "MANUAL"
+)
+
 // RiskSettings represents durable settings loaded from PostgreSQL.
 type RiskSettings struct {
 	ID                    int             `db:"id" json:"id"`
@@ -22,6 +31,7 @@ type RiskSettings struct {
 	MaxAccountExposureUSD decimal.Decimal `db:"max_account_exposure_usd" json:"maxAccountExposureUsd"`
 	MaxSymbolExposureUSD  decimal.Decimal `db:"max_symbol_exposure_usd" json:"maxSymbolExposureUsd"`
 	MaxDailyLossUSD       decimal.Decimal `db:"max_daily_loss_usd" json:"maxDailyLossUsd"`
+	BreakerMode           string          `db:"breaker_mode" json:"breakerMode"`
 	MaxLeverage           int             `db:"max_leverage" json:"maxLeverage"`
 	MaxActiveGridBots     int             `db:"max_active_grid_bots" json:"maxActiveGridBots"`
 	MaxOpenPositions      int             `db:"max_open_positions" json:"maxOpenPositions"`
@@ -41,14 +51,14 @@ func NewEngine(db *pgxpool.Pool) *Engine {
 func (e *Engine) LoadSettings(ctx context.Context) (*RiskSettings, error) {
 	query := `
 		SELECT id, kill_switch_enabled, max_account_exposure_usd, max_symbol_exposure_usd,
-		       max_daily_loss_usd, max_leverage, max_active_grid_bots, max_open_positions
+		       max_daily_loss_usd, breaker_mode, max_leverage, max_active_grid_bots, max_open_positions
 		FROM risk_settings WHERE id = 1
 	`
 	row := e.db.QueryRow(ctx, query)
 	var s RiskSettings
 	err := row.Scan(
 		&s.ID, &s.KillSwitchEnabled, &s.MaxAccountExposureUSD, &s.MaxSymbolExposureUSD,
-		&s.MaxDailyLossUSD, &s.MaxLeverage, &s.MaxActiveGridBots, &s.MaxOpenPositions,
+		&s.MaxDailyLossUSD, &s.BreakerMode, &s.MaxLeverage, &s.MaxActiveGridBots, &s.MaxOpenPositions,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query risk settings: %w", err)
@@ -269,6 +279,19 @@ func (e *Engine) UpdateSettings(ctx context.Context, settings RiskSettings) (*Ri
 	if settings.MaxSymbolExposureUSD.GreaterThan(settings.MaxAccountExposureUSD) {
 		return nil, errors.New("risk engine: symbol exposure cannot exceed account exposure")
 	}
+	// Empty means a legacy caller that never heard of breaker ownership —
+	// preserve the stored mode so a full-row replace cannot silently unpin
+	// an operator's MANUAL value (explicit AUTO/MANUAL still switches it).
+	if settings.BreakerMode == "" {
+		if err := e.db.QueryRow(ctx,
+			`SELECT breaker_mode FROM risk_settings WHERE id = $1`, settings.ID,
+		).Scan(&settings.BreakerMode); err != nil || settings.BreakerMode == "" {
+			settings.BreakerMode = BreakerModeAuto
+		}
+	}
+	if settings.BreakerMode != BreakerModeAuto && settings.BreakerMode != BreakerModeManual {
+		return nil, fmt.Errorf("risk engine: breaker mode must be %s or %s", BreakerModeAuto, BreakerModeManual)
+	}
 
 	_, err := e.db.Exec(ctx, `
 		UPDATE risk_settings
@@ -276,6 +299,7 @@ func (e *Engine) UpdateSettings(ctx context.Context, settings RiskSettings) (*Ri
 		    max_account_exposure_usd = $3,
 		    max_symbol_exposure_usd = $4,
 		    max_daily_loss_usd = $5,
+		    breaker_mode = $9,
 		    max_leverage = $6,
 		    max_active_grid_bots = $7,
 		    max_open_positions = $8,
@@ -283,7 +307,7 @@ func (e *Engine) UpdateSettings(ctx context.Context, settings RiskSettings) (*Ri
 		WHERE id = $1
 	`, settings.ID, settings.KillSwitchEnabled, settings.MaxAccountExposureUSD,
 		settings.MaxSymbolExposureUSD, settings.MaxDailyLossUSD, settings.MaxLeverage,
-		settings.MaxActiveGridBots, settings.MaxOpenPositions)
+		settings.MaxActiveGridBots, settings.MaxOpenPositions, settings.BreakerMode)
 	if err != nil {
 		return nil, fmt.Errorf("update risk settings: %w", err)
 	}

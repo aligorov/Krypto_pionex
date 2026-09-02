@@ -109,7 +109,7 @@ func NewWorker(
 		logger:          logger,
 		owner:           fmt.Sprintf("autogrid-%d", time.Now().UnixNano()),
 		trancheTBRegime: make(map[string]trancheTBTrend),
-		dataAlarmAt:    make(map[string]time.Time),
+		dataAlarmAt:     make(map[string]time.Time),
 		radarActionAt:   make(map[string]time.Time),
 	}
 }
@@ -122,6 +122,19 @@ func (worker *Worker) Run(ctx context.Context) {
 	defer scheduleTicker.Stop()
 	defer reconcileTicker.Stop()
 	worker.sweepRestartGhosts(ctx)
+	// Drift self-heal: an operator editing N/budget/leverage directly in the
+	// DB bypasses Service.UpdateSettings; re-derive the AUTO breaker once at
+	// startup so the fleet design and the risk engine never disagree for a
+	// whole process lifetime.
+	worker.runGuarded("derived_breaker", func() {
+		settings, err := worker.service.GetSettings(ctx)
+		if err != nil {
+			worker.logger.Error("derived breaker: load settings failed",
+				"component", "autogrid_worker", "error", err)
+			return
+		}
+		worker.service.SyncDerivedBreaker(ctx, *settings)
+	})
 	worker.logger.Info("AutoGrid worker started", "component", "autogrid_worker")
 	for {
 		select {
@@ -1949,6 +1962,14 @@ func (worker *Worker) deployReal(
 			botTargetSpan, _ = mesh.UpperPrice.Sub(mesh.LowerPrice).Div(candidate.CurrentPrice).Mul(decimal.NewFromInt(100)).Float64()
 		}
 		botTarget, botMaxLoss := computeBotTargets(settings, candidate, botLev, botTargetSpan)
+		// v2.0.67 parity: the deploy envelope gate reserves the candidate's
+		// FULL (post-tranche-2) stop — the amount the top-up later doubles
+		// the stored half to. It must be captured BEFORE the tranche-1
+		// halving below, mirroring the paper path (v2.0.66).
+		candidateFullStop := decimal.Zero
+		if botMaxLoss != nil {
+			candidateFullStop = *botMaxLoss
+		}
 		if settings.TrancheDeployEnabled {
 			// v2.0.15 (restored — the v2.0.13 patch was lost to a failed
 			// batch): tranche 1 commits HALF the capital, so native
@@ -1974,6 +1995,19 @@ func (worker *Worker) deployReal(
 			}
 			data.ProfitStopType = "price"
 			data.ProfitStop = &profit
+		}
+		// v2.0.67 parity: the SAME fleet stop-envelope gate the paper path
+		// runs (joint paper+REAL sum, full-stop reservation, 0.8× derived
+		// breaker). REAL used to skip it entirely — a REAL deploy could
+		// overflow the account's stop envelope while every paper deploy was
+		// being refused for it.
+		if botMaxLoss != nil {
+			if reason := worker.deployStopEnvelopeGate(ctx, settings.ID, candidateFullStop); reason != "" {
+				deployErrors = append(deployErrors, fmt.Sprintf("%s: %s", candidate.Symbol, reason))
+				worker.logger.Info("real deploy blocked by fleet stop envelope",
+					"component", "autogrid_worker", "symbol", candidate.Symbol)
+				continue
+			}
 		}
 		futuresBase := base
 		if !strings.HasSuffix(futuresBase, ".PERP") && !strings.HasSuffix(futuresBase, "_PERP") {
@@ -2409,7 +2443,7 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 	rows, err := worker.db.Query(ctx, `
 		SELECT id, account_id, bu_order_id, status, symbol, direction,
 		       lower_price, upper_price, grid_num, adjustments_count,
-		       pnl_target_usdt, max_loss_usdt, quote_investment,
+		       pnl_target_usdt, max_loss_usdt, quote_investment, leverage,
 		       anti_hunt_stop_price, COALESCE(bot_number, 0),
 		       COALESCE(peak_pnl_usdt, 0), created_at,
 		       COALESCE(NULLIF(model_state->>'trancheDeployed','')::INT, 0),
@@ -2428,7 +2462,7 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 	type managedBot struct {
 		id, accountID, remoteID, localStatus, symbol, direction string
 		lower, upper                                            decimal.Decimal
-		rowNum, adjustments                                     int
+		rowNum, adjustments, leverage                           int
 		pnlTarget, maxLoss                                      *decimal.Decimal
 		antiHuntStop                                            *decimal.Decimal
 		investment                                              decimal.Decimal
@@ -2448,6 +2482,7 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 			&item.id, &item.accountID, &item.remoteID, &item.localStatus, &item.symbol,
 			&item.direction, &item.lower, &item.upper, &item.rowNum,
 			&item.adjustments, &item.pnlTarget, &item.maxLoss, &item.investment,
+			&item.leverage,
 			&item.antiHuntStop, &item.botNumber,
 			&item.peak, &item.createdAt,
 			&item.trancheDeployed, &item.trancheBase, &item.trancheEntry,
@@ -2692,7 +2727,7 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 					// injected margin — same risk gate as the paper path. The
 					// skip writes a 1h backoff marker so an armed 24h time-box
 					// cannot re-log every manage pass.
-					if skip := worker.tranche2RiskGate(ctx, settings.ID, bot.id, botMaxLoss.Mul(decimal.NewFromInt(2)), false); skip != "" {
+					if skip := worker.tranche2RiskGate(ctx, *settings, bot.id, bot.leverage, botMaxLoss.Mul(decimal.NewFromInt(2))); skip != "" {
 						tag, tErr2 := worker.db.Exec(ctx, `
 						UPDATE grid_bots
 						SET model_state = jsonb_set(model_state, '{tranche2SkipAt}',
@@ -3103,24 +3138,67 @@ func (worker *Worker) reconcileUnknownSubmissions(ctx context.Context, client *p
 	}
 }
 
-// managePaperBots marks paper bots to market and closes them when the same
-// PnL rules that govern real bots are hit, so PAPER mode exercises the whole
-// lifecycle.
-// tranche2MaxLossCapUSDT caps the per-bot effective stop after a tranche-2
-// top-up: the doubling below doubles max_loss along with the capital, and a
-// σ-scaled target on a wide 4x mesh can authorize outsized stops (checkpoint
-// 2026-09-01: HEMI quietly carried $29.51 under an "$8" desk).
-const tranche2MaxLossCapUSDT = 12.0
+// fleetStopEnvelope returns Σ stored max_loss_usdt across the WHOLE risk
+// account — paper_grid_bots AND grid_bots (REAL) — plus the reserve, minus
+// one optionally excluded bot. PAPER and REAL stop exposure live on the same
+// account against the same breaker, so every envelope gate must sum both
+// tables jointly (v2.0.67 parity fix: the deploy gate used to count paper
+// only, the tranche-2 gate counted only the candidate's own table).
+func (worker *Worker) fleetStopEnvelope(
+	ctx context.Context,
+	settingsID string,
+	excludeBotID *string,
+	reserve decimal.Decimal,
+) (decimal.Decimal, error) {
+	var envelope decimal.Decimal
+	err := worker.db.QueryRow(ctx, `
+		SELECT
+		  (SELECT COALESCE(SUM(max_loss_usdt), 0) FROM paper_grid_bots
+		     WHERE settings_id = $1 AND status = 'RUNNING'
+		       AND ($2::UUID IS NULL OR id <> $2::UUID))
+		  +
+		  (SELECT COALESCE(SUM(max_loss_usdt), 0) FROM grid_bots
+		     WHERE autogrid_settings_id = $1 AND bu_order_id IS NOT NULL
+		       AND status IN ('RUNNING', 'STOP_REQUESTED', 'STOPPING')
+		       AND ($2::UUID IS NULL OR id <> $2::UUID))
+		  + $3::NUMERIC
+	`, settingsID, excludeBotID, reserve).Scan(&envelope)
+	return envelope, err
+}
 
-// tranche2RiskGate (v2.0.56 F2) guards the tranche-2 top-up: the doubled
-// stop must stay under the per-bot cap AND the resulting fleet stop envelope
+// tranche2MaxLossCap derives the per-bot effective-stop ceiling after a
+// tranche-2 top-up: the bot's DESIGN full stop (budget × its own leverage ×
+// ADAPTIVE_ATR floor) × breakerHeadroom. The old static $12 (v2.0.56) sat
+// below the 4x design stop ($16 on $200×4×2%) so wide 4x bots could never
+// tranche (prod BEX $16 > $12 skipped forever); the derived cap restores the
+// design: 2x→$10, 4x→$20 on the $200 budget while still refusing σ-scaled
+// overshoots ($29.51 HEMI-style outliers).
+func tranche2MaxLossCap(budgetUSDT decimal.Decimal, botLeverage int) decimal.Decimal {
+	if botLeverage < 1 {
+		botLeverage = 1
+	}
+	return budgetUSDT.
+		Mul(decimal.NewFromInt(int64(botLeverage))).
+		Mul(designStopFloorFrac()).
+		Mul(decimal.NewFromFloat(breakerHeadroom))
+}
+
+// tranche2RiskGate (v2.0.56 F2, derived cap v2.0.67) guards the tranche-2
+// top-up on BOTH fleets: the doubled stop must stay under the bot's derived
+// per-bot cap AND the whole-account stop envelope (paper + REAL joint sum)
 // under 0.8× the risk engine's daily-loss breaker (a synchronized stop wave
 // must not outrun the breaker that is supposed to catch it). Returns "" when
 // the top-up is allowed, otherwise a human-readable skip reason. Envelope
 // query failure fails OPEN: deploy-time gates stay fail-closed, but starving
 // a healthy bot of its second half over a read failure is the worse trade.
-func (worker *Worker) tranche2RiskGate(ctx context.Context, settingsID, botID string, effMaxLoss decimal.Decimal, paper bool) string {
-	capUSDT := decimal.NewFromFloat(tranche2MaxLossCapUSDT)
+func (worker *Worker) tranche2RiskGate(
+	ctx context.Context,
+	settings Settings,
+	botID string,
+	botLeverage int,
+	effMaxLoss decimal.Decimal,
+) string {
+	capUSDT := tranche2MaxLossCap(settings.BudgetUSDT, botLeverage)
 	if effMaxLoss.GreaterThan(capUSDT) {
 		return fmt.Sprintf("кап эффективного стопа: %s > %s USDT", effMaxLoss.StringFixed(2), capUSDT.StringFixed(2))
 	}
@@ -3128,26 +3206,11 @@ func (worker *Worker) tranche2RiskGate(ctx context.Context, settingsID, botID st
 	if err != nil || rs == nil || !rs.MaxDailyLossUSD.GreaterThan(decimal.Zero) {
 		return ""
 	}
-	envelopeLimit := rs.MaxDailyLossUSD.Mul(decimal.NewFromFloat(riskStopEnvelopeFraction))
-	var envelope decimal.Decimal
-	var qErr error
-	if paper {
-		qErr = worker.db.QueryRow(ctx, `
-			SELECT COALESCE(SUM(max_loss_usdt), 0) + $2::NUMERIC
-			FROM paper_grid_bots
-			WHERE settings_id = $1 AND status = 'RUNNING' AND id <> $3
-		`, settingsID, effMaxLoss, botID).Scan(&envelope)
-	} else {
-		qErr = worker.db.QueryRow(ctx, `
-			SELECT COALESCE(SUM(max_loss_usdt), 0) + $2::NUMERIC
-			FROM grid_bots
-			WHERE autogrid_settings_id = $1 AND bu_order_id IS NOT NULL
-			  AND status IN ('RUNNING', 'STOP_REQUESTED', 'STOPPING') AND id <> $3
-		`, settingsID, effMaxLoss, botID).Scan(&envelope)
-	}
+	envelope, qErr := worker.fleetStopEnvelope(ctx, settings.ID, &botID, effMaxLoss)
 	if qErr != nil {
 		return ""
 	}
+	envelopeLimit := rs.MaxDailyLossUSD.Mul(decimal.NewFromFloat(riskStopEnvelopeFraction))
 	if envelope.GreaterThan(envelopeLimit) {
 		return fmt.Sprintf("конверт стопов флота %s > 0.8× дневного брейкера %s",
 			envelope.StringFixed(2), envelopeLimit.StringFixed(2))
@@ -3168,26 +3231,24 @@ func stopEnvelopeExceeded(envelope, breaker decimal.Decimal) bool {
 }
 
 // deployStopEnvelopeGate is the deploy path's mirror of the tranche-2
-// envelope check: the fleet's RUNNING stop envelope plus the candidate's
-// FULL stop — the exact amount tranche2RiskGate re-doubles the stored
-// tranche-1 half to on the top-up — must stay under the breaker, so a
-// synchronized stop wave can never outrun the breaker that exists to catch
-// it, and no bot is born already stranded (its tranche-2 fitting only
-// after some other bot dies). Returns "" when the deploy may proceed,
-// otherwise a human-readable rejection reason. Read failures fail OPEN
-// with a logged warning (the same trade tranche2RiskGate makes); the
-// durable risk exam above stays the fail-closed line.
+// envelope check (v2.0.67: applies to PAPER and REAL deploys alike — one
+// risk account, one gate): the WHOLE account's RUNNING stop envelope (paper
+// fleet + REAL fleet, joint sum) plus the candidate's FULL stop — the exact
+// amount tranche2RiskGate re-doubles the stored tranche-1 half to on the
+// top-up — must stay under the breaker, so a synchronized stop wave can
+// never outrun the breaker that exists to catch it, and no bot is born
+// already stranded (its tranche-2 fitting only after some other bot dies).
+// Returns "" when the deploy may proceed, otherwise a human-readable
+// rejection reason. Read failures fail OPEN with a logged warning (the same
+// trade tranche2RiskGate makes); the durable risk exam above stays the
+// fail-closed line.
 func (worker *Worker) deployStopEnvelopeGate(ctx context.Context, settingsID string, candidateStop decimal.Decimal) string {
 	rs, err := worker.risk.LoadSettings(ctx)
 	if err != nil || rs == nil || !rs.MaxDailyLossUSD.GreaterThan(decimal.Zero) {
 		return ""
 	}
-	var envelope decimal.Decimal
-	if err := worker.db.QueryRow(ctx, `
-		SELECT COALESCE(SUM(max_loss_usdt), 0) + $2::NUMERIC
-		FROM paper_grid_bots
-		WHERE settings_id = $1 AND status = 'RUNNING'
-	`, settingsID, candidateStop).Scan(&envelope); err != nil {
+	envelope, err := worker.fleetStopEnvelope(ctx, settingsID, nil, candidateStop)
+	if err != nil {
 		worker.logger.Warn("deploy stop-envelope read failed; gate disarmed for this candidate",
 			"component", "autogrid_worker", "error", err)
 		return ""
@@ -3236,6 +3297,9 @@ func (worker *Worker) directionalFlipBlocked(ctx context.Context, symbol, upperT
 	return flipped
 }
 
+// managePaperBots marks paper bots to market and closes them when the same
+// PnL rules that govern real bots are hit, so PAPER mode exercises the whole
+// lifecycle.
 func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) error {
 	priceBySymbol, err := worker.priceMap(ctx)
 	if err != nil {
@@ -3722,7 +3786,7 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 					if bot.pnlTarget != nil {
 						effTarget = bot.pnlTarget.Mul(decimal.NewFromInt(2))
 					}
-					if skip := worker.tranche2RiskGate(ctx, settings.ID, bot.id, effMaxLoss, true); skip != "" {
+					if skip := worker.tranche2RiskGate(ctx, settings, bot.id, bot.leverage, effMaxLoss); skip != "" {
 						// Backoff marker: the 24h time-box keeps the trigger
 						// armed forever, so a gated skip must not re-log on
 						// every manage pass — one event per hour max.

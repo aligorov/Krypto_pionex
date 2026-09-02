@@ -14,6 +14,7 @@ import (
 	"github.com/aligorov/pionex-bot/backend/internal/autogrid"
 	"github.com/aligorov/pionex-bot/backend/internal/controlplane"
 	"github.com/aligorov/pionex-bot/backend/internal/observability"
+	"github.com/aligorov/pionex-bot/backend/internal/risk"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/shopspring/decimal"
@@ -84,9 +85,14 @@ type RiskUpdateInput struct {
 	MaxAccountExposureUSD string `json:"maxAccountExposureUsd"`
 	MaxSymbolExposureUSD  string `json:"maxSymbolExposureUsd"`
 	MaxDailyLossUSD       string `json:"maxDailyLossUsd"`
-	MaxLeverage           int    `json:"maxLeverage"`
-	MaxActiveGridBots     int    `json:"maxActiveGridBots"`
-	MaxOpenPositions      int    `json:"maxOpenPositions"`
+	// BreakerMode is optional: AUTO returns the daily-loss breaker to fleet
+	// design derivation; MANUAL keeps the maxDailyLossUsd pin. Empty
+	// preserves the stored mode, except that supplying maxDailyLossUsd pins
+	// MANUAL (an explicit operator override the derivation must respect).
+	BreakerMode       string `json:"breakerMode,omitempty" jsonschema:"Optional breaker ownership: AUTO re-derives maxDailyLossUsd from the fleet design, MANUAL pins the operator value."`
+	MaxLeverage       int    `json:"maxLeverage"`
+	MaxActiveGridBots int    `json:"maxActiveGridBots"`
+	MaxOpenPositions  int    `json:"maxOpenPositions"`
 }
 
 type LogListInput struct {
@@ -294,7 +300,10 @@ func NewServer(services Services, principal auth.Principal) *mcp.Server {
 	})
 
 	mcp.AddTool(server, &mcp.Tool{
-		Name: "risk_update", Description: "Atomically replace risk limits. Requires mcp:admin.",
+		Name: "risk_update",
+		Description: "Atomically replace risk limits. Requires mcp:admin. Passing maxDailyLossUsd pins " +
+			"breakerMode=MANUAL (the autopilot's derivation will not touch it); pass breakerMode=AUTO to " +
+			"return the breaker to fleet-design derivation.",
 		Annotations: writeHint,
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, input RiskUpdateInput) (*mcp.CallToolResult, DataOutput, error) {
 		if err := requireWrite(ctx, services, principal, "mcp:admin"); err != nil {
@@ -314,8 +323,26 @@ func NewServer(services Services, principal auth.Principal) *mcp.Server {
 		if err := current.MaxSymbolExposureUSD.UnmarshalText([]byte(input.MaxSymbolExposureUSD)); err != nil {
 			return nil, DataOutput{}, errors.New("invalid maxSymbolExposureUsd")
 		}
-		if err := current.MaxDailyLossUSD.UnmarshalText([]byte(input.MaxDailyLossUSD)); err != nil {
-			return nil, DataOutput{}, errors.New("invalid maxDailyLossUsd")
+		maxDailyLossPinned := false
+		if strings.TrimSpace(input.MaxDailyLossUSD) != "" {
+			if err := current.MaxDailyLossUSD.UnmarshalText([]byte(input.MaxDailyLossUSD)); err != nil {
+				return nil, DataOutput{}, errors.New("invalid maxDailyLossUsd")
+			}
+			maxDailyLossPinned = true
+		}
+		// Breaker ownership: an explicit breakerMode wins; otherwise an
+		// explicit maxDailyLossUsd pins MANUAL (operator override), otherwise
+		// the stored mode rides along untouched.
+		switch strings.ToUpper(strings.TrimSpace(input.BreakerMode)) {
+		case risk.BreakerModeAuto, risk.BreakerModeManual:
+			current.BreakerMode = strings.ToUpper(strings.TrimSpace(input.BreakerMode))
+		case "":
+			if maxDailyLossPinned {
+				current.BreakerMode = risk.BreakerModeManual
+			}
+		default:
+			return nil, DataOutput{}, fmt.Errorf(
+				"invalid breakerMode %q: must be AUTO or MANUAL", input.BreakerMode)
 		}
 		data, err := services.Control.UpdateRiskSettings(ctx, principal, *current)
 		return nil, DataOutput{Data: data}, err

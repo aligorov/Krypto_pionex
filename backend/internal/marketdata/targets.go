@@ -20,12 +20,16 @@ const (
 	dynamicLossDDFraction    = 0.50
 	// 4.5 - 10.0%: 5% base target on $200 budget ($10.00 profit per bot cycle)
 	// scaling up to 10% ($20.00) on high-momentum trends.
-	dynamicTargetMinPct      = 4.5
-	dynamicTargetMaxPct      = 10.0
-	dynamicLossMinPct        = 2.0
-	dynamicLossMaxPct        = 5.0
-	dynamicLossRangeFloorK   = 0.15
-	minRiskRewardRatio       = 1.50
+	dynamicTargetMinPct = 4.5
+	dynamicTargetMaxPct = 10.0
+	// DynamicLossMinPct is the ADAPTIVE_ATR stop-out floor (% of budget×
+	// leverage notional). Exported because it is ALSO the fleet-design stop
+	// floor the risk derivation (breaker, tranche-2 cap) budgets against —
+	// a designed bot can never store a smaller stop than this.
+	DynamicLossMinPct      = 2.0
+	dynamicLossMaxPct      = 5.0
+	dynamicLossRangeFloorK = 0.15
+	minRiskRewardRatio     = 1.50
 )
 
 type DynamicTargetsInput struct {
@@ -87,7 +91,7 @@ func ComputeDynamicTargets(input DynamicTargetsInput) DynamicTargets {
 			lossFloor = rangeFloor
 		}
 	}
-	lossPct := clamp(lossFloor, dynamicLossMinPct, dynamicLossMaxPct)
+	lossPct := clamp(lossFloor, DynamicLossMinPct, dynamicLossMaxPct)
 	rawTargetPct := math.Max(dynamicTargetVolFraction*vol, lossPct*minRiskRewardRatio)
 	targetPct := clamp(rawTargetPct, dynamicTargetMinPct, dynamicTargetMaxPct)
 	budget := math.Max(input.Budget, 0)

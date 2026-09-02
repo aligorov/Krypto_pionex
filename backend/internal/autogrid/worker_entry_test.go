@@ -170,8 +170,8 @@ type stopEnvelopeFleetBot struct {
 	full   decimal.Decimal
 }
 
-// stopEnvelopeFleet mirrors the two SQL envelope sums over paper_grid_bots:
-// sum of stored stops, optionally excluding one bot, plus a reservation.
+// stopEnvelopeFleet mirrors the joint SQL envelope sum: sum of stored stops
+// across the fleet, optionally excluding one bot, plus a reservation.
 func stopEnvelopeFleet(bots []stopEnvelopeFleetBot, exclude int, reserve decimal.Decimal) decimal.Decimal {
 	sum := decimal.Zero
 	for i, b := range bots {
@@ -182,11 +182,22 @@ func stopEnvelopeFleet(bots []stopEnvelopeFleetBot, exclude int, reserve decimal
 	return sum.Add(reserve)
 }
 
-// runStopEnvelopeSeries walks deploys and tranche-2 top-ups through the
-// same verdicts the production gates apply (stopEnvelopeExceeded over the
-// same sums; the tranche-2 per-bot cap tranche2MaxLossCapUSDT), asserting
-// the stationarity invariant after every step.
-func runStopEnvelopeSeries(t *testing.T, fullStops []decimal.Decimal, breaker decimal.Decimal) []stopEnvelopeFleetBot {
+// impliedLeverage recovers the design leverage behind a full stop that sits
+// exactly at the ADAPTIVE_ATR floor (full = budget×lev×2%) — the shape every
+// scenario bot has.
+func impliedLeverage(budgetUSDT, fullStop decimal.Decimal) int {
+	lev := fullStop.Div(budgetUSDT.Mul(designStopFloorFrac())).IntPart()
+	if lev < 1 {
+		return 1
+	}
+	return int(lev)
+}
+
+// runStopEnvelopeSeries walks deploys and tranche-2 top-ups through the same
+// verdicts the production gates apply (stopEnvelopeExceeded over the same
+// sums; the derived tranche-2 cap tranche2MaxLossCap), asserting the
+// stationarity invariant after every step.
+func runStopEnvelopeSeries(t *testing.T, budgetUSDT decimal.Decimal, fullStops []decimal.Decimal, breaker decimal.Decimal) []stopEnvelopeFleetBot {
 	t.Helper()
 	limit := breaker.Mul(decimal.NewFromFloat(riskStopEnvelopeFraction))
 	var fleet []stopEnvelopeFleetBot
@@ -210,10 +221,11 @@ func runStopEnvelopeSeries(t *testing.T, fullStops []decimal.Decimal, breaker de
 		}
 		fleet = append(fleet, stopEnvelopeFleetBot{stored: full.Div(decimal.NewFromInt(2)), full: full})
 		step()
-		// Tranche-2 gate: per-bot cap first, then the fleet envelope over
-		// the DOUBLED stop (the manage loop's effMaxLoss).
+		// Tranche-2 gate: per-bot derived cap first, then the fleet envelope
+		// over the DOUBLED stop (the manage loop's effMaxLoss).
+		cap := tranche2MaxLossCap(budgetUSDT, impliedLeverage(budgetUSDT, full))
 		eff := fleet[len(fleet)-1].full
-		if eff.GreaterThan(decimal.NewFromFloat(tranche2MaxLossCapUSDT)) ||
+		if eff.GreaterThan(cap) ||
 			stopEnvelopeExceeded(stopEnvelopeFleet(fleet, len(fleet)-1, eff), breaker) {
 			continue // top-up gated: the bot stays at its tranche-1 half
 		}
@@ -229,12 +241,14 @@ func runStopEnvelopeSeries(t *testing.T, fullStops []decimal.Decimal, breaker de
 // plus any live bot's full stop overflow the $40 ceiling — i.e., no live
 // bot's doubling is born stranded (the OP/ASTER pattern: a tranche-2 that
 // fits only after some other bot dies). Scenarios: five 2x bots ($8 full
-// stop each, ending exactly at the ceiling), and a mix led by a 4x $16
-// bot whose top-up the per-bot cap refuses.
+// stop each, ending exactly at the ceiling), and a mix led by a 4x $16 bot —
+// whose top-up the DERIVED cap ($20 = 200×4×2%×1.25) now admits where the
+// old static $12 refused it forever (prod BEX $16 > $12 skip).
 func TestStopEnvelopeStationaryInvariant(t *testing.T) {
 	breaker := decimal.NewFromInt(50)
+	budget := decimal.NewFromInt(200)
 
-	five := runStopEnvelopeSeries(t,
+	five := runStopEnvelopeSeries(t, budget,
 		[]decimal.Decimal{
 			decimal.NewFromInt(8), decimal.NewFromInt(8), decimal.NewFromInt(8),
 			decimal.NewFromInt(8), decimal.NewFromInt(8),
@@ -249,11 +263,10 @@ func TestStopEnvelopeStationaryInvariant(t *testing.T) {
 		}
 	}
 
-	// The mix: the 4x $16 candidate lands first (its $16 top-up is refused
-	// by the per-bot cap, so it keeps an $8 half on the books), then $8
-	// candidates rotate in — three fit before a fourth deploy would push
-	// the 4x bot's reservation (Σ stored excl + $16) past $40.
-	mix := runStopEnvelopeSeries(t,
+	// The mix: the 4x $16 candidate lands first and its $16 top-up now PASSES
+	// the derived $20 cap; $8 candidates rotate in afterwards. End state
+	// stores 16 + 3×8 = 40 exactly at the ceiling — every bot fully doubled.
+	mix := runStopEnvelopeSeries(t, budget,
 		[]decimal.Decimal{
 			decimal.NewFromInt(16),
 			decimal.NewFromInt(8), decimal.NewFromInt(8), decimal.NewFromInt(8),
@@ -261,13 +274,13 @@ func TestStopEnvelopeStationaryInvariant(t *testing.T) {
 	if len(mix) != 4 {
 		t.Fatalf("mix scenario must deploy all four bots, got %d", len(mix))
 	}
-	if !mix[0].stored.Equal(decimal.NewFromInt(8)) {
-		t.Fatalf("the 4x $16 top-up must be cap-refused, stored=%s", mix[0].stored)
+	for i, b := range mix {
+		if !b.stored.Equal(b.full) {
+			t.Fatalf("mix scenario bot %d must complete its top-up under the derived cap, stored=%s full=%s", i, b.stored, b.full)
+		}
 	}
-	// End state stores 8 + 3×8 = 32: the 4x bot's reservation lands exactly
-	// at the ceiling (24 + 16 = 40), every $8 bot has doubled.
-	if got := stopEnvelopeFleet(mix, -1, decimal.Zero); !got.Equal(decimal.NewFromInt(32)) {
-		t.Fatalf("mix scenario end state must store $32, got %s", got)
+	if got := stopEnvelopeFleet(mix, -1, decimal.Zero); !got.Equal(decimal.NewFromInt(40)) {
+		t.Fatalf("mix scenario end state must store $40, got %s", got)
 	}
 
 	// A $16 candidate against a fleet already storing 4×$8 = $32 must be

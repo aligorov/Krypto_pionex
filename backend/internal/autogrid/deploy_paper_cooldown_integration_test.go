@@ -228,53 +228,62 @@ func TestDeployPaperStopEnvelopeGate(t *testing.T) {
 	// desk numbers); STATIC 6/8 gives every candidate a FULL stop of 8
 	// (tranche stores the 4 half). The bot-count caps rise so fillers cannot
 	// trip the portfolio cap or the risk engine's active limit.
-	var savedMode, savedTarget, savedStop, savedBreaker, savedExposure string
+	var savedMode, savedTarget, savedStop, savedBreaker, savedExposure, savedBudget, savedLev, savedSymbolExposure string
 	var savedTranche bool
 	var savedMaxBots, savedMaxGridBots int
 	if err := pool.QueryRow(ctx, `
 		SELECT pnl_target_mode, pnl_target_usdt::TEXT, max_loss_usdt::TEXT, tranche_deploy_enabled,
-		       max_active_bots
+		       max_active_bots, budget_usdt::TEXT, leverage::TEXT
 		FROM autogrid_settings WHERE id = $1
-	`, liveSettings.ID).Scan(&savedMode, &savedTarget, &savedStop, &savedTranche, &savedMaxBots); err != nil {
+	`, liveSettings.ID).Scan(&savedMode, &savedTarget, &savedStop, &savedTranche, &savedMaxBots,
+		&savedBudget, &savedLev); err != nil {
 		t.Fatalf("snapshot autogrid_settings: %v", err)
 	}
 	if err := pool.QueryRow(ctx, `
-		SELECT max_daily_loss_usd::TEXT, max_account_exposure_usd::TEXT, max_active_grid_bots
+		SELECT max_daily_loss_usd::TEXT, max_account_exposure_usd::TEXT, max_active_grid_bots,
+		       max_symbol_exposure_usd::TEXT
 		FROM risk_settings WHERE id = 1
-	`).Scan(&savedBreaker, &savedExposure, &savedMaxGridBots); err != nil {
+	`).Scan(&savedBreaker, &savedExposure, &savedMaxGridBots, &savedSymbolExposure); err != nil {
 		t.Fatalf("snapshot risk_settings: %v", err)
 	}
 	t.Cleanup(func() {
 		if _, err := pool.Exec(ctx, `
 			UPDATE autogrid_settings
 			SET pnl_target_mode = $1, pnl_target_usdt = $2::NUMERIC, max_loss_usdt = $3::NUMERIC,
-			    tranche_deploy_enabled = $4, max_active_bots = $5
-			WHERE id = $6
-		`, savedMode, savedTarget, savedStop, savedTranche, savedMaxBots, liveSettings.ID); err != nil {
+			    tranche_deploy_enabled = $4, max_active_bots = $5,
+			    budget_usdt = $6::NUMERIC, leverage = $7::INT
+			WHERE id = $8
+		`, savedMode, savedTarget, savedStop, savedTranche, savedMaxBots, savedBudget, savedLev, liveSettings.ID); err != nil {
 			t.Errorf("restore autogrid_settings: %v", err)
 		}
 		if _, err := pool.Exec(ctx, `
 			UPDATE risk_settings
 			SET max_daily_loss_usd = $1::NUMERIC, max_account_exposure_usd = $2::NUMERIC,
-			    max_active_grid_bots = $3
+			    max_active_grid_bots = $3, max_symbol_exposure_usd = $4::NUMERIC
 			WHERE id = 1
-		`, savedBreaker, savedExposure, savedMaxGridBots); err != nil {
+		`, savedBreaker, savedExposure, savedMaxGridBots, savedSymbolExposure); err != nil {
 			t.Errorf("restore risk_settings: %v", err)
 		}
 	})
+	// v2.0.67: budget/leverage pinned to the desk numbers ($200 slot) — the
+	// tranche-2 cap is DERIVED from budget×leverage×2%×1.25 ($10 at 2x), and
+	// the seed values ($100/2x → $5) would refuse the newborn's $8 doubling.
 	if _, err := pool.Exec(ctx, `
 		UPDATE autogrid_settings
 		SET pnl_target_mode = 'STATIC', pnl_target_usdt = 6, max_loss_usdt = 8,
-		    tranche_deploy_enabled = TRUE, max_active_bots = 10
+		    tranche_deploy_enabled = TRUE, max_active_bots = 10,
+		    budget_usdt = 200, leverage = 2
 		WHERE id = $1
 	`, liveSettings.ID); err != nil {
 		t.Fatalf("pin autogrid_settings stops: %v", err)
 	}
 	// Four fillers at 2x carry 1600 paper notional — the account exposure
-	// cap (default 1000) must not shadow the envelope assertions.
+	// cap (default 1000) must not shadow the envelope assertions; the symbol
+	// cap (default 300 < 200×2 requested notional) likewise.
 	if _, err := pool.Exec(ctx, `
 		UPDATE risk_settings
-		SET max_daily_loss_usd = 50, max_account_exposure_usd = 100000, max_active_grid_bots = 10
+		SET max_daily_loss_usd = 50, max_account_exposure_usd = 100000,
+		    max_symbol_exposure_usd = 100000, max_active_grid_bots = 10
 		WHERE id = 1
 	`); err != nil {
 		t.Fatalf("pin breaker: %v", err)
@@ -411,16 +420,17 @@ func TestDeployPaperStopEnvelopeGate(t *testing.T) {
 	}
 	var botID string
 	var storedStop decimal.Decimal
+	var botLeverage int
 	if err := pool.QueryRow(ctx, `
-		SELECT id, max_loss_usdt FROM paper_grid_bots
+		SELECT id, max_loss_usdt, leverage FROM paper_grid_bots
 		WHERE symbol = $1 AND status = 'RUNNING'
-	`, symbol).Scan(&botID, &storedStop); err != nil {
+	`, symbol).Scan(&botID, &storedStop, &botLeverage); err != nil {
 		t.Fatalf("load deployed bot round 2: %v", err)
 	}
 	if !storedStop.Equal(decimal.NewFromInt(4)) {
 		t.Fatalf("tranche-1 storage must keep the half stop (4), got %s", storedStop)
 	}
-	if skip := worker.tranche2RiskGate(ctx, settings.ID, botID, decimal.NewFromInt(8), true); skip != "" {
+	if skip := worker.tranche2RiskGate(ctx, *settings, botID, botLeverage, decimal.NewFromInt(8)); skip != "" {
 		t.Fatalf("newborn's tranche-2 must fit at birth under full-stop reservation, got skip %q", skip)
 	}
 }

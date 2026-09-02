@@ -55,7 +55,7 @@ func TestComputeDynamicTargetsClamps(t *testing.T) {
 	flat := ComputeDynamicTargets(DynamicTargetsInput{
 		Budget: 1000, ScannerVolatilityPct: 0.1, ScannerATRPct: 0.05, ScannerDrawdownPct: 0.2,
 	})
-	if flat.TargetPct != dynamicTargetMinPct || flat.LossPct != dynamicLossMinPct {
+	if flat.TargetPct != dynamicTargetMinPct || flat.LossPct != DynamicLossMinPct {
 		t.Fatalf("floor clamps must hold: %+v", flat)
 	}
 	if flat.TargetUSDT != 45 || flat.MaxLossUSDT != 20 {
@@ -82,14 +82,14 @@ func TestComputeDynamicTargetsRangeCoupledLossFloor(t *testing.T) {
 		Budget: 100, RangeSpanPct: 3,
 		ScannerVolatilityPct: 2, ScannerATRPct: 1.5, ScannerDrawdownPct: 1,
 	})
-	if tight.LossPct != dynamicLossMinPct {
+	if tight.LossPct != DynamicLossMinPct {
 		t.Fatalf("3%% span must stay at the absolute floor, got %v", tight.LossPct)
 	}
 	// Zero span (manual deploys) contributes nothing — DD path unchanged.
 	manual := ComputeDynamicTargets(DynamicTargetsInput{
 		Budget: 100, ScannerVolatilityPct: 2, ScannerATRPct: 1.5, ScannerDrawdownPct: 2,
 	})
-	if manual.LossPct != dynamicLossMinPct {
+	if manual.LossPct != DynamicLossMinPct {
 		t.Fatalf("zero span must fall back to the DD floor, got %v", manual.LossPct)
 	}
 }
@@ -158,4 +158,3 @@ func TestGridLevelsForRangeScalesWithATR(t *testing.T) {
 		t.Fatalf("lower clamp must hold, got %d", got)
 	}
 }
-

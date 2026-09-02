@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
 	"sort"
 	"strings"
@@ -234,8 +235,9 @@ type clientCacheEntry struct {
 }
 
 type Service struct {
-	db   *pgxpool.Pool
-	risk *risk.Engine
+	db     *pgxpool.Pool
+	risk   *risk.Engine
+	logger *slog.Logger
 
 	balanceMu     sync.Mutex
 	balanceCached *ExchangeSnapshot
@@ -246,7 +248,7 @@ type Service struct {
 
 func NewService(db *pgxpool.Pool, riskEngine *risk.Engine) *Service {
 	return &Service{
-		db: db, risk: riskEngine,
+		db: db, risk: riskEngine, logger: slog.Default(),
 		clientCache: make(map[string]*clientCacheEntry),
 		publicAPI:   pionex.NewClient("", "", ""),
 	}
@@ -393,7 +395,93 @@ func (s *Service) UpdateSettings(
 	if err != nil {
 		return nil, fmt.Errorf("update AutoGrid settings: %w", err)
 	}
-	return s.GetSettings(ctx)
+	updated, err := s.GetSettings(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("reload AutoGrid settings: %w", err)
+	}
+	// The breaker is a fleet-design derivate: any N/budget/leverage change
+	// must re-align it while risk_settings.breaker_mode = AUTO. Failures are
+	// logged, never fatal — the settings update itself already committed.
+	s.SyncDerivedBreaker(ctx, *updated)
+	return updated, nil
+}
+
+// breakerHeadroom is the multiplier between the design fleet of stored stops
+// and the daily-loss breaker: stop overshoot (σ-scaled stops land up to
+// 2.5× the floor) plus fees/funding. Invariant: riskStopEnvelopeFraction ×
+// breakerHeadroom = 1.0 — a stop wave exactly at the design NEVER trips the
+// breaker that exists to catch it.
+const breakerHeadroom = 1.25
+
+// designStopFloorFrac is the ADAPTIVE_ATR stop floor as a fraction of the
+// budget×leverage notional — the single shared constant (marketdata), never
+// duplicated, so the derivation and ComputeDynamicTargets cannot drift.
+func designStopFloorFrac() decimal.Decimal {
+	return decimal.NewFromFloat(marketdata.DynamicLossMinPct / 100)
+}
+
+// DeriveDailyLossBreaker returns the daily-loss breaker implied by the fleet
+// design: maxActiveBots × the stop a designed bot STORES in steady state ×
+// breakerHeadroom. With tranches on, steady-state storage is the tranche-1
+// half (budget×leverage×floor/2 — the amount a fresh fleet actually books,
+// the tranche-2 doubling being gated per bot); with tranches off it is the
+// full budget×leverage×floor stop. Rounded to cents.
+func DeriveDailyLossBreaker(settings Settings) decimal.Decimal {
+	// Mirror the deploy path's base-leverage default (worker.go: baseLev<=0 → 3).
+	lev := settings.Leverage
+	if lev <= 0 {
+		lev = 3
+	}
+	perBotStop := settings.BudgetUSDT.
+		Mul(decimal.NewFromInt(int64(lev))).
+		Mul(designStopFloorFrac())
+	if settings.TrancheDeployEnabled {
+		perBotStop = perBotStop.Div(decimal.NewFromInt(2))
+	}
+	return decimal.NewFromInt(int64(settings.MaxActiveBots)).
+		Mul(perBotStop).
+		Mul(decimal.NewFromFloat(breakerHeadroom)).
+		Round(2)
+}
+
+// SyncDerivedBreaker aligns risk_settings.max_daily_loss_usd with
+// DeriveDailyLossBreaker when breaker_mode = AUTO. MANUAL is an operator pin
+// and is never touched. Every actual change is logged with its formula; all
+// failures are logged and swallowed (callers pass a background-style ctx on
+// the worker path where healing must not break the loop).
+func (s *Service) SyncDerivedBreaker(ctx context.Context, settings Settings) {
+	derived := DeriveDailyLossBreaker(settings)
+	var mode string
+	var current decimal.Decimal
+	if err := s.db.QueryRow(ctx, `
+		SELECT breaker_mode, max_daily_loss_usd FROM risk_settings WHERE id = 1
+	`).Scan(&mode, &current); err != nil {
+		s.logger.Error("derived breaker: load risk_settings failed",
+			"component", "autogrid_service", "error", err)
+		return
+	}
+	if mode != risk.BreakerModeAuto {
+		return // operator pin: derivation does not own the number
+	}
+	if current.Equal(derived) {
+		return
+	}
+	if _, err := s.db.Exec(ctx, `
+		UPDATE risk_settings SET max_daily_loss_usd = $1, updated_at = NOW()
+		WHERE id = 1 AND breaker_mode = 'AUTO'
+	`, derived); err != nil {
+		s.logger.Error("derived breaker: UPDATE failed",
+			"component", "autogrid_service", "error", err)
+		return
+	}
+	s.logger.Info("derived breaker: $"+derived.StringFixed(2)+
+		" (N×budget×lev×2%×1.25)",
+		"component", "autogrid_service",
+		"breakers_from_to", current.StringFixed(2)+" → "+derived.StringFixed(2),
+		"max_active_bots", settings.MaxActiveBots,
+		"budget_usdt", settings.BudgetUSDT.String(),
+		"leverage", settings.Leverage,
+		"tranche_deploy_enabled", settings.TrancheDeployEnabled)
 }
 
 func (s *Service) State(ctx context.Context) (*State, error) {
