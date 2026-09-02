@@ -37,6 +37,7 @@ var sqlAllowedTables = map[string]bool{
 	"autogrid_candidates": true, "autogrid_scan_runs": true, "autogrid_settings": true,
 	"autogrid_radar_watchlist": true,
 	"bot_execution_events":     true, "bot_risk_snapshots": true, "bot_telemetry": true,
+	"shadow_candidates": true, "macro_snapshots": true, "news_headlines": true, "fomc_meetings": true,
 	"coingecko_snapshots": true, "funding_snapshots": true, "oi_history": true,
 	"liquidation_events": true, "sentiment_snapshots": true, "economic_events": true,
 	"market_derivatives_metrics": true, "market_symbols": true, "backtest_jobs": true,

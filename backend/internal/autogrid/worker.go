@@ -471,6 +471,17 @@ func (worker *Worker) noteDeployBlock(ctx context.Context, reason string) {
 	`, reason)
 }
 
+// candidateConfluenceVerdict reads the persisted confluence verdict from
+// model_assumptions (NEUTRAL when absent).
+func candidateConfluenceVerdict(assumptions map[string]any) string {
+	if confMap, ok := assumptions["confluence"].(map[string]any); ok {
+		if v, ok := confMap["verdict"].(string); ok && strings.TrimSpace(v) != "" {
+			return v
+		}
+	}
+	return "NEUTRAL"
+}
+
 // confluenceConfidence maps the confluence engine's strength (0..1) onto a
 // 0.5..1.0 confidence scale for the direction selector; absent confluence
 // data degrades to the conservative 0.6 default.
@@ -1204,6 +1215,26 @@ func (worker *Worker) deployPaper(
 			continue
 		}
 
+		// v2.0.62 (R1): a DIRECTIONAL entry needs directional confirmation.
+		// The 14d ledger: every big directional stop (SPX/SNXXX SHORT, WLD
+		// LONG, JUP SHORT) carried confluence verdict=NEUTRAL — the engine
+		// went directional while its own confluence stayed agnostic.
+		// 1W/4L for directional entries, 69% of all losses. Cascade-shorts
+		// remain the designed exemption.
+		if (trend == "long" || trend == "short") && !(cascadeShort && trend == "short") {
+			verdict := candidateConfluenceVerdict(candidate.ModelAssumptions)
+			want := "SUPPORT_SHORT"
+			if trend == "long" {
+				want = "SUPPORT_LONG"
+			}
+			if verdict != want {
+				worker.rejectCandidate(ctx, candidate,
+					fmt.Sprintf("R1: направленный вход (%s) без направленного подтверждения — confluence verdict %s, требуется %s",
+						strings.ToUpper(trend), verdict, want), nil)
+				continue
+			}
+		}
+
 		confluence := EvaluateConfluence(candidate, nil, nil)
 
 		gridType := mesh.GridType
@@ -1736,6 +1767,22 @@ func (worker *Worker) deployReal(
 			worker.rejectCandidate(ctx, candidate,
 				"флип направления: символ закрыл бота другого направления ≤12ч назад — направленный вход отложен", nil)
 			continue
+		}
+
+		// v2.0.62 (R1, REAL mirror): directional entry requires the matching
+		// confluence verdict; cascade-shorts exempt.
+		if (trend == "long" || trend == "short") && !(cascadeShort && trend == "short") {
+			verdict := candidateConfluenceVerdict(candidate.ModelAssumptions)
+			want := "SUPPORT_SHORT"
+			if trend == "long" {
+				want = "SUPPORT_LONG"
+			}
+			if verdict != want {
+				worker.rejectCandidate(ctx, candidate,
+					fmt.Sprintf("R1: направленный вход (%s) без направленного подтверждения — confluence verdict %s, требуется %s",
+						strings.ToUpper(trend), verdict, want), nil)
+				continue
+			}
 		}
 		// v2.0.21 beta gate (REAL mirror).
 		if betaDownReal && trend != "short" {
