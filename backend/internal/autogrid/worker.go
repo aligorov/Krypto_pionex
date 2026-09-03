@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"net/http"
 	"runtime/debug"
 	"sort"
 	"strings"
@@ -1552,7 +1553,18 @@ func (worker *Worker) deployReal(
 	// REAL capital would ride. Same context load as the paper round.
 	macroCtx := worker.loadMacroContext(ctx)
 	for _, candidate := range candidates {
-		if candidate.Decision != "ACCEPTED" || activeCount >= settings.MaxActiveBots {
+		// Non-ACCEPTED rows already carry their scanner-time rejection reason.
+		if candidate.Decision != "ACCEPTED" {
+			continue
+		}
+		// Invariant: every deploy-loop skip must leave a reason on the
+		// candidate row. A silent `continue` here kept the fleet "stuck" for
+		// hours with every candidate ACCEPTED and no explanation (prod
+		// 2026-09-03: 5/5 slots taken). Text mirrors the paper path (v2.0.66)
+		// so analytics need not distinguish the source fleet.
+		if activeCount >= settings.MaxActiveBots {
+			worker.rejectCandidate(ctx, candidate,
+				fmt.Sprintf("портфель полон (%d/%d) — слот занят, вход отложен до освобождения", activeCount, settings.MaxActiveBots), nil)
 			continue
 		}
 		// Macro gate (REAL mirror of the paper path): market-wide rotation
@@ -1688,7 +1700,13 @@ func (worker *Worker) deployReal(
 		`, *settings.AccountID, candidate.Symbol).Scan(&exists); err != nil {
 			return fmt.Errorf("check duplicate real grid: %w", err)
 		}
+		// Same invariant as the slot check: the skip must be visible. The
+		// candidate row would otherwise stay ACCEPTED with no reason while a
+		// RUNNING grid already harvests the symbol (paper mirror: «символ уже
+		// в работе»).
 		if exists {
+			worker.rejectCandidate(ctx, candidate,
+				fmt.Sprintf("символ уже в работе: RUNNING-грид по %s активен, повторный деплой не нужен", candidate.Symbol), nil)
 			continue
 		}
 		// Cooldown with escalation (v2.0.28, paper-parity): each additional
@@ -2018,6 +2036,17 @@ func (worker *Worker) deployReal(
 		// Native pre-flight validation: check parameters against Pionex estimation
 		check, checkErr := client.CheckFuturesGridParams(ctx, params)
 		if checkErr != nil {
+			// Exchange-side maintenance (403) is a symbol state, not a
+			// parameter problem — the create behind this check would be
+			// refused identically, so reject the candidate BEFORE any grid
+			// row is submitted instead of re-failing every scan window.
+			if isSymbolMaintenanceError(checkErr) {
+				worker.logger.Info("entry gate: symbol under exchange maintenance, real deploy deferred",
+					"component", "autogrid_worker", "symbol", candidate.Symbol)
+				worker.rejectCandidate(ctx, candidate,
+					"символ на обслуживании биржи (maintenance) — деплой отложен до снятия", nil)
+				continue
+			}
 			worker.logger.Warn(
 				"Pionex checkParams estimation returned warning, attempting direct creation",
 				"component", "autogrid_worker", "symbol", candidate.Symbol, "error", checkErr,
@@ -2048,6 +2077,17 @@ func (worker *Worker) deployReal(
 				// A concurrent scan deployed this symbol first; not an error.
 				worker.logger.Info("skip real deploy: active grid already exists",
 					"component", "autogrid_worker", "symbol", candidate.Symbol)
+				continue
+			}
+			// The lifecycle already persisted the FAILED grid row (the
+			// authoritative audit of the refused attempt); the candidate row
+			// must still leave the maintenance reason — otherwise it stays
+			// ACCEPTED and the next scan mints yet another FAILED row for the
+			// whole maintenance window.
+			if isSymbolMaintenanceError(createErr) {
+				deployErrors = append(deployErrors, fmt.Sprintf("%s: create failed: %v", candidate.Symbol, createErr))
+				worker.rejectCandidate(ctx, candidate,
+					"символ на обслуживании биржи (maintenance) — деплой отложен до снятия", nil)
 				continue
 			}
 			deployErrors = append(deployErrors, fmt.Sprintf("%s: create failed: %v", candidate.Symbol, createErr))
@@ -2301,6 +2341,25 @@ func (worker *Worker) autotuneIfDue(ctx context.Context, settings Settings) {
 		worker.logger.Info("AI autotune adjusted settings",
 			"component", "autogrid_worker", "changes", strings.Join(changes, "; "))
 	}
+}
+
+// pionexSymbolMaintenanceReason is Pionex's refusal code for grid operations
+// on a symbol under exchange-side maintenance: HTTP 403 whose body does not
+// parse as an envelope, so the code survives only inside the client's
+// "invalid JSON response" snippet (or as the envelope code when it parses).
+const pionexSymbolMaintenanceReason = "P_TRADING_BOT_OPERATION_IS_FORBIDDEN_SYMBOL_MAINTENANCE"
+
+// isSymbolMaintenanceError reports whether err is the exchange's symbol-
+// maintenance refusal (HTTP 403 + the maintenance reason). Such a refusal is
+// a symbol state that lifts on its own — it must defer the deploy, never
+// count as a candidate defect or a pipeline failure.
+func isSymbolMaintenanceError(err error) bool {
+	var apiErr *pionex.APIError
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusForbidden {
+		return false
+	}
+	return apiErr.Code == pionexSymbolMaintenanceReason ||
+		strings.Contains(apiErr.Message, pionexSymbolMaintenanceReason)
 }
 
 // rejectCandidate records a late-stage rejection so the UI shows WHY a

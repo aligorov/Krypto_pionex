@@ -355,6 +355,16 @@ func (s *Service) UpdateSettings(
 			input.StopForecastMode = "OFF"
 		}
 	}
+	// REAL without an explicit accountId used to hard-fail validation even
+	// when exactly one enabled verified account exists — both the operator UI
+	// flow and MCP callers (which omit accountId) hit this. When resolution is
+	// unambiguous the account is substituted and persisted below; only a
+	// failed resolve keeps the honest validation error.
+	if input.ExecutionMode == "REAL" && (input.AccountID == nil || strings.TrimSpace(*input.AccountID) == "") {
+		if resolved, resolveErr := s.resolveAccount(ctx); resolveErr == nil {
+			input.AccountID = resolved
+		}
+	}
 	if err := s.validateSettings(ctx, input); err != nil {
 		return nil, err
 	}
