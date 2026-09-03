@@ -25,18 +25,70 @@ import (
 //	B4     escape re-center, may exceed the budget by one — it replaces a
 //	       stop-loss, and a stop never asked the budget's permission
 //
-// Churn guard (v2.0.56 F5 calibration): one radar action per bot per 2h plus
-// a dwell requirement — the signal must sit over B3 for ≥3 consecutive
-// snapshots before acting. On the calibration day s1≥0.9 sat in 17.8% of all
-// rows; without dwell+cooldown that saturation becomes a fee machine, with
-// them the ~20 signals/adverse-day collapse to ~22 re-centers of which ~64%
+// Churn guard (v2.0.56 F5 calibration): a per-bot cooldown plus a dwell
+// requirement — the signal must sit over B3 for ≥3 consecutive snapshots
+// before acting. On the calibration day s1≥0.9 sat in 17.8% of all rows;
+// without dwell+cooldown that saturation becomes a fee machine, with them
+// the ~20 signals/adverse-day collapse to ~22 re-centers of which ~64%
 // precede an adverse confirmation (2026-08-31 audit: even manual operator
 // churn cost $3-8/day).
+//
+// v2.0.68: the cooldown is dist-aware and durable. The flat 2h window was
+// sized for full-width distances; against the minute-knife class (OP
+// 2026-09-02: dist_to_stop 0.15σ) it reacted hours after the stop was gone.
+// The window now tracks the Brownian expected time to the barrier —
+// E[T] = d²·1h at d ATR-σ — discounted by distAwareCooldownFactor and
+// clamped to the original churn bounds (15m floor, 2h cap): 1.5σ → ~1.24h,
+// 0.15σ → the 15m floor. The last-action source is bot_execution_events,
+// not memory — a worker restart used to hand every bot a fresh window it
+// had just spent.
 const (
-	radarActionCooldown = 2 * time.Hour
-	radarDwellTicks     = 3
-	radarMinBotAge      = 30 * time.Minute
+	radarDwellTicks = 3
+	radarMinBotAge  = 30 * time.Minute
+
+	radarCooldownFloor = 15 * time.Minute
+	radarCooldownCap   = 2 * time.Hour
+	// distAwareCooldownFactor discounts the Brownian expected time-to-stop
+	// (d² hours at d ATR-σ): act at ~55% of expected survival, before the
+	// first-passage mass arrives at the barrier.
+	distAwareCooldownFactor = 0.55
 )
+
+// radarActionCooldownFor is the dist-aware re-center window for one score:
+// clamp(distAwareCooldownFactor·d²·1h, 15m, 2h) with d = dist_to_stop in
+// ATR-σ. d ≤ 0 means the price is at or through the barrier (s1 = 1) —
+// maximum urgency, the floor.
+func radarActionCooldownFor(distToStopATR float64) time.Duration {
+	if distToStopATR <= 0 {
+		return radarCooldownFloor
+	}
+	window := time.Duration(distAwareCooldownFactor * distToStopATR * distToStopATR * float64(time.Hour))
+	if window > radarCooldownCap {
+		return radarCooldownCap
+	}
+	if window < radarCooldownFloor {
+		return radarCooldownFloor
+	}
+	return window
+}
+
+// radarLastActionAt is the durable cooldown source: the newest ADJUST_RANGE
+// event whose reason marks it as a radar re-center. Manage-loop shifts log
+// the same event_type with RANGE_BREAK_* reasons and must not arm this
+// window. Fail-open (no row, no table) = no cooldown, same contract as the
+// old in-memory miss.
+func (worker *Worker) radarLastActionAt(ctx context.Context, botID string) (time.Time, bool) {
+	var at *time.Time
+	if err := worker.db.QueryRow(ctx, `
+		SELECT MAX(created_at)
+		FROM bot_execution_events
+		WHERE bot_id = $1 AND event_type = 'ADJUST_RANGE'
+		  AND details->>'reason' IN ('RADAR_B3_RECENTER', 'RADAR_B4_ESCAPE')
+	`, botID).Scan(&at); err != nil || at == nil {
+		return time.Time{}, false
+	}
+	return *at, true
+}
 
 // radarDwellAtOrAbove counts the trailing consecutive snapshots of the bot at
 // or above the threshold (current snapshot included — it is persisted before
@@ -111,16 +163,18 @@ func (worker *Worker) radarMaybeRecenter(ctx context.Context, settings Settings,
 		return
 	}
 
-	worker.radarActionMu.Lock()
-	if t, ok := worker.radarActionAt[b.botID]; ok && time.Since(t) < radarActionCooldown {
-		worker.radarActionMu.Unlock()
+	// Durable dist-aware cooldown: blocked while the bot's last radar
+	// re-center (bot_execution_events) is younger than the window its
+	// current dist_to_stop demands — restart-proof, and a 0.15σ knife waits
+	// minutes, not the flat 2h.
+	if lastAt, ok := worker.radarLastActionAt(ctx, b.botID); ok &&
+		time.Since(lastAt) < radarActionCooldownFor(rs.DistToStopATR) {
 		return
 	}
-	worker.radarActionMu.Unlock()
 
 	// v2.0.56 (F5) dwell gate: act only on a signal that has persisted for
 	// ≥3 consecutive snapshots over B3 — a single spike is noise. Checked
-	// after the in-memory cooldown so the snapshot query only runs for
+	// after the cooldown so the snapshot query only runs for
 	// cooldown-eligible bots.
 	if worker.radarDwellAtOrAbove(ctx, b.botID, bandB3) < radarDwellTicks {
 		return
@@ -165,11 +219,6 @@ func (worker *Worker) radarMaybeRecenter(ctx context.Context, settings Settings,
 	if !b.price.GreaterThan(decimal.Zero) || !bot.upper.GreaterThan(bot.lower) {
 		return
 	}
-
-	// Claim the cooldown slot before acting so a slow pass cannot double-fire.
-	worker.radarActionMu.Lock()
-	worker.radarActionAt[b.botID] = time.Now().UTC()
-	worker.radarActionMu.Unlock()
 
 	newLower, newUpper := recenterBounds(bot.lower, bot.upper, b.price)
 
@@ -229,7 +278,9 @@ func (worker *Worker) radarMaybeRecenter(ctx context.Context, settings Settings,
 		"band", rs.Band, "score", decimal.NewFromFloat(rs.Score).Round(4).String(),
 		"lower", newLower.String(), "upper", newUpper.String())
 
-	_ = LogBotEvent(ctx, worker.db, b.botID, b.botNumber, "PAPER", b.symbol, "ADJUST_RANGE", &b.price, &total, map[string]any{
+	// The event insert below ARMS the durable cooldown — a swallowed error
+	// here would leave the next re-center un-gated on the following pass.
+	if err := LogBotEvent(ctx, worker.db, b.botID, b.botNumber, "PAPER", b.symbol, "ADJUST_RANGE", &b.price, &total, map[string]any{
 		"reason": reason, "action": "RADAR_RECENTER",
 		"score":     decimal.NewFromFloat(rs.Score).Round(4).String(),
 		"band":      rs.Band,
@@ -238,7 +289,10 @@ func (worker *Worker) radarMaybeRecenter(ctx context.Context, settings Settings,
 		"s3":        decimal.NewFromFloat(rs.S3).Round(3).String(),
 		"s4":        decimal.NewFromFloat(rs.S4).Round(3).String(),
 		"new_lower": newLower.String(), "new_upper": newUpper.String(),
-	})
+	}); err != nil {
+		worker.logger.Warn("stop-radar: recenter event insert failed — durable cooldown not armed",
+			"component", "autogrid_worker", "symbol", b.symbol, "error", err)
+	}
 	_ = QueueTelegramEvent(ctx, worker.db, "ADJUST_RANGE", map[string]any{
 		"bot_number": b.botNumber, "symbol": b.symbol,
 		"lower_price": newLower.StringFixed(6), "upper_price": newUpper.StringFixed(6),

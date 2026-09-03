@@ -70,7 +70,7 @@ type DynamicTargets struct {
 
 // ComputeDynamicTargets turns market readings into a per-bot PnL target and
 // stop-out in USDT. Wide, wild ranges earn bigger targets; quiet ranges get
-// modest ones — the numbers follow the market with a strictly positive Risk-Reward Ratio (>= 1.35:1).
+// modest ones — the numbers follow the market with a strictly positive Risk-Reward Ratio (>= 1.50:1).
 func ComputeDynamicTargets(input DynamicTargetsInput) DynamicTargets {
 	vol, volSource := input.AIVolatilityPct, "pionex_ai_kit"
 	if vol <= 0 {

@@ -2,6 +2,7 @@ package autogrid
 
 import (
 	"testing"
+	"time"
 
 	"github.com/aligorov/pionex-bot/backend/internal/pionex"
 	"github.com/shopspring/decimal"
@@ -93,5 +94,41 @@ func TestRadarRecenterBudgetAllows(t *testing.T) {
 	}
 	if radarRecenterBudgetAllows(5, max+1, max) {
 		t.Fatalf("higher bands share the single escape slot, not a fresh one")
+	}
+}
+
+// TestRadarActionCooldownFor pins the dist-aware cadence contract: the window
+// is 0.55·d²·1h (Brownian expected time-to-barrier at d ATR-σ, discounted),
+// clamped to the original churn bounds. The flat 2h window answered the OP
+// 2026-09-02 minute-knife (0.15σ) hours too late.
+func TestRadarActionCooldownFor(t *testing.T) {
+	// Far from the stop: 0.55·4h = 2.2h saturates at the 2h anti-churn cap —
+	// safe distances keep the calibrated cadence.
+	if got := radarActionCooldownFor(2.0); got != 2*time.Hour {
+		t.Fatalf("dist 2σ must cap at 2h, got %v", got)
+	}
+	if got := radarActionCooldownFor(5.0); got != 2*time.Hour {
+		t.Fatalf("any dist beyond ~1.9σ must cap at 2h, got %v", got)
+	}
+	// Minute-knife: 0.55·0.04h ≈ 79s floors at 15m — the fastest legal
+	// reaction cadence (the 3-snapshot dwell still applies on top).
+	if got := radarActionCooldownFor(0.2); got != 15*time.Minute {
+		t.Fatalf("dist 0.2σ must floor at 15m, got %v", got)
+	}
+	if got := radarActionCooldownFor(0.15); got != 15*time.Minute {
+		t.Fatalf("dist 0.15σ (the OP case) must floor at 15m, got %v", got)
+	}
+	// At/through the barrier (s1 = 1): maximum urgency, still the floor —
+	// a zero window would bypass the dwell gate entirely.
+	if got := radarActionCooldownFor(0); got != 15*time.Minute {
+		t.Fatalf("dist 0 must floor at 15m, got %v", got)
+	}
+	if got := radarActionCooldownFor(-1); got != 15*time.Minute {
+		t.Fatalf("negative dist must floor at 15m, got %v", got)
+	}
+	// Mid case: 1.5σ → 0.55·2.25h = 1.2375h (74m15s), inside the bounds.
+	got := radarActionCooldownFor(1.5)
+	if got < 74*time.Minute || got > 75*time.Minute {
+		t.Fatalf("dist 1.5σ must be ~1.24h (0.55·2.25h), got %v", got)
 	}
 }

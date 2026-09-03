@@ -9,7 +9,6 @@ import (
 	"runtime/debug"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/aligorov/pionex-bot/backend/internal/accounts"
@@ -56,10 +55,6 @@ type Worker struct {
 	llm          *llm.Service
 	logger       *slog.Logger
 	owner        string
-	// radarActionAt gates Phase-B radar re-centers to one per bot per
-	// cooldown window; guarded by radarActionMu.
-	radarActionMu sync.Mutex
-	radarActionAt map[string]time.Time
 	// trancheTBRegime throttles the trend check behind the tranche-2
 	// time-box: without it every pending bot older than 24h re-fetches a
 	// 60M klines batch per manage tick for as long as the tape trends.
@@ -110,7 +105,6 @@ func NewWorker(
 		owner:           fmt.Sprintf("autogrid-%d", time.Now().UnixNano()),
 		trancheTBRegime: make(map[string]trancheTBTrend),
 		dataAlarmAt:     make(map[string]time.Time),
-		radarActionAt:   make(map[string]time.Time),
 	}
 }
 
