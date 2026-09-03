@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strconv"
+	"time"
 
 	"github.com/shopspring/decimal"
 )
@@ -127,4 +129,65 @@ func (c *Client) GetFuturesPositions(ctx context.Context) ([]FuturesPosition, er
 		return nil, err
 	}
 	return data.Positions, nil
+}
+
+// FundingFeeRecord is one entry of the documented funding history
+// (GET /uapi/v1/trade/fundingFee). FundingFee keeps the exchange's signed
+// decimal verbatim: per the official docs the field carries the paid amount
+// ("Total funding fee paid" in the bot contract), so positive = paid by the
+// account, negative = received. FundingRate is the rate used for settlement.
+type FundingFeeRecord struct {
+	Symbol       string          `json:"symbol"`
+	IsolatedMode string          `json:"isolatedMode"`
+	FundingFee   decimal.Decimal `json:"fundingFee"`
+	FundingCoin  string          `json:"fundingCoin"`
+	TimestampMS  int64           `json:"timestamp"`
+	FundingRate  decimal.Decimal `json:"fundingRate"`
+
+	Timestamp time.Time `json:"-"`
+}
+
+func (f *FundingFeeRecord) UnmarshalJSON(data []byte) error {
+	type Alias FundingFeeRecord
+	var aux Alias
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	*f = FundingFeeRecord(aux)
+	f.Timestamp = time.UnixMilli(f.TimestampMS).UTC()
+	return nil
+}
+
+// GetFundingFeeHistory pages the documented funding fee records, newest first.
+// All parameters mirror the official contract: empty symbol = all symbols,
+// zero times = unbounded, limit is clamped to the documented 1-200 range.
+func (c *Client) GetFundingFeeHistory(
+	ctx context.Context,
+	symbol string,
+	startTimeMs, endTimeMs int64,
+	limit int,
+) ([]FundingFeeRecord, error) {
+	query := url.Values{}
+	if symbol != "" {
+		query.Set("symbol", symbol)
+	}
+	if startTimeMs > 0 {
+		query.Set("startTime", strconv.FormatInt(startTimeMs, 10))
+	}
+	if endTimeMs > 0 {
+		query.Set("endTime", strconv.FormatInt(endTimeMs, 10))
+	}
+	if limit > 0 {
+		if limit > 200 {
+			limit = 200
+		}
+		query.Set("limit", strconv.Itoa(limit))
+	}
+	var data struct {
+		Fundings []FundingFeeRecord `json:"fundings"`
+	}
+	if err := c.do(ctx, http.MethodGet, "/uapi/v1/trade/fundingFee", query, nil, true, 5, &data); err != nil {
+		return nil, err
+	}
+	return data.Fundings, nil
 }

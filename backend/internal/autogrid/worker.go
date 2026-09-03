@@ -30,6 +30,11 @@ func trancheFlag(on bool) int {
 	return 0
 }
 
+// realFundingReconcileInterval bounds the funding-fee history fetch for REAL
+// bots: funding settles at most every 8h, so a 30-minute anchor keeps each
+// window tiny while capping the signed-endpoint weight per manage pass.
+const realFundingReconcileInterval = 30 * time.Minute
+
 // protectiveCloseExemptReasons is the single source of truth for close
 // reasons that must NOT arm the circuit breaker or the per-symbol cooldown.
 // Every operator-driven stop path must be listed here: CloseAllActiveBots
@@ -2444,7 +2449,8 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 		       NULLIF(model_state->>'trancheBase',''),
 		       NULLIF(model_state->>'trancheEntry',''),
 		       COALESCE(NULLIF(model_state->>'atrPctEntry','')::FLOAT8, 0),
-		       NULLIF(model_state->>'trancheFailAt','')
+		       NULLIF(model_state->>'trancheFailAt',''),
+		       COALESCE(funding_paid_usdt, 0), last_funding_reconcile_at
 		FROM grid_bots
 		WHERE autogrid_settings_id = $1 AND bu_order_id IS NOT NULL
 		  AND status IN ('RUNNING', 'STOP_REQUESTED', 'STOPPING')
@@ -2468,6 +2474,8 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 		trancheEntry                                            *string
 		atrEntry                                                float64
 		trancheFailAt                                           *string
+		fundingPaid                                             decimal.Decimal
+		lastFundingReconcileAt                                  *time.Time
 	}
 	bots := make([]managedBot, 0)
 	for rows.Next() {
@@ -2481,6 +2489,7 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 			&item.peak, &item.createdAt,
 			&item.trancheDeployed, &item.trancheBase, &item.trancheEntry,
 			&item.atrEntry, &item.trancheFailAt,
+			&item.fundingPaid, &item.lastFundingReconcileAt,
 		); err != nil {
 			rows.Close()
 			return clampInterval(settings.ManageIntervalSeconds), err
@@ -2585,6 +2594,51 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 			}
 			unrealized = position.Mul(price.Sub(remote.BUOrderData.PositionOpenPrice))
 		}
+
+		// REAL funding reconciliation: Pionex settles perpetual funding in
+		// the wallet, so remote ProfitWithdrawn never carries it. The column
+		// is cumulative and signed positive = paid; realized re-derives from
+		// remote truth minus that column EVERY pass, so the subtraction is
+		// idempotent across passes and survives anchor failures.
+		if bot.localStatus == "RUNNING" &&
+			(bot.lastFundingReconcileAt == nil ||
+				time.Since(*bot.lastFundingReconcileAt) >= realFundingReconcileInterval) {
+			anchor := bot.createdAt
+			if bot.lastFundingReconcileAt != nil && bot.lastFundingReconcileAt.After(anchor) {
+				anchor = *bot.lastFundingReconcileAt
+			}
+			fundings, fundingErr := client.GetFundingFeeHistory(
+				ctx, bot.symbol, anchor.UnixMilli(), time.Now().UnixMilli(), 200)
+			if fundingErr != nil {
+				// Fail-open, anchor untouched: advancing it on a failed fetch
+				// would silently forfeit every fee inside the skipped window;
+				// the next manage pass retries the same window instead.
+				worker.logger.Warn("REAL funding reconcile fetch failed",
+					"component", "autogrid_worker", "bot_id", bot.id,
+					"symbol", bot.symbol, "error", fundingErr)
+			} else {
+				fundingSum := decimal.Zero
+				for _, fee := range fundings {
+					fundingSum = fundingSum.Add(fee.FundingFee)
+				}
+				if _, fundingErr := worker.db.Exec(ctx, `
+					UPDATE grid_bots
+					SET funding_paid_usdt = funding_paid_usdt + $2::NUMERIC,
+					    last_funding_reconcile_at = NOW(),
+					    updated_at = NOW()
+					WHERE id = $1
+				`, bot.id, fundingSum); fundingErr != nil {
+					// Column and anchor move together in one UPDATE: a persist
+					// failure must not count the sum in memory either, or the
+					// same window would be subtracted twice on the retry.
+					worker.logger.Warn("REAL funding reconcile persist failed",
+						"component", "autogrid_worker", "bot_id", bot.id, "error", fundingErr)
+				} else {
+					bot.fundingPaid = bot.fundingPaid.Add(fundingSum)
+				}
+			}
+		}
+		realized = realized.Sub(bot.fundingPaid)
 
 		// A durable stop intent (grid.stop / autogrid.stop / manual close)
 		// must reach the exchange. Cancel-state machine values survive the
@@ -2807,7 +2861,8 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 		// Behavior trace (v2.0.56 F7): REAL bots join the bot_telemetry
 		// series so underwater/recovery analytics cover the real fleet too.
 		// inventory_notional comes from the exchange-reported position;
-		// grid_level/funding stay 0 — the real loop tracks neither per pass.
+		// grid_level stays 0 (the real loop tracks no paper ladder), while
+		// funding_paid_usdt carries the reconciled cumulative column.
 		// Best-effort insert, same contract as the paper path.
 		if bot.localStatus == "RUNNING" {
 			inventoryNotional := decimal.Zero
@@ -2820,7 +2875,7 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 					 total_pnl, grid_level, inventory_notional, adjustments_count, funding_paid_usdt)
 				VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
 			`, bot.id, bot.botNumber, bot.symbol, price, realized, unrealized,
-				realized.Add(unrealized), 0, inventoryNotional, bot.adjustments, decimal.Zero)
+				realized.Add(unrealized), 0, inventoryNotional, bot.adjustments, bot.fundingPaid)
 		}
 
 		peakNow := bot.peak
