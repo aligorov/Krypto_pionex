@@ -17,8 +17,8 @@ import (
 // range, and the underwater inventory mark crystallizes into realized
 // exactly like the manage loop's own ADJUST_RANGE shift.
 //
-// Decision matrix (mode ACTIVE, PAPER bots only — REAL is never
-// auto-adjusted):
+// Decision matrix (mode ACTIVE; v2.0.72 covers BOTH fleets — paper shifts
+// its simulated range, REAL moves the native grid through adjust_params):
 //
 //	B1/B2  observe only (B2+ still emits the shadow event/telegram)
 //	B3     re-center, consumes the normal adjustments budget
@@ -180,6 +180,14 @@ func (worker *Worker) radarMaybeRecenter(ctx context.Context, settings Settings,
 		return
 	}
 
+	// v2.0.72: REAL bots join the action matrix. Shared gates above (mode,
+	// band, durable cooldown, dwell) already ran; the arm differs only in
+	// execution — native adjust_params instead of a simulated range UPDATE.
+	if b.botSource == "REAL" {
+		worker.radarRecenterReal(ctx, settings, b, rs)
+		return
+	}
+
 	type actBot struct {
 		direction            string
 		entry, investment    decimal.Decimal
@@ -297,5 +305,119 @@ func (worker *Worker) radarMaybeRecenter(ctx context.Context, settings Settings,
 		"bot_number": b.botNumber, "symbol": b.symbol,
 		"lower_price": newLower.StringFixed(6), "upper_price": newUpper.StringFixed(6),
 		"reason": reason, "score": decimal.NewFromFloat(rs.Score).Round(3).String(),
+	})
+}
+
+// radarRecenterReal is the REAL arm of the radar action matrix (v2.0.72):
+// the same B3/B4 geometry as paper (recenterBounds), executed through
+// Service.AdjustBot mode=adjust_params — the identical path the manage
+// loop's tranche/range shifts and the operator console use, so the
+// exchange-side contract (live openPrice, row = existing grid_num,
+// status=RUNNING + settings guard) cannot drift between callers.
+//
+// Budget sharing with the manage path is structural, not duplicated: both
+// read and increment the same grid_bots.adjustments_count, so a manage
+// RANGE_BREAK shift and a radar re-center draw from one per-bot budget;
+// the durable cooldown below arms on bot_execution_events by bot_id, where
+// REAL ids already flow.
+func (worker *Worker) radarRecenterReal(ctx context.Context, settings Settings, b radarInput, rs radarScores) {
+	type realBot struct {
+		direction    string
+		lower, upper decimal.Decimal
+		gridNum      int
+		antiHunt     *decimal.Decimal
+		adjustments  int
+		total        decimal.Decimal
+		createdAt    time.Time
+	}
+	var bot realBot
+	err := worker.db.QueryRow(ctx, `
+		SELECT direction, lower_price, upper_price, grid_num,
+		       NULLIF(anti_hunt_stop_price, 0),
+		       COALESCE(adjustments_count, 0), created_at,
+		       COALESCE(realized_pnl_usdt, 0) + COALESCE(unrealized_pnl_usdt, 0)
+		FROM grid_bots
+		WHERE id = $1 AND autogrid_settings_id = $2
+		  AND bu_order_id IS NOT NULL AND status = 'RUNNING'
+	`, b.botID, settings.ID).Scan(
+		&bot.direction, &bot.lower, &bot.upper, &bot.gridNum,
+		&bot.antiHunt, &bot.adjustments, &bot.createdAt, &bot.total,
+	)
+	if err != nil {
+		return // not RUNNING (a stop won the race) or already gone
+	}
+	// Same trust gate as paper: a bot younger than 30 minutes has no radar
+	// history worth acting on.
+	if time.Since(bot.createdAt) < radarMinBotAge {
+		return
+	}
+	if !radarRecenterBudgetAllows(rs.Band, bot.adjustments, settings.MaxAdjustmentsPerBot) {
+		return // budget spent: B3 at max; B4 after its single escape slot
+	}
+	if !b.price.GreaterThan(decimal.Zero) || !bot.upper.GreaterThan(bot.lower) {
+		return
+	}
+
+	newLower, newUpper := recenterBounds(bot.lower, bot.upper, b.price)
+
+	// AdjustBot increments adjustments_count only AFTER the native
+	// adjustParams succeeds — a failed adjust returns here with the budget
+	// and geometry untouched (Warn, never a phantom shift).
+	if _, err := worker.service.AdjustBot(ctx, worker.accounts, settings.ID, b.botID, AdjustBotInput{
+		Mode:  "adjust_params",
+		Lower: newLower,
+		Upper: newUpper,
+		Row:   bot.gridNum,
+	}); err != nil {
+		worker.logger.Warn("stop-radar: REAL recenter adjust_params failed — budget untouched",
+			"component", "autogrid_worker", "symbol", b.symbol, "error", err)
+		return
+	}
+
+	// The exchange stop is immutable through adjustParams, so the local
+	// anti-hunt must travel with the range exactly like the manage path's
+	// shift — a stale stop would keep gating the OLD bounds and protect
+	// nothing.
+	if bot.antiHunt != nil && bot.antiHunt.GreaterThan(decimal.Zero) {
+		newStop := recenterStop(bot.direction, bot.lower, bot.upper, newLower, newUpper, *bot.antiHunt)
+		if _, err := worker.db.Exec(ctx, `
+			UPDATE grid_bots
+			SET anti_hunt_stop_price = $2, updated_at = NOW()
+			WHERE id = $1
+		`, b.botID, newStop); err != nil {
+			worker.logger.Warn("stop-radar: REAL anti-hunt re-anchor failed",
+				"component", "autogrid_worker", "symbol", b.symbol, "error", err)
+		}
+	}
+
+	reason := "RADAR_B3_RECENTER"
+	if rs.Band >= 4 {
+		reason = "RADAR_B4_ESCAPE"
+	}
+	worker.logger.Info("stop-radar recentered REAL grid",
+		"component", "autogrid_worker", "symbol", b.symbol,
+		"band", rs.Band, "score", decimal.NewFromFloat(rs.Score).Round(4).String(),
+		"lower", newLower.String(), "upper", newUpper.String())
+
+	// The event insert below ARMS the durable cooldown — a swallowed error
+	// here would leave the next re-center un-gated on the following pass.
+	if err := LogBotEvent(ctx, worker.db, b.botID, b.botNumber, "REAL", b.symbol, "ADJUST_RANGE", &b.price, &bot.total, map[string]any{
+		"reason": reason, "action": "RADAR_RECENTER",
+		"score":     decimal.NewFromFloat(rs.Score).Round(4).String(),
+		"band":      rs.Band,
+		"s1":        decimal.NewFromFloat(rs.S1).Round(3).String(),
+		"s2":        decimal.NewFromFloat(rs.S2).Round(3).String(),
+		"s3":        decimal.NewFromFloat(rs.S3).Round(3).String(),
+		"s4":        decimal.NewFromFloat(rs.S4).Round(3).String(),
+		"new_lower": newLower.String(), "new_upper": newUpper.String(),
+	}); err != nil {
+		worker.logger.Warn("stop-radar: REAL recenter event insert failed — durable cooldown not armed",
+			"component", "autogrid_worker", "symbol", b.symbol, "error", err)
+	}
+	_ = QueueTelegramEvent(ctx, worker.db, "ADJUST_RANGE", map[string]any{
+		"bot_number": b.botNumber, "symbol": b.symbol,
+		"lower_price": newLower.StringFixed(6), "upper_price": newUpper.StringFixed(6),
+		"reason": reason, "score": decimal.NewFromFloat(rs.Score).Round(3).String(),
+		"adjustments_count": bot.adjustments + 1,
 	})
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"math"
+	"strings"
 	"time"
 
 	"github.com/shopspring/decimal"
@@ -50,10 +51,14 @@ const (
 
 // radarInput is one running bot's per-tick state, assembled by the manage
 // loop (all of it already computed there — the radar adds no fetches on the
-// hot path; table lookups happen once per pass, not per bot).
+// hot path; table lookups happen once per pass, not per bot). botSource is
+// 'PAPER' (paper_grid_bots) or 'REAL' (grid_bots with a remote buOrderId);
+// v2.0.72 extended the radar to the REAL fleet, which previously flew
+// unscored and un-notified.
 type radarInput struct {
 	botID     string
 	botNumber int
+	botSource string
 	symbol    string
 	direction string
 
@@ -66,6 +71,71 @@ type radarInput struct {
 	// inventorySide: +1 long inventory (price below mid / LONG bot),
 	// −1 short inventory, 0 flat.
 	inventorySide float64
+}
+
+// radarPriceFor resolves a bot's live price from the pass-wide ticker map,
+// tolerating the _PERP/.PERP suffix variance between table conventions —
+// the same triple fallback the paper and REAL manage loops apply inline.
+func radarPriceFor(priceBySymbol map[string]decimal.Decimal, symbol string) (decimal.Decimal, bool) {
+	price, ok := priceBySymbol[symbol]
+	if !ok || price.IsZero() {
+		trimmed := strings.TrimSuffix(strings.TrimSuffix(strings.ToUpper(symbol), "_PERP"), ".PERP")
+		price, ok = priceBySymbol[trimmed]
+		if !ok || price.IsZero() {
+			price, ok = priceBySymbol[trimmed+"_PERP"]
+		}
+	}
+	if !ok || price.IsZero() {
+		return decimal.Zero, false
+	}
+	return price, true
+}
+
+// realRadarInputs assembles radarInput rows for the REAL fleet: RUNNING
+// grid_bots with a remote buOrderId under the active settings. PnL comes
+// from the durable columns the reconcile loop persists from remote truth
+// every pass; anti_hunt_stop_price is NULL-ed at value 0 because grid_bots
+// defaults the column to 0 (never set), which must score as "no stop
+// anchored", not as a stop at zero. REAL entry lives only in
+// model_state->>'trancheEntry'/remote PositionOpenPrice and neither scoring
+// nor re-centering reads it, so it is not selected.
+func (worker *Worker) realRadarInputs(ctx context.Context, settings Settings, priceBySymbol map[string]decimal.Decimal) []radarInput {
+	rows, err := worker.db.Query(ctx, `
+		SELECT id, COALESCE(bot_number, 0), symbol, direction,
+		       lower_price, upper_price, NULLIF(anti_hunt_stop_price, 0),
+		       COALESCE(NULLIF(model_state->>'atrPctEntry','')::FLOAT8, 0),
+		       COALESCE(realized_pnl_usdt, 0) + COALESCE(unrealized_pnl_usdt, 0)
+		FROM grid_bots
+		WHERE autogrid_settings_id = $1 AND bu_order_id IS NOT NULL
+		  AND status = 'RUNNING'
+	`, settings.ID)
+	if err != nil {
+		worker.logger.Warn("stop-radar: REAL fleet select failed",
+			"component", "autogrid_worker", "error", err)
+		return nil
+	}
+	defer rows.Close()
+	inputs := make([]radarInput, 0, 8)
+	for rows.Next() {
+		var in radarInput
+		if err := rows.Scan(
+			&in.botID, &in.botNumber, &in.symbol, &in.direction,
+			&in.lower, &in.upper, &in.antiHunt, &in.atrEntryPct, &in.total,
+		); err != nil {
+			worker.logger.Warn("stop-radar: REAL fleet row scan failed",
+				"component", "autogrid_worker", "error", err)
+			continue
+		}
+		price, ok := radarPriceFor(priceBySymbol, in.symbol)
+		if !ok {
+			continue // no live price this pass: unscoreable, same contract as paper
+		}
+		in.botSource = "REAL"
+		in.price = price
+		in.inventorySide = inventorySideOf(in.direction, price, in.lower, in.upper)
+		inputs = append(inputs, in)
+	}
+	return inputs
 }
 
 type radarFleet struct {
@@ -265,11 +335,11 @@ func (worker *Worker) radarPass(ctx context.Context, settings Settings, bots []r
 
 		if _, err := worker.db.Exec(ctx, `
 			INSERT INTO bot_risk_snapshots
-				(bot_id, bot_number, symbol, mode, s1, s2, s3, s4, m5, score, band,
+				(bot_id, bot_number, bot_source, symbol, mode, s1, s2, s3, s4, m5, score, band,
 				 dist_to_stop_atr, inventory_skew, fleet_rho_neg, dom_slope_bps_h, total_pnl)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
 		`,
-			b.botID, b.botNumber, b.symbol, settings.StopForecastMode,
+			b.botID, b.botNumber, b.botSource, b.symbol, settings.StopForecastMode,
 			decimal.NewFromFloat(rs.S1).Round(6), decimal.NewFromFloat(rs.S2).Round(6),
 			decimal.NewFromFloat(rs.S3).Round(6), decimal.NewFromFloat(rs.S4).Round(6),
 			decimal.NewFromFloat(rs.M5).Round(4), decimal.NewFromFloat(rs.Score).Round(6),
@@ -284,8 +354,10 @@ func (worker *Worker) radarPass(ctx context.Context, settings Settings, bots []r
 			continue
 		}
 
+		// v2.0.72: the shadow transition flows from the bot's own source —
+		// a REAL band change must be identifiable in the ledger and Telegram.
 		if ok && rs.Band != prevBand && rs.Band >= 2 {
-			_ = LogBotEvent(ctx, worker.db, b.botID, b.botNumber, "PAPER", b.symbol,
+			_ = LogBotEvent(ctx, worker.db, b.botID, b.botNumber, b.botSource, b.symbol,
 				"STOP_FORECAST_SHADOW", &b.price, nil, map[string]any{
 					"band": rs.Band, "prev_band": prevBand, "score": decimal.NewFromFloat(rs.Score).Round(4).String(),
 					"s1": decimal.NewFromFloat(rs.S1).Round(3).String(), "s2": decimal.NewFromFloat(rs.S2).Round(3).String(),

@@ -3632,7 +3632,8 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 		}
 		total := realized.Add(unrealized)
 		radarInputs = append(radarInputs, radarInput{
-			botID: bot.id, botNumber: bot.botNumber, symbol: bot.symbol, direction: bot.direction,
+			botID: bot.id, botNumber: bot.botNumber, botSource: "PAPER",
+			symbol: bot.symbol, direction: bot.direction,
 			price: price, antiHunt: bot.antiHuntStop, lower: bot.lower, upper: bot.upper,
 			atrEntryPct: bot.atrEntry, total: total,
 			inventorySide: inventorySideOf(bot.direction, price, bot.lower, bot.upper),
@@ -3895,6 +3896,13 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 				}
 			}
 		}
+	}
+	// v2.0.72: the REAL fleet joins the radar pass — without this append it
+	// flew unscored and un-notified while paper was already protected. The
+	// fetch is gated on the same mode switch radarPass itself checks so OFF
+	// skips the extra query entirely.
+	if settings.StopForecastMode != "OFF" {
+		radarInputs = append(radarInputs, worker.realRadarInputs(ctx, settings, priceBySymbol)...)
 	}
 	worker.radarPass(ctx, settings, radarInputs)
 
