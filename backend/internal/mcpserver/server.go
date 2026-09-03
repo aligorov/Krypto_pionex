@@ -562,6 +562,7 @@ type AutoGridManualDeployInput struct {
 	Upper       string `json:"upper,omitempty"`
 	Row         int    `json:"row,omitempty"`
 	RangeSource string `json:"rangeSource,omitempty"`
+	Investment  string `json:"investment,omitempty"` // optional per-bot budget override (USDT, ≥ $5, ≤ fleet budget)
 }
 
 type AutoGridBotAdjustInput struct {
@@ -835,7 +836,9 @@ func registerAutoGridTools(
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "autogrid_bot_deploy",
 		Description: "Open one bot with operator-confirmed parameters. Empty fields fall back to the " +
-			"latest scanner recommendation. Use autogrid_ai_strategy first to get an AI-adapted range " +
+			"latest scanner recommendation. Optional investment (USDT string, ≥ $5 and ≤ the fleet budget) " +
+			"overrides the per-bot budget for THIS deploy only — a REAL canary on minimal margin — and every " +
+			"derived target/stop follows it. Use autogrid_ai_strategy first to get an AI-adapted range " +
 			"proposal (width from the Spot AI Kit, centered on the PERP price). Requires mcp:trade.",
 		Annotations: writeHint,
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, input AutoGridManualDeployInput) (*mcp.CallToolResult, DataOutput, error) {
@@ -854,6 +857,11 @@ func registerAutoGridTools(
 		if input.Upper != "" {
 			if err := deploy.Upper.UnmarshalText([]byte(input.Upper)); err != nil {
 				return nil, DataOutput{}, errors.New("invalid upper decimal")
+			}
+		}
+		if input.Investment != "" {
+			if err := deploy.Investment.UnmarshalText([]byte(input.Investment)); err != nil {
+				return nil, DataOutput{}, errors.New("invalid investment decimal")
 			}
 		}
 		bot, source, err := services.AutoGrid.DeployManualBot(ctx, services.Accounts, deploy)

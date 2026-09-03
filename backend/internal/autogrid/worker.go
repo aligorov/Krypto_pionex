@@ -1320,7 +1320,7 @@ func (worker *Worker) deployPaper(
 		// nothing to the envelope either way, so the gate only arms when
 		// the candidate carries one.
 		if maxLoss != nil {
-			if reason := worker.deployStopEnvelopeGate(ctx, settings.ID, candidateFullStop); reason != "" {
+			if reason := deployStopEnvelopeGate(ctx, worker.db, worker.risk, worker.logger, settings.ID, candidateFullStop); reason != "" {
 				worker.rejectCandidate(ctx, candidate, reason, nil)
 				worker.logger.Info("paper deploy blocked by fleet stop envelope",
 					"component", "autogrid_worker", "symbol", candidate.Symbol)
@@ -2001,7 +2001,7 @@ func (worker *Worker) deployReal(
 		// overflow the account's stop envelope while every paper deploy was
 		// being refused for it.
 		if botMaxLoss != nil {
-			if reason := worker.deployStopEnvelopeGate(ctx, settings.ID, candidateFullStop); reason != "" {
+			if reason := deployStopEnvelopeGate(ctx, worker.db, worker.risk, worker.logger, settings.ID, candidateFullStop); reason != "" {
 				deployErrors = append(deployErrors, fmt.Sprintf("%s: %s", candidate.Symbol, reason))
 				worker.logger.Info("real deploy blocked by fleet stop envelope",
 					"component", "autogrid_worker", "symbol", candidate.Symbol)
@@ -3193,14 +3193,18 @@ func (worker *Worker) reconcileUnknownSubmissions(ctx context.Context, client *p
 // account against the same breaker, so every envelope gate must sum both
 // tables jointly (v2.0.67 parity fix: the deploy gate used to count paper
 // only, the tranche-2 gate counted only the candidate's own table).
-func (worker *Worker) fleetStopEnvelope(
+// Package-level since v2.0.71: the manual DeployManualBot REAL path runs the
+// same exam through the Service's own db/risk handles — one SQL, one verdict,
+// no drift between the scan and the hand deploy.
+func fleetStopEnvelope(
 	ctx context.Context,
+	db *pgxpool.Pool,
 	settingsID string,
 	excludeBotID *string,
 	reserve decimal.Decimal,
 ) (decimal.Decimal, error) {
 	var envelope decimal.Decimal
-	err := worker.db.QueryRow(ctx, `
+	err := db.QueryRow(ctx, `
 		SELECT
 		  (SELECT COALESCE(SUM(max_loss_usdt), 0) FROM paper_grid_bots
 		     WHERE settings_id = $1 AND status = 'RUNNING'
@@ -3255,7 +3259,7 @@ func (worker *Worker) tranche2RiskGate(
 	if err != nil || rs == nil || !rs.MaxDailyLossUSD.GreaterThan(decimal.Zero) {
 		return ""
 	}
-	envelope, qErr := worker.fleetStopEnvelope(ctx, settings.ID, &botID, effMaxLoss)
+	envelope, qErr := fleetStopEnvelope(ctx, worker.db, settings.ID, &botID, effMaxLoss)
 	if qErr != nil {
 		return ""
 	}
@@ -3290,15 +3294,23 @@ func stopEnvelopeExceeded(envelope, breaker decimal.Decimal) bool {
 // Returns "" when the deploy may proceed, otherwise a human-readable
 // rejection reason. Read failures fail OPEN with a logged warning (the same
 // trade tranche2RiskGate makes); the durable risk exam above stays the
-// fail-closed line.
-func (worker *Worker) deployStopEnvelopeGate(ctx context.Context, settingsID string, candidateStop decimal.Decimal) string {
-	rs, err := worker.risk.LoadSettings(ctx)
+// fail-closed line. Package-level since v2.0.71 so the manual REAL deploy in
+// Service.DeployManualBot runs the identical gate.
+func deployStopEnvelopeGate(
+	ctx context.Context,
+	db *pgxpool.Pool,
+	riskEngine *risk.Engine,
+	logger *slog.Logger,
+	settingsID string,
+	candidateStop decimal.Decimal,
+) string {
+	rs, err := riskEngine.LoadSettings(ctx)
 	if err != nil || rs == nil || !rs.MaxDailyLossUSD.GreaterThan(decimal.Zero) {
 		return ""
 	}
-	envelope, err := worker.fleetStopEnvelope(ctx, settingsID, nil, candidateStop)
+	envelope, err := fleetStopEnvelope(ctx, db, settingsID, nil, candidateStop)
 	if err != nil {
-		worker.logger.Warn("deploy stop-envelope read failed; gate disarmed for this candidate",
+		logger.Warn("deploy stop-envelope read failed; gate disarmed for this candidate",
 			"component", "autogrid_worker", "error", err)
 		return ""
 	}

@@ -377,7 +377,7 @@ func TestDerivedBreakerN10FleetEnvelope(t *testing.T) {
 	// Eleventh: the envelope itself must refuse it — Σ stored is now 76 and
 	// 76 + 8 = 84 > 80. Pinned on the gate directly: the deploy loop's
 	// portfolio cap (10/10) fires earlier with the same verdict (skip).
-	if verdict := worker.deployStopEnvelopeGate(ctx, settings.ID, decimal.NewFromInt(8)); verdict == "" {
+	if verdict := deployStopEnvelopeGate(ctx, worker.db, worker.risk, worker.logger, settings.ID, decimal.NewFromInt(8)); verdict == "" {
 		t.Fatalf("the eleventh deploy must be envelope-refused: 76 + 8 = 84 > 0.8×100")
 	}
 	scanID2 := seedFleetScan(t, pool, symbol11)
@@ -480,7 +480,7 @@ func TestDeployStopEnvelopeParityPaperReal(t *testing.T) {
 	for i := 0; i < 4; i++ {
 		insertPaper(fmt.Sprintf("PARITYP%d_USDT_PERP", i), 9)
 	}
-	paperVerdict := worker.deployStopEnvelopeGate(ctx, settings.ID, candidateStop)
+	paperVerdict := deployStopEnvelopeGate(ctx, worker.db, worker.risk, worker.logger, settings.ID, candidateStop)
 	if paperVerdict == "" {
 		t.Fatalf("Σ36 paper + $8 reserve must be refused (44 > 0.8×50)")
 	}
@@ -490,7 +490,7 @@ func TestDeployStopEnvelopeParityPaperReal(t *testing.T) {
 	for i := 0; i < 4; i++ {
 		insertReal(fmt.Sprintf("PARITYR%d_USDT_PERP", i), 9)
 	}
-	realVerdict := worker.deployStopEnvelopeGate(ctx, settings.ID, candidateStop)
+	realVerdict := deployStopEnvelopeGate(ctx, worker.db, worker.risk, worker.logger, settings.ID, candidateStop)
 	if realVerdict == "" {
 		t.Fatalf("Σ36 real + $8 reserve must be refused (44 > 0.8×50)")
 	}
@@ -504,7 +504,7 @@ func TestDeployStopEnvelopeParityPaperReal(t *testing.T) {
 		insertPaper(fmt.Sprintf("PARITYMIXP%d_USDT_PERP", i), 9)
 		insertReal(fmt.Sprintf("PARITYMIXR%d_USDT_PERP", i), 9)
 	}
-	mixedVerdict := worker.deployStopEnvelopeGate(ctx, settings.ID, candidateStop)
+	mixedVerdict := deployStopEnvelopeGate(ctx, worker.db, worker.risk, worker.logger, settings.ID, candidateStop)
 	if mixedVerdict != paperVerdict {
 		t.Fatalf("parity: mixed Σ36 must equal the single-table verdict, got %q vs %q", mixedVerdict, paperVerdict)
 	}
@@ -514,7 +514,7 @@ func TestDeployStopEnvelopeParityPaperReal(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		insertReal(fmt.Sprintf("PARITYOK%d_USDT_PERP", i), 9)
 	}
-	if verdict := worker.deployStopEnvelopeGate(ctx, settings.ID, candidateStop); verdict != "" {
+	if verdict := deployStopEnvelopeGate(ctx, worker.db, worker.risk, worker.logger, settings.ID, candidateStop); verdict != "" {
 		t.Fatalf("Σ27 real + $8 reserve must pass, got %q", verdict)
 	}
 }

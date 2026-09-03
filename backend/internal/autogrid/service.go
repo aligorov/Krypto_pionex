@@ -1851,8 +1851,16 @@ func (s *Service) lastATRPct(ctx context.Context, symbol string) float64 {
 	return marketdata.DetectRegime(candles).ATRPct
 }
 
+// manualInvestmentFloor is the smallest per-deploy investment override the
+// operator may hand in: below it a typo ($0.5 instead of $5) could pass every
+// native check and still be dust after fees.
+const manualInvestmentFloor = 5
+
 // ManualDeployInput opens a bot with operator-confirmed parameters. Empty
 // fields fall back to the latest scanner recommendation for the symbol.
+// Investment (zero/negative = unset) overrides the fleet budget for THIS bot
+// only — a REAL canary on minimal margin — and every derived amount (targets,
+// stops, risk gates, native QuoteInvestment) follows the override.
 type ManualDeployInput struct {
 	Symbol      string          `json:"symbol"`
 	Mode        string          `json:"mode"`      // PAPER, REAL or empty (= autopilot mode)
@@ -1862,6 +1870,7 @@ type ManualDeployInput struct {
 	Upper       decimal.Decimal `json:"upper"`
 	Row         int             `json:"row"`
 	RangeSource string          `json:"rangeSource"` // SCANNER or AI_KIT (recorded)
+	Investment  decimal.Decimal `json:"investment"`  // optional per-bot budget override
 }
 
 // DeployManualBot opens one bot with explicit operator parameters, gated by
@@ -1878,6 +1887,27 @@ func (s *Service) DeployManualBot(
 	if err != nil {
 		return nil, "", err
 	}
+	// Per-deploy investment override (REAL canary on minimal margin): zero or
+	// negative means "not set" and the fleet budget stays in charge.
+	investment := settings.BudgetUSDT
+	if input.Investment.IsPositive() {
+		if input.Investment.LessThan(decimal.NewFromInt(manualInvestmentFloor)) {
+			return nil, "", fmt.Errorf(
+				"investment override %s is below the $%d minimum — a canary under it is dust after fees",
+				input.Investment.StringFixed(2), manualInvestmentFloor)
+		}
+		if input.Investment.GreaterThan(settings.BudgetUSDT) {
+			return nil, "", fmt.Errorf(
+				"investment override %s exceeds the fleet budget %s — a canary cannot outsize the fleet",
+				input.Investment.StringFixed(2), settings.BudgetUSDT.StringFixed(2))
+		}
+		investment = input.Investment
+	}
+	// Settings is a value struct, so a copy with the swapped BudgetUSDT is the
+	// single point every downstream derivation (computeManualTargets reads
+	// Budget in DYNAMIC mode) needs to follow the canary margin.
+	targetSettings := *settings
+	targetSettings.BudgetUSDT = investment
 	mode := input.Mode
 	if mode == "" {
 		mode = settings.ExecutionMode
@@ -1960,7 +1990,7 @@ func (s *Service) DeployManualBot(
 			return nil, "", fmt.Errorf(
 				"cannot fetch live PERP price for %s: %w", input.Symbol, livePriceErr)
 		}
-		botTarget, botMaxLoss := s.computeManualTargets(ctx, *settings, input.Symbol, leverage)
+		botTarget, botMaxLoss := s.computeManualTargets(ctx, targetSettings, input.Symbol, leverage)
 		var id string
 		if err := s.db.QueryRow(ctx, `
 			INSERT INTO paper_grid_bots (
@@ -1979,7 +2009,7 @@ func (s *Service) DeployManualBot(
 			DO NOTHING
 			RETURNING id
 		`, settings.ID, input.Symbol, dbDirection(trend), "ARITHMETIC",
-			lower, upper, row, leverage, settings.BudgetUSDT,
+			lower, upper, row, leverage, investment,
 			livePrice, input.RangeSource, settings.PnLTargetMode,
 			botTarget, botMaxLoss,
 		).Scan(&id); err != nil {
@@ -1995,7 +2025,7 @@ func (s *Service) DeployManualBot(
 		return &ActiveBot{ID: id, Source: "PAPER", Symbol: input.Symbol,
 			Status: "RUNNING", Direction: dbDirection(trend),
 			LowerPrice: lower, UpperPrice: upper, GridNum: row,
-			Leverage: leverage, QuoteInvestment: settings.BudgetUSDT}, "PAPER", nil
+			Leverage: leverage, QuoteInvestment: investment}, "PAPER", nil
 	}
 
 	// REAL mode: durable execution gates, risk gate, native checkParams,
@@ -2016,7 +2046,7 @@ func (s *Service) DeployManualBot(
 			WHERE id = $1 AND account_id IS NULL
 		`, settings.ID, *accountID)
 	}
-	if err := s.risk.ValidateNewGrid(ctx, *accountID, input.Symbol, leverage, settings.BudgetUSDT); err != nil {
+	if err := s.risk.ValidateNewGrid(ctx, *accountID, input.Symbol, leverage, investment); err != nil {
 		return nil, "", err
 	}
 	client, err := s.PrivateClient(ctx, accountService, *accountID)
@@ -2033,19 +2063,29 @@ func (s *Service) DeployManualBot(
 		BUOrderData: pionex.BUOrderData{
 			Top: upper, Bottom: lower, Row: row,
 			GridType: "arithmetic", Trend: trend,
-			Leverage: leverage, QuoteInvestment: settings.BudgetUSDT,
+			Leverage: leverage, QuoteInvestment: investment,
 		},
 	}
-	botTarget, botMaxLoss := s.computeManualTargets(ctx, *settings, input.Symbol, leverage)
+	botTarget, botMaxLoss := s.computeManualTargets(ctx, targetSettings, input.Symbol, leverage)
 	if botTarget != nil && botTarget.GreaterThan(decimal.Zero) {
 		params.BUOrderData.ProfitStopType = "profit_amount"
 		params.BUOrderData.ProfitStop = botTarget
 	}
+	// v2.0.71 parity: the deploy-scan paths have run the fleet stop-envelope
+	// gate since v2.0.66/67; the manual REAL path skipped it, so a hand deploy
+	// could overflow the account's stop envelope while every scan deploy was
+	// refused for it. Manual bots carry no tranche markers, so the stored stop
+	// IS the full stop — the reserve is exactly botMaxLoss below.
+	if botMaxLoss != nil {
+		if reason := deployStopEnvelopeGate(ctx, s.db, s.risk, s.logger, settings.ID, *botMaxLoss); reason != "" {
+			return nil, "", errors.New(reason)
+		}
+	}
 	check, checkErr := client.CheckFuturesGridParams(ctx, params)
-	if checkErr == nil && check != nil && check.GetMinInvestment().GreaterThan(decimal.Zero) && settings.BudgetUSDT.LessThan(check.GetMinInvestment()) {
+	if checkErr == nil && check != nil && check.GetMinInvestment().GreaterThan(decimal.Zero) && investment.LessThan(check.GetMinInvestment()) {
 		return nil, "", fmt.Errorf(
-			"budget %s is below the Pionex minimum investment %s",
-			settings.BudgetUSDT, check.GetMinInvestment())
+			"investment %s is below the Pionex minimum investment %s",
+			investment.StringFixed(2), check.GetMinInvestment().StringFixed(2))
 	}
 	manager := grid.NewLifecycleManager(s.db, client)
 	gridID, createErr := manager.CreateGridBot(ctx, grid.CreateInput{
@@ -2068,7 +2108,7 @@ func (s *Service) DeployManualBot(
 	return &ActiveBot{ID: gridID, Source: "REAL", Symbol: input.Symbol,
 		Status: "RUNNING", Direction: dbDirection(trend),
 		LowerPrice: lower, UpperPrice: upper, GridNum: row,
-		Leverage: leverage, QuoteInvestment: settings.BudgetUSDT}, "REAL", nil
+		Leverage: leverage, QuoteInvestment: investment}, "REAL", nil
 }
 
 func dbDirection(trend string) string {
