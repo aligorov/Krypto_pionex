@@ -36,7 +36,7 @@ const (
 	shadowSimBatch = 50              // rows per simulation run
 	shadowSimDue   = 20 * time.Hour  // min spacing between simulation runs
 	shadowSimAge   = 24 * time.Hour  // row must mature (tranche time-box horizon)
-	shadowKlines   = 600             // 5M candles ≈ 50h of coverage
+	shadowKlines   = 500             // 5M candles ≈ 42h; /market/klines hard limit is 500 (live-probed: 600 → MARKET_PARAMETER_ERROR "limit error", 500 → ok)
 )
 
 func (worker *Worker) shadowPortfolioEnabled(ctx context.Context) bool {
