@@ -200,6 +200,10 @@ func (c *Client) ListBotOrders(
 		Orders           []BotOrder `json:"orders"`
 		BotOrders        []BotOrder `json:"botOrders"`
 		Items            []BotOrder `json:"items"`
+		// `results` is the DOCUMENTED key of BotOrderListResponse; the
+		// others are tolerated aliases. Missing it made the finished-list
+		// path decode an empty array and report "exchange has no final".
+		Results          []BotOrder `json:"results"`
 		NextPageToken    string     `json:"nextPageToken"`
 		NextPageTokenAlt string     `json:"next_page_token"`
 	}
@@ -212,6 +216,9 @@ func (c *Client) ListBotOrders(
 	}
 	if len(orders) == 0 {
 		orders = envelope.Items
+	}
+	if len(orders) == 0 {
+		orders = envelope.Results
 	}
 	next := envelope.NextPageToken
 	if next == "" {
