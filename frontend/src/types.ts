@@ -437,16 +437,25 @@ export interface AutoGridState {
 
 // Wallet-truth epoch accounting served by GET /api/autogrid/equity: the
 // operator's headline TOTAL PnL measured on the futures wallet itself
-// (equity_now − first snapshot), with the exchange's own unrealized PnL
-// and the capture time so staleness is visible at a glance.
-// available=false means the capture pipeline is not writing snapshots.
+// TOTAL PnL (v2.0.83): the bot aggregate — running (grid profit + funding +
+// floating) plus closed-of-epoch finals, with refused settles estimated from
+// telemetry. The account endpoints cannot see isolated-grid margins, so the
+// aggregate over bots IS the application truth.
+// available=false only on real errors (no account / DB); an empty epoch
+// answers zeroes and never raises the capture alarm.
 export interface EquityEpochSummary {
   epochStartedAt: string;
   epochPnlUsdt: string;
-  equityStartUsdt: string;
-  equityNowUsdt: string;
+  runningPnlUsdt: string;
+  runningFloatingUsdt: string;
+  runningInvestmentUsdt: string;
+  runningBots: number;
+  closedKnownUsdt: string;
+  closedKnownBots: number;
+  closedEstimatedUsdt: string;
+  closedEstimatedBots: number;
+  unknownCount: number;
   snapshots: number;
-  exchangeUnrealizedPnlUsdt: string;
   capturedAt: string;
 }
 

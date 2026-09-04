@@ -985,29 +985,38 @@ func (s *Service) CloseAllActiveBots(ctx context.Context, reason string) error {
 	return nil
 }
 
-// AccountEquitySummary is the wallet-truth epoch accounting: the operator's
-// headline "итоговый PnL" measured on the futures wallet itself, immune to
-// the fee blindness of every bot-level PnL field (v2.0.75).
+// AccountEquitySummary is the bot-aggregate epoch accounting (v2.0.83): the
+// operator's headline "итоговый PnL" summed over the bots themselves — the
+// account endpoints are structurally blind to isolated-grid margins, so the
+// aggregate over bots IS the application truth (the same figure the Pionex
+// app shows). Every leg of the sum is exchange truth as persisted by the
+// manage pass; refused settles appear as telemetry-derived estimates.
 type AccountEquitySummary struct {
-	EpochStartedAt  time.Time       `json:"epochStartedAt"`
-	EpochPnLUSDT    decimal.Decimal `json:"epochPnlUsdt"`
-	EquityStartUSDT decimal.Decimal `json:"equityStartUsdt"`
-	EquityNowUSDT   decimal.Decimal `json:"equityNowUsdt"`
-	Snapshots       int             `json:"snapshots"`
-	// The exchange's own account-level unrealized PnL and the capture time of
-	// the newest snapshot (v2.0.80): the UI shows them under the headline
-	// figure so staleness is visible at a glance.
-	UnrealizedPnLUSDT decimal.Decimal `json:"exchangeUnrealizedPnlUsdt"`
-	CapturedAt        time.Time       `json:"capturedAt"`
+	EpochStartedAt time.Time       `json:"epochStartedAt"`
+	EpochPnLUSDT   decimal.Decimal `json:"epochPnlUsdt"`
+	// Breakdown legs (v2.0.83): running fleet PnL/investment/floating and
+	// the closed-of-epoch finals split by provenance.
+	RunningPnLUSDT        decimal.Decimal `json:"runningPnlUsdt"`
+	RunningFloatingUSDT   decimal.Decimal `json:"runningFloatingUsdt"`
+	RunningInvestmentUSDT decimal.Decimal `json:"runningInvestmentUsdt"`
+	RunningBots           int             `json:"runningBots"`
+	ClosedKnownUSDT       decimal.Decimal `json:"closedKnownUsdt"`
+	ClosedKnownBots       int             `json:"closedKnownBots"`
+	ClosedEstimatedUSDT   decimal.Decimal `json:"closedEstimatedUsdt"`
+	ClosedEstimatedBots   int             `json:"closedEstimatedBots"`
+	UnknownCount          int             `json:"unknownCount"`
+	// Snapshots counts bot_aggregate rows; CapturedAt is the newest capture
+	// so staleness is visible at a glance.
+	Snapshots  int       `json:"snapshots"`
+	CapturedAt time.Time `json:"capturedAt"`
 }
 
-// AccountEquityEpoch derives the wallet-truth epoch PnL from the equity
-// snapshot ledger: equity_now − equity_first_snapshot for the managed
-// account. No snapshots yet → nil, and the caller reports available=false.
-// Every column scans into a pointer: an empty table yields a row of NULLs
-// (scalar subqueries over zero rows), and a NULL into a plain decimal used
-// to fail the scan — this endpoint 500'd on the exact empty-ledger state
-// the capture outage produced (v2.0.80 fix).
+// AccountEquityEpoch derives the bot-aggregate epoch PnL for the managed
+// account: Σ running (realized + floating) + Σ closed-of-epoch finals, the
+// NULL finals estimated from the last telemetry total before close. The
+// summary is always non-nil on success — an empty epoch answers zeroes, and
+// only a real failure (bad anchor, DB error, no account) returns an error
+// the endpoint reports as available:false.
 func (s *Service) AccountEquityEpoch(ctx context.Context) (*AccountEquitySummary, error) {
 	accountID, err := s.resolveAccount(ctx)
 	if err != nil {
@@ -1016,42 +1025,41 @@ func (s *Service) AccountEquityEpoch(ctx context.Context) (*AccountEquitySummary
 	if accountID == nil {
 		return nil, errors.New("no Pionex account configured")
 	}
-	var equityStart, equityNow, unrealized *decimal.Decimal
-	var epochStart, capturedAt *time.Time
-	var snapshots int
-	if err := s.db.QueryRow(ctx, `
-		SELECT
-		  (SELECT equity_usdt FROM account_equity_snapshots WHERE account_id = $1 ORDER BY captured_at ASC LIMIT 1),
-		  (SELECT captured_at FROM account_equity_snapshots WHERE account_id = $1 ORDER BY captured_at ASC LIMIT 1),
-		  (SELECT equity_usdt FROM account_equity_snapshots WHERE account_id = $1 ORDER BY captured_at DESC LIMIT 1),
-		  (SELECT unrealized_pnl_usdt FROM account_equity_snapshots WHERE account_id = $1 ORDER BY captured_at DESC LIMIT 1),
-		  (SELECT captured_at FROM account_equity_snapshots WHERE account_id = $1 ORDER BY captured_at DESC LIMIT 1),
-		  (SELECT COUNT(*) FROM account_equity_snapshots WHERE account_id = $1)
-	`, *accountID).Scan(
-		&equityStart, &epochStart,
-		&equityNow, &unrealized, &capturedAt, &snapshots,
-	); err != nil {
-		return nil, fmt.Errorf("load equity epoch: %w", err)
+	epochStart, err := s.PNLEpochStart(ctx)
+	if err != nil {
+		return nil, err
 	}
-	if equityStart == nil || equityNow == nil {
-		// Empty ledger (or NULL rows): not an error — the caller reports
-		// available:false and the UI raises the "snapshots are not being
-		// written" alarm.
-		return nil, nil
+	breakdown, err := ComputeEquityBreakdown(ctx, s.db, *accountID, epochStart)
+	if err != nil {
+		return nil, err
 	}
 	summary := &AccountEquitySummary{
-		EpochStartedAt:  *epochStart,
-		EquityStartUSDT: *equityStart,
-		EquityNowUSDT:   *equityNow,
-		Snapshots:       snapshots,
+		EpochStartedAt:        epochStart,
+		EpochPnLUSDT:          breakdown.EpochPnL(),
+		RunningPnLUSDT:        breakdown.RunningPnL,
+		RunningFloatingUSDT:   breakdown.RunningFloating,
+		RunningInvestmentUSDT: breakdown.RunningInvestment,
+		RunningBots:           breakdown.RunningBots,
+		ClosedKnownUSDT:       breakdown.ClosedKnown,
+		ClosedKnownBots:       breakdown.ClosedKnownBots,
+		ClosedEstimatedUSDT:   breakdown.ClosedEstimated,
+		ClosedEstimatedBots:   breakdown.ClosedEstimatedBots,
+		UnknownCount:          breakdown.UnknownCount,
 	}
-	if unrealized != nil {
-		summary.UnrealizedPnLUSDT = *unrealized
+	// Snapshot telemetry: pointer scan — zero rows must not 500 the card.
+	var capturedAt *time.Time
+	if err := s.db.QueryRow(ctx, `
+		SELECT COUNT(*),
+		       (SELECT MAX(captured_at) FROM account_equity_snapshots
+		        WHERE account_id = $1 AND source = 'bot_aggregate')
+		FROM account_equity_snapshots
+		WHERE account_id = $1 AND source = 'bot_aggregate'
+	`, *accountID).Scan(&summary.Snapshots, &capturedAt); err != nil {
+		return nil, fmt.Errorf("load equity snapshots: %w", err)
 	}
 	if capturedAt != nil {
 		summary.CapturedAt = *capturedAt
 	}
-	summary.EpochPnLUSDT = summary.EquityNowUSDT.Sub(summary.EquityStartUSDT)
 	return summary, nil
 }
 

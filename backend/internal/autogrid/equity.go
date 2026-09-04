@@ -1,64 +1,272 @@
 package autogrid
 
 import (
-	"encoding/json"
 	"context"
 	"errors"
 	"fmt"
 	"strings"
 	"time"
 
-	"github.com/aligorov/pionex-bot/backend/internal/pionex"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/shopspring/decimal"
 )
 
-// Wallet-equity truth (v2.0.75). The bots' own PnL attribution
-// (profitReduce/profitExited → grid_bots.realized_pnl_usdt) never sees the
-// entry/exit/invest_in fees — Pionex charges those straight to the futures
-// wallet — so any epoch PnL summed from bot rows overstates reality by the
-// accumulated fee bleed. The wallet itself is the only complete ledger:
-// every manage pass (self-throttled to 5 minutes by the snapshot table)
-// captures the USDT cross-margin equity from /uapi/v1/account/detail and the
-// epoch PnL is equity_now − equity_first_snapshot.
+// TOTAL PnL = bot aggregate (v2.0.83). Raw /uapi/v1/account/detail captures
+// closed the v2.0.75–82 wallet-truth chase: every coin row answers zero and
+// positions is [] because the margins and floating PnL live INSIDE the
+// isolated futures-grid bots — the account endpoints are structurally blind
+// to them. The application truth (the figure the Pionex app itself shows) is
+// the aggregate over bots:
+//
+//	epoch_pnl = Σ running (realized[grid profit + funding] + floating)
+//	         + Σ closed-of-epoch (final where known; NULL final → the last
+//	           telemetry total before closed_at, tagged estimated)
+//
+// The manage pass refreshes grid_bots.realized_pnl_usdt (profitReduce +
+// fundingFeePayment) and unrealized_pnl_usdt (position × (mark − open)) from
+// remote truth every cycle, so summing those columns IS summing the remote
+// figures — no extra exchange round-trip.
 const (
 	// equitySnapshotMinSpacing is the capture throttle. The manage loop can
 	// run as fast as every 15s; the durable table itself enforces the floor
 	// so a restart cannot machine-gun the endpoint either.
 	equitySnapshotMinSpacing = 5 * time.Minute
-	// equityChangeLogThresholdUSDT gates the Info log: silent ticks stay
-	// silent, a real wallet move (fee batch, close, funding) gets one line.
-	equityChangeLogThresholdUSDT = 1.0
 	// equityFailureDedup bounds the EQUITY_CAPTURE_FAILED marker: one durable
 	// event per hour per failure mode. The manage pass runs every ~15-60s,
 	// so an undeduped marker would flood bot_execution_events.
 	equityFailureDedup = time.Hour
+	// equityInfoEventDedup bounds the hourly EQUITY_SNAPSHOT Info marker —
+	// the operator gets one aggregate heartbeat per hour, Telegram stays
+	// silent (Info events never reach the outbox).
+	equityInfoEventDedup = time.Hour
+	// equityTelemetryFreshWindow is how close to closed_at the last telemetry
+	// row must be to count as a fresh estimate; older rows are still used
+	// (nearest-earlier) but the staleness is visible in the breakdown.
+	equityTelemetryFreshWindow = 5 * time.Minute
+	// equitySnapshotSourceBotAggregate tags rows written by the bot-aggregate
+	// capture (v2.0.83 semantics) against the legacy wallet snapshots.
+	equitySnapshotSourceBotAggregate = "bot_aggregate"
 )
 
-// equityWallet is one captured USDT wallet state, source-agnostic: the
-// primary /uapi/v1/account/detail row or the balances+positions fallback.
-type equityWallet struct {
-	assets        decimal.Decimal
-	available     decimal.Decimal
-	unrealizedPnL decimal.Decimal
-	debts         decimal.Decimal
+// pnlEpochDefaultStart seeds fresh installs (and predates the backfill):
+// execution mode REAL went live 2026-09-03 16:33Z. The precise anchor lives
+// in app_config('pnl_epoch_started_at'), backfilled by migration 0041 from
+// the first REAL bot created after 16:30Z that day.
+var pnlEpochDefaultStart = time.Date(2026, 9, 3, 16, 33, 0, 0, time.UTC)
+
+// pnlEpochAnchorLayouts accepts the canonical RFC3339 (what migration 0041
+// writes) plus the tolerant shapes an operator may hand-write into
+// app_config — a Postgres-style "2026-09-03 16:33:00+00" or a naive UTC
+// timestamp must re-anchor the epoch, not error the card.
+var pnlEpochAnchorLayouts = []string{
+	time.RFC3339,
+	"2006-01-02 15:04:05-07",
+	"2006-01-02 15:04:05",
 }
 
-func (w *equityWallet) equity() decimal.Decimal {
-	value := w.assets.Add(w.unrealizedPnL)
-	if w.debts.IsPositive() {
-		value = value.Sub(w.debts)
+// PNLEpochStart resolves the durable epoch anchor from app_config. Missing
+// key → the default seed (fresh installs). A malformed value is an error,
+// never silently re-anchored: the epoch boundary decides the headline PnL.
+func (s *Service) PNLEpochStart(ctx context.Context) (time.Time, error) {
+	var raw *string
+	if err := s.db.QueryRow(ctx, `
+		SELECT value #>> '{}' FROM app_config WHERE key = 'pnl_epoch_started_at'
+	`).Scan(&raw); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return pnlEpochDefaultStart, nil
+		}
+		return time.Time{}, fmt.Errorf("load pnl epoch anchor: %w", err)
 	}
-	return value
+	if raw == nil || strings.TrimSpace(*raw) == "" {
+		return pnlEpochDefaultStart, nil
+	}
+	value := strings.TrimSpace(*raw)
+	for _, layout := range pnlEpochAnchorLayouts {
+		if parsed, err := time.Parse(layout, value); err == nil {
+			return parsed.UTC(), nil
+		}
+	}
+	return time.Time{}, fmt.Errorf("pnl epoch anchor %q matches no accepted timestamp layout", value)
 }
 
-// captureAccountEquity snapshots the futures wallet's USDT equity for the
-// managed account. Fail-open by design: a failing endpoint or a missing
-// account must never disturb the manage pass that supervises real grids —
-// but never silent again (v2.0.80): every outcome that does NOT produce a
-// snapshot row leaves a durable EQUITY_CAPTURE_FAILED marker, so an empty
-// ledger is diagnosable from the DB instead of from docker stdout.
-func (worker *Worker) captureAccountEquity(ctx context.Context, settings Settings) {
+// EquityBreakdown is the bot-aggregate epoch PnL split into its legs. Every
+// component is exchange truth as persisted by the manage pass; the closed
+// legs separate what the exchange settled (known) from telemetry-derived
+// estimates so the UI can mark the confidence.
+type EquityBreakdown struct {
+	// RunningPnL = Σ running (realized + floating) for epoch bots.
+	RunningPnL decimal.Decimal
+	// RunningFloating = Σ running unrealized (the "Floating PnL" leg).
+	RunningFloating decimal.Decimal
+	// RunningInvestment = Σ running quote investment (the isolated margins).
+	RunningInvestment decimal.Decimal
+	// RunningBots = count of epoch bots in RUNNING/STOP_REQUESTED/STOPPING.
+	RunningBots int
+	// ClosedKnown = Σ final realized over closed epoch bots with a settled figure.
+	ClosedKnown decimal.Decimal
+	// ClosedKnownBots counts those finals.
+	ClosedKnownBots int
+	// ClosedEstimated = Σ telemetry-fallback totals over closed epoch bots
+	// whose realized_pnl_usdt is NULL (refused settle) but which carry a
+	// telemetry trace. The last total before closed_at is the exchange truth
+	// minus the closing fees — close, and marked estimated.
+	ClosedEstimated decimal.Decimal
+	// ClosedEstimatedBots counts those estimates.
+	ClosedEstimatedBots int
+	// UnknownCount counts closed epoch bots with a NULL final and no usable
+	// telemetry: deliberately NOT estimated, excluded from EpochPnL.
+	UnknownCount int
+}
+
+// EpochPnL folds the breakdown into the operator's headline number.
+func (b EquityBreakdown) EpochPnL() decimal.Decimal {
+	return b.RunningPnL.Add(b.ClosedKnown).Add(b.ClosedEstimated)
+}
+
+// ComputeEquityBreakdown derives the epoch aggregate from grid_bots (+ the
+// bot_telemetry fallback for refused settles), scoped to one account.
+// Every query error is returned — the headline number must not degrade
+// silently.
+func ComputeEquityBreakdown(
+	ctx context.Context, db *pgxpool.Pool, accountID string, epochStart time.Time,
+) (EquityBreakdown, error) {
+	breakdown := EquityBreakdown{}
+	if err := db.QueryRow(ctx, `
+		SELECT COALESCE(SUM(realized_pnl_usdt), 0),
+		       COALESCE(SUM(unrealized_pnl_usdt), 0),
+		       COALESCE(SUM(quote_investment), 0),
+		       COUNT(*)
+		FROM grid_bots
+		WHERE account_id = $1
+		  AND bu_order_id IS NOT NULL
+		  AND execution_mode = 'REAL'
+		  AND created_at >= $2
+		  AND status IN ('RUNNING', 'STOP_REQUESTED', 'STOPPING')
+	`, accountID, epochStart).Scan(
+		&breakdown.RunningPnL, &breakdown.RunningFloating,
+		&breakdown.RunningInvestment, &breakdown.RunningBots,
+	); err != nil {
+		return breakdown, fmt.Errorf("equity breakdown: sum running legs: %w", err)
+	}
+	breakdown.RunningPnL = breakdown.RunningPnL.Add(breakdown.RunningFloating)
+
+	// Closed legs: settled finals count directly; NULL finals (refused
+	// settle — the honesty gate NULLed a grid-only positive on a loss-class
+	// close) fall back to the last telemetry total before close.
+	closedRows, err := db.Query(ctx, `
+		SELECT id, realized_pnl_usdt, COALESCE(closed_at, updated_at)
+		FROM grid_bots
+		WHERE account_id = $1
+		  AND bu_order_id IS NOT NULL
+		  AND execution_mode = 'REAL'
+		  AND created_at >= $2
+		  AND status IN ('STOPPED', 'COMPLETED', 'CANCELLED', 'LIQUIDATED')
+	`, accountID, epochStart)
+	if err != nil {
+		return breakdown, fmt.Errorf("equity breakdown: load closed epoch bots: %w", err)
+	}
+	type closedRef struct {
+		id     string
+		anchor *time.Time
+	}
+	var unsettled []closedRef
+	for closedRows.Next() {
+		var id string
+		var realized *decimal.Decimal
+		var anchor *time.Time
+		if err := closedRows.Scan(&id, &realized, &anchor); err != nil {
+			closedRows.Close()
+			return breakdown, fmt.Errorf("equity breakdown: scan closed epoch bot: %w", err)
+		}
+		if realized != nil {
+			breakdown.ClosedKnown = breakdown.ClosedKnown.Add(*realized)
+			breakdown.ClosedKnownBots++
+			continue
+		}
+		unsettled = append(unsettled, closedRef{id: id, anchor: anchor})
+	}
+	closedRows.Close()
+	if err := closedRows.Err(); err != nil {
+		return breakdown, fmt.Errorf("equity breakdown: iterate closed epoch bots: %w", err)
+	}
+
+	for _, ref := range unsettled {
+		estimate, err := lastTelemetryTotalBefore(ctx, db, ref.id, ref.anchor)
+		if err != nil {
+			return breakdown, fmt.Errorf("equity breakdown: telemetry fallback for %s: %w", ref.id, err)
+		}
+		if estimate == nil {
+			// No telemetry at all: do NOT invent a figure — the bot is
+			// counted as unknown and stays out of the epoch sum.
+			breakdown.UnknownCount++
+			continue
+		}
+		breakdown.ClosedEstimated = breakdown.ClosedEstimated.Add(*estimate)
+		breakdown.ClosedEstimatedBots++
+	}
+	return breakdown, nil
+}
+
+// lastTelemetryTotalBefore implements the closed-bot telemetry fallback:
+// the freshest total within equityTelemetryFreshWindow before closed_at,
+// else the nearest earlier row. NULL anchor (no close time recorded) or no
+// row at all → nil (unknown).
+func lastTelemetryTotalBefore(
+	ctx context.Context, db *pgxpool.Pool, botID string, closedAt *time.Time,
+) (*decimal.Decimal, error) {
+	if closedAt == nil {
+		return nil, nil
+	}
+	windowStart := closedAt.Add(-equityTelemetryFreshWindow)
+	var total decimal.Decimal
+	err := db.QueryRow(ctx, `
+		SELECT total_pnl FROM bot_telemetry
+		WHERE bot_id = $1
+		  AND captured_at BETWEEN $2 AND $3
+		ORDER BY captured_at DESC
+		LIMIT 1
+	`, botID, windowStart, *closedAt).Scan(&total)
+	if err == nil {
+		return &total, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return nil, fmt.Errorf("fresh telemetry probe: %w", err)
+	}
+	// Nothing fresh: the nearest earlier row is still the best exchange-truth
+	// proxy (it is the running total the manage loop marked from remote).
+	err = db.QueryRow(ctx, `
+		SELECT total_pnl FROM bot_telemetry
+		WHERE bot_id = $1 AND captured_at <= $2
+		ORDER BY captured_at DESC
+		LIMIT 1
+	`, botID, *closedAt).Scan(&total)
+	if err == nil {
+		return &total, nil
+	}
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	return nil, fmt.Errorf("telemetry fallback probe: %w", err)
+}
+
+// captureBotAggregateEquity snapshots the fleet's bot-aggregate state into
+// account_equity_snapshots (source='bot_aggregate'):
+//
+//	assets_usdt       = Σ running investment (the isolated margins)
+//	unrealized_pnl    = Σ running floating
+//	equity_usdt       = wallet USDT assets (0 in isolated reality) + assets
+//	                    + Σ running (realized + floating)
+//	available_usdt    = wallet USDT free
+//
+// It runs AFTER the manage bot loop, so the summed columns were just
+// refreshed from remote truth. Fail-open by design — a failing capture must
+// never disturb the manage pass — but never silent: real failures (fetch,
+// decode, persist) leave a durable EQUITY_CAPTURE_FAILED marker. An account
+// endpoint answering zero/empty is NOT a failure (that is the isolated-bot
+// norm); the aggregate still lands and an hourly Info EQUITY_SNAPSHOT event
+// carries the heartbeat without touching Telegram.
+func (worker *Worker) captureBotAggregateEquity(ctx context.Context, settings Settings) {
 	accountID := settings.AccountID
 	if accountID == nil {
 		resolved, err := worker.service.resolveAccount(ctx)
@@ -74,17 +282,18 @@ func (worker *Worker) captureAccountEquity(ctx context.Context, settings Setting
 		}
 		accountID = resolved
 	}
-	// Durable throttle: the newest snapshot for THIS account younger than the
-	// spacing means this pass has nothing to record.
+	// Durable throttle: the newest bot_aggregate snapshot for THIS account
+	// younger than the spacing means this pass has nothing to record.
 	var lastAt *time.Time
 	if err := worker.db.QueryRow(ctx, `
-		SELECT MAX(captured_at) FROM account_equity_snapshots WHERE account_id = $1
-	`, *accountID).Scan(&lastAt); err == nil && lastAt != nil &&
+		SELECT MAX(captured_at) FROM account_equity_snapshots
+		WHERE account_id = $1 AND source = $2
+	`, *accountID, equitySnapshotSourceBotAggregate).Scan(&lastAt); err == nil && lastAt != nil &&
 		time.Since(*lastAt) < equitySnapshotMinSpacing {
 		return
 	} else if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		// A broken throttle probe (missing table, connectivity) must not turn
-		// into an unthrottled endpoint hammer: report and stand down this pass.
+		// into an unthrottled write path: report and stand down this pass.
 		worker.logger.Warn("equity snapshot: throttle probe failed",
 			"component", "autogrid_worker", "error", err)
 		worker.alertEquityCaptureFailure(ctx, "THROTTLE_PROBE_FAILED", err.Error())
@@ -98,140 +307,108 @@ func (worker *Worker) captureAccountEquity(ctx context.Context, settings Setting
 		worker.alertEquityCaptureFailure(ctx, "CLIENT_UNAVAILABLE", err.Error())
 		return
 	}
-	wallet, walletSource, walletErr, rawDetail := worker.fetchEquityWallet(ctx, client)
-	if walletErr != nil {
+	// The wallet leg: isolated grids park every cent inside the bots, so the
+	// USDT row answers zero — that is the NORM, not an alarm (the v2.0.80–82
+	// EMPTY_DECODE alarm fired weekly against a healthy fleet). Only a
+	// transport/decode failure is a real capture error.
+	walletAssets, walletAvailable := decimal.Zero, decimal.Zero
+	balances, _, detailErr := client.GetFuturesAccountDetailRaw(ctx)
+	if detailErr != nil {
 		worker.logger.Warn("equity snapshot: account detail fetch failed",
-			"component", "autogrid_worker", "error", walletErr)
-		worker.alertEquityCaptureFailure(ctx, "FETCH_FAILED", walletErr.Error()+" | raw: "+rawDetail)
+			"component", "autogrid_worker", "error", detailErr)
+		worker.alertEquityCaptureFailure(ctx, "FETCH_FAILED", detailErr.Error())
 		return
 	}
-	if wallet == nil {
-		// No USDT row anywhere: either the detail endpoint decoded empty
-		// (live-shape deviation — the v2.0.75–79 prod state that left the
-		// ledger at 0 rows with zero traces) or the wallet is genuinely
-		// empty. Either way the ledger is not being written: that is exactly
-		// what the operator must see, once per hour, not never.
-		worker.logger.Warn("equity snapshot: no USDT wallet decoded (empty balances)")
-		positionsProbe := ""
-		if pos, posErr := client.GetFuturesPositions(ctx); posErr == nil {
-			probe, _ := json.Marshal(pos)
-			if len(probe) > 400 {
-				probe = probe[:400]
-			}
-			positionsProbe = " | positions: " + string(probe)
+	for i := range balances {
+		if strings.EqualFold(balances[i].Coin, "USDT") {
+			walletAssets = balances[i].Assets
+			walletAvailable = balances[i].Available
+			break
 		}
-		worker.alertEquityCaptureFailure(ctx, "EMPTY_DECODE",
-			"account/detail без USDT>0; raw: "+rawDetail+positionsProbe)
+	}
+
+	epochStart, err := worker.service.PNLEpochStart(ctx)
+	if err != nil {
+		worker.logger.Warn("equity snapshot: epoch anchor unavailable",
+			"component", "autogrid_worker", "error", err)
+		worker.alertEquityCaptureFailure(ctx, "EPOCH_ANCHOR_INVALID", err.Error())
+		return
+	}
+	breakdown, err := ComputeEquityBreakdown(ctx, worker.db, *accountID, epochStart)
+	if err != nil {
+		worker.logger.Warn("equity snapshot: aggregate computation failed",
+			"component", "autogrid_worker", "error", err)
+		worker.alertEquityCaptureFailure(ctx, "AGGREGATE_FAILED", err.Error())
 		return
 	}
 
-	equity := wallet.equity()
+	runningPnL := breakdown.RunningPnL
+	equity := walletAssets.Add(breakdown.RunningInvestment).Add(runningPnL)
 	if _, err := worker.db.Exec(ctx, `
 		INSERT INTO account_equity_snapshots
-			(account_id, equity_usdt, assets_usdt, available_usdt, unrealized_pnl_usdt)
-		VALUES ($1, $2, $3, $4, $5)
-	`, *accountID, equity, wallet.assets, wallet.available, wallet.unrealizedPnL); err != nil {
+			(account_id, equity_usdt, assets_usdt, available_usdt, unrealized_pnl_usdt, source)
+		VALUES ($1, $2, $3, $4, $5, $6)
+	`, *accountID, equity, breakdown.RunningInvestment, walletAvailable,
+		breakdown.RunningFloating, equitySnapshotSourceBotAggregate); err != nil {
 		worker.logger.Warn("equity snapshot persist failed",
 			"component", "autogrid_worker", "error", err)
 		worker.alertEquityCaptureFailure(ctx, "PERSIST_FAILED", err.Error())
 		return
 	}
-
-	// Epoch accounting: the FIRST snapshot row is the epoch anchor — the
-	// snapshots only exist since this feature runs, which is the only epoch
-	// the wallet can prove. Log on the anchor and on any ≥$1 move.
-	var firstEquity, prevEquity decimal.Decimal
-	var firstAt time.Time
-	hasPrev := true
-	if err := worker.db.QueryRow(ctx, `
-		SELECT equity_usdt FROM account_equity_snapshots
-		WHERE account_id = $1 ORDER BY captured_at DESC LIMIT 1 OFFSET 1
-	`, *accountID).Scan(&prevEquity); err != nil {
-		hasPrev = false
-	}
-	if err := worker.db.QueryRow(ctx, `
-		SELECT equity_usdt, captured_at FROM account_equity_snapshots
-		WHERE account_id = $1 ORDER BY captured_at ASC LIMIT 1
-	`, *accountID).Scan(&firstEquity, &firstAt); err != nil {
-		return
-	}
-	epochPnL := equity.Sub(firstEquity)
-	anchorLine := !hasPrev
-	moved := hasPrev && equity.Sub(prevEquity).Abs().
-		GreaterThanOrEqual(decimal.NewFromFloat(equityChangeLogThresholdUSDT))
-	if anchorLine || moved {
-		worker.logger.Info("epoch PnL (wallet truth)",
-			"component", "autogrid_worker",
-			"account_id", *accountID,
-			"source", walletSource,
-			"epoch_pnl_usdt", epochPnL.StringFixed(4),
-			"equity_usdt", equity.StringFixed(4),
-			"epoch_started_at", firstAt.UTC().Format(time.RFC3339),
-			"delta_vs_prev", hasPrev && moved)
-	}
+	worker.logger.Info("epoch PnL (bot aggregate)",
+		"component", "autogrid_worker",
+		"account_id", *accountID,
+		"epoch_pnl_usdt", breakdown.EpochPnL().StringFixed(4),
+		"running_pnl_usdt", breakdown.RunningPnL.StringFixed(4),
+		"closed_known_usdt", breakdown.ClosedKnown.StringFixed(4),
+		"closed_estimated_usdt", breakdown.ClosedEstimated.StringFixed(4),
+		"unknown_finals", breakdown.UnknownCount,
+		"wallet_usdt", walletAssets.StringFixed(4))
+	worker.recordEquitySnapshotHeartbeat(ctx, *accountID, breakdown)
 }
 
-// fetchEquityWallet builds the USDT wallet state. Primary source is
-// /uapi/v1/account/detail (carries unrealizedPnL per the docs); when the
-// detail payload decodes to no USDT row, the documented sibling endpoints
-// /uapi/v1/account/balances + /uapi/v1/account/positions reconstruct the
-// same figure (assets = free+frozen, floating PnL summed over positions).
-// Both sources are Pionex-only and per the official spec (AGENTS.md rule 1).
-func (worker *Worker) fetchEquityWallet(
-	ctx context.Context, client *pionex.Client,
-) (*equityWallet, string, error, string) {
-	balances, rawDetail, err := client.GetFuturesAccountDetailRaw(ctx)
-	if err != nil {
-		return nil, "", err, rawDetail
+// recordEquitySnapshotHeartbeat leaves one Info EQUITY_SNAPSHOT event per
+// hour with the live aggregate — a durable heartbeat for the SQL journal
+// that never reaches Telegram (only EQUITY_CAPTURE_FAILED alarms do).
+func (worker *Worker) recordEquitySnapshotHeartbeat(
+	ctx context.Context, accountID string, breakdown EquityBreakdown,
+) {
+	var recent bool
+	if err := worker.db.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM bot_execution_events
+			WHERE event_type = 'EQUITY_SNAPSHOT'
+			  AND bot_id = 'equity'
+			  AND created_at > NOW() - INTERVAL '1 hour'
+		)
+	`).Scan(&recent); err == nil && recent {
+		return
+	} else if err != nil {
+		worker.logger.Warn("equity snapshot: heartbeat dedup probe failed",
+			"component", "autogrid_worker", "error", err)
+		return
 	}
-	for i := range balances {
-		if strings.EqualFold(balances[i].Coin, "USDT") && balances[i].Assets.GreaterThan(decimal.Zero) {
-			return &equityWallet{
-				assets:        balances[i].Assets,
-				available:     balances[i].Available,
-				unrealizedPnL: balances[i].UnrealizedPnL,
-				debts:         balances[i].Debts,
-			}, "account_detail", nil, rawDetail
-		}
+	epochPnL := breakdown.EpochPnL()
+	if err := LogBotEvent(ctx, worker.db, "equity", 0, "SYSTEM", "", "EQUITY_SNAPSHOT", nil, &epochPnL, map[string]any{
+		"account_id":            accountID,
+		"epoch_pnl_usdt":        epochPnL.StringFixed(4),
+		"running_pnl_usdt":      breakdown.RunningPnL.StringFixed(4),
+		"running_bots":          breakdown.RunningBots,
+		"running_investment":    breakdown.RunningInvestment.StringFixed(2),
+		"closed_known_usdt":     breakdown.ClosedKnown.StringFixed(4),
+		"closed_estimated_usdt": breakdown.ClosedEstimated.StringFixed(4),
+		"unknown_finals":        breakdown.UnknownCount,
+	}); err != nil {
+		worker.logger.Warn("equity snapshot: heartbeat event write failed",
+			"component", "autogrid_worker", "error", err)
 	}
-	// Fallback: balances has no unrealizedPnL field; positions does.
-	walletBalances, balErr := client.GetFuturesBalances(ctx)
-	if balErr != nil {
-		return nil, "", fmt.Errorf("detail empty, balances fallback failed: %w", balErr), rawDetail
-	}
-	wallet := &equityWallet{}
-	found := false
-	for i := range walletBalances {
-		if strings.EqualFold(walletBalances[i].Coin, "USDT") {
-			wallet.assets = walletBalances[i].Free.Add(walletBalances[i].Frozen)
-			wallet.available = walletBalances[i].Free
-			wallet.debts = walletBalances[i].Debts
-			found = wallet.assets.GreaterThan(decimal.Zero)
-			break
-		}
-	}
-	if !found {
-		return nil, "", nil, rawDetail
-	}
-	positions, posErr := client.GetFuturesPositions(ctx)
-	if posErr != nil {
-		// Positions only refine the floating leg; the equity without it is
-		// still the wallet truth minus the floating PnL — accept, but carry
-		// the failure into the source tag so audits see the degradation.
-		return wallet, "balances_no_positions", nil, rawDetail
-	}
-	for _, position := range positions {
-		wallet.unrealizedPnL = wallet.unrealizedPnL.Add(position.UnrealizedPNL)
-	}
-	return wallet, "balances_positions", nil, rawDetail
 }
 
 // alertEquityCaptureFailure makes a dying equity capture visible outside
 // docker stdout: one durable bot_execution_events marker plus a queued
-// Telegram event, deduped to at most one per hour (the SHADOW_CAPTURE_FAILED
-// pattern). Without it an empty account_equity_snapshots table is
-// indistinguishable from a healthy one (v2.0.75–v2.0.79 prod: 0 rows, 0
-// traces, the operator's TOTAL PnL card left without data).
+// Telegram event, deduped to at most one per hour. Reserved for REAL
+// failures (fetch/decode/persist/compute) — an empty account answer is the
+// isolated-bot norm since v2.0.83 and never lands here.
 func (worker *Worker) alertEquityCaptureFailure(ctx context.Context, reason, detail string) {
 	var recentlyAlerted bool
 	if err := worker.db.QueryRow(ctx, `
@@ -251,6 +428,6 @@ func (worker *Worker) alertEquityCaptureFailure(ctx context.Context, reason, det
 			"component", "autogrid_worker", "error", err)
 	}
 	_ = QueueTelegramEvent(ctx, worker.db, "EQUITY_CAPTURE_FAILED", map[string]any{
-		"message": fmt.Sprintf("TOTAL PnL: снапшоты кошелька не пишутся (%s): %s", reason, detail),
+		"message": fmt.Sprintf("TOTAL PnL: агрегатный снапшот не пишется (%s): %s", reason, detail),
 	})
 }

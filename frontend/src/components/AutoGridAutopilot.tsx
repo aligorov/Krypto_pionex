@@ -39,8 +39,9 @@ export default function AutoGridAutopilot({ canOperate, accountsHref }: Props) {
   const [presets, setPresets] = useState<AutoGridPreset[]>([]);
   const [busyPreset, setBusyPreset] = useState<string | null>(null);
   const [busyMode, setBusyMode] = useState<string | null>(null);
-  // Wallet-truth TOTAL PnL: snapshots land every 5 minutes on the worker,
-  // so a 60-second poll is far inside the data's own resolution.
+  // TOTAL PnL (bot aggregate): the manage pass refreshes the per-bot PnL
+  // columns every cycle and the snapshot ledger lands every 5 minutes, so a
+  // 60-second poll is far inside the data's own resolution.
   const [equity, setEquity] = useState<EquityEpochSummary | null>(null);
   const [equityAvailable, setEquityAvailable] = useState<boolean | null>(null);
 
@@ -463,43 +464,52 @@ function Metric({
 }
 
 // TotalPnlCard is the operator's headline number, the same "Total PnL" the
-// Pionex app shows: epoch PnL measured on the futures wallet itself
-// (equity_now − first snapshot) — the only figure that contains the
-// entry/exit/invest_in fees the per-bot PnL fields never see. The card is
-// the most prominent element of the summary row; when snapshots are not
-// being written it turns into the capture-pipeline alarm.
+// Pionex app shows: the epoch aggregate over bots (running grid profit +
+// funding + floating, plus closed-of-epoch finals) — the account endpoints
+// cannot see isolated-grid margins, so the bots themselves are the only
+// truth. The breakdown line splits the headline into running / closed /
+// telemetry-estimated legs; unknown finals (no data at all) are counted but
+// never invented. A failed fetch shows a neutral placeholder: an empty
+// account answer is the isolated-bot norm, not an alarm (v2.0.83).
 function TotalPnlCard({ equity, available }: { equity: EquityEpochSummary | null; available: boolean | null }) {
   if (!equity || available !== true) {
     return (
       <div className="metric-card metric-card-hero">
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
-          <span>TOTAL PnL (биржа)</span>
-          <span className="badge danger">снапшоты не пишутся</span>
+          <span>TOTAL PnL</span>
+          <span className="badge neutral">нет данных</span>
         </div>
         <strong className="muted">—</strong>
         <small className="muted">
-          Кошелёк не снапшотится: захват equity мёртв или ещё не написал первую
-          точку (событие EQUITY_CAPTURE_FAILED в журнале покажет причину).
+          Агрегат недоступен: нет настроенного аккаунта или ошибка запроса
+          (причина — в журнале, событие EQUITY_CAPTURE_FAILED).
         </small>
       </div>
     );
   }
+  const fmt = (value: string) => {
+    const num = Number(value) || 0;
+    return `${num >= 0 ? '+' : ''}${num.toFixed(2)}`;
+  };
   const epochPnl = Number(equity.epochPnlUsdt) || 0;
-  const unrealized = Number(equity.exchangeUnrealizedPnlUsdt) || 0;
   const capturedAt = equity.capturedAt ? new Date(equity.capturedAt).toLocaleTimeString() : '—';
+  const unknown = equity.unknownCount > 0 ? ` · без данных: ${equity.unknownCount}` : '';
   return (
     <div className="metric-card metric-card-hero">
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
-        <span>TOTAL PnL (биржа)</span>
+        <span>TOTAL PnL</span>
         <span className="badge neutral">снапшотов: {equity.snapshots}</span>
       </div>
       <strong className={epochPnl >= 0 ? 'positive' : 'negative'}>
         {epochPnl >= 0 ? '+' : ''}{epochPnl.toFixed(2)} USDT
       </strong>
       <small className="muted">
-        Плавающий (биржа): {unrealized >= 0 ? '+' : ''}{unrealized.toFixed(2)} · equity сейчас{' '}
-        {(Number(equity.equityNowUsdt) || 0).toFixed(2)} / на старте{' '}
-        {(Number(equity.equityStartUsdt) || 0).toFixed(2)} · снапшот {capturedAt}
+        Работают: {fmt(equity.runningPnlUsdt)} ({equity.runningBots}) · Закрыты: {fmt(equity.closedKnownUsdt)} ·
+        Оценки: {fmt(equity.closedEstimatedUsdt)}{unknown}
+      </small>
+      <small className="muted">
+        Плавающий: {fmt(equity.runningFloatingUsdt)} · в ботах{' '}
+        {(Number(equity.runningInvestmentUsdt) || 0).toFixed(0)} USDT · снапшот {capturedAt}
       </small>
     </div>
   );

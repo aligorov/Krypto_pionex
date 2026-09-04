@@ -19,72 +19,41 @@ import (
 	"github.com/shopspring/decimal"
 )
 
-// equityDetailMock serves the three documented wallet endpoints:
-// GET /uapi/v1/account/detail (primary equity source), GET
-// /uapi/v1/account/balances + GET /uapi/v1/account/positions (fallback).
-// Modes cover the failure shapes the capture must survive or report:
-//   - normal:   per-spec string fields
-//   - tolerant: unquoted numbers + empty-string fields (live-API deviation)
-//   - empty:    balances:[] (the silent empty-decode of the prod outage)
-//   - error:    HTTP 500 on every call
-type equityDetailMock struct {
+// equityAggregateMock serves the exchange surfaces the bot-aggregate capture
+// touches: the grid-order detail endpoint (running remote PnL truth for the
+// manage loop) and /uapi/v1/account/detail (the wallet leg, structurally
+// zero on an isolated-grid account — the prod shape v2.0.83 was built for).
+// Modes:
+//   - normal: detail answers all-zero USDT (the isolated norm, NOT an alarm)
+//   - error:  HTTP 500 on account/detail (a real fetch failure → alarm)
+type equityAggregateMock struct {
 	server *httptest.Server
 	mu     sync.Mutex
 	mode   string
-	assets string
-	unreal string
-	avail  string
-	debts  string
-	// fallback payloads for the empty-detail path
-	fallbackAssets string
-	positionsPnL   string
+	// walletUSDT optionally overrides the USDT row of account/detail.
+	walletUSDT string
 }
 
-func newEquityDetailMock(t *testing.T) *equityDetailMock {
+func newEquityAggregateMock(t *testing.T) *equityAggregateMock {
 	t.Helper()
-	mock := &equityDetailMock{
-		mode:           "normal",
-		assets:         "500",
-		unreal:         "0",
-		avail:          "500",
-		debts:          "0",
-		fallbackAssets: "",
-		positionsPnL:   "",
+	mock := &equityAggregateMock{mode: "normal", walletUSDT: "0"}
+	gridPayload := func(reduce string) map[string]any {
+		return map[string]any{
+			"status": "running", "reasonBy": "",
+			"top": "1.8", "bottom": "1.4", "row": 20,
+			"gridType": "arithmetic", "trend": "no_trend", "leverage": 1,
+			"position": "0", "positionOpenPrice": "1.5",
+			"profitReduce": reduce, "profitWithdrawn": "0",
+			"profitExited": "0", "fundingFeePayment": "0",
+			"riskStatus": "NORMAL",
+		}
+	}
+	respond := func(w http.ResponseWriter, payload any) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(payload)
 	}
 	mux := http.NewServeMux()
-	encode := func(w http.ResponseWriter, data any) {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]any{
-			"result": true, "timestamp": time.Now().UnixMilli(), "data": data,
-		})
-	}
 	mux.HandleFunc("GET /uapi/v1/account/detail", func(w http.ResponseWriter, _ *http.Request) {
-		mock.mu.Lock()
-		defer mock.mu.Unlock()
-		switch mock.mode {
-		case "error":
-			w.WriteHeader(http.StatusInternalServerError)
-			fmt.Fprintln(w, "boom")
-			return
-		case "empty":
-			encode(w, map[string]any{"balances": []map[string]any{}})
-			return
-		case "tolerant":
-			encode(w, map[string]any{"balances": []map[string]any{{
-				"coin": "USDT", "assets": 501.25, "free": 480, "frozen": 21.25,
-				"transferable": 480, "available": 480, "unrealizedPnL": -1.25,
-				"totalInitialMargin": 21.25, "debts": "",
-			}}})
-			return
-		default:
-			encode(w, map[string]any{"balances": []map[string]any{{
-				"coin": "USDT", "assets": mock.assets, "free": mock.avail,
-				"frozen": "0", "available": mock.avail, "unrealizedPnL": mock.unreal,
-				"totalInitialMargin": "0", "debts": mock.debts,
-			}}})
-		}
-	})
-	mux.HandleFunc("GET /uapi/v1/account/balances", func(w http.ResponseWriter, _ *http.Request) {
 		mock.mu.Lock()
 		defer mock.mu.Unlock()
 		if mock.mode == "error" {
@@ -92,59 +61,73 @@ func newEquityDetailMock(t *testing.T) *equityDetailMock {
 			fmt.Fprintln(w, "boom")
 			return
 		}
-		balances := []map[string]any{}
-		if mock.fallbackAssets != "" {
-			balances = append(balances, map[string]any{
-				"coin": "USDT", "free": mock.fallbackAssets, "frozen": "0", "debts": "0",
-			})
-		}
-		encode(w, map[string]any{"balances": balances})
+		respond(w, map[string]any{
+			"result": true, "timestamp": time.Now().UnixMilli(),
+			"data": map[string]any{"balances": []map[string]any{{
+				"coin": "USDT", "assets": mock.walletUSDT, "free": mock.walletUSDT,
+				"frozen": "0", "available": mock.walletUSDT, "unrealizedPnL": "0",
+				"totalInitialMargin": "0", "debts": "0",
+			}}},
+		})
 	})
-	mux.HandleFunc("GET /uapi/v1/account/positions", func(w http.ResponseWriter, _ *http.Request) {
+	// Grid-order detail: every EQ-* bot answers a running grid with the
+	// profitReduce the test configures per bot id.
+	mux.HandleFunc("GET /api/v1/bot/orders/futuresGrid/order", func(w http.ResponseWriter, r *http.Request) {
 		mock.mu.Lock()
 		defer mock.mu.Unlock()
-		positions := []map[string]any{}
-		if mock.positionsPnL != "" {
-			positions = append(positions, map[string]any{
-				"symbol": "BTC_USDT_PERP", "unrealizedPnL": mock.positionsPnL,
-			})
+		reduce := "0"
+		switch r.URL.Query().Get("buOrderId") {
+		case "EQ-R1":
+			reduce = "1.0"
+		case "EQ-R2":
+			reduce = "2.0"
 		}
-		encode(w, map[string]any{"positions": positions})
+		respond(w, map[string]any{
+			"result": true, "timestamp": time.Now().UnixMilli(),
+			"data": map[string]any{
+				"buOrderId": r.URL.Query().Get("buOrderId"), "status": "running", "reasonBy": "",
+				"buOrderData": gridPayload(reduce),
+			},
+		})
+	})
+	mux.HandleFunc("GET /api/v1/bot/orders", func(w http.ResponseWriter, r *http.Request) {
+		respond(w, map[string]any{
+			"result": true, "timestamp": time.Now().UnixMilli(),
+			"data": map[string]any{"orders": []any{}},
+		})
+	})
+	mux.HandleFunc("POST /api/v1/bot/orders/futuresGrid/cancel", func(w http.ResponseWriter, _ *http.Request) {
+		respond(w, map[string]any{"result": true, "timestamp": time.Now().UnixMilli()})
+	})
+	mux.HandleFunc("GET /api/v1/market/indexes", func(w http.ResponseWriter, _ *http.Request) {
+		respond(w, map[string]any{
+			"result": true, "timestamp": time.Now().UnixMilli(),
+			"data": map[string]any{"indexes": []map[string]any{
+				{"symbol": "EQR1_USDT_PERP", "indexPrice": "1.5", "markPrice": "1.5"},
+				{"symbol": "EQR2_USDT_PERP", "indexPrice": "1.5", "markPrice": "1.5"},
+			}},
+		})
 	})
 	mock.server = httptest.NewServer(mux)
 	t.Cleanup(mock.server.Close)
 	return mock
 }
 
-func (m *equityDetailMock) set(t *testing.T, assets, unreal, avail string) {
-	t.Helper()
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.assets, m.unreal, m.avail = assets, unreal, avail
-}
-
-func (m *equityDetailMock) setMode(t *testing.T, mode string) {
+func (m *equityAggregateMock) setMode(t *testing.T, mode string) {
 	t.Helper()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.mode = mode
 }
 
-func (m *equityDetailMock) setFallback(t *testing.T, fallbackAssets, positionsPnL string) {
-	t.Helper()
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.fallbackAssets, m.positionsPnL = fallbackAssets, positionsPnL
-}
-
 // equityTestEnv wires a disposable account + worker against the mock. The
-// returned cleanup removes every row the test touched (snapshots, failure
-// markers, account, settings pin).
+// returned cleanup removes every row the test touched (bots, telemetry,
+// snapshots, events, epoch anchor, settings pin, account).
 type equityTestEnv struct {
 	pool     *pgxpool.Pool
 	service  *Service
 	worker   *Worker
-	mock     *equityDetailMock
+	mock     *equityAggregateMock
 	account  *accounts.Account
 	settings *Settings
 }
@@ -159,15 +142,22 @@ func newEquityTestEnv(t *testing.T) *equityTestEnv {
 	}
 	t.Cleanup(pool.Close)
 
-	mock := newEquityDetailMock(t)
+	mock := newEquityAggregateMock(t)
 	accountService := accounts.NewService(pool)
 	riskEngine := risk.NewEngine(pool)
 	service := NewService(pool, riskEngine)
 
 	accountName := "integration-equity-test-" + time.Now().Format("150405.000000000")
+	// Other integration suites drive reconcileAndManage against mocks that
+	// do not serve /uapi/v1/account/detail — their captures legitimately
+	// leave FETCH_FAILED markers (bot_id='equity', 1h dedup, GLOBAL). Clear
+	// them so this suite's zero-alarm assertions are hermetic.
+	_, _ = pool.Exec(ctx, `DELETE FROM bot_execution_events WHERE bot_id = 'equity'`)
 	_, _ = pool.Exec(ctx, `UPDATE autogrid_settings SET account_id = NULL
 		WHERE scope_key = 'default' AND account_id IN (
 			SELECT id FROM pionex_accounts WHERE name LIKE 'integration-equity-test%')`)
+	_, _ = pool.Exec(ctx, `DELETE FROM grid_bots WHERE account_id IN (
+		SELECT id FROM pionex_accounts WHERE name LIKE 'integration-equity-test%')`)
 	_, _ = pool.Exec(ctx, `DELETE FROM pionex_accounts WHERE name LIKE 'integration-equity-test%'`)
 	account, err := accountService.Create(ctx, accounts.CreateInput{
 		Name: accountName, APIKey: "itest-key", APISecret: "itest-secret",
@@ -177,8 +167,12 @@ func newEquityTestEnv(t *testing.T) *equityTestEnv {
 		t.Fatalf("create account: %v", err)
 	}
 	t.Cleanup(func() {
+		_, _ = pool.Exec(ctx, `DELETE FROM bot_telemetry WHERE bot_id IN (
+			SELECT id FROM grid_bots WHERE account_id = $1)`, account.ID)
+		_, _ = pool.Exec(ctx, `DELETE FROM grid_bots WHERE account_id = $1`, account.ID)
 		_, _ = pool.Exec(ctx, `DELETE FROM account_equity_snapshots WHERE account_id = $1`, account.ID)
 		_, _ = pool.Exec(ctx, `DELETE FROM bot_execution_events WHERE bot_id = 'equity'`)
+		_, _ = pool.Exec(ctx, `DELETE FROM app_config WHERE key = 'pnl_epoch_started_at'`)
 		_, _ = pool.Exec(ctx, `UPDATE autogrid_settings SET account_id = NULL WHERE account_id = $1`, account.ID)
 		_, _ = pool.Exec(ctx, `DELETE FROM pionex_accounts WHERE id = $1`, account.ID)
 	})
@@ -191,18 +185,26 @@ func newEquityTestEnv(t *testing.T) *equityTestEnv {
 	service.clientMu.Unlock()
 
 	var savedAccountID *string
+	var savedStatus, savedMode string
+	var savedAutotune bool
 	if err := pool.QueryRow(ctx, `
-		SELECT account_id FROM autogrid_settings WHERE scope_key = 'default'
-	`).Scan(&savedAccountID); err != nil {
+		SELECT account_id, status, execution_mode, ai_autotune_enabled
+		FROM autogrid_settings WHERE scope_key = 'default'
+	`).Scan(&savedAccountID, &savedStatus, &savedMode, &savedAutotune); err != nil {
 		t.Fatalf("load settings: %v", err)
 	}
 	t.Cleanup(func() {
 		_, _ = pool.Exec(ctx, `
-			UPDATE autogrid_settings SET account_id = $2 WHERE scope_key = $1::VARCHAR
-		`, DefaultScope, savedAccountID)
+			UPDATE autogrid_settings
+			SET account_id = $2, status = $3, execution_mode = $4, ai_autotune_enabled = $5
+			WHERE scope_key = $1::VARCHAR
+		`, DefaultScope, savedAccountID, savedStatus, savedMode, savedAutotune)
 	})
 	if _, err := pool.Exec(ctx, `
-		UPDATE autogrid_settings SET account_id = $2 WHERE scope_key = $1::VARCHAR
+		UPDATE autogrid_settings
+		SET account_id = $2, status = 'RUNNING', execution_mode = 'REAL',
+		    ai_autotune_enabled = false
+		WHERE scope_key = $1::VARCHAR
 	`, DefaultScope, account.ID); err != nil {
 		t.Fatalf("retarget settings: %v", err)
 	}
@@ -214,31 +216,96 @@ func newEquityTestEnv(t *testing.T) *equityTestEnv {
 	worker := NewWorker(pool, service, accountService, riskEngine,
 		llm.NewService(pool, slog.New(slog.DiscardHandler)),
 		slog.New(slog.DiscardHandler))
+	worker.publicClient = pionex.NewClient(mock.server.URL, "", "")
 	return &equityTestEnv{
 		pool: pool, service: service, worker: worker,
 		mock: mock, account: account, settings: settings,
 	}
 }
 
-func (env *equityTestEnv) snapshotCount(t *testing.T) int {
+// pinEpochAnchor rewrites app_config('pnl_epoch_started_at') so seeded bots
+// with NOW() created_at fall inside the epoch deterministically.
+func (env *equityTestEnv) pinEpochAnchor(t *testing.T, anchor time.Time) {
+	t.Helper()
+	if _, err := env.pool.Exec(context.Background(), `
+		INSERT INTO app_config (key, value, description)
+		VALUES ('pnl_epoch_started_at', to_jsonb($1::TEXT), 'test anchor')
+		ON CONFLICT (key) DO UPDATE SET value = to_jsonb($1::TEXT)
+	`, anchor.Format(time.RFC3339)); err != nil {
+		t.Fatalf("pin epoch anchor: %v", err)
+	}
+}
+
+func (env *equityTestEnv) seedBot(t *testing.T, symbol, remoteID, status string, investment, realized, unrealized any) string {
+	t.Helper()
+	ctx := context.Background()
+	var botID string
+	isClosed := status == "STOPPED" || status == "COMPLETED" || status == "CANCELLED" || status == "LIQUIDATED"
+	// Closed seeds carry the finalProfitSource marker every real settle
+	// writes — without it the 48h backfill would re-settle them against the
+	// mock's running payload and overwrite the fixture figures.
+	modelState := "'{}'::JSONB"
+	if isClosed {
+		modelState = `CASE WHEN $8::NUMERIC IS NULL THEN '{"finalProfitSource":"refused_profit_exited"}'::JSONB
+			ELSE '{"finalProfitSource":"profit_exited"}'::JSONB END`
+	}
+	err := env.pool.QueryRow(ctx, `
+		INSERT INTO grid_bots (
+			account_id, autogrid_settings_id, symbol, status, direction,
+			grid_type, lower_price, upper_price, grid_num, leverage,
+			quote_investment, extra_margin, request_fingerprint,
+			execution_mode, reconciliation_state, bu_order_id,
+			pnl_target_usdt, max_loss_usdt, realized_pnl_usdt, unrealized_pnl_usdt,
+			closed_at, model_state
+		) VALUES (
+			$1, $2, $3, $4, 'NEUTRAL',
+			'ARITHMETIC', 1.4, 1.8, 20, 1,
+			$5, 0, $6, 'REAL', 'REMOTE_ID_PERSISTED', $7,
+			1000, 1000, $8, $9,
+			CASE WHEN $10::BOOLEAN THEN NOW() ELSE NULL END,
+			`+modelState+`
+		)
+		RETURNING id
+	`, env.account.ID, env.settings.ID, symbol, status, investment,
+		"itest-"+time.Now().Format("150405.000000000")+"-"+symbol+"-"+remoteID,
+		remoteID, realized, unrealized, isClosed,
+	).Scan(&botID)
+	if err != nil {
+		t.Fatalf("seed bot %s: %v", symbol, err)
+	}
+	return botID
+}
+
+func (env *equityTestEnv) seedTelemetry(t *testing.T, botID string, total string, capturedAt time.Time) {
+	t.Helper()
+	if _, err := env.pool.Exec(context.Background(), `
+		INSERT INTO bot_telemetry (bot_id, bot_number, symbol, captured_at, price, total_pnl)
+		VALUES ($1, 0, 'TEST', $2, 1.5, $3::NUMERIC)
+	`, botID, capturedAt, total); err != nil {
+		t.Fatalf("seed telemetry: %v", err)
+	}
+}
+
+func (env *equityTestEnv) snapshots(t *testing.T) int {
 	t.Helper()
 	var count int
 	if err := env.pool.QueryRow(context.Background(), `
-		SELECT COUNT(*) FROM account_equity_snapshots WHERE account_id = $1
+		SELECT COUNT(*) FROM account_equity_snapshots
+		WHERE account_id = $1 AND source = 'bot_aggregate'
 	`, env.account.ID).Scan(&count); err != nil {
 		t.Fatalf("count snapshots: %v", err)
 	}
 	return count
 }
 
-func (env *equityTestEnv) equityFailureEvents(t *testing.T) int {
+func (env *equityTestEnv) equityEvents(t *testing.T, eventType string) int {
 	t.Helper()
 	var count int
 	if err := env.pool.QueryRow(context.Background(), `
 		SELECT COUNT(*) FROM bot_execution_events
-		WHERE bot_id = 'equity' AND event_type = 'EQUITY_CAPTURE_FAILED'
-	`).Scan(&count); err != nil {
-		t.Fatalf("count equity failure events: %v", err)
+		WHERE bot_id = 'equity' AND event_type = $1
+	`, eventType).Scan(&count); err != nil {
+		t.Fatalf("count %s events: %v", eventType, err)
 	}
 	return count
 }
@@ -248,137 +315,268 @@ func (env *equityTestEnv) ageSnapshots(t *testing.T) {
 	if _, err := env.pool.Exec(context.Background(), `
 		UPDATE account_equity_snapshots
 		SET captured_at = NOW() - INTERVAL '6 minutes'
-		WHERE account_id = $1
+		WHERE account_id = $1 AND source = 'bot_aggregate'
 	`, env.account.ID); err != nil {
 		t.Fatalf("age snapshots: %v", err)
 	}
 }
 
-// TestAccountEquitySnapshotEpoch proves the wallet-truth chain end to end:
-// (1) the worker snapshots the futures wallet equity from
-// /uapi/v1/account/detail, (2) the 5-minute durable throttle holds, (3) the
-// epoch PnL (equity_now − first snapshot) is derivable through the service —
-// the operator's headline number can no longer be read off fee-blind bot PnL
-// fields.
-func TestAccountEquitySnapshotEpoch(t *testing.T) {
+func mustDec(t *testing.T, value string) decimal.Decimal {
+	t.Helper()
+	parsed, err := decimal.NewFromString(value)
+	if err != nil {
+		t.Fatalf("parse decimal %q: %v", value, err)
+	}
+	return parsed
+}
+
+// TestBotAggregateSnapshotAndEpoch is the end-to-end proof of the v2.0.83
+// model: after a reconcile pass over two running bots (remote profitReduce
+// 1.0/2.0, floating −0.5/+0.25, investment 50/100 — floating is seeded
+// directly because the mock answers a flat position) and a closed-of-epoch
+// fleet (known +1.5, telemetry-estimated −2.5, one unknown), the snapshot
+// row and the endpoint breakdown must carry exactly:
+//
+//	assets_usdt       = 150        (Σ running investment)
+//	unrealized_pnl    = −0.25      (Σ running floating)
+//	equity_usdt       = 0 + 150 + 2.75 = 152.75
+//	running_pnl       = 3.0 + (−0.25) = 2.75
+//	closed_known      = 1.5, closed_estimated = −2.5, unknown_count = 1
+//	epoch_pnl         = 2.75 + 1.5 − 2.5 = 1.75
+func TestBotAggregateSnapshotAndEpoch(t *testing.T) {
 	env := newEquityTestEnv(t)
 	ctx := context.Background()
+	env.pinEpochAnchor(t, time.Now().UTC().Add(-time.Hour))
 
-	// Anchor: $500 wallet, no floating PnL.
-	env.worker.captureAccountEquity(ctx, *env.settings)
-	if count := env.snapshotCount(t); count != 1 {
-		t.Fatalf("anchor snapshot must persist, got n=%d", count)
-	}
-	var equity, available string
-	if err := env.pool.QueryRow(ctx, `
-		SELECT MAX(equity_usdt)::TEXT, MAX(available_usdt)::TEXT
-		FROM account_equity_snapshots WHERE account_id = $1
-	`, env.account.ID).Scan(&equity, &available); err != nil {
-		t.Fatalf("load snapshots: %v", err)
-	}
-	if !decimal.RequireFromString(equity).Equal(decimal.NewFromInt(500)) ||
-		!decimal.RequireFromString(available).Equal(decimal.NewFromInt(500)) {
-		t.Fatalf("anchor snapshot wrong: equity=%s available=%s", equity, available)
-	}
+	// Running fleet: the manage pass resyncs realized from remote
+	// profitReduce (1.0 / 2.0 — funding reported 0) and keeps the seeded
+	// floating marks (flat position in the mock: position=0 → floating
+	// would be zeroed, so seed the floating through a second pass below).
+	runningA := env.seedBot(t, "EQR1_USDT_PERP", "EQ-R1", "RUNNING", 50, 0, "-0.5")
+	runningB := env.seedBot(t, "EQR2_USDT_PERP", "EQ-R2", "RUNNING", 100, 0, "0.25")
 
-	// The durable 5-minute throttle: an immediate second capture must not
-	// add a row even though the wallet moved.
-	env.mock.set(t, "503", "0", "503")
-	env.worker.captureAccountEquity(ctx, *env.settings)
-	if count := env.snapshotCount(t); count != 1 {
-		t.Fatalf("5-minute throttle violated: n=%d", count)
+	// Closed fleet of the epoch: a settled final, a refused settle with a
+	// telemetry trace, and a refused settle with no trace at all.
+	knownBot := env.seedBot(t, "EQC1_USDT_PERP", "EQ-C1", "STOPPED", 50, "1.5", 0)
+	_ = knownBot
+	estimatedBot := env.seedBot(t, "EQC2_USDT_PERP", "EQ-C2", "STOPPED", 50, nil, 0)
+	env.seedTelemetry(t, estimatedBot, "-2.5", time.Now().UTC().Add(-time.Minute))
+	unknownBot := env.seedBot(t, "EQC3_USDT_PERP", "EQ-C3", "STOPPED", 50, nil, 0)
+	_ = unknownBot
+
+	if _, err := env.worker.reconcileAndManage(ctx); err != nil {
+		t.Fatalf("reconcile pass: %v", err)
 	}
 
-	// Age the anchor past the throttle and move the wallet by −$2.60 (fees +
-	// a stop the bot PnL fields never see): equity 497.40 via assets 500 +
-	// unrealized −2.60 — the unrealized leg MUST be included.
+	// The manage pass resynced realized from remote profitReduce and — flat
+	// position — zeroed the floating column. Re-seed the floating marks and
+	// write them durably through one more pass cycle's PnL persist by
+	// setting them directly (the floating leg of the aggregate reads the
+	// persisted column; remote position=0 is the "no floating" truth, the
+	// seeded marks emulate a live mark-price gap).
+	for _, seed := range []struct {
+		botID      string
+		unrealized string
+	}{{runningA, "-0.5"}, {runningB, "0.25"}} {
+		if _, err := env.pool.Exec(ctx, `
+			UPDATE grid_bots SET unrealized_pnl_usdt = $2::NUMERIC WHERE id = $1
+		`, seed.botID, seed.unrealized); err != nil {
+			t.Fatalf("re-seed floating: %v", err)
+		}
+	}
 	env.ageSnapshots(t)
-	env.mock.set(t, "500", "-2.6", "480")
-	env.worker.captureAccountEquity(ctx, *env.settings)
-	if count := env.snapshotCount(t); count != 2 {
-		t.Fatalf("second snapshot must persist after the throttle window, got n=%d", count)
-	}
+	env.worker.captureBotAggregateEquity(ctx, *env.settings)
+
+	// (a) The snapshot row: bot-aggregate semantics.
+	var equity, assets, avail, unrealized string
 	if err := env.pool.QueryRow(ctx, `
-		SELECT equity_usdt::TEXT FROM account_equity_snapshots
-		WHERE account_id = $1 ORDER BY captured_at DESC LIMIT 1
-	`, env.account.ID).Scan(&equity); err != nil {
-		t.Fatalf("load newest snapshot: %v", err)
+		SELECT equity_usdt::TEXT, assets_usdt::TEXT, available_usdt::TEXT, unrealized_pnl_usdt::TEXT
+		FROM account_equity_snapshots
+		WHERE account_id = $1 AND source = 'bot_aggregate'
+		ORDER BY captured_at DESC LIMIT 1
+	`, env.account.ID).Scan(&equity, &assets, &avail, &unrealized); err != nil {
+		t.Fatalf("load aggregate snapshot: %v", err)
 	}
-	if got := decimal.RequireFromString(equity); !got.Equal(decimal.NewFromFloat(497.4)) {
-		t.Fatalf("equity must net assets + unrealizedPnL (500 − 2.6), got %s", equity)
+	if !mustDec(t, assets).Equal(mustDec(t, "150")) {
+		t.Fatalf("assets_usdt = Σ running investment (50+100), got %s", assets)
+	}
+	if !mustDec(t, unrealized).Equal(mustDec(t, "-0.25")) {
+		t.Fatalf("unrealized_pnl_usdt = Σ running floating (−0.5+0.25), got %s", unrealized)
+	}
+	if !mustDec(t, equity).Equal(mustDec(t, "152.75")) {
+		t.Fatalf("equity_usdt = wallet 0 + investment 150 + running PnL 2.75, got %s", equity)
+	}
+	if !mustDec(t, avail).IsZero() {
+		t.Fatalf("available_usdt mirrors the empty wallet, got %s", avail)
 	}
 
-	// The service-side epoch accounting: equity_now − first snapshot.
+	// (b)+(c) The endpoint breakdown.
 	summary, err := env.service.AccountEquityEpoch(ctx)
 	if err != nil {
 		t.Fatalf("epoch summary: %v", err)
 	}
 	if summary == nil {
-		t.Fatal("epoch summary must exist after snapshots")
+		t.Fatal("epoch summary must always exist on success")
 	}
-	if !summary.EquityStartUSDT.Equal(decimal.NewFromInt(500)) {
-		t.Fatalf("epoch anchor must be the first snapshot (500), got %s", summary.EquityStartUSDT)
+	if !summary.RunningPnLUSDT.Equal(mustDec(t, "2.75")) {
+		t.Fatalf("running_pnl = 3.0 realized + (−0.25) floating, got %s", summary.RunningPnLUSDT)
 	}
-	if !summary.EpochPnLUSDT.Equal(decimal.NewFromFloat(-2.6)) {
-		t.Fatalf("epoch PnL (wallet truth) must be −2.60, got %s", summary.EpochPnLUSDT)
+	if !summary.RunningFloatingUSDT.Equal(mustDec(t, "-0.25")) {
+		t.Fatalf("running floating leg, got %s", summary.RunningFloatingUSDT)
 	}
-	if summary.Snapshots != 2 {
-		t.Fatalf("summary must count both snapshots, got %d", summary.Snapshots)
+	if !summary.RunningInvestmentUSDT.Equal(mustDec(t, "150")) {
+		t.Fatalf("running investment leg, got %s", summary.RunningInvestmentUSDT)
 	}
-	if !summary.UnrealizedPnLUSDT.Equal(decimal.NewFromFloat(-2.6)) {
-		t.Fatalf("exchange unrealized must mirror the newest snapshot (−2.6), got %s", summary.UnrealizedPnLUSDT)
+	if summary.RunningBots != 2 {
+		t.Fatalf("running bots, got %d", summary.RunningBots)
 	}
-	if summary.CapturedAt.IsZero() {
-		t.Fatal("summary must expose the newest capture time")
+	if !summary.ClosedKnownUSDT.Equal(mustDec(t, "1.5")) {
+		t.Fatalf("closed_known = the settled final, got %s", summary.ClosedKnownUSDT)
+	}
+	if !summary.ClosedEstimatedUSDT.Equal(mustDec(t, "-2.5")) {
+		t.Fatalf("closed_estimated = telemetry fallback, got %s", summary.ClosedEstimatedUSDT)
+	}
+	if summary.UnknownCount != 1 {
+		t.Fatalf("unknown_count = 1 (NULL final, no telemetry), got %d", summary.UnknownCount)
+	}
+	if !summary.EpochPnLUSDT.Equal(mustDec(t, "1.75")) {
+		t.Fatalf("epoch PnL = 2.75 + 1.5 − 2.5, got %s", summary.EpochPnLUSDT)
+	}
+	if summary.Snapshots < 1 {
+		t.Fatalf("summary must count the bot_aggregate snapshots, got %d", summary.Snapshots)
 	}
 
-	// An empty futures wallet still adds no snapshot (fail-open), but the
-	// death is no longer silent: an EQUITY_CAPTURE_FAILED marker lands.
-	env.ageSnapshots(t)
-	env.mock.set(t, "0", "0", "0")
-	env.worker.captureAccountEquity(ctx, *env.settings)
-	if count := env.snapshotCount(t); count != 2 {
-		t.Fatalf("an empty wallet must add no snapshot, got n=%d", count)
+	// The 5-minute durable throttle: an immediate second capture must not
+	// add a row.
+	env.worker.captureBotAggregateEquity(ctx, *env.settings)
+	if got := env.snapshots(t); got != 2 { // reconcile wrote one, capture wrote one
+		t.Fatalf("5-minute throttle violated: n=%d", got)
 	}
-	if events := env.equityFailureEvents(t); events != 1 {
-		t.Fatalf("empty wallet must leave exactly one EQUITY_CAPTURE_FAILED marker, got %d", events)
+
+	// An account answering zero (the isolated norm) must NOT alarm — the
+	// aggregate landed, zero alarm events, one hourly heartbeat.
+	if got := env.equityEvents(t, "EQUITY_CAPTURE_FAILED"); got != 0 {
+		t.Fatalf("an empty wallet is the isolated norm — no alarm, got %d", got)
+	}
+	if got := env.equityEvents(t, "EQUITY_SNAPSHOT"); got != 1 {
+		t.Fatalf("exactly one hourly EQUITY_SNAPSHOT heartbeat expected, got %d", got)
 	}
 }
 
-// TestAccountEquityCaptureObservability pins the v2.0.80 no-silent-death
-// contract: a failing fetch and an empty decode each produce a durable
-// EQUITY_CAPTURE_FAILED marker (deduped to one per hour) and zero snapshot
-// rows — the prod state that hid for weeks behind a bare Warn.
-func TestAccountEquityCaptureObservability(t *testing.T) {
+// TestBotAggregateTelemetryFallbackWindow pins the fallback ladder: a fresh
+// row (<5 min before close) wins over an older one; with nothing fresh the
+// nearest-earlier row still estimates; with no telemetry at all the bot is
+// counted unknown and excluded from the epoch sum.
+func TestBotAggregateTelemetryFallbackWindow(t *testing.T) {
 	env := newEquityTestEnv(t)
 	ctx := context.Background()
+	env.pinEpochAnchor(t, time.Now().UTC().Add(-time.Hour))
 
-	// Fetch error → no snapshot, one durable marker.
+	freshBot := env.seedBot(t, "EQW1_USDT_PERP", "EQ-W1", "STOPPED", 50, nil, 0)
+	// One stale row (2h before close) and one fresh row (1 min before close):
+	// the fresh row must win even though the stale one exists.
+	env.seedTelemetry(t, freshBot, "-9.9", time.Now().UTC().Add(-2*time.Hour))
+	if _, err := env.pool.Exec(ctx, `
+		UPDATE grid_bots SET closed_at = NOW() - INTERVAL '1 minute' WHERE id = $1
+	`, freshBot); err != nil {
+		t.Fatalf("shift closed_at: %v", err)
+	}
+	env.seedTelemetry(t, freshBot, "-2.5", time.Now().UTC().Add(-90*time.Second))
+
+	staleBot := env.seedBot(t, "EQW2_USDT_PERP", "EQ-W2", "STOPPED", 50, nil, 0)
+	// Only a row from 2h before close: nearest-earlier must still estimate.
+	if _, err := env.pool.Exec(ctx, `
+		UPDATE grid_bots SET closed_at = NOW() WHERE id = $1
+	`, staleBot); err != nil {
+		t.Fatalf("shift closed_at: %v", err)
+	}
+	env.seedTelemetry(t, staleBot, "-0.75", time.Now().UTC().Add(-2*time.Hour))
+
+	botAfterClose := env.seedBot(t, "EQW3_USDT_PERP", "EQ-W3", "STOPPED", 50, nil, 0)
+	// A row captured AFTER close must never be used (post-close noise).
+	env.seedTelemetry(t, botAfterClose, "-5.0", time.Now().UTC().Add(time.Minute))
+
+	breakdown, err := ComputeEquityBreakdown(ctx, env.pool, env.account.ID, time.Now().UTC().Add(-time.Hour))
+	if err != nil {
+		t.Fatalf("breakdown: %v", err)
+	}
+	if !breakdown.ClosedEstimated.Equal(mustDec(t, "-3.25")) {
+		t.Fatalf("estimated = fresh −2.5 + nearest-earlier −0.75, got %s", breakdown.ClosedEstimated)
+	}
+	if breakdown.ClosedEstimatedBots != 2 {
+		t.Fatalf("estimated bots, got %d", breakdown.ClosedEstimatedBots)
+	}
+	if breakdown.UnknownCount != 1 {
+		t.Fatalf("the after-close-only bot must be unknown, got %d", breakdown.UnknownCount)
+	}
+	if !breakdown.EpochPnL().Equal(mustDec(t, "-3.25")) {
+		t.Fatalf("epoch PnL excludes unknowns, got %s", breakdown.EpochPnL())
+	}
+}
+
+// TestBotAggregateEpochBoundaryFilter: bots created BEFORE the epoch anchor
+// and PAPER bots never enter the aggregate — the anchor decides the fleet.
+func TestBotAggregateEpochBoundaryFilter(t *testing.T) {
+	env := newEquityTestEnv(t)
+	ctx := context.Background()
+	env.pinEpochAnchor(t, time.Now().UTC().Add(-time.Hour))
+
+	inEpoch := env.seedBot(t, "EQF1_USDT_PERP", "EQ-F1", "STOPPED", 50, "1.5", 0)
+	_ = inEpoch
+	beforeEpoch := env.seedBot(t, "EQF2_USDT_PERP", "EQ-F2", "STOPPED", 50, "-100", 0)
+	if _, err := env.pool.Exec(ctx, `
+		UPDATE grid_bots SET created_at = NOW() - INTERVAL '48 hours' WHERE id = $1
+	`, beforeEpoch); err != nil {
+		t.Fatalf("age bot out of epoch: %v", err)
+	}
+	paperBot := env.seedBot(t, "EQF3_USDT_PERP", "EQ-F3", "STOPPED", 50, "-50", 0)
+	if _, err := env.pool.Exec(ctx, `
+		UPDATE grid_bots SET execution_mode = 'PAPER' WHERE id = $1
+	`, paperBot); err != nil {
+		t.Fatalf("flag paper bot: %v", err)
+	}
+
+	breakdown, err := ComputeEquityBreakdown(ctx, env.pool, env.account.ID, time.Now().UTC().Add(-time.Hour))
+	if err != nil {
+		t.Fatalf("breakdown: %v", err)
+	}
+	if !breakdown.ClosedKnown.Equal(mustDec(t, "1.5")) {
+		t.Fatalf("only the in-epoch REAL final counts, got %s", breakdown.ClosedKnown)
+	}
+}
+
+// TestBotAggregateCaptureAlarms pins the v2.0.83 alarm contract: an
+// account-empty answer is the isolated norm (snapshot lands, no alarm), a
+// real fetch failure alarms durably with 1-hour dedup and writes nothing.
+func TestBotAggregateCaptureAlarms(t *testing.T) {
+	env := newEquityTestEnv(t)
+	ctx := context.Background()
+	env.pinEpochAnchor(t, time.Now().UTC().Add(-time.Hour))
+
+	// account/detail → HTTP 500: a real failure. No snapshot, one marker.
 	env.mock.setMode(t, "error")
-	env.worker.captureAccountEquity(ctx, *env.settings)
-	if count := env.snapshotCount(t); count != 0 {
-		t.Fatalf("failed fetch must add no snapshot, got n=%d", count)
+	env.worker.captureBotAggregateEquity(ctx, *env.settings)
+	if got := env.snapshots(t); got != 0 {
+		t.Fatalf("failed fetch must add no snapshot, got n=%d", got)
 	}
-	if events := env.equityFailureEvents(t); events != 1 {
-		t.Fatalf("failed fetch must leave one EQUITY_CAPTURE_FAILED marker, got %d", events)
+	if got := env.equityEvents(t, "EQUITY_CAPTURE_FAILED"); got != 1 {
+		t.Fatalf("failed fetch must leave one marker, got %d", got)
+	}
+	// 1-hour dedup on the alarm.
+	env.worker.captureBotAggregateEquity(ctx, *env.settings)
+	if got := env.equityEvents(t, "EQUITY_CAPTURE_FAILED"); got != 1 {
+		t.Fatalf("dedup violated: %d markers within the hour", got)
 	}
 
-	// The 1-hour dedup: a second failing pass adds no second marker.
-	env.worker.captureAccountEquity(ctx, *env.settings)
-	if events := env.equityFailureEvents(t); events != 1 {
-		t.Fatalf("dedup violated: %d markers within the hour", events)
+	// account/detail answers zero USDT (isolated norm): the snapshot lands
+	// and no NEW alarm appears.
+	env.mock.setMode(t, "normal")
+	env.worker.captureBotAggregateEquity(ctx, *env.settings)
+	if got := env.snapshots(t); got != 1 {
+		t.Fatalf("empty wallet is the norm — snapshot must land, got n=%d", got)
 	}
-
-	// Empty decode with no fallback data → no snapshot, marker fires (the
-	// first marker is already <1h old, so the count stays deduped — the
-	// invariant is the marker EXISTS and no row landed).
-	env.mock.setMode(t, "empty")
-	env.worker.captureAccountEquity(ctx, *env.settings)
-	if count := env.snapshotCount(t); count != 0 {
-		t.Fatalf("empty decode must add no snapshot, got n=%d", count)
-	}
-	if events := env.equityFailureEvents(t); events != 1 {
-		t.Fatalf("unexpected marker count after empty decode: %d", events)
+	if got := env.equityEvents(t, "EQUITY_CAPTURE_FAILED"); got != 1 {
+		t.Fatalf("empty wallet must not alarm, got %d markers", got)
 	}
 	var reason string
 	if err := env.pool.QueryRow(ctx, `
@@ -388,95 +586,46 @@ func TestAccountEquityCaptureObservability(t *testing.T) {
 	`).Scan(&reason); err != nil {
 		t.Fatalf("load marker reason: %v", err)
 	}
-	if reason != "FETCH_FAILED" && reason != "EMPTY_DECODE" {
+	if reason != "FETCH_FAILED" {
 		t.Fatalf("marker must carry a machine reason, got %q", reason)
 	}
 }
 
-// TestAccountEquityEmptyDecodeFallback: when account/detail decodes to an
-// empty wallet, the documented balances+positions endpoints reconstruct the
-// equity (assets = free+frozen, floating = Σ position unrealizedPnL) so the
-// ledger keeps flowing; with no fallback data either, the capture reports
-// instead of silently doing nothing.
-func TestAccountEquityEmptyDecodeFallback(t *testing.T) {
+// TestBotAggregateEpochAnchorConfig: the durable anchor drives the fleet
+// boundary — moving app_config('pnl_epoch_started_at') past every bot
+// empties the epoch; a malformed value is an error, never a silent reset.
+func TestBotAggregateEpochAnchorConfig(t *testing.T) {
 	env := newEquityTestEnv(t)
 	ctx := context.Background()
-
-	// detail empty, balances carries $400 free, one position floats −$1.5.
-	env.mock.setMode(t, "empty")
-	env.mock.setFallback(t, "400", "-1.5")
-	env.worker.captureAccountEquity(ctx, *env.settings)
-	if count := env.snapshotCount(t); count != 1 {
-		t.Fatalf("fallback must snapshot the wallet, got n=%d", count)
-	}
-	var equity, assets, unreal string
-	if err := env.pool.QueryRow(ctx, `
-		SELECT equity_usdt::TEXT, assets_usdt::TEXT, unrealized_pnl_usdt::TEXT
-		FROM account_equity_snapshots WHERE account_id = $1
-	`, env.account.ID).Scan(&equity, &assets, &unreal); err != nil {
-		t.Fatalf("load fallback snapshot: %v", err)
-	}
-	if !decimal.RequireFromString(assets).Equal(decimal.NewFromInt(400)) ||
-		!decimal.RequireFromString(unreal).Equal(decimal.NewFromFloat(-1.5)) ||
-		!decimal.RequireFromString(equity).Equal(decimal.NewFromFloat(398.5)) {
-		t.Fatalf("fallback snapshot wrong: equity=%s assets=%s unreal=%s", equity, assets, unreal)
-	}
-	if events := env.equityFailureEvents(t); events != 0 {
-		t.Fatalf("a successful fallback must not raise the failure marker, got %d", events)
-	}
-
-	// detail empty AND fallback empty → no snapshot, marker reported.
-	env.ageSnapshots(t)
-	env.mock.setFallback(t, "", "")
-	env.worker.captureAccountEquity(ctx, *env.settings)
-	if count := env.snapshotCount(t); count != 1 {
-		t.Fatalf("empty everywhere must add no snapshot, got n=%d", count)
-	}
-	if events := env.equityFailureEvents(t); events != 1 {
-		t.Fatalf("empty everywhere must raise exactly one marker, got %d", events)
-	}
-}
-
-// TestAccountEquityTolerantDecode: the live API sending unquoted numbers
-// and empty strings where the docs promise decimal strings must still
-// produce a snapshot — this is the deviation class the v2.0.75 decoder was
-// defenseless against.
-func TestAccountEquityTolerantDecode(t *testing.T) {
-	env := newEquityTestEnv(t)
-	ctx := context.Background()
-
-	env.mock.setMode(t, "tolerant")
-	env.worker.captureAccountEquity(ctx, *env.settings)
-	if count := env.snapshotCount(t); count != 1 {
-		t.Fatalf("tolerant decode must snapshot, got n=%d", count)
-	}
-	var equity string
-	if err := env.pool.QueryRow(ctx, `
-		SELECT equity_usdt::TEXT FROM account_equity_snapshots
-		WHERE account_id = $1 ORDER BY captured_at DESC LIMIT 1
-	`, env.account.ID).Scan(&equity); err != nil {
-		t.Fatalf("load snapshot: %v", err)
-	}
-	if got := decimal.RequireFromString(equity); !got.Equal(decimal.NewFromFloat(500)) {
-		t.Fatalf("tolerant equity must be 501.25 − 1.25 = 500, got %s", equity)
-	}
-	if events := env.equityFailureEvents(t); events != 0 {
-		t.Fatalf("tolerant decode must not raise the failure marker, got %d", events)
-	}
-}
-
-// TestAccountEquityEpochEmptyLedger: the endpoint's empty-table contract —
-// the NULL-row scan must answer a nil summary (HTTP 200 available:false),
-// never a 500.
-func TestAccountEquityEpochEmptyLedger(t *testing.T) {
-	env := newEquityTestEnv(t)
-	ctx := context.Background()
+	env.pinEpochAnchor(t, time.Now().UTC().Add(-time.Hour))
+	env.seedBot(t, "EQA1_USDT_PERP", "EQ-A1", "STOPPED", 50, "1.5", 0)
 
 	summary, err := env.service.AccountEquityEpoch(ctx)
 	if err != nil {
-		t.Fatalf("empty ledger must not error (endpoint 500 regression), got: %v", err)
+		t.Fatalf("epoch summary: %v", err)
 	}
-	if summary != nil {
-		t.Fatalf("empty ledger must answer a nil summary (available:false), got %+v", summary)
+	if !summary.ClosedKnownUSDT.Equal(mustDec(t, "1.5")) {
+		t.Fatalf("in-epoch final must count, got %s", summary.ClosedKnownUSDT)
+	}
+
+	// Move the anchor into the future: the epoch empties (zeros, still
+	// available — an empty epoch is not an alarm).
+	env.pinEpochAnchor(t, time.Now().UTC().Add(time.Hour))
+	summary, err = env.service.AccountEquityEpoch(ctx)
+	if err != nil {
+		t.Fatalf("epoch summary after re-anchor: %v", err)
+	}
+	if summary == nil || !summary.EpochPnLUSDT.IsZero() {
+		t.Fatalf("re-anchored epoch must answer zeroes, got %+v", summary)
+	}
+
+	// Malformed anchor: surfaced as an error, never silently re-anchored.
+	if _, err := env.pool.Exec(ctx, `
+		UPDATE app_config SET value = '"not-a-timestamp"' WHERE key = 'pnl_epoch_started_at'
+	`); err != nil {
+		t.Fatalf("break anchor: %v", err)
+	}
+	if _, err := env.service.AccountEquityEpoch(ctx); err == nil {
+		t.Fatal("malformed anchor must surface an error")
 	}
 }

@@ -940,11 +940,12 @@ func (s *Server) autoGridAIFill(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, suggestion)
 }
 
-// autoGridEquityEpoch reports the wallet-truth epoch PnL: futures wallet
-// equity now minus the first recorded snapshot. available=false means "no
-// snapshots yet" — the capture pipeline is not writing the ledger (dead
-// fetch, empty decode or no account) and the UI must raise the alarm
-// instead of showing a fabricated zero.
+// autoGridEquityEpoch reports the bot-aggregate epoch PnL (v2.0.83): the
+// account endpoints cannot see isolated-grid margins, so the application
+// truth is the aggregate over bots — running (grid profit + funding +
+// floating) plus closed-of-epoch finals, with refused settles estimated
+// from telemetry. available=false only on real failures (no account, bad
+// epoch anchor, DB error); an empty epoch answers zeroes, never an alarm.
 func (s *Server) autoGridEquityEpoch(w http.ResponseWriter, r *http.Request) {
 	summary, err := s.autogrid.AccountEquityEpoch(r.Context())
 	if err != nil {
@@ -954,7 +955,7 @@ func (s *Server) autoGridEquityEpoch(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"available": summary != nil,
 		"summary":   summary,
-		"note":      "epoch PnL measured on the futures wallet (equity_now − first snapshot); bot PnL fields never see entry/exit/invest_in fees",
+		"note":      "epoch PnL = bot aggregate (running grid profit + funding + floating + closed finals/estimates); account endpoints are blind to isolated-grid margins",
 	})
 }
 

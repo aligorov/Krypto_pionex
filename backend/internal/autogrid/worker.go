@@ -145,11 +145,11 @@ func (worker *Worker) Run(ctx context.Context) {
 			return
 		}
 		worker.service.SyncDerivedBreaker(ctx, *settings)
-		// v2.0.75 wallet truth: the first equity snapshot of the process must
-		// land at startup, not one manage interval later — the epoch anchor's
-		// precision is the operator's headline PnL figure.
+		// v2.0.83 bot-aggregate equity: the first snapshot of the process
+		// must land at startup, not one manage interval later — the running
+		// PnL columns were persisted by the previous process's passes.
 		worker.runGuarded("equity_snapshot", func() {
-			worker.captureAccountEquity(ctx, *settings)
+			worker.captureBotAggregateEquity(ctx, *settings)
 		})
 	})
 	worker.logger.Info("AutoGrid worker started", "component", "autogrid_worker")
@@ -2619,9 +2619,6 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 	// v2.0.58: data-feed health — a silently dead collector must announce
 	// itself instead of fail-opening every gate that leans on it.
 	worker.dataHealthCheck(ctx)
-	// v2.0.75 wallet truth: self-throttled (5m) equity snapshot so the epoch
-	// PnL comes from the wallet, not from fee-blind bot PnL fields.
-	worker.captureAccountEquity(ctx, *settings)
 	worker.maybeQueueCascadeShortScan(ctx, *settings)
 	// Pin the implicitly resolved account into settings when possible so
 	// deploys and supervision stay on the same account. Supervision itself
@@ -2634,6 +2631,11 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 		WHERE autogrid_settings_id = $1 AND bu_order_id IS NOT NULL
 		  AND status IN ('RUNNING', 'STOP_REQUESTED', 'STOPPING')
 	`, settings.ID).Scan(&count); err != nil || count == 0 {
+		// v2.0.83: even with zero running bots the epoch still owns its
+		// closed terminals — the bot-aggregate ledger keeps flowing.
+		if err == nil {
+			worker.captureBotAggregateEquity(ctx, *settings)
+		}
 		return clampInterval(settings.ManageIntervalSeconds), err
 	}
 	priceBySymbol, priceErr := worker.priceMap(ctx)
@@ -3434,15 +3436,17 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 					"component", "autogrid_worker", "bot_id", bot.id, "symbol", bot.symbol)
 				break
 			}
-			// v2.0.76 feasibility preflight, same floor as the radar: the
-			// live remote total (grid profit + floating at mark) must clear
-			// the buffer or the exchange rejects adjust_params with
-			// BOT_INVALID_ARGUMENT/PROFIT_LESS_THAN_ZERO. Skipping the call
-			// removes the guaranteed-rejection spam; the break itself stays
-			// owned by the existing ladder — RANGE_BREAK_* closes on adverse
-			// regime, _NO_ADJUSTMENTS_LEFT on budget exhaustion, plus the
-			// anti-hunt structural stop and the max-loss stop keep running.
-			if remoteTotal := realized.Add(unrealized); !adjustShiftFeasible(remoteTotal) {
+			// v2.0.76 feasibility preflight, same floor as the radar: the live
+			// remote FLOATING PnL must clear the buffer or the exchange rejects
+			// adjust_params with BOT_INVALID_ARGUMENT/PROFIT_LESS_THAN_ZERO
+			// (v2.0.83: the gate is the floating leg — the exchange keys on pure
+			// floating PnL > 0, so banked grid profit cannot mask a sinking
+			// position, prod NEAR #688). Skipping the call removes the
+			// guaranteed-rejection spam; the break itself stays owned by the
+			// existing ladder — RANGE_BREAK_* closes on adverse regime,
+			// _NO_ADJUSTMENTS_LEFT on budget exhaustion, plus the anti-hunt
+			// structural stop and the max-loss stop keep running.
+			if remoteTotal := realized.Add(unrealized); !adjustShiftFeasible(unrealized) {
 				worker.manageShiftBlockedUnderwater(ctx, bot.id, bot.botNumber, bot.symbol,
 					decision.Reason, remoteTotal, price)
 				break
@@ -3627,6 +3631,12 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 		}
 		unknownAccountRows.Close()
 	}
+
+	// v2.0.83 bot-aggregate equity: capture runs AFTER the bot loop — the
+	// realized/unrealized columns it sums were just refreshed from remote
+	// truth by the passes above (running persist, terminal settle, 48h
+	// backfill). Self-throttled to 5 minutes by the snapshot table.
+	worker.captureBotAggregateEquity(ctx, *settings)
 
 	return clampInterval(settings.ManageIntervalSeconds), nil
 }

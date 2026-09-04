@@ -27,21 +27,88 @@ import (
 
 // (a, pure levels) The preflight floor: >= +$0.10 passes, everything below —
 // including the 0..0.10 drift band between reconcile and shift — is blocked.
+// v2.0.83: the figure under test is the FLOATING PnL, not the bot total.
 func TestAdjustShiftPreflightLevels(t *testing.T) {
 	if !adjustShiftFeasible(d("0.5")) {
-		t.Fatal("total +$0.5 must pass the preflight")
+		t.Fatal("floating +$0.5 must pass the preflight")
 	}
 	if !adjustShiftFeasible(d("0.10")) {
 		t.Fatal("the floor itself must pass (>=, not >)")
 	}
 	if adjustShiftFeasible(d("0.09")) {
-		t.Fatal("total inside the drift buffer must be blocked")
+		t.Fatal("floating inside the drift buffer must be blocked")
 	}
 	if adjustShiftFeasible(d("0")) {
-		t.Fatal("flat total must be blocked — the exchange requires profit > 0")
+		t.Fatal("flat floating must be blocked — the exchange requires floating profit > 0")
 	}
 	if adjustShiftFeasible(d("-0.5")) {
-		t.Fatal("underwater total must be blocked")
+		t.Fatal("underwater floating must be blocked")
+	}
+}
+
+// (a-regress, the prod NEAR #688 shape) Banked grid profit must NOT mask a
+// sinking position: total +1.5 (realized +2.0, floating −0.5) cleared the
+// v2.0.76 total-based preflight and the exchange still refused
+// adjust_params with PROFIT_LESS_THAN_ZERO (2026-09-04 19:05Z). The v2.0.83
+// gate keys on the floating leg, so this exact bot must now be blocked
+// BEFORE the exchange call, with the durable blocked event as the trace.
+func TestRadarRealPreflightFloatingNotTotal(t *testing.T) {
+	h := newRadarRealHarness(t)
+	ctx := context.Background()
+	const symbol = "RADR_USDT_PERP"
+	botID := h.seedRealBot(t, symbol, 2)
+	h.seedDwell(t, botID, symbol)
+	if _, err := h.pool.Exec(ctx, `
+		UPDATE grid_bots SET realized_pnl_usdt = 2.0, unrealized_pnl_usdt = -0.5 WHERE id = $1
+	`, botID); err != nil {
+		t.Fatalf("plant the NEAR #688 shape (total +1.5, floating −0.5): %v", err)
+	}
+
+	h.settings.StopForecastMode = "ACTIVE"
+	b := realRadarAction(symbol, decimal.NewFromFloat(103.5))
+	b.botID = botID
+	h.worker.radarMaybeRecenter(ctx, *h.settings, b, radarScores{Band: 3, Score: 0.80, DistToStopATR: 2.0})
+
+	if got := h.mock.adjustCount.Load(); got != 0 {
+		t.Fatalf("floating −0.5 must veto the exchange call even with total +1.5, got %d adjusts", got)
+	}
+	var blocked int
+	var totalPayload string
+	if err := h.pool.QueryRow(ctx, `
+		SELECT COUNT(*), COALESCE((SELECT details->>'total_pnl' FROM bot_execution_events
+			WHERE bot_id = $1 AND event_type = 'RADAR_SHIFT_BLOCKED_UNDERWATER'
+			ORDER BY created_at DESC LIMIT 1), '')
+		FROM bot_execution_events
+		WHERE bot_id = $1 AND event_type = 'RADAR_SHIFT_BLOCKED_UNDERWATER'
+	`, botID).Scan(&blocked, &totalPayload); err != nil || blocked != 1 {
+		t.Fatalf("exactly one blocked event expected, got %d (%v)", blocked, err)
+	}
+	if totalPayload != "1.5000" {
+		t.Fatalf("blocked event must carry the total (+1.5) for context, got %q", totalPayload)
+	}
+	var adjustments int
+	if err := h.pool.QueryRow(ctx, `SELECT adjustments_count FROM grid_bots WHERE id = $1`, botID).
+		Scan(&adjustments); err != nil || adjustments != 2 {
+		t.Fatalf("blocked shift must keep the budget, got %d (%v)", adjustments, err)
+	}
+
+	// The same bot with the floating leg recovered (+0.5) shifts again —
+	// the gate opens the moment pure floating goes green.
+	if _, err := h.pool.Exec(ctx, `
+		UPDATE grid_bots SET unrealized_pnl_usdt = 0.5 WHERE id = $1
+	`, botID); err != nil {
+		t.Fatalf("recover the floating leg: %v", err)
+	}
+	if _, err := h.pool.Exec(ctx, `
+		UPDATE grid_bots
+		SET model_state = jsonb_set(COALESCE(model_state,'{}'::jsonb), '{radarShiftBlockedAt}', '"1970-01-01T00:00:00Z"')
+		WHERE id = $1
+	`, botID); err != nil {
+		t.Fatalf("re-arm the blocked marker: %v", err)
+	}
+	h.worker.radarMaybeRecenter(ctx, *h.settings, b, radarScores{Band: 3, Score: 0.80, DistToStopATR: 2.0})
+	if got := h.mock.adjustCount.Load(); got != 1 {
+		t.Fatalf("recovered floating (+0.5) must allow the shift, got %d adjusts", got)
 	}
 }
 
@@ -88,9 +155,9 @@ func TestRadarRealPreflightUnderwaterBlocked(t *testing.T) {
 	botID := h.seedRealBot(t, symbol, 2)
 	h.seedDwell(t, botID, symbol)
 	if _, err := h.pool.Exec(ctx, `
-		UPDATE grid_bots SET realized_pnl_usdt = -0.5 WHERE id = $1
+		UPDATE grid_bots SET realized_pnl_usdt = -0.5, unrealized_pnl_usdt = -0.5 WHERE id = $1
 	`, botID); err != nil {
-		t.Fatalf("sink the bot under water: %v", err)
+		t.Fatalf("sink the bot under water (both legs): %v", err)
 	}
 
 	h.settings.StopForecastMode = "ACTIVE"
@@ -327,14 +394,14 @@ func newManageExchangeMock(t *testing.T) *manageExchangeMock {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
 			"result": true, "timestamp": time.Now().UnixMilli(),
-			"data":   map[string]any{"fundings": []map[string]any{}},
+			"data": map[string]any{"fundings": []map[string]any{}},
 		})
 	})
 	mux.HandleFunc("GET /uapi/v1/account/detail", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
 			"result": true, "timestamp": time.Now().UnixMilli(),
-			"data":   map[string]any{"balances": []map[string]any{}},
+			"data": map[string]any{"balances": []map[string]any{}},
 		})
 	})
 	mux.HandleFunc("POST /api/v1/bot/orders/futuresGrid/adjustParams", func(w http.ResponseWriter, _ *http.Request) {

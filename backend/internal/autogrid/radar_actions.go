@@ -75,19 +75,24 @@ const (
 )
 
 // adjustShiftProfitFloor is the local feasibility floor for any native
-// adjust_params range shift. The exchange gate is floating PnL > 0
-// (PROFIT_LESS_THAN_ZERO); the local proxy is the remote total
-// (realized+floating from the last reconcile), and the +$0.10 buffer absorbs
-// drift between the reconcile and the shift attempt so a borderline bot is
-// not shipped into a guaranteed rejection.
+// adjust_params range shift. The exchange gate is the order's PURE FLOATING
+// PnL > 0 (PROFIT_LESS_THAN_ZERO; prod NEAR #688 2026-09-04 19:05Z: grid
+// profit +2 with floating −0.5 cleared the old total-based preflight and
+// the shift was refused anyway), so the preflight watches the same leg —
+// the floating (unrealized) figure from the last reconcile — and the +$0.10
+// buffer absorbs drift between the reconcile and the shift attempt so a
+// borderline bot is not shipped into a guaranteed rejection. The realized
+// grid profit never enters the decision.
 var adjustShiftProfitFloor = decimal.NewFromFloat(0.10)
 
 // adjustShiftFeasible reports whether a native range shift is locally
 // executable. It is the single preflight both the radar arms and the manage
 // RANGE_BREAK path must clear before touching adjust_params — calling the
-// exchange below the floor can only produce PROFIT_LESS_THAN_ZERO.
-func adjustShiftFeasible(remoteTotal decimal.Decimal) bool {
-	return remoteTotal.GreaterThanOrEqual(adjustShiftProfitFloor)
+// exchange below the floor can only produce PROFIT_LESS_THAN_ZERO. The
+// figure under test is the FLOATING PnL (unrealized leg of the last
+// reconcile), not the bot total.
+func adjustShiftFeasible(floatingPnL decimal.Decimal) bool {
+	return floatingPnL.GreaterThanOrEqual(adjustShiftProfitFloor)
 }
 
 // radarB2EarlyEdgeProgress is the share of the range width the price has
@@ -357,7 +362,11 @@ func (worker *Worker) radarMaybeRecenter(ctx context.Context, settings Settings,
 	// v2.0.76 feasibility preflight, paper arm: the simulated shift must obey
 	// the same green-only policy the exchange enforces on REAL, or paper
 	// calibration keeps endorsing maneuvers the native fleet cannot execute.
-	if paperTotal := bot.realized.Add(bot.unrealized); !adjustShiftFeasible(paperTotal) {
+	// v2.0.83: the gate is the FLOATING leg — the exchange keys on pure
+	// floating PnL, a paper bot with banked grid profit and a sinking
+	// position must not "pass" (the NEAR #688 lesson).
+	paperTotal := bot.realized.Add(bot.unrealized)
+	if !adjustShiftFeasible(bot.unrealized) {
 		worker.radarShiftBlockedUnderwater(ctx, b, rs, paperTotal)
 		return
 	}
@@ -458,9 +467,9 @@ func queueRadarB2EarlyTelegram(ctx context.Context, worker *Worker, b radarInput
 	_ = QueueTelegramEvent(ctx, worker.db, "RADAR_B2_EARLY_RECENTER", map[string]any{
 		"bot_number": b.botNumber, "symbol": b.symbol,
 		"lower_price": newLower.StringFixed(6), "upper_price": newUpper.StringFixed(6),
-		"score":              decimal.NewFromFloat(rs.Score).Round(3).String(),
-		"edge_progress_pct":  decimal.NewFromFloat(progress * 100).Round(0).String(),
-		"total":              b.total.StringFixed(2),
+		"score":             decimal.NewFromFloat(rs.Score).Round(3).String(),
+		"edge_progress_pct": decimal.NewFromFloat(progress * 100).Round(0).String(),
+		"total":             b.total.StringFixed(2),
 	})
 }
 
@@ -483,6 +492,7 @@ func (worker *Worker) radarRecenterReal(ctx context.Context, settings Settings, 
 		gridNum      int
 		antiHunt     *decimal.Decimal
 		adjustments  int
+		floating     decimal.Decimal
 		total        decimal.Decimal
 		createdAt    time.Time
 	}
@@ -491,13 +501,15 @@ func (worker *Worker) radarRecenterReal(ctx context.Context, settings Settings, 
 		SELECT direction, lower_price, upper_price, grid_num,
 		       NULLIF(anti_hunt_stop_price, 0),
 		       COALESCE(adjustments_count, 0), created_at,
+		       COALESCE(unrealized_pnl_usdt, 0),
 		       COALESCE(realized_pnl_usdt, 0) + COALESCE(unrealized_pnl_usdt, 0)
 		FROM grid_bots
 		WHERE id = $1 AND autogrid_settings_id = $2
 		  AND bu_order_id IS NOT NULL AND status = 'RUNNING'
 	`, b.botID, settings.ID).Scan(
 		&bot.direction, &bot.lower, &bot.upper, &bot.gridNum,
-		&bot.antiHunt, &bot.adjustments, &bot.createdAt, &bot.total,
+		&bot.antiHunt, &bot.adjustments, &bot.createdAt,
+		&bot.floating, &bot.total,
 	)
 	if err != nil {
 		return // not RUNNING (a stop won the race) or already gone
@@ -516,14 +528,16 @@ func (worker *Worker) radarRecenterReal(ctx context.Context, settings Settings, 
 
 	newLower, newUpper := recenterBounds(bot.lower, bot.upper, b.price)
 
-	// v2.0.76 feasibility preflight: the last-reconciled remote total must
-	// clear the profit floor or the exchange rejects adjust_params with
-	// BOT_INVALID_ARGUMENT/PROFIT_LESS_THAN_ZERO (prod SNXXX #669: band 3,
-	// dwell satisfied, shift refused 08:12:48Z 09-04 — the only successful
-	// REAL shifts in the ledger came from bots in profit). A blocked shift
-	// becomes the durable RADAR_SHIFT_BLOCKED_UNDERWATER decision instead of
-	// a guaranteed rejection; the exit stays with the stop ladder/operator.
-	if !adjustShiftFeasible(bot.total) {
+	// v2.0.76 feasibility preflight (v2.0.83 floating-gate): the exchange
+	// rejects adjust_params unless the order's PURE FLOATING PnL is positive
+	// (BOT_INVALID_ARGUMENT/PROFIT_LESS_THAN_ZERO; prod NEAR #688: total +1.5
+	// with floating −0.5 cleared the old total preflight and the shift was
+	// still refused at 19:05Z 09-04). The gate therefore watches the floating
+	// leg of the last reconcile; the total rides along only in the blocked
+	// event. A blocked shift becomes the durable RADAR_SHIFT_BLOCKED_UNDERWATER
+	// decision instead of a guaranteed rejection; the exit stays with the stop
+	// ladder/operator.
+	if !adjustShiftFeasible(bot.floating) {
 		worker.radarShiftBlockedUnderwater(ctx, b, rs, bot.total)
 		return
 	}
