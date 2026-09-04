@@ -49,6 +49,12 @@ type CreateInput struct {
 	// StructContext snapshots the deploy-time confluence/structure thesis
 	// (Hurst, verdict, invalidation) for later drift detection.
 	StructContext map[string]any
+	// TrancheState carries the deploy-time tranche markers (trancheDeployed/
+	// trancheBase/trancheEntry/atrPctEntry) into the INSERT itself — a
+	// follow-up UPDATE was best-effort and a swallowed failure stripped the
+	// bot of its tranche contract (v2.0.78). nil keeps the empty-object
+	// model_state the schema default always wrote.
+	TrancheState map[string]any
 }
 
 func NewLifecycleManager(db *pgxpool.Pool, pionexClient *pionex.Client) *LifecycleManager {
@@ -122,10 +128,12 @@ func (manager *LifecycleManager) CreateGridBot(
 				grid_type, lower_price, upper_price, grid_num, leverage,
 				quote_investment, extra_margin, stop_loss, take_profit,
 				request_fingerprint, execution_mode, reconciliation_state,
-				pnl_target_usdt, max_loss_usdt, anti_hunt_stop_price, struct_context
+				pnl_target_usdt, max_loss_usdt, anti_hunt_stop_price, struct_context,
+				model_state
 			) VALUES (
 				$1, $2, $3, 'PENDING_SUBMISSION', $4, $5, $6, $7, $8, $9,
-				$10, $11, $12, $13, $14, 'REAL', 'PENDING', $15, $16, $17, $18
+				$10, $11, $12, $13, $14, 'REAL', 'PENDING', $15, $16, $17, $18,
+				$19::JSONB
 			)
 			ON CONFLICT (request_fingerprint) DO NOTHING
 			RETURNING id
@@ -143,6 +151,9 @@ func (manager *LifecycleManager) CreateGridBot(
 			input.MaxLossUSDT,
 			input.AntiHuntStop,
 			input.StructContext,
+			// model_state is NOT NULL in the schema; callers without tranche
+			// markers (manual deploys) keep the historical empty-object shape.
+			orEmptyJSON(input.TrancheState),
 		).Scan(&gridID)
 		if errors.Is(insertErr, pgx.ErrNoRows) {
 			loadErr := tx.QueryRow(ctx, `
@@ -198,19 +209,38 @@ func (manager *LifecycleManager) CreateGridBot(
 
 	tag, err := manager.db.Exec(ctx, `
 		UPDATE grid_bots
-		SET status = 'RUNNING', bu_order_id = $2,
+		SET status = CASE
+		        WHEN status IN ('STOP_REQUESTED', 'STOPPING') THEN status
+		        ELSE 'RUNNING'
+		    END,
+		    bu_order_id = $2,
 		    reconciliation_state = 'REMOTE_ID_PERSISTED',
 		    last_remote_status = 'CREATED', last_error = NULL,
 		    last_reconciled_at = NOW(), updated_at = NOW()
-		WHERE id = $1 AND status = 'PENDING_SUBMISSION'
+		WHERE id = $1
+		  AND (status = 'PENDING_SUBMISSION' OR bu_order_id IS NULL)
 	`, gridID, result.BUOrderID)
 	if err != nil {
 		return "", fmt.Errorf("persist remote Pionex buOrderId: %w", err)
 	}
 	if tag.RowsAffected() != 1 {
-		return "", errors.New("grid state changed before remote id could be persisted")
+		// v2.0.78 CRIT-3: the WHERE must not lose the remote id to a status
+		// raced by a stop request — the old equality guard made the exchange
+		// bot unmanaged forever (adoption cannot reach a STOP_REQUESTED row
+		// it is not allowed to consider). Any terminal state that is not a
+		// stop intent still refuses the RUNNING write.
+		return "", fmt.Errorf("grid state changed before remote id could be persisted (status raced for bot %s)", gridID)
 	}
 	return gridID, nil
+}
+
+// orEmptyJSON keeps a NOT NULL JSONB column on its empty-object default when
+// the caller passed no state.
+func orEmptyJSON(state map[string]any) map[string]any {
+	if state == nil {
+		return map[string]any{}
+	}
+	return state
 }
 
 func (manager *LifecycleManager) validatePionexSymbol(

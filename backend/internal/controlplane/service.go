@@ -687,14 +687,18 @@ func (s *Service) executeCommand(
 			executeErr = errors.New("grid bot id is required")
 			break
 		}
+		// v2.0.78 CRIT-3: never stop-request a row without a buOrderId — it
+		// would become an unsupervisable STOP_REQUESTED zombie that blocks
+		// the symbol; adoption owns NULL-bu rows until the remote id lands.
 		var tag pgconn.CommandTag
 		tag, executeErr = s.db.Exec(ctx, `
 			UPDATE grid_bots
 			SET status = 'STOP_REQUESTED', updated_at = NOW()
-			WHERE id = $1 AND status NOT IN ('STOPPED', 'CANCELLED', 'COMPLETED', 'LIQUIDATED')
+			WHERE id = $1 AND bu_order_id IS NOT NULL
+			  AND status NOT IN ('STOPPED', 'CANCELLED', 'COMPLETED', 'LIQUIDATED')
 		`, resourceID)
 		if executeErr == nil && tag.RowsAffected() == 0 {
-			executeErr = errors.New("grid bot not found or already terminal")
+			executeErr = errors.New("grid bot not found, not yet submitted (adoption pending) or already terminal")
 		}
 		status = "QUEUED"
 		result["executor"] = "native_grid_worker"

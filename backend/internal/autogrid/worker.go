@@ -31,6 +31,17 @@ func trancheFlag(on bool) int {
 	return 0
 }
 
+// trancheMarkerFresh reports whether an RFC3339 model_state marker (written
+// with the to_char UTC pattern) is younger than maxAge. Fresh invest intents
+// fence fail-closed paths that cannot verify the remote outcome.
+func trancheMarkerFresh(marker *string, maxAge time.Duration) bool {
+	if marker == nil {
+		return false
+	}
+	stamped, err := time.Parse(time.RFC3339, strings.TrimSpace(*marker))
+	return err == nil && time.Since(stamped) < maxAge
+}
+
 // realFundingReconcileInterval bounds the funding-fee history fetch for REAL
 // bots: funding settles at most every 8h, so a 30-minute anchor keeps each
 // window tiny while capping the signed-endpoint weight per manage pass.
@@ -2097,6 +2108,18 @@ func (worker *Worker) deployReal(
 			// Confluence readings ride in model_assumptions JSONB.
 			AntiHuntStop:  &antiHuntStop,
 			StructContext: deployStructContext(candidate, antiHuntStop),
+			// v2.0.13: per-bot tranche markers (audit F1/F6) — deriving the
+			// pending tranche from live settings would auto-inject real margin
+			// into every old bot on any budget raise. v2.0.78: they ride the
+			// lifecycle INSERT — the old follow-up UPDATE was best-effort and
+			// its failure silently stripped the bot of its tranche contract.
+			// Markers match the paper model_state contract.
+			TrancheState: map[string]any{
+				"trancheDeployed": trancheFlag(settings.TrancheDeployEnabled),
+				"trancheBase":     settings.BudgetUSDT.String(),
+				"trancheEntry":    candidate.CurrentPrice.String(),
+				"atrPctEntry":     atrPct,
+			},
 		})
 		if createErr != nil {
 			if errors.Is(createErr, grid.ErrDuplicateActiveBot) {
@@ -2123,23 +2146,6 @@ func (worker *Worker) deployReal(
 
 		var botNum int
 		_ = worker.db.QueryRow(ctx, `SELECT COALESCE(bot_number, 0) FROM grid_bots WHERE id = $1`, botID).Scan(&botNum)
-
-		// v2.0.13: per-bot tranche markers (audit F1/F6) — deriving the
-		// pending tranche from live settings would auto-inject real margin
-		// into every old bot on any budget raise. Markers match the paper
-		// model_state contract.
-		_, _ = worker.db.Exec(ctx, `
-			UPDATE grid_bots
-			SET model_state = jsonb_build_object(
-			        'trancheDeployed', $2::INT,
-			        'trancheBase', $3::TEXT,
-			        'trancheEntry', $4::TEXT,
-			        'atrPctEntry', $5::FLOAT8
-			    ),
-			    updated_at = NOW()
-			WHERE id = $1
-		`, botID, trancheFlag(settings.TrancheDeployEnabled), settings.BudgetUSDT.String(),
-			candidate.CurrentPrice.String(), atrPct)
 
 		_ = LogBotEvent(ctx, worker.db, botID, botNum, "REAL", candidate.Symbol, "CREATED", &candidate.CurrentPrice, nil, map[string]any{
 			"leverage": botLev, "gridNum": mesh.GridNum, "lowerPrice": lowerPrice, "upperPrice": upperPrice, "budget": settings.BudgetUSDT,
@@ -2188,10 +2194,15 @@ func (worker *Worker) stop(ctx context.Context) error {
 	}
 	// Real grids get a durable stop intent; reconcileAndManage submits the
 	// native Pionex cancel and verifies the terminal state remotely.
+	// v2.0.78 CRIT-3: rows without a buOrderId are never touched — a stop
+	// request on an unadopted submission makes the row a STOP_REQUESTED zombie
+	// (the manage loop only supervises rows WITH a remote id) that blocks the
+	// symbol and the slot forever. Adoption owns NULL-bu rows instead.
 	if _, err := worker.db.Exec(ctx, `
 		UPDATE grid_bots
 		SET status = 'STOP_REQUESTED', closed_reason = COALESCE(closed_reason, 'AUTOGRID_STOP'), updated_at = NOW()
 		WHERE autogrid_settings_id = $1
+		  AND bu_order_id IS NOT NULL
 		  AND status IN ('RUNNING', 'PENDING_SUBMISSION', 'SUBMISSION_UNKNOWN')
 	`, settings.ID); err != nil {
 		return fmt.Errorf("request real AutoGrid stop: %w", err)
@@ -2531,45 +2542,67 @@ func lossClassClose(reason string) bool {
 		normalized == "LIQUIDATION",
 		normalized == "STRUCT_INVALID_ANTI_HUNT",
 		normalized == "RANGE_BREAK_DOWN",
+		normalized == "RANGE_BREAK_UP",
 		normalized == "RANGE_BREAK_UP_TREND_STOP",
 		normalized == "LOSS_STOP",
 		normalized == "FORCE_LIQUIDATION":
 		return true
 	}
-	return false
+	// RANGE_SHIFT_*_NO_ADJUSTMENTS_LEFT: budget exhaustion closed the bot
+	// against the break, the same adverse exit as RANGE_BREAK_DOWN/UP.
+	return strings.HasPrefix(normalized, "RANGE_SHIFT_") &&
+		strings.HasSuffix(normalized, "_NO_ADJUSTMENTS_LEFT")
 }
 
-// gateSettledProfit applies the v2.0.75 honesty gate to a finished grid's
-// settled figure. On a loss-class close, the grid+funding leg with residual
-// inventory (FinalProfitGridResidual) is INCOMPLETE by construction — the
-// position-close loss is missing — and its grid profit is typically
+// unknownClassClose reports whether a close reason carries NO usable close
+// class at all. The honesty gate fails closed on unknown: a positive residual
+// leg on a close whose class nobody recorded is the same unauditable + that
+// the gate exists to refuse (prod FARTCOIN-class already-closed settles).
+func unknownClassClose(reason string) bool {
+	normalized := strings.ToUpper(strings.TrimSpace(reason))
+	return normalized == "" || normalized == "ALREADY_CLOSED"
+}
+
+// gateSettledProfit applies the v2.0.75/v2.0.78 honesty gate to a finished
+// grid's settled figure. On a loss-class close, the grid+funding leg with
+// residual inventory (FinalProfitGridResidual) is INCOMPLETE by construction —
+// the position-close loss is missing — and its grid profit is typically
 // positive, so accepting it reports +0.22 for a bot the app shows at −2.5
-// (prod XMR #672 / JTO #674). Refused → nil ("better empty than a lie");
-// the caller must Warn and mark the row.
+// (prod XMR #672 / JTO #674). Loss-class is decided from BOTH sources of the
+// close reason: the stored closed_reason (our own manage stop — the exchange
+// only answers "user cancel" for a stop we submitted via native cancel, which
+// alone is an operator-class reason; prod FARTCOIN settled +2.349 on an
+// ANTI_HUNT loss this way) and the exchange's reasonBy. Either source saying
+// loss-class refuses the leg; residual on a close class UNKNOWN to both
+// sources is refused too. Refused → nil ("better empty than a lie"); the
+// caller must Warn and mark the row.
 func gateSettledProfit(
 	total decimal.Decimal,
 	source pionex.FinalProfitSource,
-	closeReason string,
+	storedReason, exchangeReason string,
 ) *decimal.Decimal {
-	if source == pionex.FinalProfitGridResidual && lossClassClose(closeReason) && !total.IsNegative() {
+	if source != pionex.FinalProfitGridResidual || total.IsNegative() {
+		return &total
+	}
+	if lossClassClose(storedReason) || lossClassClose(exchangeReason) {
+		return nil
+	}
+	if unknownClassClose(storedReason) && unknownClassClose(exchangeReason) {
 		return nil
 	}
 	return &total
 }
 
-// persistFinalProfitSource records which chain leg settled a terminal bot
-// (model_state.finalProfitSource) — the audit trail behind every headline
-// PnL figure, and the backfill's exactly-once marker.
-func (worker *Worker) persistFinalProfitSource(ctx context.Context, botID string, source string) {
-	if _, err := worker.db.Exec(ctx, `
-		UPDATE grid_bots
-		SET model_state = jsonb_set(COALESCE(model_state, '{}'::jsonb), '{finalProfitSource}', to_jsonb($2::TEXT)),
-		    updated_at = NOW()
-		WHERE id = $1
-	`, botID, source); err != nil {
-		worker.logger.Warn("final profit source marker write failed",
-			"component", "autogrid_worker", "bot_id", botID, "error", err)
+// finalProfitMarkerValue is the model_state.finalProfitSource value a settle
+// writes: the chain leg that settled, or the refusal marker. It rides IN the
+// realized UPDATE (v2.0.78): a standalone marker write that succeeded while
+// the realized persist failed would arm the exactly-once key against a row
+// whose figure never landed.
+func finalProfitMarkerValue(source pionex.FinalProfitSource, refused bool) string {
+	if refused {
+		return "refused_" + string(source)
 	}
+	return string(source)
 }
 
 func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
@@ -2612,12 +2645,13 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 		       lower_price, upper_price, grid_num, adjustments_count,
 		       pnl_target_usdt, max_loss_usdt, quote_investment, leverage,
 		       anti_hunt_stop_price, COALESCE(bot_number, 0),
-		       COALESCE(peak_pnl_usdt, 0), created_at,
+		       COALESCE(peak_pnl_usdt, 0), created_at, COALESCE(closed_reason, ''),
 		       COALESCE(NULLIF(model_state->>'trancheDeployed','')::INT, 0),
 		       NULLIF(model_state->>'trancheBase',''),
 		       NULLIF(model_state->>'trancheEntry',''),
 		       COALESCE(NULLIF(model_state->>'atrPctEntry','')::FLOAT8, 0),
 		       NULLIF(model_state->>'trancheFailAt',''),
+		       NULLIF(model_state->>'trancheIntentAt',''),
 		       COALESCE(funding_paid_usdt, 0), last_funding_reconcile_at
 		FROM grid_bots
 		WHERE autogrid_settings_id = $1 AND bu_order_id IS NOT NULL
@@ -2637,11 +2671,13 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 		botNumber                                               int
 		peak                                                    decimal.Decimal
 		createdAt                                               time.Time
+		closedReason                                            string
 		trancheDeployed                                         int
 		trancheBase                                             *string
 		trancheEntry                                            *string
 		atrEntry                                                float64
 		trancheFailAt                                           *string
+		trancheIntentAt                                         *string
 		fundingPaid                                             decimal.Decimal
 		lastFundingReconcileAt                                  *time.Time
 	}
@@ -2654,9 +2690,9 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 			&item.adjustments, &item.pnlTarget, &item.maxLoss, &item.investment,
 			&item.leverage,
 			&item.antiHuntStop, &item.botNumber,
-			&item.peak, &item.createdAt,
+			&item.peak, &item.createdAt, &item.closedReason,
 			&item.trancheDeployed, &item.trancheBase, &item.trancheEntry,
-			&item.atrEntry, &item.trancheFailAt,
+			&item.atrEntry, &item.trancheFailAt, &item.trancheIntentAt,
 			&item.fundingPaid, &item.lastFundingReconcileAt,
 		); err != nil {
 			rows.Close()
@@ -2718,27 +2754,34 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 				closedReason := "ALREADY_CLOSED"
 				var finalRealizedArg any
 				settleRefused := false
+				var markerValue *string
 				if finished := findFinishedGridRecord(ctx, client, bot.remoteID); finished != nil {
 					// v2.0.75: the finished record's own reasonBy drives the
 					// honesty gate — the detail endpoint's refusal already
 					// lost the close class, the list record still knows it.
+					// v2.0.78: the STORED closed_reason (our manage stop)
+					// drives it too — the exchange answers "user cancel" for
+					// every stop we submit through native cancel, and that
+					// alone must not launder a loss-class close open.
 					// A refused settle NULLs the stored figure: the running
 					// accrual it would keep is the same incomplete chain.
 					settled, source := finished.SettledProfit()
-					gateReason := closedReason
-					if strings.TrimSpace(finished.ReasonBy) != "" {
-						gateReason = finished.ReasonBy
+					exchangeReason := strings.TrimSpace(finished.ReasonBy)
+					gateReason := exchangeReason
+					if gateReason == "" {
+						gateReason = closedReason
 					}
-					if gated := gateSettledProfit(settled, source, gateReason); gated != nil {
+					if gated := gateSettledProfit(settled, source, bot.closedReason, exchangeReason); gated != nil {
 						finalRealizedArg = *gated
-						worker.persistFinalProfitSource(ctx, bot.id, string(source))
 					} else {
 						settleRefused = true
-						worker.persistFinalProfitSource(ctx, bot.id, "refused_"+string(source))
-						worker.logger.Warn("already-closed settle refused: positive grid-fallback on a loss-class close — final PnL set NULL",
+						worker.logger.Warn("already-closed settle refused: positive grid-fallback on a loss-class/unknown close — final PnL set NULL",
 							"component", "autogrid_worker", "bot_id", bot.id, "symbol", bot.symbol,
-							"reason_by", gateReason, "grid_fallback", settled.StringFixed(4))
+							"stored_reason", bot.closedReason, "reason_by", gateReason,
+							"grid_fallback", settled.StringFixed(4))
 					}
+					marker := finalProfitMarkerValue(source, settleRefused)
+					markerValue = &marker
 				}
 				if _, err := worker.db.Exec(ctx, `
 					UPDATE grid_bots
@@ -2746,9 +2789,11 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 					    reconciliation_state = 'REMOTE_TERMINAL_CONFIRMED',
 					    realized_pnl_usdt = CASE WHEN $4::BOOLEAN THEN NULL ELSE COALESCE($3, realized_pnl_usdt) END,
 					    unrealized_pnl_usdt = 0,
+					    model_state = CASE WHEN $5::TEXT IS NULL THEN model_state
+					        ELSE jsonb_set(COALESCE(model_state, '{}'::jsonb), '{finalProfitSource}', to_jsonb($5::TEXT)) END,
 					    closed_at = NOW(), last_reconciled_at = NOW(), last_error = NULL, updated_at = NOW()
 					WHERE id = $1
-				`, bot.id, closedReason, finalRealizedArg, settleRefused); err != nil {
+				`, bot.id, closedReason, finalRealizedArg, settleRefused, markerValue); err != nil {
 					worker.logger.Error("persist already-closed grid state",
 						"component", "autogrid_worker", "bot_id", bot.id, "error", err)
 				}
@@ -2895,17 +2940,22 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 			// figure. v2.0.75: the figure is only accepted when its chain leg
 			// is trustworthy for this close class — the grid-only fallback on
 			// a native stop reported +0.22 while the app showed −2.5 (the
-			// position-close leg was missing). Refused → NULL, never a lie.
+			// position-close leg was missing). v2.0.78: the class is decided
+			// from the STORED closed_reason too — our own manage stop maps to
+			// "user cancel" at the exchange, which alone would launder the
+			// loss-class close open (prod FARTCOIN +2.349 on ANTI_HUNT).
+			// Refused → NULL, never a lie.
 			settled, source := remote.BUOrderData.SettledProfit()
 			var finalRealizedArg any
-			if gated := gateSettledProfit(settled, source, closedReason); gated != nil {
+			settleRefused := false
+			if gated := gateSettledProfit(settled, source, bot.closedReason, closedReason); gated != nil {
 				finalRealizedArg = *gated
-				worker.persistFinalProfitSource(ctx, bot.id, string(source))
 			} else {
-				worker.persistFinalProfitSource(ctx, bot.id, "refused_"+string(source))
-				worker.logger.Warn("terminal settle refused: positive grid-fallback on a loss-class close — final PnL left NULL",
+				settleRefused = true
+				worker.logger.Warn("terminal settle refused: positive grid-fallback on a loss-class/unknown close — final PnL left NULL",
 					"component", "autogrid_worker", "bot_id", bot.id, "symbol", bot.symbol,
-					"closed_reason", closedReason, "grid_fallback", settled.StringFixed(4))
+					"stored_reason", bot.closedReason, "closed_reason", closedReason,
+					"grid_fallback", settled.StringFixed(4))
 			}
 			if _, err := worker.db.Exec(ctx, `
 				UPDATE grid_bots
@@ -2914,9 +2964,12 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 				    reconciliation_state = 'REMOTE_TERMINAL_CONFIRMED',
 				    last_remote_status = $4, realized_pnl_usdt = $5,
 				    unrealized_pnl_usdt = 0, closed_at = NOW(),
+				    model_state = jsonb_set(COALESCE(model_state, '{}'::jsonb), '{finalProfitSource}',
+				        to_jsonb($6::TEXT)),
 				    last_reconciled_at = NOW(), last_error = NULL, updated_at = NOW()
 				WHERE id = $1
-			`, bot.id, status, closedReason, remoteStatus, finalRealizedArg); err != nil {
+			`, bot.id, status, closedReason, remoteStatus, finalRealizedArg,
+				finalProfitMarkerValue(source, settleRefused)); err != nil {
 				worker.logger.Error("persist terminal grid state",
 					"component", "autogrid_worker", "bot_id", bot.id, "error", err)
 			}
@@ -2930,13 +2983,19 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 
 		// Persist remote truth and PnL without reverting durable stop intents:
 		// the local status is kept and in-flight cancel states are preserved.
+		// v2.0.78: the status guard keeps stop intents recorded by a concurrent
+		// command goroutine (worker.stop / CloseAll / grid.stop) — writing back
+		// the stale RUNNING snapshot reverts the intent and the bot never stops.
 		persistedReconciliation := "REMOTE_TERMINAL_PENDING"
 		if bot.localStatus == "RUNNING" {
 			persistedReconciliation = "REST_AUTHORITATIVE_OK"
 		}
 		if _, err := worker.db.Exec(ctx, `
 			UPDATE grid_bots
-			SET status = $2,
+			SET status = CASE
+					WHEN status IN ('STOP_REQUESTED', 'STOPPING') THEN status
+					ELSE $2
+				END,
 			    reconciliation_state = CASE
 					WHEN reconciliation_state IN `+cancelStates+` THEN reconciliation_state
 					ELSE $3
@@ -3003,6 +3062,98 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 				trancheBackoff = true
 			}
 		}
+		// v2.0.78 CRIT-2 self-heal: invest_in is at-least-once at the exchange
+		// but exactly-once locally, and native pour + local persist + target
+		// doubling were three separate writes. A crash between them either
+		// double-poured real margin on retry or left a doubled margin with
+		// half-size stops forever. Exchange truth wins every pass.
+		remoteInvestment, remoteInvestmentReported := remote.BUOrderData.Investment()
+		trancheActive := false
+		trancheBaseParsed := decimal.Zero
+		if bot.trancheBase != nil {
+			if base, bErr := decimal.NewFromString(*bot.trancheBase); bErr == nil && base.GreaterThan(decimal.Zero) {
+				trancheBaseParsed = base
+				trancheActive = bot.trancheDeployed >= 1
+			}
+		}
+		if bot.localStatus == "RUNNING" && trancheActive {
+			// (a) Resync the local investment column to the exchange-reported
+			// figure when they diverge: the previous pour may have landed
+			// without its persist (or the persist may have landed twice).
+			if remoteInvestmentReported &&
+				remoteInvestment.Sub(bot.investment).Abs().GreaterThan(decimal.NewFromInt(1)) {
+				localBefore := bot.investment
+				if _, err := worker.db.Exec(ctx, `
+					UPDATE grid_bots
+					SET quote_investment = $2::NUMERIC, updated_at = NOW()
+					WHERE id = $1
+				`, bot.id, remoteInvestment); err != nil {
+					worker.logger.Error("tranche resync: persist exchange investment failed",
+						"component", "autogrid_worker", "bot_id", bot.id, "error", err)
+				} else {
+					bot.investment = remoteInvestment
+					worker.logger.Warn("tranche resync: local investment diverged from exchange truth — resynced",
+						"component", "autogrid_worker", "bot_id", bot.id, "symbol", bot.symbol,
+						"local", localBefore.StringFixed(2), "remote", remoteInvestment.StringFixed(2))
+					tag, markErr := worker.db.Exec(ctx, `
+						UPDATE grid_bots
+						SET model_state = jsonb_set(COALESCE(model_state, '{}'::jsonb), '{trancheResyncAt}',
+							to_jsonb(to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'))),
+						    updated_at = NOW()
+						WHERE id = $1
+						  AND COALESCE((model_state->>'trancheResyncAt')::TIMESTAMPTZ, '1970-01-01') < NOW() - INTERVAL '1 hour'
+					`, bot.id)
+					if markErr == nil && tag.RowsAffected() == 1 {
+						_ = LogBotEvent(ctx, worker.db, bot.id, bot.botNumber, "REAL", bot.symbol,
+							"TRANCHE_RESYNC", &price, nil, map[string]any{
+								"action":            "investment_resynced",
+								"local_investment":  localBefore.String(),
+								"remote_investment": remoteInvestment.String(),
+							})
+					}
+				}
+			}
+			// (b) The exchange already holds the full tranche while the
+			// targets/stop are still single-sized (pour landed, doubling
+			// persist fell): complete the doubling idempotently — the
+			// trancheDeployed=1 guard makes it exactly-once.
+			if bot.trancheDeployed == 1 && !bot.investment.LessThan(trancheBaseParsed) {
+				tag, dErr := worker.db.Exec(ctx, `
+					UPDATE grid_bots
+					SET pnl_target_usdt = pnl_target_usdt * 2,
+					    max_loss_usdt = max_loss_usdt * 2,
+					    model_state = jsonb_set(COALESCE(model_state, '{}'::jsonb), '{trancheDeployed}', '2'::jsonb),
+					    updated_at = NOW()
+					WHERE id = $1
+					  AND COALESCE(NULLIF(model_state->>'trancheDeployed','')::INT, 0) = 1
+				`, bot.id)
+				if dErr != nil {
+					worker.logger.Error("tranche self-heal: target doubling persist failed",
+						"component", "autogrid_worker", "bot_id", bot.id, "error", dErr)
+				} else if tag.RowsAffected() == 1 {
+					bot.trancheDeployed = 2
+					if bot.pnlTarget != nil {
+						doubled := bot.pnlTarget.Mul(decimal.NewFromInt(2))
+						bot.pnlTarget = &doubled
+						botTarget = doubled
+					}
+					if bot.maxLoss != nil {
+						doubled := bot.maxLoss.Mul(decimal.NewFromInt(2))
+						bot.maxLoss = &doubled
+						botMaxLoss = doubled
+					}
+					worker.logger.Warn("tranche self-heal: full tranche found with single-sized targets — doubling completed",
+						"component", "autogrid_worker", "bot_id", bot.id, "symbol", bot.symbol)
+					_ = LogBotEvent(ctx, worker.db, bot.id, bot.botNumber, "REAL", bot.symbol,
+						"TRANCHE_RESYNC", &price, nil, map[string]any{
+							"action":             "targets_doubled",
+							"investment":         bot.investment.String(),
+							"effective_target":   botTarget.StringFixed(2),
+							"effective_max_loss": botMaxLoss.StringFixed(2),
+						})
+				}
+			}
+		}
 		if !trancheBackoff && bot.trancheDeployed == 1 && bot.trancheBase != nil && bot.localStatus == "RUNNING" && price.IsPositive() {
 			if base, bErr := decimal.NewFromString(*bot.trancheBase); bErr == nil && base.GreaterThan(bot.investment) {
 				entry := price
@@ -3066,87 +3217,138 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 				if topUp != "" {
 					investmentBefore := bot.investment
 					pending := base.Sub(bot.investment)
-					if _, err := worker.service.AdjustBot(ctx, worker.accounts, settings.ID, bot.id, AdjustBotInput{
-						Mode:            "invest_in",
-						QuoteInvestment: pending.Round(2),
-					}); err != nil {
-						worker.logger.Error("tranche 2 invest_in failed",
-							"component", "autogrid_worker", "bot_id", bot.id, "error", err)
-						if _, markErr := worker.db.Exec(ctx, `
+					// v2.0.78 CRIT-2(c): the pour is fenced by durable intent
+					// and remote truth. A marker written before the native call
+					// plus the exchange-reported investment make a retry decide
+					// "already landed" instead of pouring a second margin.
+					pour := true
+					if remoteInvestmentReported && !remoteInvestment.LessThan(base.Sub(decimal.NewFromInt(1))) {
+						pour = false
+						worker.logger.Warn("tranche 2 pour skipped: exchange already holds the full tranche — resyncing instead of re-pouring",
+							"component", "autogrid_worker", "bot_id", bot.id, "symbol", bot.symbol,
+							"remote_investment", remoteInvestment.StringFixed(2))
+					} else if !remoteInvestmentReported && trancheMarkerFresh(bot.trancheIntentAt, 24*time.Hour) {
+						// No remote truth to consult while a previous attempt's
+						// outcome is unconfirmed: fail closed — starving one
+						// top-up window is cheaper than a second real pour.
+						pour = false
+						worker.logger.Warn("tranche 2 pour deferred: fresh invest intent with no exchange investment to verify against",
+							"component", "autogrid_worker", "bot_id", bot.id, "symbol", bot.symbol)
+					}
+					if pour {
+						intentTag, intentErr := worker.db.Exec(ctx, `
 						UPDATE grid_bots
-						SET model_state = jsonb_set(model_state, '{trancheFailAt}', to_jsonb(to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'))),
+						SET model_state = jsonb_set(COALESCE(model_state, '{}'::jsonb), '{trancheIntentAt}',
+							to_jsonb(to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'))),
 						    updated_at = NOW()
 						WHERE id = $1
-					`, bot.id); markErr != nil {
-							worker.logger.Error("tranche 2 fail-marker write failed",
-								"component", "autogrid_worker", "bot_id", bot.id, "error", markErr)
+					`, bot.id)
+						if intentErr != nil || intentTag.RowsAffected() != 1 {
+							// Without the durable intent the pour cannot be
+							// verified on retry — refuse to move real margin.
+							worker.logger.Error("tranche 2 intent-marker write failed — pour refused",
+								"component", "autogrid_worker", "bot_id", bot.id, "error", intentErr)
+							pour = false
 						}
-					} else {
-						// v2.0.19: peak_pnl_usdt must NOT double here. The
-						// freshly injected margin starts at ~0 PnL, so doubling
-						// the stored peak armed the trailing floor
-						// max(0.8·2P, 0.5·2T) against total ≈ P on the very next
-						// manage tick — an instant false TRAILING_TAKE_PROFIT on
-						// exactly the most successful bots. Paper never doubled
-						// it; this aligns REAL with the paper semantics.
-						if _, err := worker.db.Exec(ctx, `
-						UPDATE grid_bots
-						SET pnl_target_usdt = pnl_target_usdt * 2,
-						    max_loss_usdt = max_loss_usdt * 2,
-						    model_state = jsonb_set(model_state, '{trancheDeployed}', '2'::jsonb),
-						    updated_at = NOW()
-						WHERE id = $1
-					`, bot.id); err != nil {
-							worker.logger.Error("tranche 2 target doubling failed (invest_in already committed)",
+					}
+					if pour {
+						if _, err := worker.service.AdjustBot(ctx, worker.accounts, settings.ID, bot.id, AdjustBotInput{
+							Mode:            "invest_in",
+							QuoteInvestment: pending.Round(2),
+						}); err != nil {
+							worker.logger.Error("tranche 2 invest_in failed",
 								"component", "autogrid_worker", "bot_id", bot.id, "error", err)
+							if errors.Is(err, ErrNativeAdjustRefused) && !pionex.IsOutcomeUnknown(err) {
+								// The exchange itself refused the call: the pour
+								// provably never landed — clear the intent so the
+								// backoff retry is not fenced by a stale marker.
+								_, _ = worker.db.Exec(ctx, `
+									UPDATE grid_bots
+									SET model_state = model_state - 'trancheIntentAt', updated_at = NOW()
+									WHERE id = $1
+								`, bot.id)
+							}
+							if _, markErr := worker.db.Exec(ctx, `
+							UPDATE grid_bots
+							SET model_state = jsonb_set(model_state, '{trancheFailAt}', to_jsonb(to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'))),
+							    updated_at = NOW()
+							WHERE id = $1
+						`, bot.id); markErr != nil {
+								worker.logger.Error("tranche 2 fail-marker write failed",
+									"component", "autogrid_worker", "bot_id", bot.id, "error", markErr)
+							}
 						} else {
-							// Same-tick decision safety: decideBotAction below
-							// reads the LOCAL copies taken before the tranche
-							// block, not the struct fields — refresh BOTH, or
-							// the top-up tick can fire a half-size TP/SL against
-							// the doubled position.
-							bot.investment = base
+							// v2.0.19: peak_pnl_usdt must NOT double here. The
+							// freshly injected margin starts at ~0 PnL, so doubling
+							// the stored peak armed the trailing floor
+							// max(0.8·2P, 0.5·2T) against total ≈ P on the very next
+							// manage tick — an instant false TRAILING_TAKE_PROFIT on
+							// exactly the most successful bots. Paper never doubled
+							// it; this aligns REAL with the paper semantics.
+							// v2.0.78: the trancheDeployed=1 guard makes a retry of
+							// this statement exactly-once (CRIT-2 self-heal branch b
+							// uses the same guard).
+							if _, err := worker.db.Exec(ctx, `
+							UPDATE grid_bots
+							SET pnl_target_usdt = pnl_target_usdt * 2,
+							    max_loss_usdt = max_loss_usdt * 2,
+							    model_state = jsonb_set(model_state, '{trancheDeployed}', '2'::jsonb),
+							    updated_at = NOW()
+							WHERE id = $1
+							  AND COALESCE(NULLIF(model_state->>'trancheDeployed','')::INT, 0) = 1
+						`, bot.id); err != nil {
+								worker.logger.Error("tranche 2 target doubling failed (invest_in already committed — self-heal will complete it)",
+									"component", "autogrid_worker", "bot_id", bot.id, "error", err)
+							} else {
+								// Same-tick decision safety: decideBotAction below
+								// reads the LOCAL copies taken before the tranche
+								// block, not the struct fields — refresh BOTH, or
+								// the top-up tick can fire a half-size TP/SL against
+								// the doubled position.
+								bot.investment = base
+								bot.trancheDeployed = 2
+								if bot.pnlTarget != nil {
+									doubled := bot.pnlTarget.Mul(decimal.NewFromInt(2))
+									bot.pnlTarget = &doubled
+									botTarget = doubled
+								}
+								if bot.maxLoss != nil {
+									doubled := bot.maxLoss.Mul(decimal.NewFromInt(2))
+									bot.maxLoss = &doubled
+									botMaxLoss = doubled
+								}
+							}
+							worker.logger.Info("tranche 2 deployed (REAL invest_in)",
+								"component", "autogrid_worker", "symbol", bot.symbol, "reason", topUp)
+							// v2.0.75 parity: the REAL top-up used to be telegram-only
+							// — the ledger never saw the margin doubling (paper logs
+							// TRANCHE_2 since v2.0.13). Same payload shape, REAL source.
+							// botTarget/botMaxLoss were refreshed to the doubled
+							// figures by the block above — those ARE the effective
+							// post-top-up target/stop.
+							effTarget, effStop := decimal.Zero, decimal.Zero
 							if bot.pnlTarget != nil {
-								doubled := bot.pnlTarget.Mul(decimal.NewFromInt(2))
-								bot.pnlTarget = &doubled
-								botTarget = doubled
+								effTarget = *bot.pnlTarget
 							}
 							if bot.maxLoss != nil {
-								doubled := bot.maxLoss.Mul(decimal.NewFromInt(2))
-								bot.maxLoss = &doubled
-								botMaxLoss = doubled
+								effStop = *bot.maxLoss
 							}
+							_ = LogBotEvent(ctx, worker.db, bot.id, bot.botNumber, "REAL", bot.symbol, "TRANCHE_2", &price, nil, map[string]any{
+								"reason":            topUp,
+								"investment_before": investmentBefore.String(), "investment_after": base.String(),
+								"effective_target": effTarget.StringFixed(2), "effective_max_loss": effStop.StringFixed(2),
+							})
+							// Vars cover every placeholder of template_range_adjust
+							// (bot_number/symbol/lower_price/upper_price/
+							// adjustments_count) so the operator message renders the
+							// real template instead of the compose-fallback line.
+							_ = QueueTelegramEvent(ctx, worker.db, "TRANCHE_2", map[string]any{
+								"bot_number": bot.botNumber, "symbol": bot.symbol, "reason": topUp,
+								"effective_max_loss": effStop.StringFixed(2),
+								"lower_price":        bot.lower.StringFixed(6), "upper_price": bot.upper.StringFixed(6),
+								"adjustments_count": bot.adjustments + 1,
+							})
 						}
-						worker.logger.Info("tranche 2 deployed (REAL invest_in)",
-							"component", "autogrid_worker", "symbol", bot.symbol, "reason", topUp)
-						// v2.0.75 parity: the REAL top-up used to be telegram-only
-						// — the ledger never saw the margin doubling (paper logs
-						// TRANCHE_2 since v2.0.13). Same payload shape, REAL source.
-						// botTarget/botMaxLoss were refreshed to the doubled
-						// figures by the block above — those ARE the effective
-						// post-top-up target/stop.
-						effTarget, effStop := decimal.Zero, decimal.Zero
-						if bot.pnlTarget != nil {
-							effTarget = *bot.pnlTarget
-						}
-						if bot.maxLoss != nil {
-							effStop = *bot.maxLoss
-						}
-						_ = LogBotEvent(ctx, worker.db, bot.id, bot.botNumber, "REAL", bot.symbol, "TRANCHE_2", &price, nil, map[string]any{
-							"reason":            topUp,
-							"investment_before": investmentBefore.String(), "investment_after": base.String(),
-							"effective_target": effTarget.StringFixed(2), "effective_max_loss": effStop.StringFixed(2),
-						})
-						// Vars cover every placeholder of template_range_adjust
-						// (bot_number/symbol/lower_price/upper_price/
-						// adjustments_count) so the operator message renders the
-						// real template instead of the compose-fallback line.
-						_ = QueueTelegramEvent(ctx, worker.db, "TRANCHE_2", map[string]any{
-							"bot_number": bot.botNumber, "symbol": bot.symbol, "reason": topUp,
-							"effective_max_loss": effStop.StringFixed(2),
-							"lower_price":        bot.lower.StringFixed(6), "upper_price": bot.upper.StringFixed(6),
-							"adjustments_count": bot.adjustments + 1,
-						})
 					}
 				}
 			}
@@ -3267,20 +3469,35 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 					setStop = ", anti_hunt_stop_price = $4"
 					stopArg = append(stopArg, newStop)
 				}
-				_, _ = worker.db.Exec(ctx, `
+				// v2.0.78: the range persist is CHECKED — a swallowed failure
+				// here would silently desync the local bounds and re-arm the
+				// same shift on the next pass. The ADJUST_RANGE event below
+				// still fires on exchange success regardless: it is what arms
+				// the durable radar cooldown, and the exchange has already
+				// moved the range.
+				if tag, persistErr := worker.db.Exec(ctx, `
 					UPDATE grid_bots
 					SET lower_price = $2, upper_price = $3,
 					    adjustments_count = adjustments_count + 1`+setStop+`, updated_at = NOW()
 					WHERE id = $1
-				`, append([]any{bot.id, decision.NewLower, decision.NewUpper}, stopArg...)...)
+				`, append([]any{bot.id, decision.NewLower, decision.NewUpper}, stopArg...)...); persistErr != nil || tag.RowsAffected() != 1 {
+					worker.logger.Error("adjusted native grid range, but local range persist failed — next reconcile resyncs from remote truth",
+						"component", "autogrid_worker", "bot_id", bot.id,
+						"rows_affected", tag.RowsAffected(), "error", persistErr)
+				} else {
+					bot.adjustments++
+				}
 				worker.logger.Info("adjusted native grid range",
 					"component", "autogrid_worker", "symbol", bot.symbol,
 					"lower", decision.NewLower.String(), "upper", decision.NewUpper.String())
 
 				totalPnL := realized.Add(unrealized)
-				_ = LogBotEvent(ctx, worker.db, bot.id, bot.botNumber, "REAL", bot.symbol, "ADJUST_RANGE", &price, &totalPnL, map[string]any{
+				if err := LogBotEvent(ctx, worker.db, bot.id, bot.botNumber, "REAL", bot.symbol, "ADJUST_RANGE", &price, &totalPnL, map[string]any{
 					"reason": decision.Reason, "new_lower": decision.NewLower.String(), "new_upper": decision.NewUpper.String(),
-				})
+				}); err != nil {
+					worker.logger.Warn("adjust-range event insert failed — durable cooldown not armed",
+						"component", "autogrid_worker", "bot_id", bot.id, "error", err)
+				}
 				_ = QueueTelegramEvent(ctx, worker.db, "ADJUST_RANGE", map[string]any{
 					"bot_number": bot.botNumber, "symbol": bot.symbol,
 					"lower_price": decision.NewLower.StringFixed(6), "upper_price": decision.NewUpper.StringFixed(6),
@@ -3333,47 +3550,55 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 			// figure — the previous value is the same incomplete chain.
 			var settled decimal.Decimal
 			var source pionex.FinalProfitSource
-			var gateReason string
+			var exchangeReason string
 			haveFigure := false
 			if remote, remoteErr := historyClient.GetFuturesGridBot(ctx, item.remoteID); remoteErr == nil && remote != nil {
 				settled, source = remote.BUOrderData.SettledProfit()
-				gateReason = remote.ReasonBy
+				exchangeReason = remote.ReasonBy
 				haveFigure = true
 			} else if finished := findFinishedGridRecord(ctx, historyClient, item.remoteID); finished != nil {
 				settled, source = finished.SettledProfit()
-				gateReason = finished.ReasonBy
+				exchangeReason = finished.ReasonBy
 				haveFigure = true
 			}
 			if !haveFigure {
 				continue
 			}
-			if strings.TrimSpace(gateReason) == "" {
-				if err := worker.db.QueryRow(ctx, `
-					SELECT COALESCE(closed_reason, '') FROM grid_bots WHERE id = $1
-				`, item.id).Scan(&gateReason); err != nil {
-					gateReason = ""
-				}
+			// v2.0.78: the stored closed_reason is a gate source in its own
+			// right, not only a fallback — the exchange answers "user cancel"
+			// for every manage stop we submit, so the local reason is the only
+			// witness of the loss class (prod FARTCOIN +2.349 on ANTI_HUNT).
+			storedReason := ""
+			if err := worker.db.QueryRow(ctx, `
+				SELECT COALESCE(closed_reason, '') FROM grid_bots WHERE id = $1
+			`, item.id).Scan(&storedReason); err != nil {
+				storedReason = ""
 			}
 			var profitArg any
 			settleRefused := false
-			if gated := gateSettledProfit(settled, source, gateReason); gated != nil {
+			if gated := gateSettledProfit(settled, source, storedReason, exchangeReason); gated != nil {
 				profitArg = *gated
-				worker.persistFinalProfitSource(ctx, item.id, string(source))
 			} else {
 				settleRefused = true
-				worker.persistFinalProfitSource(ctx, item.id, "refused_"+string(source))
-				worker.logger.Warn("backfill settle refused: positive grid-fallback on a loss-class close — final PnL set NULL",
+				worker.logger.Warn("backfill settle refused: positive grid-fallback on a loss-class/unknown close — final PnL set NULL",
 					"component", "autogrid_worker", "bot_id", item.id,
-					"reason_by", gateReason, "grid_fallback", settled.StringFixed(4))
+					"stored_reason", storedReason, "reason_by", exchangeReason,
+					"grid_fallback", settled.StringFixed(4))
 			}
+			// The finalProfitSource marker rides IN the realized UPDATE
+			// (v2.0.78): a standalone marker write that outlived a failed
+			// realized persist would arm the exactly-once key against a row
+			// whose figure never landed.
 			if _, err := worker.db.Exec(ctx, `
 				UPDATE grid_bots
 				SET realized_pnl_usdt = CASE WHEN $3::BOOLEAN THEN NULL ELSE $2::NUMERIC END,
 				    unrealized_pnl_usdt = 0,
 				    reconciliation_state = 'REMOTE_TERMINAL_CONFIRMED',
+				    model_state = jsonb_set(COALESCE(model_state, '{}'::jsonb), '{finalProfitSource}',
+				        to_jsonb($4::TEXT)),
 				    updated_at = NOW()
 				WHERE id = $1
-			`, item.id, profitArg, settleRefused); err != nil {
+			`, item.id, profitArg, settleRefused, finalProfitMarkerValue(source, settleRefused)); err != nil {
 				worker.logger.Error("backfill closed grid final PnL",
 					"component", "autogrid_worker", "bot_id", item.id, "error", err)
 			}
@@ -3381,11 +3606,14 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 	}
 
 	// Unknown submissions are adopted per account: each pending row carries
-	// the account its client must authenticate as.
+	// the account its client must authenticate as. v2.0.78 CRIT-3: STOP_REQUESTED
+	// rows with a NULL bu_order_id (stop requests that raced a create, or the
+	// pre-fix zombies) join the adoption pool — the stop intent itself is
+	// preserved on adopt, the manage loop then submits the native cancel.
 	unknownAccountRows, err := worker.db.Query(ctx, `
 		SELECT DISTINCT account_id FROM grid_bots
 		WHERE bu_order_id IS NULL
-		  AND status IN ('SUBMISSION_UNKNOWN', 'PENDING_SUBMISSION')
+		  AND status IN ('SUBMISSION_UNKNOWN', 'PENDING_SUBMISSION', 'STOP_REQUESTED')
 		  AND created_at > NOW() - INTERVAL '48 hours'
 	`)
 	if err == nil {
@@ -3452,12 +3680,14 @@ func (worker *Worker) manageShiftBlockedUnderwater(
 // GET /api/v1/bot/orders list are matched by symbol and creation time:
 // a unique match adopts the remote buOrderId; a provably absent bot (lists
 // fully paginated without error) is cleared so the symbol is freed.
+// v2.0.78 CRIT-3: STOP_REQUESTED rows with a NULL bu_order_id join the pool —
+// they are the stop-race zombies; adoption preserves their stop intent.
 func (worker *Worker) reconcileUnknownSubmissions(ctx context.Context, client *pionex.Client) {
 	rows, err := worker.db.Query(ctx, `
 		SELECT id, symbol, quote_investment, EXTRACT(EPOCH FROM created_at) * 1000
 		FROM grid_bots
 		WHERE bu_order_id IS NULL
-		  AND status IN ('SUBMISSION_UNKNOWN', 'PENDING_SUBMISSION')
+		  AND status IN ('SUBMISSION_UNKNOWN', 'PENDING_SUBMISSION', 'STOP_REQUESTED')
 		  AND created_at > NOW() - INTERVAL '48 hours'
 		  AND created_at < NOW() - INTERVAL '90 seconds'
 		ORDER BY created_at
@@ -3533,12 +3763,13 @@ func (worker *Worker) reconcileUnknownSubmissions(ctx context.Context, client *p
 		if len(matches) == 1 {
 			tag, err := worker.db.Exec(ctx, `
 				UPDATE grid_bots
-				SET bu_order_id = $2, status = 'RUNNING',
+				SET bu_order_id = $2,
+				    status = CASE WHEN status = 'STOP_REQUESTED' THEN status ELSE 'RUNNING' END,
 				    reconciliation_state = 'REMOTE_ID_PERSISTED',
 				    last_remote_status = 'ADOPTED_AFTER_UNKNOWN_SUBMISSION',
 				    last_error = NULL, updated_at = NOW()
 				WHERE id = $1 AND bu_order_id IS NULL
-				  AND status IN ('SUBMISSION_UNKNOWN', 'PENDING_SUBMISSION')
+				  AND status IN ('SUBMISSION_UNKNOWN', 'PENDING_SUBMISSION', 'STOP_REQUESTED')
 			`, bot.id, matches[0].BUOrderID)
 			if err == nil && tag.RowsAffected() == 1 {
 				worker.logger.Info("adopted remotely created grid after unknown submission",
@@ -3568,7 +3799,7 @@ func (worker *Worker) reconcileUnknownSubmissions(ctx context.Context, client *p
 			    reconciliation_state = 'REMOTE_TERMINAL_CONFIRMED',
 			    last_error = NULL, closed_at = NOW(), updated_at = NOW()
 			WHERE id = $1 AND bu_order_id IS NULL
-			  AND status IN ('SUBMISSION_UNKNOWN', 'PENDING_SUBMISSION')
+			  AND status IN ('SUBMISSION_UNKNOWN', 'PENDING_SUBMISSION', 'STOP_REQUESTED')
 		`, bot.id)
 		if err == nil && tag.RowsAffected() == 1 {
 			worker.logger.Info("cleared unknown submission: no matching exchange bot exists",

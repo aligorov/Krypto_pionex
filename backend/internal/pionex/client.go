@@ -142,6 +142,8 @@ type BUOrderDataResponse struct {
 	GridType             string          `json:"gridType"`
 	Trend                string          `json:"trend"`
 	LeverageRaw          json.RawMessage `json:"leverage"`
+	QuoteInvestmentRaw   json.RawMessage `json:"quoteInvestment"`
+	InvestmentAliasRaw   json.RawMessage `json:"investment"`
 	OpenPriceRaw         json.RawMessage `json:"openPrice"`
 	PositionRaw          json.RawMessage `json:"position"`
 	PositionOpenPriceRaw json.RawMessage `json:"positionOpenPrice"`
@@ -162,6 +164,7 @@ type BUOrderDataResponse struct {
 	Bottom            decimal.Decimal `json:"-"`
 	Row               int             `json:"-"`
 	Leverage          int             `json:"-"`
+	QuoteInvestment   decimal.Decimal `json:"-"`
 	OpenPrice         decimal.Decimal `json:"-"`
 	Position          decimal.Decimal `json:"-"`
 	PositionOpenPrice decimal.Decimal `json:"-"`
@@ -214,6 +217,10 @@ func (b *BUOrderDataResponse) UnmarshalJSON(data []byte) error {
 	b.Bottom = parseDecimalRaw(b.BottomRaw)
 	b.Row = parseIntRaw(b.RowRaw)
 	b.Leverage = parseIntRaw(b.LeverageRaw)
+	b.QuoteInvestment = parseDecimalRaw(b.QuoteInvestmentRaw)
+	if !rawFieldPresent(b.QuoteInvestmentRaw) {
+		b.QuoteInvestment = parseDecimalRaw(b.InvestmentAliasRaw)
+	}
 	b.OpenPrice = parseDecimalRaw(b.OpenPriceRaw)
 	b.Position = parseDecimalRaw(b.PositionRaw)
 	b.PositionOpenPrice = parseDecimalRaw(b.PositionOpenPriceRaw)
@@ -270,6 +277,19 @@ func (b *BUOrderDataResponse) FundingFeePaymentReported() bool {
 		return false
 	}
 	return rawFieldPresent(b.FundingFeePaymentRaw)
+}
+
+// Investment returns the exchange-reported quote investment of the grid —
+// the remote truth an invest_in reconcile must resync to. Absent on payloads
+// that predate the field; callers must treat !ok as "unknown", never zero.
+func (b *BUOrderDataResponse) Investment() (decimal.Decimal, bool) {
+	if b == nil {
+		return decimal.Zero, false
+	}
+	if rawFieldPresent(b.QuoteInvestmentRaw) || rawFieldPresent(b.InvestmentAliasRaw) {
+		return b.QuoteInvestment, true
+	}
+	return decimal.Zero, false
 }
 
 // FinalProfitSource names the chain leg that produced a settled figure, so

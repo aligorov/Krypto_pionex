@@ -964,13 +964,19 @@ func (s *Service) CloseAllActiveBots(ctx context.Context, reason string) error {
 		return fmt.Errorf("close all paper bots: %w", err)
 	}
 
-	// 2. Request stop for all real bots
+	// 2. Request stop for all real bots. v2.0.78 CRIT-3: rows without a
+	// buOrderId are never touched — a stop request on an unadopted submission
+	// makes the row a STOP_REQUESTED zombie the manage loop cannot see (it
+	// only supervises rows WITH a remote id) while it keeps blocking the
+	// symbol and the slot. Adoption owns NULL-bu rows; once adopted, the stop
+	// intent can be honored.
 	_, err = s.db.Exec(ctx, `
 		UPDATE grid_bots
 		SET status = 'STOP_REQUESTED',
 		    closed_reason = COALESCE(closed_reason, $2),
 		    updated_at = NOW()
 		WHERE autogrid_settings_id = $1
+		  AND bu_order_id IS NOT NULL
 		  AND status IN ('PENDING_SUBMISSION', 'SUBMISSION_UNKNOWN', 'RUNNING')
 	`, settings.ID, reason)
 	if err != nil {
@@ -1412,10 +1418,14 @@ func sortClosedBots(items []ClosedBot) {
 // STOP_REQUESTED and the reconcile loop submits the native Pionex cancel;
 // paper bots close immediately with a final PnL mark.
 func (s *Service) RequestBotClose(ctx context.Context, settingsID, botID, reason string) (string, error) {
+	// v2.0.78 CRIT-3: a stop request on a row without a buOrderId creates a
+	// STOP_REQUESTED zombie (no remote id → no supervision, no adoption) that
+	// blocks the symbol; NULL-bu rows stay with the adoption reconciler.
 	tag, err := s.db.Exec(ctx, `
 		UPDATE grid_bots
 		SET status = 'STOP_REQUESTED', closed_reason = $3, updated_at = NOW()
 		WHERE id = $1 AND autogrid_settings_id = $2
+		  AND bu_order_id IS NOT NULL
 		  AND status IN ('PENDING_SUBMISSION', 'SUBMISSION_UNKNOWN', 'RUNNING')
 	`, botID, settingsID, reason)
 	if err != nil {
@@ -1607,6 +1617,13 @@ type AdjustBotInput struct {
 	Row             int             `json:"row,omitempty"`
 }
 
+// ErrNativeAdjustRefused marks an adjust that the EXCHANGE itself refused —
+// the native call never landed, so no money moved. Callers that keep durable
+// intents around native pours (the tranche-2 fence) may clear them on this
+// sentinel; a persist failure after a successful native call must NOT
+// (errors.Is reaches through the wrap, IsOutcomeUnknown still classifies).
+var ErrNativeAdjustRefused = errors.New("native adjust failed")
+
 // AdjustBot manages a single running bot through the native Pionex
 // adjustParams endpoint (invest_in adds capital, adjust_params moves the
 // grid range). Paper bots only move their simulated range.
@@ -1675,7 +1692,7 @@ func (s *Service) AdjustBot(
 			}
 		}
 		if err := client.AdjustFuturesGridBot(ctx, params); err != nil {
-			return "", fmt.Errorf("native adjust failed: %w", err)
+			return "", fmt.Errorf("%w: %w", ErrNativeAdjustRefused, err)
 		}
 		if input.Mode == "adjust_params" {
 			_, err = s.db.Exec(ctx, `
