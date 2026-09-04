@@ -2532,7 +2532,7 @@ func (worker *Worker) dataHealthCheck(ctx context.Context) {
 		SELECT COUNT(*) FROM economic_events
 		WHERE event_time > NOW() AND event_time < NOW() + INTERVAL '7 days'
 		  AND (country = 'USD' OR country IS NULL OR country = '')
-		  AND source IN ('FRED', 'forexfactory')
+		  AND source IN ('FRED', 'forexfactory', 'BLS_SCHED')
 	`).Scan(&freshEvents); err == nil && freshEvents == 0 {
 		alarm("economic_events",
 			"Календарь USD пуст: нет событий (FRED/ForexFactory) в окне +7д — эконом-гейт деплоя слеп (оба источника мертвы?)")
