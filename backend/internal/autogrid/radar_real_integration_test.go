@@ -148,7 +148,11 @@ func newRadarRealHarness(t *testing.T) *radarRealHarness {
 }
 
 // seedRealBot inserts one RUNNING native grid bot (2h old — past
-// radarMinBotAge) with a stored anti-hunt stop 2 below the lower bound.
+// radarMinBotAge) with a stored anti-hunt stop 2 below the lower bound and a
+// positive last-reconciled total (+$0.50 realized): since v2.0.76 every native
+// shift must clear the profit preflight (exchange-side
+// PROFIT_LESS_THAN_ZERO), so the default fixture is a shiftable green bot —
+// underwater tests flip the columns afterwards.
 func (h *radarRealHarness) seedRealBot(t *testing.T, symbol string, adjustments int) string {
 	t.Helper()
 	var botID string
@@ -159,12 +163,12 @@ func (h *radarRealHarness) seedRealBot(t *testing.T, symbol string, adjustments 
 			grid_type, lower_price, upper_price, grid_num, leverage,
 			quote_investment, extra_margin, request_fingerprint,
 			execution_mode, reconciliation_state, bu_order_id,
-			anti_hunt_stop_price, adjustments_count, created_at
+			anti_hunt_stop_price, adjustments_count, realized_pnl_usdt, created_at
 		) VALUES (
 			$1, $2, $3, 'RUNNING', 'NEUTRAL',
 			'ARITHMETIC', 90, 110, 20, 2,
 			200, 0, $4, 'REAL', 'REST_AUTHORITATIVE_OK', $5,
-			88, $6, NOW() - INTERVAL '2 hours'
+			88, $6, 0.5, NOW() - INTERVAL '2 hours'
 		)
 		RETURNING id
 	`, h.account.ID, h.settings.ID, symbol,

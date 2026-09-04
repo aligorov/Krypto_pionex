@@ -2322,13 +2322,19 @@ func (worker *Worker) cancelRealBot(
 		`, botID, state, cancelErr.Error())
 		return fmt.Errorf("cancel Pionex grid %s: %w", remoteID, cancelErr)
 	}
-	_, _ = worker.db.Exec(ctx, `
+	if _, err := worker.db.Exec(ctx, `
 		UPDATE grid_bots
 		SET status = 'STOP_REQUESTED',
 		    reconciliation_state = 'CANCEL_ACCEPTED_REMOTE_VERIFY_PENDING',
 		    last_error = NULL, updated_at = NOW()
 		WHERE id = $1
-	`, botID)
+	`, botID); err != nil {
+		// The marker arms the reconcile loop's cancel verification; losing it
+		// to a swallowed error left STOP_REQUESTED dead code (pre-0039 the
+		// 38-char value also overflowed VARCHAR(32) silently).
+		worker.logger.Warn("mark cancel accepted failed",
+			"component", "autogrid_worker", "bot_id", botID, "error", err)
+	}
 	return nil
 }
 
@@ -3226,6 +3232,19 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 					"component", "autogrid_worker", "bot_id", bot.id, "symbol", bot.symbol)
 				break
 			}
+			// v2.0.76 feasibility preflight, same floor as the radar: the
+			// live remote total (grid profit + floating at mark) must clear
+			// the buffer or the exchange rejects adjust_params with
+			// BOT_INVALID_ARGUMENT/PROFIT_LESS_THAN_ZERO. Skipping the call
+			// removes the guaranteed-rejection spam; the break itself stays
+			// owned by the existing ladder — RANGE_BREAK_* closes on adverse
+			// regime, _NO_ADJUSTMENTS_LEFT on budget exhaustion, plus the
+			// anti-hunt structural stop and the max-loss stop keep running.
+			if remoteTotal := realized.Add(unrealized); !adjustShiftFeasible(remoteTotal) {
+				worker.manageShiftBlockedUnderwater(ctx, bot.id, bot.botNumber, bot.symbol,
+					decision.Reason, remoteTotal, price)
+				break
+			}
 			if err := client.AdjustFuturesGridBot(ctx, pionex.AdjustFuturesGridParams{
 				BUOrderID: bot.remoteID, Type: "adjust_params",
 				ExtraMargin: false, OpenPrice: &price,
@@ -3382,6 +3401,47 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 	}
 
 	return clampInterval(settings.ManageIntervalSeconds), nil
+}
+
+// manageShiftBlockedUnderwater is the manage-path twin of the radar preflight
+// veto: a RANGE_BREAK range shift on an under-water REAL bot is a guaranteed
+// BOT_INVALID_ARGUMENT/PROFIT_LESS_THAN_ZERO rejection, so the exchange is
+// never asked. The bot is NOT force-closed — the break keeps its existing
+// owners (adverse-regime RANGE_BREAK_* close, _NO_ADJUSTMENTS_LEFT close on
+// budget exhaustion, the anti-hunt structural stop and the max-loss stop).
+// One durable SHIFT_BLOCKED_UNDERWATER event per bot per hour
+// (model_state marker, the tranche2SkipAt pattern).
+func (worker *Worker) manageShiftBlockedUnderwater(
+	ctx context.Context,
+	botID string,
+	botNumber int,
+	symbol, reason string,
+	total, price decimal.Decimal,
+) {
+	tag, err := worker.db.Exec(ctx, `
+		UPDATE grid_bots
+		SET model_state = jsonb_set(COALESCE(model_state, '{}'::jsonb), '{shiftBlockedAt}',
+			to_jsonb(to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'))),
+		    updated_at = NOW()
+		WHERE id = $1
+		  AND COALESCE((model_state->>'shiftBlockedAt')::TIMESTAMPTZ, '1970-01-01') < NOW() - INTERVAL '1 hour'
+	`, botID)
+	if err != nil {
+		worker.logger.Warn("manage: shift-blocked marker write failed",
+			"component", "autogrid_worker", "bot_id", botID, "error", err)
+		return
+	}
+	if tag.RowsAffected() != 1 {
+		return // deduped: the hour-old blocked event still speaks for this state
+	}
+	_ = LogBotEvent(ctx, worker.db, botID, botNumber, "REAL", symbol,
+		"SHIFT_BLOCKED_UNDERWATER", &price, &total, map[string]any{
+			"reason": reason, "total_pnl": total.StringFixed(4),
+		})
+	_ = QueueTelegramEvent(ctx, worker.db, "SHIFT_BLOCKED_UNDERWATER", map[string]any{
+		"bot_number": botNumber, "symbol": symbol, "reason": reason,
+		"total": total.StringFixed(2),
+	})
 }
 
 // reconcileUnknownSubmissions resolves grid bots whose create outcome is

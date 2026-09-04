@@ -149,6 +149,25 @@ func QueueTelegramEvent(
 		// in band 4 for hours. One line per hour, first-class signal.
 		shouldSend = notifyAdjust
 		tmpl = "⚠️ <b>Радар: эскейп отклонён биржей:</b> бот #{{bot_number}} {{symbol}} band {{band}} — {{error}}"
+	case "RADAR_B2_EARLY_RECENTER":
+		// v2.0.76 "shift on green": the preventive band-2 re-center fired
+		// while the profit preflight still passes — the only window the
+		// exchange will actually execute the shift (PROFIT_LESS_THAN_ZERO
+		// closes it the moment the bot goes under water).
+		shouldSend = notifyAdjust
+		tmpl = "🛡 <b>Радар: ранний ре-центр на зелёном (B2):</b> бот #{{bot_number}} {{symbol}} — цена прошла {{edge_progress_pct}}% пути к опасному краю, score {{score}}, total {{total}} USDT → [{{lower_price}}, {{upper_price}}]"
+	case "RADAR_SHIFT_BLOCKED_UNDERWATER":
+		// v2.0.76: the preflight vetoed a radar re-center because the bot is
+		// under water — the exchange would reject adjust_params
+		// (PROFIT_LESS_THAN_ZERO), so nothing was sent and the exit stays
+		// with the stop ladder / operator.
+		shouldSend = notifyAdjust
+		tmpl = "⛔ <b>Радар: сдвиг заблокирован — бот под водой:</b> бот #{{bot_number}} {{symbol}} band {{band}} (score {{score}}), total {{total}} USDT — биржа отклоняет adjust_params при отрицательном профите; ждём стоп/оператора"
+	case "SHIFT_BLOCKED_UNDERWATER":
+		// v2.0.76 manage twin: a RANGE_BREAK shift was skipped for the same
+		// exchange-side reason instead of hammering a guaranteed rejection.
+		shouldSend = notifyAdjust
+		tmpl = "⛔ <b>Сдвиг диапазона заблокирован — бот под водой:</b> бот #{{bot_number}} {{symbol}} ({{reason}}), total {{total}} USDT — биржа не примет adjustParams; пробой остаётся за стопом/оператором"
 	case "STOP_FORECAST_SHADOW":
 		// v2.0.57: the radar's band transitions used to fall into the
 		// generic {{message}} fallback and shipped literal placeholders
