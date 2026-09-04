@@ -162,6 +162,21 @@ func (order BotOrder) GridInvestment() (decimal.Decimal, bool) {
 	return decimal.Zero, false
 }
 
+// FuturesGridData decodes the dynamic buOrderData of a futures-grid list
+// entry into the typed detail payload, so a finished bot found through
+// GET /api/v1/bot/orders carries the same profit accessors as the
+// order-detail endpoint response.
+func (order BotOrder) FuturesGridData() (*BUOrderDataResponse, error) {
+	if len(order.BUOrderData) == 0 {
+		return nil, fmt.Errorf("bot order %s carries no buOrderData", order.BUOrderID)
+	}
+	var data BUOrderDataResponse
+	if err := json.Unmarshal(order.BUOrderData, &data); err != nil {
+		return nil, fmt.Errorf("decode bot order buOrderData: %w", err)
+	}
+	return &data, nil
+}
+
 // ListBotOrders pages through the documented bot order list
 // (GET /api/v1/bot/orders) filtered to futures grids. status is "running"
 // (default) or "finished"; pass an empty pageToken to start. The next token

@@ -65,7 +65,11 @@ func newFundingExchangeMock(t *testing.T) *fundingExchangeMock {
 					"top": "120", "bottom": "100", "row": 20,
 					"gridType": "arithmetic", "trend": "no_trend", "leverage": 1,
 					"position": "0.5", "positionOpenPrice": "100",
-					"profitWithdrawn": "1.5", "riskStatus": "NORMAL",
+					// No fundingFeePayment on this payload: the legacy
+					// symbol-wide history path must stay exercised. Grid
+					// profit rides profitReduce (v2.0.74 contract).
+					"profitReduce": "1.5", "profitWithdrawn": "0",
+					"riskStatus": "NORMAL",
 				},
 			},
 		})
@@ -288,7 +292,7 @@ func TestManageRealFundingReconciliationIntegration(t *testing.T) {
 		if got := decimal.RequireFromString(fundingPaidCol); !got.Equal(fundingPaid[symbol]) {
 			t.Fatalf("%s: funding_paid_usdt = %s, want %s", symbol, fundingPaidCol, fundingPaid[symbol])
 		}
-		// Remote truth 1.5 minus the signed column: paid (positive) drags
+		// Grid profit 1.5 minus the signed column: paid (positive) drags
 		// realized down, received (negative) lifts it — the paper mirror.
 		wantRealized := decimal.NewFromFloat(1.5).Sub(fundingPaid[symbol])
 		if got := decimal.RequireFromString(realized); !got.Equal(wantRealized) {

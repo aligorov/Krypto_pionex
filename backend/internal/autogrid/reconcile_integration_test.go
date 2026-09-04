@@ -31,7 +31,7 @@ func integrationDatabaseURL(t *testing.T) string {
 }
 
 // exchangeMock emulates the native Pionex Futures Grid endpoints for one bot:
-// it reports a running bot with position and withdrawn profit, flips to
+// it reports a running bot with position and accumulated grid profit, flips to
 // canceled/profit_stop after the cancel call, and counts cancels.
 type exchangeMock struct {
 	cancelCount atomic.Int64
@@ -59,7 +59,11 @@ func newExchangeMock(t *testing.T) *exchangeMock {
 					"top": "120", "bottom": "100", "row": 20,
 					"gridType": "arithmetic", "trend": "no_trend", "leverage": 1,
 					"position": "0.5", "positionOpenPrice": "100",
-					"profitWithdrawn": "1.5", "riskStatus": "NORMAL",
+					// v2.0.74 contract: profitReduce carries the realized grid
+					// profit; profitWithdrawn stays 0 for a compounding grid
+					// and must never win the mapping.
+					"profitReduce": "1.5", "profitWithdrawn": "0",
+					"riskStatus": "NORMAL",
 				},
 			},
 		})
@@ -210,8 +214,10 @@ func TestReconcileAndManageIntegration(t *testing.T) {
 	if realized == nil {
 		t.Fatal("realized PnL must be persisted")
 	}
+	// v2.0.74: realized mirrors the accumulated grid profit (profitReduce),
+	// not the withdrawn figure.
 	if value, err := strconv.ParseFloat(*realized, 64); err != nil || value != 1.5 {
-		t.Fatalf("remote profitWithdrawn must persist as realized PnL 1.5, got %q", *realized)
+		t.Fatalf("remote grid profit must persist as realized PnL 1.5, got %q", *realized)
 	}
 	// The loop verifies the remote state right after submitting the cancel in
 	// the same pass, so an exchange that confirms instantly (like the mock)
@@ -225,13 +231,18 @@ func TestReconcileAndManageIntegration(t *testing.T) {
 		t.Fatalf("reconcile round 2: %v", err)
 	}
 	var finalStatus, closedReason string
+	var finalRealized string
 	if err := pool.QueryRow(ctx, `
-		SELECT status, COALESCE(closed_reason,'') FROM grid_bots WHERE id = $1
-	`, botID).Scan(&finalStatus, &closedReason); err != nil {
+		SELECT status, COALESCE(closed_reason,''), realized_pnl_usdt::TEXT
+		FROM grid_bots WHERE id = $1
+	`, botID).Scan(&finalStatus, &closedReason, &finalRealized); err != nil {
 		t.Fatalf("load bot after round 2: %v", err)
 	}
 	if finalStatus != "COMPLETED" || closedReason != "TAKE_PROFIT_NATIVE" {
 		t.Fatalf("expected COMPLETED/TAKE_PROFIT_NATIVE, got %s/%s", finalStatus, closedReason)
+	}
+	if value, err := strconv.ParseFloat(finalRealized, 64); err != nil || value != 1.5 {
+		t.Fatalf("terminal record without profitExited must keep grid profit as final realized 1.5, got %q", finalRealized)
 	}
 	if got := mock.cancelCount.Load(); got != 1 {
 		t.Fatalf("terminal verification must not re-cancel, got %d cancels", got)

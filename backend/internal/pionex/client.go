@@ -151,6 +151,9 @@ type BUOrderDataResponse struct {
 	PnlRaw               json.RawMessage `json:"pnl"`
 	RealizedProfitRaw    json.RawMessage `json:"realizedProfit"`
 	GridProfitRaw        json.RawMessage `json:"gridProfit"`
+	ProfitReduceRaw      json.RawMessage `json:"profitReduce"`
+	ProfitExitedRaw      json.RawMessage `json:"profitExited"`
+	FundingFeePaymentRaw json.RawMessage `json:"fundingFeePayment"`
 	RiskStatus           string          `json:"riskStatus"`
 	LiquidationPriceRaw  json.RawMessage `json:"liquidationPrice"`
 
@@ -228,6 +231,71 @@ func (b *BUOrderDataResponse) UnmarshalJSON(data []byte) error {
 	}
 	b.LiquidationPrice = parseDecimalRaw(b.LiquidationPriceRaw)
 	return nil
+}
+
+// GridProfit returns the accumulated realized grid profit — the "Grid Profit"
+// figure the Pionex app shows for a running futures grid. The documented
+// carrier is buOrderData.profitReduce ("grid profit from position reduction,
+// accumulated"); gridProfit is kept as an observed-legacy fallback.
+// profitWithdrawn is deliberately NOT consulted: it stays 0 for a running
+// grid (profit compounds inside the bot unless manually released), so the
+// old mapping silently zeroed realized PnL for every live bot.
+func (b *BUOrderDataResponse) GridProfit() decimal.Decimal {
+	if b == nil {
+		return decimal.Zero
+	}
+	if value := parseDecimalRaw(b.ProfitReduceRaw); !value.IsZero() {
+		return value
+	}
+	return parseDecimalRaw(b.GridProfitRaw)
+}
+
+// FundingFeePayment returns the exchange-reported per-bot cumulative funding
+// (negative when paid, positive when received). It is strictly per-bot truth
+// and must replace any symbol-wide history accumulation when present.
+func (b *BUOrderDataResponse) FundingFeePayment() decimal.Decimal {
+	if b == nil {
+		return decimal.Zero
+	}
+	return parseDecimalRaw(b.FundingFeePaymentRaw)
+}
+
+// FundingFeePaymentReported distinguishes "exchange sent 0 funding" from
+// "field absent": only a present field may resync local funding columns.
+func (b *BUOrderDataResponse) FundingFeePaymentReported() bool {
+	if b == nil {
+		return false
+	}
+	return rawFieldPresent(b.FundingFeePaymentRaw)
+}
+
+// FinalProfit returns the settled profit of a finished grid — the final
+// Total PnL the Pionex app shows after close. profitExited is the
+// documented settled figure (it already nets the position-close PnL); the
+// fallbacks keep older exchange variants and the pre-v2.0.74 chain alive.
+func (b *BUOrderDataResponse) FinalProfit() decimal.Decimal {
+	if b == nil {
+		return decimal.Zero
+	}
+	if exited := parseDecimalRaw(b.ProfitExitedRaw); !exited.IsZero() {
+		return exited
+	}
+	if grid := b.GridProfit(); !grid.IsZero() {
+		return grid.Add(b.FundingFeePayment())
+	}
+	if withdrawn := parseDecimalRaw(b.ProfitWithdrawnRaw); !withdrawn.IsZero() {
+		return withdrawn
+	}
+	return b.TotalProfit
+}
+
+// rawFieldPresent reports whether a raw JSON payload slot carried an actual
+// value (missing key and explicit null both count as absent).
+func rawFieldPresent(raw json.RawMessage) bool {
+	if len(raw) == 0 {
+		return false
+	}
+	return strings.TrimSpace(string(raw)) != "null"
 }
 
 func (f *FuturesGridOrder) UnmarshalJSON(data []byte) error {

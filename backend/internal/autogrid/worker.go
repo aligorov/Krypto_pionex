@@ -2036,15 +2036,15 @@ func (worker *Worker) deployReal(
 		// Native pre-flight validation: check parameters against Pionex estimation
 		check, checkErr := client.CheckFuturesGridParams(ctx, params)
 		if checkErr != nil {
-			// Exchange-side maintenance (403) is a symbol state, not a
-			// parameter problem — the create behind this check would be
-			// refused identically, so reject the candidate BEFORE any grid
-			// row is submitted instead of re-failing every scan window.
-			if isSymbolMaintenanceError(checkErr) {
-				worker.logger.Info("entry gate: symbol under exchange maintenance, real deploy deferred",
+			// Exchange-side refusal (403 forbidden/maintenance) is a symbol
+			// state, not a parameter problem — the create behind this check
+			// would be refused identically, so reject the candidate BEFORE any
+			// grid row is submitted instead of re-failing every scan window.
+			if isSymbolOperationForbiddenError(checkErr) {
+				worker.logger.Info("entry gate: exchange forbids the operation on symbol, real deploy deferred",
 					"component", "autogrid_worker", "symbol", candidate.Symbol)
 				worker.rejectCandidate(ctx, candidate,
-					"символ на обслуживании биржи (maintenance) — деплой отложен до снятия", nil)
+					"биржа запрещает операцию по символу (forbidden/maintenance) — деплой отложен", nil)
 				continue
 			}
 			worker.logger.Warn(
@@ -2081,13 +2081,13 @@ func (worker *Worker) deployReal(
 			}
 			// The lifecycle already persisted the FAILED grid row (the
 			// authoritative audit of the refused attempt); the candidate row
-			// must still leave the maintenance reason — otherwise it stays
+			// must still leave the refusal reason — otherwise it stays
 			// ACCEPTED and the next scan mints yet another FAILED row for the
 			// whole maintenance window.
-			if isSymbolMaintenanceError(createErr) {
+			if isSymbolOperationForbiddenError(createErr) {
 				deployErrors = append(deployErrors, fmt.Sprintf("%s: create failed: %v", candidate.Symbol, createErr))
 				worker.rejectCandidate(ctx, candidate,
-					"символ на обслуживании биржи (maintenance) — деплой отложен до снятия", nil)
+					"биржа запрещает операцию по символу (forbidden/maintenance) — деплой отложен", nil)
 				continue
 			}
 			deployErrors = append(deployErrors, fmt.Sprintf("%s: create failed: %v", candidate.Symbol, createErr))
@@ -2349,17 +2349,39 @@ func (worker *Worker) autotuneIfDue(ctx context.Context, settings Settings) {
 // "invalid JSON response" snippet (or as the envelope code when it parses).
 const pionexSymbolMaintenanceReason = "P_TRADING_BOT_OPERATION_IS_FORBIDDEN_SYMBOL_MAINTENANCE"
 
-// isSymbolMaintenanceError reports whether err is the exchange's symbol-
-// maintenance refusal (HTTP 403 + the maintenance reason). Such a refusal is
-// a symbol state that lifts on its own — it must defer the deploy, never
-// count as a candidate defect or a pipeline failure.
-func isSymbolMaintenanceError(err error) bool {
+// pionexCredentialRefusalMarkers identify a 403 that is about the API
+// credentials rather than the symbol: such a refusal is an account/config
+// problem that touching another symbol will not dodge, and classifying it
+// as a symbol state would silently mask a broken key as "deferred deploys".
+var pionexCredentialRefusalMarkers = []string{
+	"api_key", "api key", "apikey", "p_api",
+	"signature", "unauthorized", "unauthorised",
+	"authentication", "permission", "ip_whitelist",
+}
+
+// isSymbolOperationForbiddenError reports whether err is the exchange's
+// symbol-scoped operation refusal: an HTTP 403 from the futuresGrid
+// create/checkParams endpoints whose body names a forbidden operation — the
+// maintenance reason code, "IS_FORBIDDEN", "Operation is forbidden" or any
+// other "forbidden" fragment in the code/message snippet (Pionex also emits
+// truncated non-JSON 403 bodies where the reason only survives inside the
+// client's body snippet). Such a refusal is a symbol state that lifts on its
+// own — it must defer the deploy, never count as a candidate defect or a
+// pipeline failure. Credential refusals are explicitly NOT symbol states.
+func isSymbolOperationForbiddenError(err error) bool {
 	var apiErr *pionex.APIError
 	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusForbidden {
 		return false
 	}
-	return apiErr.Code == pionexSymbolMaintenanceReason ||
-		strings.Contains(apiErr.Message, pionexSymbolMaintenanceReason)
+	text := strings.ToLower(apiErr.Code + " " + apiErr.Message)
+	for _, marker := range pionexCredentialRefusalMarkers {
+		if strings.Contains(text, marker) {
+			return false
+		}
+	}
+	// Covers the maintenance code, any *_IS_FORBIDDEN_* code and the plain
+	// "Operation is forbidden" message in one case-insensitive fragment.
+	return strings.Contains(text, "forbidden")
 }
 
 // rejectCandidate records a late-stage rejection so the UI shows WHY a
@@ -2601,23 +2623,48 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 				strings.Contains(errStr, "already_closed") || strings.Contains(errStr, "already closed") ||
 				strings.Contains(errStr, "not_exist") || strings.Contains(errStr, "404") || strings.Contains(errStr, "invalid_order") ||
 				strings.Contains(errStr, "forbidden current state") || strings.Contains(errStr, "can not cancel") {
-				_, _ = worker.db.Exec(ctx, `
+				// The order-detail endpoint refuses finished grids, so the
+				// final profit must come from the finished-bot list. Without
+				// it the row would keep realized 0 and its last floating
+				// mark forever (v2.0.74: 22 closures carried a stale −$0.35
+				// unrealized sum the app showed as settled).
+				closedReason := "ALREADY_CLOSED"
+				finalRealized := decimal.Zero
+				finalReported := false
+				if finished := findFinishedGridRecord(ctx, client, bot.remoteID); finished != nil {
+					finalRealized = finished.FinalProfit()
+					finalReported = true
+				}
+				var finalRealizedArg any
+				if finalReported {
+					finalRealizedArg = finalRealized
+				}
+				if _, err := worker.db.Exec(ctx, `
 					UPDATE grid_bots
-					SET status = 'STOPPED', closed_reason = 'ALREADY_CLOSED',
+					SET status = 'STOPPED', closed_reason = $2,
 					    reconciliation_state = 'REMOTE_TERMINAL_CONFIRMED',
+					    realized_pnl_usdt = COALESCE($3, realized_pnl_usdt),
+					    unrealized_pnl_usdt = 0,
 					    closed_at = NOW(), last_reconciled_at = NOW(), last_error = NULL, updated_at = NOW()
 					WHERE id = $1
-				`, bot.id)
+				`, bot.id, closedReason, finalRealizedArg); err != nil {
+					worker.logger.Error("persist already-closed grid state",
+						"component", "autogrid_worker", "bot_id", bot.id, "error", err)
+				}
 				worker.logger.Info("Pionex grid not found or already closed on exchange, marked STOPPED",
-					"component", "autogrid_worker", "symbol", bot.symbol, "bot_id", bot.id)
+					"component", "autogrid_worker", "symbol", bot.symbol, "bot_id", bot.id,
+					"final_pnl_persisted", finalReported)
 				continue
 			}
-			_, _ = worker.db.Exec(ctx, `
+			if _, err := worker.db.Exec(ctx, `
 				UPDATE grid_bots
 				SET reconciliation_state = 'REMOTE_READ_FAILED',
 				    last_error = $2, last_reconciled_at = NOW(), updated_at = NOW()
 				WHERE id = $1
-			`, bot.id, getErr.Error())
+			`, bot.id, getErr.Error()); err != nil {
+				worker.logger.Error("persist remote read failure",
+					"component", "autogrid_worker", "bot_id", bot.id, "error", err)
+			}
 			continue
 		}
 
@@ -2637,7 +2684,13 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 				price = priceBySymbol[trimmed+"_PERP"]
 			}
 		}
-		realized := remote.BUOrderData.ProfitWithdrawn
+		// v2.0.74: realized must mirror the app's "Grid Profit" — the
+		// exchange's accumulated realized grid profit (profitReduce), NOT
+		// profitWithdrawn, which stays 0 while a futures grid compounds its
+		// profit internally. unrealized stays the position's floating PnL at
+		// the mark price, matching the app's "Floating PnL". total
+		// (realized+unrealized) then reconciles with the app's "Total PnL".
+		realized := remote.BUOrderData.GridProfit()
 		unrealized := decimal.Zero
 		if !remote.BUOrderData.Position.IsZero() && price.GreaterThan(decimal.Zero) {
 			position := remote.BUOrderData.Position
@@ -2654,50 +2707,81 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 			unrealized = position.Mul(price.Sub(remote.BUOrderData.PositionOpenPrice))
 		}
 
-		// REAL funding reconciliation: Pionex settles perpetual funding in
-		// the wallet, so remote ProfitWithdrawn never carries it. The column
-		// is cumulative and signed positive = paid; realized re-derives from
-		// remote truth minus that column EVERY pass, so the subtraction is
-		// idempotent across passes and survives anchor failures.
-		if bot.localStatus == "RUNNING" &&
-			(bot.lastFundingReconcileAt == nil ||
-				time.Since(*bot.lastFundingReconcileAt) >= realFundingReconcileInterval) {
-			anchor := bot.createdAt
-			if bot.lastFundingReconcileAt != nil && bot.lastFundingReconcileAt.After(anchor) {
-				anchor = *bot.lastFundingReconcileAt
-			}
-			fundings, fundingErr := client.GetFundingFeeHistory(
-				ctx, bot.symbol, anchor.UnixMilli(), time.Now().UnixMilli(), 200)
-			if fundingErr != nil {
-				// Fail-open, anchor untouched: advancing it on a failed fetch
-				// would silently forfeit every fee inside the skipped window;
-				// the next manage pass retries the same window instead.
-				worker.logger.Warn("REAL funding reconcile fetch failed",
-					"component", "autogrid_worker", "bot_id", bot.id,
-					"symbol", bot.symbol, "error", fundingErr)
+		// REAL funding reconciliation: prefer the exchange's per-bot
+		// fundingFeePayment (present on the grid record) over the symbol-wide
+		// history fetch — the symbol fetch attributes every bot on a symbol
+		// (and manual positions) to each bot. When the exchange field is
+		// present, the durable column is resynced to it so telemetry and
+		// realized never disagree; the history path stays only for records
+		// that predate the field.
+		if remote.BUOrderData.FundingFeePaymentReported() {
+			exchangeFunding := remote.BUOrderData.FundingFeePayment()
+			realized = realized.Add(exchangeFunding)
+			if _, err := worker.db.Exec(ctx, `
+				UPDATE grid_bots
+				SET funding_paid_usdt = $2::NUMERIC,
+				    last_funding_reconcile_at = NOW(),
+				    updated_at = NOW()
+				WHERE id = $1
+			`, bot.id, exchangeFunding.Neg()); err != nil {
+				// Persist failure must not corrupt the in-memory figure the
+				// same pass persists as realized PnL, or the column and the
+				// PnL would diverge until the next pass resyncs them.
+				worker.logger.Warn("REAL funding per-bot resync persist failed",
+					"component", "autogrid_worker", "bot_id", bot.id, "error", err)
 			} else {
-				fundingSum := decimal.Zero
-				for _, fee := range fundings {
-					fundingSum = fundingSum.Add(fee.FundingFee)
+				bot.fundingPaid = exchangeFunding.Neg()
+			}
+		} else {
+			// Legacy symbol-wide accrual, kept only for records that predate
+			// the exchange field: Pionex settles perpetual funding in the
+			// wallet, so no remote profit figure carries it.
+			if bot.localStatus == "RUNNING" &&
+				(bot.lastFundingReconcileAt == nil ||
+					time.Since(*bot.lastFundingReconcileAt) >= realFundingReconcileInterval) {
+				anchor := bot.createdAt
+				if bot.lastFundingReconcileAt != nil && bot.lastFundingReconcileAt.After(anchor) {
+					anchor = *bot.lastFundingReconcileAt
 				}
-				if _, fundingErr := worker.db.Exec(ctx, `
-					UPDATE grid_bots
-					SET funding_paid_usdt = funding_paid_usdt + $2::NUMERIC,
-					    last_funding_reconcile_at = NOW(),
-					    updated_at = NOW()
-					WHERE id = $1
-				`, bot.id, fundingSum); fundingErr != nil {
-					// Column and anchor move together in one UPDATE: a persist
-					// failure must not count the sum in memory either, or the
-					// same window would be subtracted twice on the retry.
-					worker.logger.Warn("REAL funding reconcile persist failed",
-						"component", "autogrid_worker", "bot_id", bot.id, "error", fundingErr)
+				fundings, fundingErr := client.GetFundingFeeHistory(
+					ctx, bot.symbol, anchor.UnixMilli(), time.Now().UnixMilli(), 200)
+				if fundingErr != nil {
+					// Fail-open, anchor untouched: advancing it on a failed fetch
+					// would silently forfeit every fee inside the skipped window;
+					// the next manage pass retries the same window instead.
+					worker.logger.Warn("REAL funding reconcile fetch failed",
+						"component", "autogrid_worker", "bot_id", bot.id,
+						"symbol", bot.symbol, "error", fundingErr)
 				} else {
-					bot.fundingPaid = bot.fundingPaid.Add(fundingSum)
+					fundingSum := decimal.Zero
+					for _, fee := range fundings {
+						fundingSum = fundingSum.Add(fee.FundingFee)
+					}
+					if _, fundingErr := worker.db.Exec(ctx, `
+						UPDATE grid_bots
+						SET funding_paid_usdt = funding_paid_usdt + $2::NUMERIC,
+						    last_funding_reconcile_at = NOW(),
+						    updated_at = NOW()
+						WHERE id = $1
+					`, bot.id, fundingSum); fundingErr != nil {
+						// Column and anchor move together in one UPDATE: a persist
+						// failure must not count the sum in memory either, or the
+						// same window would be subtracted twice on the retry.
+						worker.logger.Warn("REAL funding reconcile persist failed",
+							"component", "autogrid_worker", "bot_id", bot.id, "error", fundingErr)
+					} else {
+						bot.fundingPaid = bot.fundingPaid.Add(fundingSum)
+					}
 				}
 			}
+			// The column is cumulative and signed positive = paid; realized
+			// re-derives from remote truth minus that column EVERY pass, so
+			// the subtraction is idempotent across passes and survives anchor
+			// failures. When the exchange reports fundingFeePayment the
+			// funding is already inside realized above and bot.fundingPaid
+			// was resynced to the same figure, so this branch is skipped.
+			realized = realized.Sub(bot.fundingPaid)
 		}
-		realized = realized.Sub(bot.fundingPaid)
 
 		// A durable stop intent (grid.stop / autogrid.stop / manual close)
 		// must reach the exchange. Cancel-state machine values survive the
@@ -2706,7 +2790,12 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 
 		if terminalRemoteGridStatus(remoteStatus) {
 			status, closedReason := terminalOutcome(reasonBy)
-			_, _ = worker.db.Exec(ctx, `
+			// v2.0.74: a finished grid settles at the exchange's own final
+			// figure (profitExited nets grid profit, position-close PnL and
+			// fees). The grid-profit `realized` above never includes the
+			// position-close leg, so it must not survive as the final number.
+			finalRealized := remote.BUOrderData.FinalProfit()
+			if _, err := worker.db.Exec(ctx, `
 				UPDATE grid_bots
 				SET status = $2,
 				    closed_reason = COALESCE(NULLIF(closed_reason, ''), $3),
@@ -2715,11 +2804,14 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 				    unrealized_pnl_usdt = 0, closed_at = NOW(),
 				    last_reconciled_at = NOW(), last_error = NULL, updated_at = NOW()
 				WHERE id = $1
-			`, bot.id, status, closedReason, remoteStatus, realized)
+			`, bot.id, status, closedReason, remoteStatus, finalRealized); err != nil {
+				worker.logger.Error("persist terminal grid state",
+					"component", "autogrid_worker", "bot_id", bot.id, "error", err)
+			}
 			worker.logger.Info(
 				"Pionex grid reached terminal state",
 				"component", "autogrid_worker", "symbol", bot.symbol,
-				"status", status, "reason", closedReason, "realized_pnl", realized.String(),
+				"status", status, "reason", closedReason, "realized_pnl", finalRealized.String(),
 			)
 			continue
 		}
@@ -2730,7 +2822,7 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 		if bot.localStatus == "RUNNING" {
 			persistedReconciliation = "REST_AUTHORITATIVE_OK"
 		}
-		_, _ = worker.db.Exec(ctx, `
+		if _, err := worker.db.Exec(ctx, `
 			UPDATE grid_bots
 			SET status = $2,
 			    reconciliation_state = CASE
@@ -2744,7 +2836,12 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 			    last_reconciled_at = NOW(),
 			    last_error = NULL, updated_at = NOW()
 			WHERE id = $1
-		`, bot.id, bot.localStatus, persistedReconciliation, remoteStatus, realized, unrealized)
+		`, bot.id, bot.localStatus, persistedReconciliation, remoteStatus, realized, unrealized); err != nil {
+			// The PnL persist must never fail silently: v2.0.45 lost every
+			// REAL mark for weeks exactly because this error was swallowed.
+			worker.logger.Error("persist remote grid truth and PnL",
+				"component", "autogrid_worker", "bot_id", bot.id, "error", err)
+		}
 
 		if bot.localStatus != "RUNNING" {
 			var reconciliation string
@@ -3074,18 +3171,30 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 			if clientErr != nil {
 				continue
 			}
+			// v2.0.74: the detail endpoint refuses finished grids, so the
+			// finished-bot list is the authoritative fallback for the final
+			// profit. Either source must also zero any stale floating mark:
+			// a terminal bot has no position left to float.
+			var profit *decimal.Decimal
 			if remote, remoteErr := historyClient.GetFuturesGridBot(ctx, item.remoteID); remoteErr == nil && remote != nil {
-				profit := remote.BUOrderData.ProfitWithdrawn
-				if profit.IsZero() {
-					profit = remote.BUOrderData.TotalProfit
-				}
-				_, _ = worker.db.Exec(ctx, `
+				value := remote.BUOrderData.FinalProfit()
+				profit = &value
+			} else if finished := findFinishedGridRecord(ctx, historyClient, item.remoteID); finished != nil {
+				value := finished.FinalProfit()
+				profit = &value
+			}
+			if profit != nil {
+				if _, err := worker.db.Exec(ctx, `
 					UPDATE grid_bots
 					SET realized_pnl_usdt = $2,
+					    unrealized_pnl_usdt = 0,
 					    reconciliation_state = 'REMOTE_TERMINAL_CONFIRMED',
 					    updated_at = NOW()
 					WHERE id = $1
-				`, item.id, profit)
+				`, item.id, *profit); err != nil {
+					worker.logger.Error("backfill closed grid final PnL",
+						"component", "autogrid_worker", "bot_id", item.id, "error", err)
+				}
 			}
 		}
 	}
@@ -3244,6 +3353,40 @@ func (worker *Worker) reconcileUnknownSubmissions(ctx context.Context, client *p
 				"component", "autogrid_worker", "symbol", bot.symbol)
 		}
 	}
+}
+
+// findFinishedGridRecord pages the documented finished-bot list
+// (GET /api/v1/bot/orders?status=finished) and returns the futures-grid
+// entry with the given buOrderId, decoded into the typed detail payload.
+// The order-detail endpoint refuses finished grids, so this list is the
+// authoritative source of a closed grid's final profit figures. Returns nil
+// when the record is absent or the listing fails; callers must treat nil as
+// "unknown", never as "zero profit".
+func findFinishedGridRecord(ctx context.Context, client *pionex.Client, buOrderID string) *pionex.BUOrderDataResponse {
+	if strings.TrimSpace(buOrderID) == "" {
+		return nil
+	}
+	token := ""
+	for page := 0; page < 10; page++ {
+		orders, next, listErr := client.ListBotOrders(ctx, "finished", token)
+		if listErr != nil {
+			return nil
+		}
+		for _, order := range orders {
+			if order.BUOrderID == buOrderID {
+				data, decodeErr := order.FuturesGridData()
+				if decodeErr != nil {
+					return nil
+				}
+				return data
+			}
+		}
+		if next == "" {
+			return nil
+		}
+		token = next
+	}
+	return nil
 }
 
 // fleetStopEnvelope returns Σ stored max_loss_usdt across the WHOLE risk

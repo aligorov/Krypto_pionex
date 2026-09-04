@@ -32,6 +32,11 @@ type realDeployExchangeMock struct {
 	createCalls atomic.Int64
 	checkMaint  atomic.Bool
 	createMaint atomic.Bool
+	// v2.0.74: raw 403 bodies for the broadened forbidden classifier — set
+	// one to make the matching endpoint answer 403 with exactly that body
+	// (checkBody wins over checkMaint, createBody over createMaint).
+	checkBody  atomic.Value
+	createBody atomic.Value
 }
 
 func maintenanceBody() string {
@@ -92,10 +97,15 @@ func newRealDeployExchangeMock(t *testing.T, symbols ...string) *realDeployExcha
 		}
 		writeJSON(w, map[string]any{
 			"result": true, "timestamp": time.Now().UnixMilli(),
-			"data":   map[string]any{"symbols": list},
+			"data": map[string]any{"symbols": list},
 		})
 	})
 	mux.HandleFunc("POST /api/v1/bot/orders/futuresGrid/checkParams", func(w http.ResponseWriter, _ *http.Request) {
+		if body, ok := mock.checkBody.Load().(string); ok && body != "" {
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(body))
+			return
+		}
 		if mock.checkMaint.Load() {
 			w.WriteHeader(http.StatusForbidden)
 			_, _ = w.Write([]byte(maintenanceBody()))
@@ -103,11 +113,16 @@ func newRealDeployExchangeMock(t *testing.T, symbols ...string) *realDeployExcha
 		}
 		writeJSON(w, map[string]any{
 			"result": true, "timestamp": time.Now().UnixMilli(),
-			"data":   map[string]any{"minInvestment": "30"},
+			"data": map[string]any{"minInvestment": "30"},
 		})
 	})
 	mux.HandleFunc("POST /api/v1/bot/orders/futuresGrid/create", func(w http.ResponseWriter, _ *http.Request) {
 		mock.createCalls.Add(1)
+		if body, ok := mock.createBody.Load().(string); ok && body != "" {
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(body))
+			return
+		}
 		if mock.createMaint.Load() {
 			w.WriteHeader(http.StatusForbidden)
 			_, _ = w.Write([]byte(maintenanceBody()))
@@ -115,7 +130,7 @@ func newRealDeployExchangeMock(t *testing.T, symbols ...string) *realDeployExcha
 		}
 		writeJSON(w, map[string]any{
 			"result": true, "timestamp": time.Now().UnixMilli(),
-			"data":   map[string]any{"buOrderId": "REALSKIP-1"},
+			"data": map[string]any{"buOrderId": "REALSKIP-1"},
 		})
 	})
 	mock.server = httptest.NewServer(mux)
@@ -409,20 +424,26 @@ func TestDeployRealDuplicateSymbolSkipIsVisible(t *testing.T) {
 	}
 }
 
-// (e) The exchange's symbol-maintenance refusal (HTTP 403 +
-// P_TRADING_BOT_OPERATION_IS_FORBIDDEN_SYMBOL_MAINTENANCE in a non-JSON
-// body) must defer the candidate with a visible rejection instead of
-// leaving it ACCEPTED to re-fail every scan of the maintenance window.
-// Round 1 pins the pre-flight (checkParams) refusal: rejected BEFORE any
-// grid row exists and without touching the create endpoint. Round 2 pins
-// the create-stage refusal (check passed, create 403): the lifecycle's
-// FAILED row is the single authoritative audit of the refused attempt and
-// the candidate still gets the maintenance reason.
+// (e) The exchange's symbol-operation refusal (HTTP 403 + a forbidden
+// fragment in the body) must defer the candidate with a visible rejection
+// instead of leaving it ACCEPTED to re-fail every scan of the refusal
+// window. Round 1 pins the pre-flight (checkParams) refusal: rejected
+// BEFORE any grid row exists and without touching the create endpoint.
+// Round 2 pins the create-stage refusal (check passed, create 403): the
+// lifecycle's FAILED row is the single authoritative audit of the refused
+// attempt and the candidate still gets the refusal reason. Rounds 3-5 pin
+// v2.0.74's broadened classifier: a truncated "Operation is forbidden"
+// envelope at checkParams, an unparseable {"data":null,"code":40...} body
+// at create, and — negatively — a 403 about the API key which must NOT be
+// treated as a symbol state (old behavior: warn and attempt the create).
 func TestDeployRealSymbolMaintenanceRejection(t *testing.T) {
-	h := newRealDeployHarness(t, 5, "MAINT1_USDT_PERP", "MAINT2_USDT_PERP")
+	h := newRealDeployHarness(t, 5, "MAINT1_USDT_PERP", "MAINT2_USDT_PERP",
+		"MAINT3_USDT_PERP", "MAINT4_USDT_PERP", "MAINT5_USDT_PERP")
 	ctx := context.Background()
-	h.cleanupSymbol(t, "MAINT1_USDT_PERP")
-	h.cleanupSymbol(t, "MAINT2_USDT_PERP")
+	for _, symbol := range []string{"MAINT1_USDT_PERP", "MAINT2_USDT_PERP",
+		"MAINT3_USDT_PERP", "MAINT4_USDT_PERP", "MAINT5_USDT_PERP"} {
+		h.cleanupSymbol(t, symbol)
+	}
 
 	// Round 1: checkParams refuses with maintenance — no row, no create.
 	h.mock.checkMaint.Store(true)
@@ -431,8 +452,8 @@ func TestDeployRealSymbolMaintenanceRejection(t *testing.T) {
 		t.Fatalf("deployReal round 1: %v", err)
 	}
 	decision, reason := h.candidateRow(t, scanID, "MAINT1_USDT_PERP")
-	if decision != "REJECTED" || !strings.Contains(reason, "символ на обслуживании биржи (maintenance)") {
-		t.Fatalf("check-stage maintenance must reject with the maintenance reason, got %s / %q", decision, reason)
+	if decision != "REJECTED" || !strings.Contains(reason, "биржа запрещает операцию по символу (forbidden/maintenance)") {
+		t.Fatalf("check-stage refusal must reject with the forbidden reason, got %s / %q", decision, reason)
 	}
 	var rows int
 	if err := h.pool.QueryRow(ctx, `
@@ -453,8 +474,8 @@ func TestDeployRealSymbolMaintenanceRejection(t *testing.T) {
 		t.Fatalf("deployReal round 2: %v", err)
 	}
 	decision2, reason2 := h.candidateRow(t, scanID2, "MAINT2_USDT_PERP")
-	if decision2 != "REJECTED" || !strings.Contains(reason2, "символ на обслуживании биржи (maintenance)") {
-		t.Fatalf("create-stage maintenance must reject with the maintenance reason, got %s / %q", decision2, reason2)
+	if decision2 != "REJECTED" || !strings.Contains(reason2, "биржа запрещает операцию по символу (forbidden/maintenance)") {
+		t.Fatalf("create-stage refusal must reject with the forbidden reason, got %s / %q", decision2, reason2)
 	}
 	var status, reconciliation, lastError string
 	if err := h.pool.QueryRow(ctx, `
@@ -469,5 +490,46 @@ func TestDeployRealSymbolMaintenanceRejection(t *testing.T) {
 	if got := h.mock.createCalls.Load(); got != 1 {
 		t.Fatalf("create must have been attempted exactly once, got %d", got)
 	}
-}
 
+	// Round 3: truncated "Operation is forbidden" envelope at checkParams —
+	// parseable body, result=false, no code: the message alone must classify.
+	h.mock.createMaint.Store(false)
+	h.mock.checkBody.Store(`{"result":false,"message":"Operation is forbidden"}`)
+	scanID3 := h.seedAcceptedCandidate(t, "MAINT3_USDT_PERP")
+	if err := h.worker.deployReal(ctx, *h.settings, scanID3, false); err != nil {
+		t.Fatalf("deployReal round 3: %v", err)
+	}
+	decision3, reason3 := h.candidateRow(t, scanID3, "MAINT3_USDT_PERP")
+	if decision3 != "REJECTED" || !strings.Contains(reason3, "forbidden/maintenance") {
+		t.Fatalf("truncated forbidden envelope must reject the candidate, got %s / %q", decision3, reason3)
+	}
+
+	// Round 4: unparseable {"data":null,"code":40...} body at create — the
+	// numeric code breaks envelope decoding, the reason rides the snippet.
+	h.mock.checkBody.Store("")
+	h.mock.createBody.Store(`{"data":null,"code":403,"reason":"P_TRADING_BOT_OPERATION_IS_FORBIDDEN"}`)
+	scanID4 := h.seedAcceptedCandidate(t, "MAINT4_USDT_PERP")
+	if err := h.worker.deployReal(ctx, *h.settings, scanID4, false); err != nil {
+		t.Fatalf("deployReal round 4: %v", err)
+	}
+	decision4, reason4 := h.candidateRow(t, scanID4, "MAINT4_USDT_PERP")
+	if decision4 != "REJECTED" || !strings.Contains(reason4, "forbidden/maintenance") {
+		t.Fatalf("snippet-only forbidden body must reject the candidate, got %s / %q", decision4, reason4)
+	}
+
+	// Round 5 (negative): a 403 about the API key is a credential refusal,
+	// never a symbol state — the deploy path must attempt the create and the
+	// candidate must stay ACCEPTED until a real outcome resolves it.
+	h.mock.createBody.Store(`{"result":false,"code":"P_API_KEY_INVALID","message":"api key is invalid"}`)
+	scanID5 := h.seedAcceptedCandidate(t, "MAINT5_USDT_PERP")
+	if err := h.worker.deployReal(ctx, *h.settings, scanID5, false); err != nil {
+		t.Fatalf("deployReal round 5: %v", err)
+	}
+	decision5, _ := h.candidateRow(t, scanID5, "MAINT5_USDT_PERP")
+	if decision5 == "REJECTED" {
+		t.Fatalf("credential 403 must not be classified as a symbol refusal")
+	}
+	if got := h.mock.createCalls.Load(); got < 2 {
+		t.Fatalf("credential 403 must fall through to a create attempt, got %d creates", got)
+	}
+}
