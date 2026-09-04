@@ -26,8 +26,13 @@ const (
 	// leverage notional). Exported because it is ALSO the fleet-design stop
 	// floor the risk derivation (breaker, tranche-2 cap) budgets against —
 	// a designed bot can never store a smaller stop than this.
-	DynamicLossMinPct      = 2.0
-	dynamicLossMaxPct      = 5.0
+	DynamicLossMinPct = 2.0
+	// DynamicLossMaxPct is the stop-out ceiling of the same formula. The
+	// tranche-2 per-bot cap must budget against THIS bound, not the floor:
+	// σ-scaled stops legally land anywhere in [Min, Max], and a floor-based
+	// cap refuses exactly the wide-stop bots the top-up exists to save
+	// (prod 2026-09-04: SKYAI 6x skipped ×3 with "$21.57 > $15").
+	DynamicLossMaxPct      = 5.0
 	dynamicLossRangeFloorK = 0.15
 	minRiskRewardRatio     = 1.50
 )
@@ -91,7 +96,7 @@ func ComputeDynamicTargets(input DynamicTargetsInput) DynamicTargets {
 			lossFloor = rangeFloor
 		}
 	}
-	lossPct := clamp(lossFloor, DynamicLossMinPct, dynamicLossMaxPct)
+	lossPct := clamp(lossFloor, DynamicLossMinPct, DynamicLossMaxPct)
 	rawTargetPct := math.Max(dynamicTargetVolFraction*vol, lossPct*minRiskRewardRatio)
 	targetPct := clamp(rawTargetPct, dynamicTargetMinPct, dynamicTargetMaxPct)
 	budget := math.Max(input.Budget, 0)
@@ -109,21 +114,52 @@ func ComputeDynamicTargets(input DynamicTargetsInput) DynamicTargets {
 	}
 }
 
-// GridLevelsForRange derives the grid level count from the pair's own
-// volatility: the step should track ~0.3×ATR so each level captures a real
-// travel distance instead of noise, floored above the fee-dominant zone.
-// Native AI Kit counts override this when an account is configured; the
-// clamp keeps the futures contract range (2–500) inside practical bounds.
-func GridLevelsForRange(rangePct, atrPct float64) int {
+// Grid density doctrine (v2.0.75): DENSITY SCALES WITH THE MARGIN, not with
+// a fee-floor guess. The old economics floored the step at ~0.80% and clamped
+// the count at 6..14, so every $200-notional 4%-span deploy collapsed to 6
+// levels of 0.64-0.75% — three such bots produced ZERO grid profit in 8h
+// while the dense deployments (0.22% step, 29-60 levels) harvested
+// everything. The only two economic constraints that matter:
+//
+//   - the step floor: 0.25% — dense enough that a normal oscillation
+//     crosses levels, wide enough that maker fees (2×~2-5bps round trip)
+//     stay a small fraction of the captured step;
+//   - the per-level notional floor: notional/levels ≥ $8 — below it the
+//     per-fill harvest is dust and the order sits near exchange minimums.
+//
+// levels = clamp(round(span / max(0.25%, $8-step)), 6, 500).
+// $100×2x on a 4% span → 16 levels × $12.5; $50 on the same span → the
+// min-order step widens to 0.64% → 6 levels × $8.33.
+const (
+	// GridStepFloorPct is the economic density floor for the grid step.
+	GridStepFloorPct = 0.25
+	// MinGridLevelNotionalUSDT is the smallest acceptable per-level order
+	// notional (budget×leverage/levels).
+	MinGridLevelNotionalUSDT = 8.0
+	// gridLevelsMin/Max clamp the count: 6 keeps a grid a grid, 500 is the
+	// Pionex futures contract row ceiling.
+	gridLevelsMin = 6
+	gridLevelsMax = 500
+)
+
+// GridLevelsForRange derives the grid level count for a span (%) under the
+// margin-density doctrine: the step is max(0.25%, the step at which every
+// level still carries ≥ $8 of the budget×leverage notional). notional ≤ 0
+// (unknown) falls back to the pure step floor. floor() — not round() — is
+// load-bearing: rounding UP past notional/$8 would silently shrink the
+// per-level notional below the floor the whole formula exists to protect.
+func GridLevelsForRange(rangePct, notionalUSDT float64) int {
 	if rangePct <= 0 {
 		return 8
 	}
-	stepTarget := clamp(0.65*atrPct, 0.80, 3.5)
-	if stepTarget <= 0 {
-		return 8
+	stepPct := GridStepFloorPct
+	if notionalUSDT > 0 {
+		if minOrderStep := MinGridLevelNotionalUSDT * rangePct / notionalUSDT; minOrderStep > stepPct {
+			stepPct = minOrderStep
+		}
 	}
-	levels := math.Round(rangePct / stepTarget)
-	return int(clamp(levels, 6, 14))
+	levels := math.Floor(rangePct / stepPct)
+	return int(clamp(levels, gridLevelsMin, gridLevelsMax))
 }
 
 // ValidateMinGridStep checks if the grid step % is large enough to exceed

@@ -154,6 +154,7 @@ type BUOrderDataResponse struct {
 	ProfitReduceRaw      json.RawMessage `json:"profitReduce"`
 	ProfitExitedRaw      json.RawMessage `json:"profitExited"`
 	FundingFeePaymentRaw json.RawMessage `json:"fundingFeePayment"`
+	ClosedBaseAmountRaw  json.RawMessage `json:"closedBaseAmount"`
 	RiskStatus           string          `json:"riskStatus"`
 	LiquidationPriceRaw  json.RawMessage `json:"liquidationPrice"`
 
@@ -166,6 +167,7 @@ type BUOrderDataResponse struct {
 	PositionOpenPrice decimal.Decimal `json:"-"`
 	ProfitWithdrawn   decimal.Decimal `json:"-"`
 	TotalProfit       decimal.Decimal `json:"-"`
+	ClosedBaseAmount  decimal.Decimal `json:"-"`
 	LiquidationPrice  decimal.Decimal `json:"-"`
 }
 
@@ -229,6 +231,7 @@ func (b *BUOrderDataResponse) UnmarshalJSON(data []byte) error {
 	if b.ProfitWithdrawn.IsZero() && !b.TotalProfit.IsZero() {
 		b.ProfitWithdrawn = b.TotalProfit
 	}
+	b.ClosedBaseAmount = parseDecimalRaw(b.ClosedBaseAmountRaw)
 	b.LiquidationPrice = parseDecimalRaw(b.LiquidationPriceRaw)
 	return nil
 }
@@ -269,24 +272,68 @@ func (b *BUOrderDataResponse) FundingFeePaymentReported() bool {
 	return rawFieldPresent(b.FundingFeePaymentRaw)
 }
 
-// FinalProfit returns the settled profit of a finished grid — the final
-// Total PnL the Pionex app shows after close. profitExited is the
-// documented settled figure (it already nets the position-close PnL); the
-// fallbacks keep older exchange variants and the pre-v2.0.74 chain alive.
-func (b *BUOrderDataResponse) FinalProfit() decimal.Decimal {
+// FinalProfitSource names the chain leg that produced a settled figure, so
+// callers can refuse chain legs that are provably incomplete for their close
+// class (v2.0.75: a native stop-loss showed +0.22 from the grid-only leg
+// while the app's Total PnL was −2.5 — the position-close leg was silently
+// dropped).
+type FinalProfitSource string
+
+const (
+	// FinalProfitExited is the documented settled figure ("Exited profit") —
+	// the only field the exchange itself nets grid + position-close + fees in.
+	FinalProfitExited FinalProfitSource = "profit_exited"
+	// FinalProfitTotalAlias covers totalProfit/profit/pnl/realizedProfit —
+	// observed variants of the full-total carrier on finished records.
+	FinalProfitTotalAlias FinalProfitSource = "total_profit_alias"
+	// FinalProfitGridFlat is grid + funding on a provably flat position: with
+	// no residual inventory there IS no position-close leg, so the sum is the
+	// complete total.
+	FinalProfitGridFlat FinalProfitSource = "grid_funding_flat"
+	// FinalProfitGridResidual is grid + funding while the record still shows
+	// inventory (position ≠ 0 or closedBaseAmount ≠ 0): the position-close
+	// PnL is NOT included. On a loss-class close this leg is a lie by
+	// construction and callers must gate it.
+	FinalProfitGridResidual FinalProfitSource = "grid_funding_residual"
+	// FinalProfitWithdrawn is the withdrawn-profit carrier.
+	FinalProfitWithdrawn FinalProfitSource = "profit_withdrawn"
+	// FinalProfitNone means no carrier carried anything.
+	FinalProfitNone FinalProfitSource = "none"
+)
+
+// SettledProfit returns the finished grid's settled total plus the chain leg
+// it came from. Priority: the exchange's own netted figures first (profitExited,
+// total-alias), then grid+funding — complete only when the record shows no
+// residual inventory — and withdrawn profit last.
+func (b *BUOrderDataResponse) SettledProfit() (decimal.Decimal, FinalProfitSource) {
 	if b == nil {
-		return decimal.Zero
+		return decimal.Zero, FinalProfitNone
 	}
 	if exited := parseDecimalRaw(b.ProfitExitedRaw); !exited.IsZero() {
-		return exited
+		return exited, FinalProfitExited
 	}
-	if grid := b.GridProfit(); !grid.IsZero() {
-		return grid.Add(b.FundingFeePayment())
+	if total := b.TotalProfit; !total.IsZero() {
+		return total, FinalProfitTotalAlias
+	}
+	gridPlusFunding := b.GridProfit().Add(b.FundingFeePayment())
+	if !gridPlusFunding.IsZero() {
+		if !b.Position.IsZero() || !b.ClosedBaseAmount.IsZero() {
+			return gridPlusFunding, FinalProfitGridResidual
+		}
+		return gridPlusFunding, FinalProfitGridFlat
 	}
 	if withdrawn := parseDecimalRaw(b.ProfitWithdrawnRaw); !withdrawn.IsZero() {
-		return withdrawn
+		return withdrawn, FinalProfitWithdrawn
 	}
-	return b.TotalProfit
+	return decimal.Zero, FinalProfitNone
+}
+
+// FinalProfit returns just the settled figure (provenance-free). New callers
+// should prefer SettledProfit — the source decides whether the figure is
+// trustworthy for the bot's close class.
+func (b *BUOrderDataResponse) FinalProfit() decimal.Decimal {
+	total, _ := b.SettledProfit()
+	return total
 }
 
 // rawFieldPresent reports whether a raw JSON payload slot carried an actual
@@ -371,6 +418,34 @@ func (c *Client) GetFuturesBalances(ctx context.Context) ([]FuturesBalance, erro
 		Balances []FuturesBalance `json:"balances"`
 	}
 	if err := c.do(ctx, http.MethodGet, "/uapi/v1/account/balances", nil, nil, true, 5, &data); err != nil {
+		return nil, err
+	}
+	return data.Balances, nil
+}
+
+// FuturesDetailBalance is one cross-margin coin row of GET /uapi/v1/account/detail.
+// Unlike /uapi/v1/account/balances this schema carries unrealizedPnL and the
+// derived totals, which makes it the ONLY wallet source an equity figure can
+// be marked against — the grid bots' own profit fields never see the fees.
+type FuturesDetailBalance struct {
+	Coin               string          `json:"coin"`
+	Assets             decimal.Decimal `json:"assets"` // total assets = free + frozen
+	Free               decimal.Decimal `json:"free"`   // available balance
+	Frozen             decimal.Decimal `json:"frozen"` // frozen (position margin + order frozen)
+	Transferable       decimal.Decimal `json:"transferable"`
+	Available          decimal.Decimal `json:"available"` // available margin
+	UnrealizedPnL      decimal.Decimal `json:"unrealizedPnL"`
+	TotalInitialMargin decimal.Decimal `json:"totalInitialMargin"`
+	Debts              decimal.Decimal `json:"debts"`
+}
+
+// GetFuturesAccountDetail returns the cross-margin balance list of GET
+// /uapi/v1/account/detail (official docs: AccountDetail.balances[]).
+func (c *Client) GetFuturesAccountDetail(ctx context.Context) ([]FuturesDetailBalance, error) {
+	var data struct {
+		Balances []FuturesDetailBalance `json:"balances"`
+	}
+	if err := c.do(ctx, http.MethodGet, "/uapi/v1/account/detail", nil, nil, true, 5, &data); err != nil {
 		return nil, err
 	}
 	return data.Balances, nil

@@ -20,8 +20,10 @@ type GridGeometry struct {
 // notional stays above a Pionex-executable size. At ~$2/level a real grid's
 // orders drop below exchange minimums on many futures pairs — the pre-flight
 // checkParams would reject the config in REAL mode, so the geometry must not
-// produce it in the first place.
-const minPerLevelNotionalUsdt = 5.0
+// produce it in the first place. v2.0.75: raised 5 → 8 to match the shared
+// margin-density doctrine (MinGridLevelNotionalUSDT) so every level-count
+// path — scanner, mesh, HAR, manual — agrees on the same economics.
+const minPerLevelNotionalUsdt = 8.0
 
 // ComputeGridGeometry converts a HAR volatility forecast into grid parameters.
 //
@@ -53,10 +55,12 @@ func ComputeGridGeometry(forecastVolPct float64, harR2 float64, feeBps float64, 
 	}
 
 	// Step must clear fees: 2× for the round trip + 1× buffer.
-	// feeBps/100 converts basis points to percent.
+	// feeBps/100 converts basis points to percent. The absolute minimum is
+	// the shared 0.25% density floor (GridStepFloorPct) — cheaper fees must
+	// not produce sub-floor steps the rest of the fleet no longer makes.
 	minStepPct := feeBps * 3.0 / 100.0
-	if minStepPct < 0.15 {
-		minStepPct = 0.15 // absolute minimum step, keeps level counts sane on cheap fees
+	if minStepPct < GridStepFloorPct {
+		minStepPct = GridStepFloorPct
 	}
 
 	// Leverage inversely proportional to volatility.
@@ -79,11 +83,15 @@ func ComputeGridGeometry(forecastVolPct float64, harR2 float64, feeBps float64, 
 			gridCount = maxByBudget
 		}
 	}
-	if gridCount < 8 {
-		gridCount = 8 // fewer levels fragments capital and misses fills
+	// v2.0.75: the 8..100 window joins the shared 6..500 clamp of the
+	// margin-density doctrine — a thin-notional HAR forecast may legally
+	// land below 8 levels, and 100 was an arbitrary ceiling below the
+	// exchange's own 500.
+	if gridCount < gridLevelsMin {
+		gridCount = gridLevelsMin
 	}
-	if gridCount > 100 {
-		gridCount = 100 // practical ceiling for futures grids
+	if gridCount > gridLevelsMax {
+		gridCount = gridLevelsMax
 	}
 
 	// Stop at half the range below the lower bound: outside normal grid

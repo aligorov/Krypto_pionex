@@ -166,6 +166,9 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /api/autogrid/bots/{id}/close", s.withRole(auth.RoleOperator, http.HandlerFunc(s.closeAutoGridBot)))
 	mux.Handle("POST /api/autogrid/bots/{id}/adjust", s.withRole(auth.RoleOperator, http.HandlerFunc(s.adjustAutoGridBot)))
 	mux.Handle("GET /api/autogrid/ai-strategy", s.withSession(http.HandlerFunc(s.autoGridAIStrategy)))
+	// v2.0.75 wallet truth: the operator's headline epoch PnL measured on the
+	// futures wallet (equity_now − epoch anchor), immune to fee-blind bot PnL.
+	mux.Handle("GET /api/autogrid/equity", s.withSession(http.HandlerFunc(s.autoGridEquityEpoch)))
 	mux.Handle("GET /api/autogrid/presets", s.withSession(http.HandlerFunc(s.listAutoGridPresets)))
 	mux.Handle("GET /api/autogrid/settings/ai-fill", s.withSession(http.HandlerFunc(s.autoGridAIFill)))
 	mux.Handle("POST /api/autogrid/presets/{id}/apply", s.withRole(auth.RoleOperator, http.HandlerFunc(s.applyAutoGridPreset)))
@@ -935,6 +938,21 @@ func (s *Server) autoGridAIFill(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, suggestion)
+}
+
+// autoGridEquityEpoch reports the wallet-truth epoch PnL: futures wallet
+// equity now minus the first recorded snapshot. Null summary means "no
+// snapshots yet" — the measurement starts with the worker's first capture.
+func (s *Server) autoGridEquityEpoch(w http.ResponseWriter, r *http.Request) {
+	summary, err := s.autogrid.AccountEquityEpoch(r.Context())
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"summary": summary,
+		"note":    "epoch PnL measured on the futures wallet (equity_now − first snapshot); bot PnL fields never see entry/exit/invest_in fees",
+	})
 }
 
 func (s *Server) listAutoGridPresets(w http.ResponseWriter, _ *http.Request) {

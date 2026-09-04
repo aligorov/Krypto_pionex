@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -31,12 +32,12 @@ import (
 
 const (
 	shadowFlagKey  = "shadow_portfolio"
-	shadowTopZ     = 5               // top-scored rejected candidates captured per scan
-	shadowOpenCap  = 200             // max unsimulated rows before capture pauses
-	shadowSimBatch = 50              // rows per simulation run
-	shadowSimDue   = 20 * time.Hour  // min spacing between simulation runs
-	shadowSimAge   = 24 * time.Hour  // row must mature (tranche time-box horizon)
-	shadowKlines   = 500             // 5M candles ≈ 42h; /market/klines hard limit is 500 (live-probed: 600 → MARKET_PARAMETER_ERROR "limit error", 500 → ok)
+	shadowTopZ     = 5              // top-scored rejected candidates captured per scan
+	shadowOpenCap  = 200            // max unsimulated rows before capture pauses
+	shadowSimBatch = 50             // rows per simulation run
+	shadowSimDue   = 20 * time.Hour // min spacing between simulation runs
+	shadowSimAge   = 24 * time.Hour // row must mature (tranche time-box horizon)
+	shadowKlines   = 500            // 5M candles ≈ 42h; /market/klines hard limit is 500 (live-probed: 600 → MARKET_PARAMETER_ERROR "limit error", 500 → ok)
 )
 
 func (worker *Worker) shadowPortfolioEnabled(ctx context.Context) bool {
@@ -169,18 +170,18 @@ func (worker *Worker) shadowSimIfDue(ctx context.Context, settings Settings) {
 	}
 
 	type shadowRow struct {
-		id           string
-		candidateID  string
-		symbol       string
-		direction    string
-		meshLower    decimal.Decimal
-		meshUpper    decimal.Decimal
-		gridNum      int
-		entry        decimal.Decimal
-		leverage     int
-		investment   decimal.Decimal
-		feeBps       decimal.Decimal
-		capturedAt   time.Time
+		id          string
+		candidateID string
+		symbol      string
+		direction   string
+		meshLower   decimal.Decimal
+		meshUpper   decimal.Decimal
+		gridNum     int
+		entry       decimal.Decimal
+		leverage    int
+		investment  decimal.Decimal
+		feeBps      decimal.Decimal
+		capturedAt  time.Time
 	}
 	rows, err := worker.db.Query(ctx, `
 		SELECT id, candidate_id::TEXT, symbol, direction,
@@ -334,6 +335,15 @@ func (worker *Worker) simulateShadowRow(
 		fail("klines: "+err.Error(), err)
 		return
 	}
+	// v2.0.75: /api/v1/market/klines returns candles newest-first (the same
+	// contract DetectRegime already sorts around). The replay used to walk
+	// the raw order: the FIRST candle is the newest, and by the time a row
+	// matures (captured_at+24h ≤ NOW) every fetched candle sits after the
+	// window end — the `After(windowEnd)` break fired on entry and the whole
+	// replay consumed zero candles (prod: 50 sims with candles_used=0,
+	// WINDOW_END, PnL 0, sim_window 0001-01-01). Oldest-first ordering makes
+	// the window walk terminate correctly.
+	sort.Slice(candles, func(i, j int) bool { return candles[i].Time < candles[j].Time })
 	windowEnd := capturedAt.Add(24 * time.Hour)
 	started := false
 	windowStart := time.Time{}

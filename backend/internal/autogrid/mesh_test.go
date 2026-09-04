@@ -3,23 +3,47 @@ package autogrid
 import (
 	"testing"
 
+	"github.com/aligorov/pionex-bot/backend/internal/marketdata"
 	"github.com/shopspring/decimal"
 )
 
-func TestComputeAdaptiveMeshBreakEvenFloor(t *testing.T) {
-	lower := decimal.NewFromFloat(0.020)
-	upper := decimal.NewFromFloat(0.024)
-	price := decimal.NewFromFloat(0.022)
+func TestComputeAdaptiveMeshDensityFromMargin(t *testing.T) {
+	// A true 4% span around the price: (102−98)/100.
+	lower := decimal.NewFromFloat(98)
+	upper := decimal.NewFromFloat(102)
+	price := decimal.NewFromFloat(100)
 	budget := decimal.NewFromFloat(100)
 
-	// Test that even with low ATR, step never falls below BreakEvenFloorPct (0.30%)
+	// v2.0.75 margin-density doctrine: $100×2x = $200 notional on a 4% span
+	// → 16 levels × $12.50 (step 0.25%). The old 0.80% floor + 6..14 clamp
+	// starved this exact shape to 6 levels that never crossed.
 	res := ComputeAdaptiveMesh(lower, upper, price, 0.50, "RANGE", budget, 2, 0.30)
-	step, _ := res.GridStepPct.Float64()
-	if step < BreakEvenFloorPct {
-		t.Errorf("expected grid step >= %.2f%%, got %.4f%%", BreakEvenFloorPct, step)
+	if res.GridNum != 16 {
+		t.Errorf("expected 16 levels for $200 notional on a 4%% span, got %d", res.GridNum)
 	}
-	if res.GridNum < 10 || res.GridNum > 60 {
-		t.Errorf("expected grid num between 10 and 60, got %d", res.GridNum)
+	step, _ := res.GridStepPct.Float64()
+	if step < 0.24 || step > 0.26 {
+		t.Errorf("expected ~0.25%% step, got %.4f%%", step)
+	}
+	if perLevel := 200.0 / float64(res.GridNum); perLevel < marketdata.MinGridLevelNotionalUSDT {
+		t.Errorf("every level must carry ≥ $8, got %.2f", perLevel)
+	}
+
+	// Thin notional widens the step to keep $8/level: $25×2x = $50 notional
+	// on 4% → 6 levels × $8.33 (the operator's clamp-down case).
+	thin := ComputeAdaptiveMesh(lower, upper, price, 0.50, "RANGE", decimal.NewFromFloat(25), 2, 0.30)
+	if thin.GridNum != 6 {
+		t.Errorf("expected 6 levels for $50 notional on a 4%% span, got %d", thin.GridNum)
+	}
+	// A high-ATR regime no longer sparses the grid — density follows margin.
+	wild := ComputeAdaptiveMesh(lower, upper, price, 5.0, "VOLATILE", budget, 2, 0.30)
+	if wild.GridNum != res.GridNum {
+		t.Errorf("regime/ATR must not change density anymore: %d vs %d", wild.GridNum, res.GridNum)
+	}
+	// Degenerate geometry keeps the 8-level fallback.
+	degenerate := ComputeAdaptiveMesh(upper, lower, price, 0.5, "RANGE", budget, 2, 0.30)
+	if degenerate.GridNum != 8 {
+		t.Errorf("degenerate geometry must fall back to 8 levels, got %d", degenerate.GridNum)
 	}
 }
 

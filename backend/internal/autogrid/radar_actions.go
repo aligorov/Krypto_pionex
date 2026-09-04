@@ -90,9 +90,14 @@ func (worker *Worker) radarLastActionAt(ctx context.Context, botID string) (time
 	return *at, true
 }
 
-// radarDwellAtOrAbove counts the trailing consecutive snapshots of the bot at
-// or above the threshold (current snapshot included — it is persisted before
-// the action matrix runs).
+// radarDwellAtOrAbove counts the trailing snapshots of the bot at or above
+// the threshold (current snapshot included — it is persisted before the
+// action matrix runs). v2.0.75 flicker tolerance: the count is taken over a
+// window of radarDwellTicks+1 snapshots and ONE sub-threshold flicker inside
+// the window no longer resets it — prod AXTIX #668 alternated 2↔3↔4 at the
+// band boundary and the strict-consecutive rule read dwell=1 on exactly the
+// snapshots that mattered. Two misses inside the window still block: the
+// signal must persist, not just recur.
 func (worker *Worker) radarDwellAtOrAbove(ctx context.Context, botID string, threshold float64) int {
 	rows, err := worker.db.Query(ctx, `
 		SELECT score FROM bot_risk_snapshots
@@ -102,17 +107,22 @@ func (worker *Worker) radarDwellAtOrAbove(ctx context.Context, botID string, thr
 		return 0
 	}
 	defer rows.Close()
-	n := 0
+	window := make([]float64, 0, radarDwellTicks+1)
 	for rows.Next() {
 		var score decimal.Decimal
 		if err := rows.Scan(&score); err != nil {
 			break
 		}
 		f, _ := score.Float64()
+		window = append(window, f)
+		if len(window) == radarDwellTicks+1 {
+			break
+		}
+	}
+	n := 0
+	for _, f := range window {
 		if f >= threshold {
 			n++
-		} else {
-			break
 		}
 	}
 	return n
@@ -371,6 +381,33 @@ func (worker *Worker) radarRecenterReal(ctx context.Context, settings Settings, 
 	}); err != nil {
 		worker.logger.Warn("stop-radar: REAL recenter adjust_params failed — budget untouched",
 			"component", "autogrid_worker", "symbol", b.symbol, "error", err)
+		// v2.0.75 deaf-branch fix: the exchange rejecting adjustParams used
+		// to leave ONLY this Warn — no event, no telegram, no backoff, so the
+		// radar retried invisibly forever while the operator saw "радар
+		// молчал" (prod AXTIX #668: band-4 with satisfied dwell for 8h, zero
+		// actions, zero traces). One durable RADAR_RECENTER_FAILED event per
+		// hour (model_state marker, the tranche2SkipAt pattern) + a telegram
+		// line — the failure becomes a first-class signal.
+		tag, markErr := worker.db.Exec(ctx, `
+			UPDATE grid_bots
+			SET model_state = jsonb_set(COALESCE(model_state, '{}'::jsonb), '{radarFailAlertAt}',
+				to_jsonb(to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'))),
+			    updated_at = NOW()
+			WHERE id = $1
+			  AND COALESCE((model_state->>'radarFailAlertAt')::TIMESTAMPTZ, '1970-01-01') < NOW() - INTERVAL '1 hour'
+		`, b.botID)
+		if markErr == nil && tag.RowsAffected() == 1 {
+			_ = LogBotEvent(ctx, worker.db, b.botID, b.botNumber, "REAL", b.symbol,
+				"RADAR_RECENTER_FAILED", &b.price, nil, map[string]any{
+					"band": rs.Band, "score": decimal.NewFromFloat(rs.Score).Round(4).String(),
+					"error":          err.Error(),
+					"proposed_lower": newLower.String(), "proposed_upper": newUpper.String(),
+				})
+			_ = QueueTelegramEvent(ctx, worker.db, "RADAR_RECENTER_FAILED", map[string]any{
+				"bot_number": b.botNumber, "symbol": b.symbol, "band": rs.Band,
+				"error": err.Error(),
+			})
+		}
 		return
 	}
 

@@ -49,7 +49,7 @@ func TestComputeDynamicTargetsClamps(t *testing.T) {
 	extreme := ComputeDynamicTargets(DynamicTargetsInput{
 		Budget: 1000, ScannerVolatilityPct: 90, ScannerATRPct: 60, ScannerDrawdownPct: 95,
 	})
-	if extreme.TargetPct != dynamicTargetMaxPct || extreme.LossPct != dynamicLossMaxPct {
+	if extreme.TargetPct != dynamicTargetMaxPct || extreme.LossPct != DynamicLossMaxPct {
 		t.Fatalf("clamps must hold: %+v", extreme)
 	}
 	flat := ComputeDynamicTargets(DynamicTargetsInput{
@@ -137,24 +137,43 @@ func TestComputeDynamicTargetsScaleWithLeverage(t *testing.T) {
 	}
 }
 
-func TestGridLevelsForRangeScalesWithATR(t *testing.T) {
-	// Same range width: a wild pair (high ATR) needs fewer, wider levels.
-	calm := GridLevelsForRange(10, 1)
-	wild := GridLevelsForRange(10, 5)
-	if !(wild < calm) {
-		t.Fatalf("higher ATR must mean fewer levels: calm=%d wild=%d", calm, wild)
+// v2.0.75 margin-density doctrine: density scales with the notional
+// (budget×leverage), not with a fee-floor guess. The step is
+// max(0.25%, the step at which every level still carries ≥ $8).
+func TestGridLevelsForRangeScalesWithNotional(t *testing.T) {
+	// $200 notional on a 4% span: step floor 0.25% binds (the $8-step is
+	// 8×4/200 = 0.16%) → 16 levels × $12.50 — the operator doctrine case.
+	if got := GridLevelsForRange(4, 200); got < 14 {
+		t.Fatalf("span 4%% at $200 notional must give ≥14 levels (16 expected), got %d", got)
 	}
-	if calm == wild {
-		t.Fatal("levels must differ across volatility regimes")
+	if got := GridLevelsForRange(4, 200); got != 16 {
+		t.Fatalf("span 4%% at $200 notional = 4/0.25 = 16 levels, got %d", got)
 	}
-	// Clamps hold for degenerate inputs.
-	if got := GridLevelsForRange(0, 0); got != 8 {
-		t.Fatalf("degenerate input must fall back to 8, got %d", got)
+	// $50 notional on the same span: the $8 floor binds (step 0.64%) →
+	// round(6.25) = 6 levels, each carrying ≥ $8.
+	thin := GridLevelsForRange(4, 50)
+	if thin != 6 {
+		t.Fatalf("span 4%% at $50 notional must clamp to 6 levels, got %d", thin)
 	}
-	if got := GridLevelsForRange(100, 0.01); got != 14 {
-		t.Fatalf("upper clamp must hold, got %d", got)
+	if perLevel := 50.0 / float64(thin); perLevel < 8.0 {
+		t.Fatalf("every level must carry ≥ $8, got %.2f", perLevel)
 	}
-	if got := GridLevelsForRange(2, 20); got != 6 {
-		t.Fatalf("lower clamp must hold, got %d", got)
+	// The 6-level minimum survives even with unbounded notional on a tight
+	// span (a 0.5% span at $10k still clamps up from 2 to 6).
+	if got := GridLevelsForRange(0.5, 10_000); got != 6 {
+		t.Fatalf("min clamp must hold, got %d", got)
+	}
+	// Huge span on huge notional must not hit the old ×14 ceiling but the
+	// exchange row ceiling.
+	if got := GridLevelsForRange(400, 1_000_000); got > 500 {
+		t.Fatalf("max clamp must hold at 500, got %d", got)
+	}
+	// Degenerate span falls back.
+	if got := GridLevelsForRange(0, 200); got != 8 {
+		t.Fatalf("degenerate span must fall back to 8, got %d", got)
+	}
+	// Unknown notional follows the bare step floor.
+	if got := GridLevelsForRange(2, 0); got != 8 {
+		t.Fatalf("span 2%% unknown notional = 2/0.25 = 8 levels, got %d", got)
 	}
 }

@@ -134,6 +134,12 @@ func (worker *Worker) Run(ctx context.Context) {
 			return
 		}
 		worker.service.SyncDerivedBreaker(ctx, *settings)
+		// v2.0.75 wallet truth: the first equity snapshot of the process must
+		// land at startup, not one manage interval later — the epoch anchor's
+		// precision is the operator's headline PnL figure.
+		worker.runGuarded("equity_snapshot", func() {
+			worker.captureAccountEquity(ctx, *settings)
+		})
 	})
 	worker.logger.Info("AutoGrid worker started", "component", "autogrid_worker")
 	for {
@@ -1737,6 +1743,26 @@ func (worker *Worker) deployReal(
 		if val, ok := candidate.ModelAssumptions["atrPct"].(float64); ok && val > 0 {
 			atrPct = val
 		}
+		// v2.0.75 exchange-rejection cooldown: a FAILED create (403 forbidden/
+		// maintenance at the create stage, BOT_INTERNAL_ERROR) is a symbol
+		// state that persists across scans — the lifecycle already persists
+		// the authoritative FAILED grid row, so the durable marker IS the
+		// grid_bots ledger itself. Without this gate PUMP hammered 8 refused
+		// creates in a row (one per scan window, ~2.5m apart).
+		var rejectedCreateAt *time.Time
+		if err := worker.db.QueryRow(ctx, `
+			SELECT MAX(updated_at)
+			FROM grid_bots
+			WHERE account_id = $1 AND symbol = $2
+			  AND status = 'FAILED'
+			  AND reconciliation_state = 'FAILED_AUTHORITATIVE'
+			  AND updated_at > NOW() - INTERVAL '1 hour'
+		`, *settings.AccountID, candidate.Symbol).Scan(&rejectedCreateAt); err == nil && rejectedCreateAt != nil {
+			worker.rejectCandidate(ctx, candidate,
+				fmt.Sprintf("биржа отклонила создание (%s в %sZ) — кулдаун 1ч",
+					candidate.Symbol, rejectedCreateAt.UTC().Format("15:04")), nil)
+			continue
+		}
 		regime := "RANGE"
 		if val, ok := candidate.ModelAssumptions["regime"].(string); ok && val != "" {
 			regime = val
@@ -2488,6 +2514,58 @@ func (worker *Worker) dataHealthCheck(ctx context.Context) {
 	}
 }
 
+// lossClassClose reports whether a close reason (our closed_reason or the
+// exchange's reasonBy) is a LOSS-class exit. Only loss-class closes get the
+// settled-profit honesty gate: a stop cannot settle positive on a chain leg
+// that provably dropped the losing position-close leg.
+func lossClassClose(reason string) bool {
+	normalized := strings.ToUpper(strings.TrimSpace(reason))
+	switch {
+	case strings.HasPrefix(normalized, "STOP_LOSS"),
+		normalized == "LIQUIDATION",
+		normalized == "STRUCT_INVALID_ANTI_HUNT",
+		normalized == "RANGE_BREAK_DOWN",
+		normalized == "RANGE_BREAK_UP_TREND_STOP",
+		normalized == "LOSS_STOP",
+		normalized == "FORCE_LIQUIDATION":
+		return true
+	}
+	return false
+}
+
+// gateSettledProfit applies the v2.0.75 honesty gate to a finished grid's
+// settled figure. On a loss-class close, the grid+funding leg with residual
+// inventory (FinalProfitGridResidual) is INCOMPLETE by construction — the
+// position-close loss is missing — and its grid profit is typically
+// positive, so accepting it reports +0.22 for a bot the app shows at −2.5
+// (prod XMR #672 / JTO #674). Refused → nil ("better empty than a lie");
+// the caller must Warn and mark the row.
+func gateSettledProfit(
+	total decimal.Decimal,
+	source pionex.FinalProfitSource,
+	closeReason string,
+) *decimal.Decimal {
+	if source == pionex.FinalProfitGridResidual && lossClassClose(closeReason) && !total.IsNegative() {
+		return nil
+	}
+	return &total
+}
+
+// persistFinalProfitSource records which chain leg settled a terminal bot
+// (model_state.finalProfitSource) — the audit trail behind every headline
+// PnL figure, and the backfill's exactly-once marker.
+func (worker *Worker) persistFinalProfitSource(ctx context.Context, botID string, source string) {
+	if _, err := worker.db.Exec(ctx, `
+		UPDATE grid_bots
+		SET model_state = jsonb_set(COALESCE(model_state, '{}'::jsonb), '{finalProfitSource}', to_jsonb($2::TEXT)),
+		    updated_at = NOW()
+		WHERE id = $1
+	`, botID, source); err != nil {
+		worker.logger.Warn("final profit source marker write failed",
+			"component", "autogrid_worker", "bot_id", botID, "error", err)
+	}
+}
+
 func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 	settings, err := worker.service.GetSettings(ctx)
 	if err != nil {
@@ -2502,6 +2580,9 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 	// v2.0.58: data-feed health — a silently dead collector must announce
 	// itself instead of fail-opening every gate that leans on it.
 	worker.dataHealthCheck(ctx)
+	// v2.0.75 wallet truth: self-throttled (5m) equity snapshot so the epoch
+	// PnL comes from the wallet, not from fee-blind bot PnL fields.
+	worker.captureAccountEquity(ctx, *settings)
 	worker.maybeQueueCascadeShortScan(ctx, *settings)
 	// Pin the implicitly resolved account into settings when possible so
 	// deploys and supervision stay on the same account. Supervision itself
@@ -2629,31 +2710,45 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 				// mark forever (v2.0.74: 22 closures carried a stale −$0.35
 				// unrealized sum the app showed as settled).
 				closedReason := "ALREADY_CLOSED"
-				finalRealized := decimal.Zero
-				finalReported := false
-				if finished := findFinishedGridRecord(ctx, client, bot.remoteID); finished != nil {
-					finalRealized = finished.FinalProfit()
-					finalReported = true
-				}
 				var finalRealizedArg any
-				if finalReported {
-					finalRealizedArg = finalRealized
+				settleRefused := false
+				if finished := findFinishedGridRecord(ctx, client, bot.remoteID); finished != nil {
+					// v2.0.75: the finished record's own reasonBy drives the
+					// honesty gate — the detail endpoint's refusal already
+					// lost the close class, the list record still knows it.
+					// A refused settle NULLs the stored figure: the running
+					// accrual it would keep is the same incomplete chain.
+					settled, source := finished.SettledProfit()
+					gateReason := closedReason
+					if strings.TrimSpace(finished.ReasonBy) != "" {
+						gateReason = finished.ReasonBy
+					}
+					if gated := gateSettledProfit(settled, source, gateReason); gated != nil {
+						finalRealizedArg = *gated
+						worker.persistFinalProfitSource(ctx, bot.id, string(source))
+					} else {
+						settleRefused = true
+						worker.persistFinalProfitSource(ctx, bot.id, "refused_"+string(source))
+						worker.logger.Warn("already-closed settle refused: positive grid-fallback on a loss-class close — final PnL set NULL",
+							"component", "autogrid_worker", "bot_id", bot.id, "symbol", bot.symbol,
+							"reason_by", gateReason, "grid_fallback", settled.StringFixed(4))
+					}
 				}
 				if _, err := worker.db.Exec(ctx, `
 					UPDATE grid_bots
 					SET status = 'STOPPED', closed_reason = $2,
 					    reconciliation_state = 'REMOTE_TERMINAL_CONFIRMED',
-					    realized_pnl_usdt = COALESCE($3, realized_pnl_usdt),
+					    realized_pnl_usdt = CASE WHEN $4::BOOLEAN THEN NULL ELSE COALESCE($3, realized_pnl_usdt) END,
 					    unrealized_pnl_usdt = 0,
 					    closed_at = NOW(), last_reconciled_at = NOW(), last_error = NULL, updated_at = NOW()
 					WHERE id = $1
-				`, bot.id, closedReason, finalRealizedArg); err != nil {
+				`, bot.id, closedReason, finalRealizedArg, settleRefused); err != nil {
 					worker.logger.Error("persist already-closed grid state",
 						"component", "autogrid_worker", "bot_id", bot.id, "error", err)
 				}
 				worker.logger.Info("Pionex grid not found or already closed on exchange, marked STOPPED",
 					"component", "autogrid_worker", "symbol", bot.symbol, "bot_id", bot.id,
-					"final_pnl_persisted", finalReported)
+					"final_pnl_persisted", finalRealizedArg != nil, "settle_refused", settleRefused)
 				continue
 			}
 			if _, err := worker.db.Exec(ctx, `
@@ -2791,10 +2886,21 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 		if terminalRemoteGridStatus(remoteStatus) {
 			status, closedReason := terminalOutcome(reasonBy)
 			// v2.0.74: a finished grid settles at the exchange's own final
-			// figure (profitExited nets grid profit, position-close PnL and
-			// fees). The grid-profit `realized` above never includes the
-			// position-close leg, so it must not survive as the final number.
-			finalRealized := remote.BUOrderData.FinalProfit()
+			// figure. v2.0.75: the figure is only accepted when its chain leg
+			// is trustworthy for this close class — the grid-only fallback on
+			// a native stop reported +0.22 while the app showed −2.5 (the
+			// position-close leg was missing). Refused → NULL, never a lie.
+			settled, source := remote.BUOrderData.SettledProfit()
+			var finalRealizedArg any
+			if gated := gateSettledProfit(settled, source, closedReason); gated != nil {
+				finalRealizedArg = *gated
+				worker.persistFinalProfitSource(ctx, bot.id, string(source))
+			} else {
+				worker.persistFinalProfitSource(ctx, bot.id, "refused_"+string(source))
+				worker.logger.Warn("terminal settle refused: positive grid-fallback on a loss-class close — final PnL left NULL",
+					"component", "autogrid_worker", "bot_id", bot.id, "symbol", bot.symbol,
+					"closed_reason", closedReason, "grid_fallback", settled.StringFixed(4))
+			}
 			if _, err := worker.db.Exec(ctx, `
 				UPDATE grid_bots
 				SET status = $2,
@@ -2804,14 +2910,14 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 				    unrealized_pnl_usdt = 0, closed_at = NOW(),
 				    last_reconciled_at = NOW(), last_error = NULL, updated_at = NOW()
 				WHERE id = $1
-			`, bot.id, status, closedReason, remoteStatus, finalRealized); err != nil {
+			`, bot.id, status, closedReason, remoteStatus, finalRealizedArg); err != nil {
 				worker.logger.Error("persist terminal grid state",
 					"component", "autogrid_worker", "bot_id", bot.id, "error", err)
 			}
 			worker.logger.Info(
 				"Pionex grid reached terminal state",
 				"component", "autogrid_worker", "symbol", bot.symbol,
-				"status", status, "reason", closedReason, "realized_pnl", finalRealized.String(),
+				"status", status, "reason", closedReason, "realized_pnl", finalRealizedArg, "profit_source", source,
 			)
 			continue
 		}
@@ -2952,6 +3058,7 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 					}
 				}
 				if topUp != "" {
+					investmentBefore := bot.investment
 					pending := base.Sub(bot.investment)
 					if _, err := worker.service.AdjustBot(ctx, worker.accounts, settings.ID, bot.id, AdjustBotInput{
 						Mode:            "invest_in",
@@ -3006,8 +3113,33 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 						}
 						worker.logger.Info("tranche 2 deployed (REAL invest_in)",
 							"component", "autogrid_worker", "symbol", bot.symbol, "reason", topUp)
+						// v2.0.75 parity: the REAL top-up used to be telegram-only
+						// — the ledger never saw the margin doubling (paper logs
+						// TRANCHE_2 since v2.0.13). Same payload shape, REAL source.
+						// botTarget/botMaxLoss were refreshed to the doubled
+						// figures by the block above — those ARE the effective
+						// post-top-up target/stop.
+						effTarget, effStop := decimal.Zero, decimal.Zero
+						if bot.pnlTarget != nil {
+							effTarget = *bot.pnlTarget
+						}
+						if bot.maxLoss != nil {
+							effStop = *bot.maxLoss
+						}
+						_ = LogBotEvent(ctx, worker.db, bot.id, bot.botNumber, "REAL", bot.symbol, "TRANCHE_2", &price, nil, map[string]any{
+							"reason":            topUp,
+							"investment_before": investmentBefore.String(), "investment_after": base.String(),
+							"effective_target": effTarget.StringFixed(2), "effective_max_loss": effStop.StringFixed(2),
+						})
+						// Vars cover every placeholder of template_range_adjust
+						// (bot_number/symbol/lower_price/upper_price/
+						// adjustments_count) so the operator message renders the
+						// real template instead of the compose-fallback line.
 						_ = QueueTelegramEvent(ctx, worker.db, "TRANCHE_2", map[string]any{
 							"bot_number": bot.botNumber, "symbol": bot.symbol, "reason": topUp,
+							"effective_max_loss": effStop.StringFixed(2),
+							"lower_price":        bot.lower.StringFixed(6), "upper_price": bot.upper.StringFixed(6),
+							"adjustments_count": bot.adjustments + 1,
 						})
 					}
 				}
@@ -3140,16 +3272,19 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 	}
 
 	// Synchronize closed bots with exchange history to fill accurate realized PnL.
-	// The old query excluded zero-PnL REMOTE_TERMINAL_CONFIRMED bots — exactly
-	// the population written by the ALREADY_CLOSED paths without PnL — which
-	// permanently understated realized results. Bounded to a 48h window so the
-	// per-cycle work stays finite.
+	// v2.0.74 admitted the zero-PnL REMOTE_TERMINAL_CONFIRMED population the
+	// old query excluded. v2.0.75 settles every terminal row in the 48h
+	// window EXACTLY ONCE: the selection is the absence of the
+	// model_state.finalProfitSource marker (written by every settle,
+	// including refusals), which also re-settles everything the v2.0.74 chain
+	// misreported — grid-only positives on native stops (prod XMR #672 /
+	// JTO #674: +0.22/+0.27 stored while the app showed ≈ −2.5 each).
 	closedRows, err := worker.db.Query(ctx, `
 		SELECT id, bu_order_id, account_id
 		FROM grid_bots
 		WHERE bu_order_id IS NOT NULL
 		  AND status IN ('STOPPED', 'COMPLETED', 'CANCELLED', 'LIQUIDATED')
-		  AND (realized_pnl_usdt IS NULL OR realized_pnl_usdt = 0)
+		  AND model_state->>'finalProfitSource' IS NULL
 		  AND COALESCE(closed_at, updated_at) > NOW() - INTERVAL '48 hours'
 		ORDER BY created_at DESC
 		LIMIT 20
@@ -3174,27 +3309,54 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 			// v2.0.74: the detail endpoint refuses finished grids, so the
 			// finished-bot list is the authoritative fallback for the final
 			// profit. Either source must also zero any stale floating mark:
-			// a terminal bot has no position left to float.
-			var profit *decimal.Decimal
+			// a terminal bot has no position left to float. v2.0.75: both
+			// sources run the honesty gate; a refused settle NULLs the stored
+			// figure — the previous value is the same incomplete chain.
+			var settled decimal.Decimal
+			var source pionex.FinalProfitSource
+			var gateReason string
+			haveFigure := false
 			if remote, remoteErr := historyClient.GetFuturesGridBot(ctx, item.remoteID); remoteErr == nil && remote != nil {
-				value := remote.BUOrderData.FinalProfit()
-				profit = &value
+				settled, source = remote.BUOrderData.SettledProfit()
+				gateReason = remote.ReasonBy
+				haveFigure = true
 			} else if finished := findFinishedGridRecord(ctx, historyClient, item.remoteID); finished != nil {
-				value := finished.FinalProfit()
-				profit = &value
+				settled, source = finished.SettledProfit()
+				gateReason = finished.ReasonBy
+				haveFigure = true
 			}
-			if profit != nil {
-				if _, err := worker.db.Exec(ctx, `
-					UPDATE grid_bots
-					SET realized_pnl_usdt = $2,
-					    unrealized_pnl_usdt = 0,
-					    reconciliation_state = 'REMOTE_TERMINAL_CONFIRMED',
-					    updated_at = NOW()
-					WHERE id = $1
-				`, item.id, *profit); err != nil {
-					worker.logger.Error("backfill closed grid final PnL",
-						"component", "autogrid_worker", "bot_id", item.id, "error", err)
+			if !haveFigure {
+				continue
+			}
+			if strings.TrimSpace(gateReason) == "" {
+				if err := worker.db.QueryRow(ctx, `
+					SELECT COALESCE(closed_reason, '') FROM grid_bots WHERE id = $1
+				`, item.id).Scan(&gateReason); err != nil {
+					gateReason = ""
 				}
+			}
+			var profitArg any
+			settleRefused := false
+			if gated := gateSettledProfit(settled, source, gateReason); gated != nil {
+				profitArg = *gated
+				worker.persistFinalProfitSource(ctx, item.id, string(source))
+			} else {
+				settleRefused = true
+				worker.persistFinalProfitSource(ctx, item.id, "refused_"+string(source))
+				worker.logger.Warn("backfill settle refused: positive grid-fallback on a loss-class close — final PnL set NULL",
+					"component", "autogrid_worker", "bot_id", item.id,
+					"reason_by", gateReason, "grid_fallback", settled.StringFixed(4))
+			}
+			if _, err := worker.db.Exec(ctx, `
+				UPDATE grid_bots
+				SET realized_pnl_usdt = CASE WHEN $3::BOOLEAN THEN NULL ELSE $2::NUMERIC END,
+				    unrealized_pnl_usdt = 0,
+				    reconciliation_state = 'REMOTE_TERMINAL_CONFIRMED',
+				    updated_at = NOW()
+				WHERE id = $1
+			`, item.id, profitArg, settleRefused); err != nil {
+				worker.logger.Error("backfill closed grid final PnL",
+					"component", "autogrid_worker", "bot_id", item.id, "error", err)
 			}
 		}
 	}
@@ -3422,19 +3584,22 @@ func fleetStopEnvelope(
 }
 
 // tranche2MaxLossCap derives the per-bot effective-stop ceiling after a
-// tranche-2 top-up: the bot's DESIGN full stop (budget × its own leverage ×
-// ADAPTIVE_ATR floor) × breakerHeadroom. The old static $12 (v2.0.56) sat
-// below the 4x design stop ($16 on $200×4×2%) so wide 4x bots could never
-// tranche (prod BEX $16 > $12 skipped forever); the derived cap restores the
-// design: 2x→$10, 4x→$20 on the $200 budget while still refusing σ-scaled
-// overshoots ($29.51 HEMI-style outliers).
+// tranche-2 top-up: the bot's DESIGN full stop range (budget × its own
+// leverage × the ADAPTIVE_ATR stop CEILING) × breakerHeadroom. v2.0.67 sized
+// the cap against the stop FLOOR (2%), which refused exactly the wide-stop
+// bots the top-up exists to save: σ-scaled stops legally land anywhere in
+// [DynamicLossMinPct, DynamicLossMaxPct], and a 6x/$100 bot with a $21.57
+// stop was skipped ×3 against the floor-based $15 (prod SKYAI 2026-09-04).
+// The ceiling-based cap admits the whole legal stop range (6x/$100 → $37.50)
+// while still refusing genuine overshoots (a $40 stop on 6x/$100 exceeds
+// even the ceiling by headroom).
 func tranche2MaxLossCap(budgetUSDT decimal.Decimal, botLeverage int) decimal.Decimal {
 	if botLeverage < 1 {
 		botLeverage = 1
 	}
 	return budgetUSDT.
 		Mul(decimal.NewFromInt(int64(botLeverage))).
-		Mul(designStopFloorFrac()).
+		Mul(designStopCeilFrac()).
 		Mul(decimal.NewFromFloat(breakerHeadroom))
 }
 

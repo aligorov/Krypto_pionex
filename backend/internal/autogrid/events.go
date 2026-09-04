@@ -143,6 +143,12 @@ func QueueTelegramEvent(
 		// stays on its first tranche (cap $12 / fleet envelope).
 		shouldSend = notifyAdjust
 		tmpl = "⛔ <b>Транш-2 отложен:</b> бот #{{bot_number}} {{symbol}} — {{reason}}"
+	case "RADAR_RECENTER_FAILED":
+		// v2.0.75: the exchange refusing the radar's escape adjust used to be
+		// a Warn-only swallow — the operator saw a silent radar while bots sat
+		// in band 4 for hours. One line per hour, first-class signal.
+		shouldSend = notifyAdjust
+		tmpl = "⚠️ <b>Радар: эскейп отклонён биржей:</b> бот #{{bot_number}} {{symbol}} band {{band}} — {{error}}"
 	case "STOP_FORECAST_SHADOW":
 		// v2.0.57: the radar's band transitions used to fall into the
 		// generic {{message}} fallback and shipped literal placeholders

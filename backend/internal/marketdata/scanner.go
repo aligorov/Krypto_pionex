@@ -75,6 +75,10 @@ type ScanConfig struct {
 	// the continuation entries this scan exists to deploy. All other
 	// vetoes (volatility caps, LONG floors, Hurst, backtest) stay armed.
 	CascadeShortMode bool
+	// NotionalPerBot (v2.0.75) is budget×leverage the fleet commits per bot.
+	// Grid density scales with it (GridLevelsForRange): 0 = unknown, the
+	// level count then follows the bare 0.25% step floor.
+	NotionalPerBot float64
 }
 
 type MarketClient interface {
@@ -304,8 +308,11 @@ func scoreCandidate(
 	regime := DetectRegime(sorted)
 	rangePct := clamp(math.Max(volatilityPct*2.5, 2.0), 2.0, 25.0)
 
-	// Grid Level count derived from pair's ATR
-	gridNum := GridLevelsForRange(rangePct, regime.ATRPct)
+	// Grid level count: density scales with the margin (v2.0.75) — the
+	// 0.80% ATR-floored step starved every 4%-span deploy to 6 levels that
+	// never crossed; the count now comes from notional/level ≥ $8 with a
+	// 0.25% step floor.
+	gridNum := GridLevelsForRange(rangePct, config.NotionalPerBot)
 	gridStep := rangePct / 100 / float64(gridNum)
 	friction := 2 * (config.FeeBps + config.SlippageBps) / 10_000
 
@@ -688,29 +695,29 @@ func scoreCandidate(
 			"volatilityParkinson": volParkinson,
 			"hurst":               bundle.Hurst,
 			"confluence": map[string]any{
-				"verdict":          confluence.Verdict,
-				"strength":         confluence.Strength,
-				"longScore":        confluence.LongScore,
-				"shortScore":       confluence.ShortScore,
-				"rangeScore":       confluence.RangeScore,
-				"hurstGate":        confluence.HurstGate,
-				"obvDivDir":        bundle.OBVDiv.Direction,
-				"rsiDivDir":        bundle.RSIDiv.Direction,
-				"iftRsi":           bundle.IFT.Current,
-				"avwapZ":           bundle.AVWAP.ZScore,
-				"keltnerSqueeze":   bundle.Keltner.InSqueeze,
+				"verdict":           confluence.Verdict,
+				"strength":          confluence.Strength,
+				"longScore":         confluence.LongScore,
+				"shortScore":        confluence.ShortScore,
+				"rangeScore":        confluence.RangeScore,
+				"hurstGate":         confluence.HurstGate,
+				"obvDivDir":         bundle.OBVDiv.Direction,
+				"rsiDivDir":         bundle.RSIDiv.Direction,
+				"iftRsi":            bundle.IFT.Current,
+				"avwapZ":            bundle.AVWAP.ZScore,
+				"keltnerSqueeze":    bundle.Keltner.InSqueeze,
 				"fibInGoldenPocket": bundle.Fib.InGoldenPocket,
-				"fibNearRatio":     bundle.Fib.NearRatio,
-				"fibNearLevel":     bundle.Fib.NearLevel,
-				"macdCrossedUp":    bundle.MACD.CrossedUp,
-				"macdCrossedDown":  bundle.MACD.CrossedDown,
-				"macdHistogram":    bundle.MACD.Histogram,
-				"stochK":           bundle.StochRSI.K,
-				"stochD":           bundle.StochRSI.D,
-				"stochCrossedUp":   bundle.StochRSI.CrossedUp,
-				"stochCrossedDown": bundle.StochRSI.CrossedDown,
-				"srNearestSupport": bundle.SR.NearestSupport,
-				"srNearestResist":  bundle.SR.NearestResist,
+				"fibNearRatio":      bundle.Fib.NearRatio,
+				"fibNearLevel":      bundle.Fib.NearLevel,
+				"macdCrossedUp":     bundle.MACD.CrossedUp,
+				"macdCrossedDown":   bundle.MACD.CrossedDown,
+				"macdHistogram":     bundle.MACD.Histogram,
+				"stochK":            bundle.StochRSI.K,
+				"stochD":            bundle.StochRSI.D,
+				"stochCrossedUp":    bundle.StochRSI.CrossedUp,
+				"stochCrossedDown":  bundle.StochRSI.CrossedDown,
+				"srNearestSupport":  bundle.SR.NearestSupport,
+				"srNearestResist":   bundle.SR.NearestResist,
 			},
 			"rangeSource":     "support_resistance_atr_buffered",
 			"fundingIncluded": false,

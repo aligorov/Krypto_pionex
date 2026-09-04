@@ -199,10 +199,12 @@ func mustSettings(t *testing.T, service *Service, id string) *Settings {
 	return settings
 }
 
-// TestTranche2DerivedCapGate pins the derived per-bot cap on a live gate:
-// budget×leverage×2%×1.25 — 2x $8 ≤ $10 passes, 4x $16 ≤ $20 passes (the
-// prod BEX case the static $12 refused forever), $21 > $20 is skipped with
-// the actual cap printed. The breaker is pinned high so only the cap speaks.
+// TestTranche2DerivedCapGate pins the v2.0.75 per-bot cap on a live gate:
+// budget×leverage×5% CEILING×1.25 — 2x $8 ≤ $25 and 4x $16 ≤ $50 pass, and
+// the wide σ-scaled stop class the floor-based cap refused (prod SKYAI 6x
+// $21.57 > $15 skipped ×3) now passes; a $40 stop on 6x/$100 exceeds the
+// $37.50 ceiling cap and is skipped with the actual cap printed. The breaker
+// is pinned high so only the cap speaks.
 func TestTranche2DerivedCapGate(t *testing.T) {
 	dbURL := integrationDatabaseURL(t)
 	ctx := context.Background()
@@ -214,20 +216,26 @@ func TestTranche2DerivedCapGate(t *testing.T) {
 
 	worker, _, live := newCooldownTestWorker(t, pool)
 	pinBreakerFixture(t, pool, live.ID, 11, "1000")
-	settings := *mustSettings(t, worker.service, live.ID)
+	sixFigure := *mustSettings(t, worker.service, live.ID)
+	sixFigure.BudgetUSDT = decimal.NewFromInt(100)
 
 	ghostBot := "00000000-0000-0000-0000-000000000001"
-	if skip := worker.tranche2RiskGate(ctx, settings, ghostBot, 2, decimal.NewFromInt(8)); skip != "" {
-		t.Fatalf("2x bot $8 must pass the derived $10 cap, got %q", skip)
+	if skip := worker.tranche2RiskGate(ctx, sixFigure, ghostBot, 2, decimal.NewFromInt(8)); skip != "" {
+		t.Fatalf("2x bot $8 must pass the derived $25 cap, got %q", skip)
 	}
-	if skip := worker.tranche2RiskGate(ctx, settings, ghostBot, 4, decimal.NewFromInt(16)); skip != "" {
-		t.Fatalf("4x bot $16 must pass the derived $20 cap (prod BEX case), got %q", skip)
+	if skip := worker.tranche2RiskGate(ctx, sixFigure, ghostBot, 4, decimal.NewFromInt(16)); skip != "" {
+		t.Fatalf("4x bot $16 must pass the derived $50 cap, got %q", skip)
 	}
-	skip := worker.tranche2RiskGate(ctx, settings, ghostBot, 4, decimal.NewFromInt(21))
+	// The prod SKYAI case: a $21.57 dynamic stop on 6x/$100 fits under the
+	// $37.50 ceiling the stop formula itself defines.
+	if skip := worker.tranche2RiskGate(ctx, sixFigure, ghostBot, 6, decimal.NewFromFloat(21.57)); skip != "" {
+		t.Fatalf("6x bot $21.57 must pass the derived $37.50 cap (prod SKYAI case), got %q", skip)
+	}
+	skip := worker.tranche2RiskGate(ctx, sixFigure, ghostBot, 6, decimal.NewFromInt(40))
 	if skip == "" {
-		t.Fatalf("$21 must be skipped above the derived $20 cap")
+		t.Fatalf("$40 must be skipped above the derived $37.50 cap")
 	}
-	if !strings.Contains(skip, "20") || !strings.Contains(skip, "21") {
+	if !strings.Contains(skip, "37.5") || !strings.Contains(skip, "40") {
 		t.Fatalf("skip reason must print the actual cap and stop, got %q", skip)
 	}
 }

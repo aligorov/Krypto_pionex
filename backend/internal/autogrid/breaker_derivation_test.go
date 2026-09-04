@@ -62,20 +62,34 @@ func TestDeriveDailyLossBreaker(t *testing.T) {
 	}
 }
 
-// TestTranche2MaxLossCap pins the derived per-bot tranche-2 ceiling
-// budget×leverage×2%×1.25: the old static $12 refused the 4x design stop
-// ($16) forever (prod BEX); the derived cap admits design stops with 25%
-// overshoot headroom and still blocks σ-scaled outliers.
+// TestTranche2MaxLossCap pins the v2.075 per-bot tranche-2 ceiling
+// budget×leverage×5% CEILING×1.25: the floor-based cap (2% → $15 at 6x/$100)
+// refused exactly the wide σ-scaled stops the design formula legally
+// produces (prod SKYAI: $21.57 skipped ×3). The ceiling cap admits the whole
+// legal stop range and still blocks genuine overshoots.
 func TestTranche2MaxLossCap(t *testing.T) {
 	budget := decimal.NewFromInt(200)
-	if cap := tranche2MaxLossCap(budget, 2); !cap.Equal(decimal.NewFromInt(10)) {
-		t.Fatalf("2x cap must be $10, got %s", cap)
+	if cap := tranche2MaxLossCap(budget, 2); !cap.Equal(decimal.NewFromInt(25)) {
+		t.Fatalf("2x cap must be $25, got %s", cap)
 	}
-	if cap := tranche2MaxLossCap(budget, 4); !cap.Equal(decimal.NewFromInt(20)) {
-		t.Fatalf("4x cap must be $20, got %s", cap)
+	if cap := tranche2MaxLossCap(budget, 4); !cap.Equal(decimal.NewFromInt(50)) {
+		t.Fatalf("4x cap must be $50, got %s", cap)
 	}
 	// Degenerate leverage falls back to 1x, never to zero.
-	if cap := tranche2MaxLossCap(budget, 0); !cap.Equal(decimal.NewFromInt(5)) {
-		t.Fatalf("0x (fallback 1x) cap must be $5, got %s", cap)
+	if cap := tranche2MaxLossCap(budget, 0); !cap.Equal(decimal.NewFromFloat(12.5)) {
+		t.Fatalf("0x (fallback 1x) cap must be $12.50, got %s", cap)
+	}
+
+	// Operator case: 6x on $100 → cap $37.50; a $21.57 dynamic stop passes,
+	// a $40 overshoot does not.
+	sixCap := tranche2MaxLossCap(decimal.NewFromInt(100), 6)
+	if !sixCap.Equal(decimal.NewFromFloat(37.5)) {
+		t.Fatalf("6x/$100 cap must be $37.50, got %s", sixCap)
+	}
+	if stop := decimal.NewFromFloat(21.57); stop.GreaterThan(sixCap) {
+		t.Fatalf("$21.57 must fit under the 6x cap %s", sixCap)
+	}
+	if stop := decimal.NewFromFloat(40); !stop.GreaterThan(sixCap) {
+		t.Fatalf("$40 must exceed the 6x cap %s", sixCap)
 	}
 }

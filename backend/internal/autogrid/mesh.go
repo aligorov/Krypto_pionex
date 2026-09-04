@@ -5,16 +5,8 @@ import (
 	"math"
 	"strings"
 
+	"github.com/aligorov/pionex-bot/backend/internal/marketdata"
 	"github.com/shopspring/decimal"
-)
-
-const (
-	// BreakEvenFloorPct is the minimum profitable grid step (0.80%).
-	// Sub-0.80% micro-steps generate pennies that are wiped out by slippage and fees.
-	BreakEvenFloorPct = 0.80
-
-	// MinOrderUsdtPerLevel is the Pionex minimum futures order size per grid level.
-	MinOrderUsdtPerLevel = 2.00
 )
 
 type AdaptiveMeshResult struct {
@@ -26,9 +18,15 @@ type AdaptiveMeshResult struct {
 	UpperPrice   decimal.Decimal `json:"upperPrice"`
 }
 
-// ComputeAdaptiveMesh dynamically calculates the optimal high-yield grid count and step size.
-// It sizes grids with 6 to 14 solid levels ($20-$40/level on $200) and 1.0%-2.5% step sizes,
-// ensuring each grid crossing generates substantial cash profit ($0.70 - $1.50 per fill).
+// ComputeAdaptiveMesh sizes the grid level count under the margin-density
+// doctrine (v2.0.75): step = max(0.25%, the step at which every level still
+// carries ≥ $8 of the budget×leverage notional), levels =
+// clamp(round(span/step), 6, 500). The old economics — a 0.80% "break-even"
+// step floor plus a 6..14 count clamp — starved every $200-notional 4%-span
+// deploy to 6 levels of 0.64-0.75%: three such live bots booked ZERO grid
+// profit in 8h while the dense deployments (0.22% step, 29-60 levels)
+// harvested everything. ATR/regime stay accepted for signature stability but
+// no longer drive density — only the margin does.
 func ComputeAdaptiveMesh(
 	lower decimal.Decimal,
 	upper decimal.Decimal,
@@ -39,14 +37,14 @@ func ComputeAdaptiveMesh(
 	leverage int,
 	minGridStepPct float64,
 ) AdaptiveMeshResult {
-	if minGridStepPct < BreakEvenFloorPct {
-		minGridStepPct = BreakEvenFloorPct
-	}
+	_ = atrPct         // density no longer follows volatility (see doc comment)
+	_ = regime         // and the regime step multiplier is retired with it
+	_ = minGridStepPct // the 0.25% economic floor supersedes caller guesses
 
 	if upper.LessThanOrEqual(lower) || currentPrice.LessThanOrEqual(decimal.Zero) {
 		return AdaptiveMeshResult{
 			GridNum:     8,
-			GridStepPct: decimal.NewFromFloat(minGridStepPct),
+			GridStepPct: decimal.NewFromFloat(marketdata.GridStepFloorPct),
 			GridType:    "GEOMETRIC",
 			LowerPrice:  lower,
 			UpperPrice:  upper,
@@ -59,50 +57,14 @@ func ComputeAdaptiveMesh(
 		spanPct = 12.0
 	}
 
-	// Meaty Step Multiplier based on market regime:
-	// - Range: 0.65 * ATR (giving 1.0% - 1.8% step for fat $0.70-$1.20 fills)
-	// - Trend: 1.00 * ATR (giving 1.8% - 2.8% step for momentum continuation)
-	// - Volatile / Breakout: 1.30 * ATR (giving 2.5% - 4.0% step)
-	stepMult := 0.70
-	switch regime {
-	case "RANGE", "CONSOLIDATION":
-		stepMult = 0.65
-	case "TREND_UP", "TREND_DOWN":
-		stepMult = 1.00
-	case "VOLATILE", "BREAKOUT":
-		stepMult = 1.30
+	lev := int64(1)
+	if leverage > 1 {
+		lev = int64(leverage)
 	}
-
-	targetStepPct := atrPct * stepMult
-	if targetStepPct < minGridStepPct {
-		targetStepPct = minGridStepPct
-	}
-
-	// Calculate ideal grid count (target 6 to 14 solid levels)
-	idealGrids := int(math.Round(spanPct / targetStepPct))
-	if idealGrids < 6 {
-		idealGrids = 6
-	}
-	if idealGrids > 14 {
-		idealGrids = 14
-	}
-
-	// Capital constraint: Total Buying Power / Min Order Value
-	totalBuyingPower, _ := budgetUsdt.Mul(decimal.NewFromInt(int64(leverage))).Float64()
-	maxGridsByCapital := int(totalBuyingPower / MinOrderUsdtPerLevel)
-	if maxGridsByCapital < 6 {
-		maxGridsByCapital = 6
-	}
-	if idealGrids > maxGridsByCapital {
-		idealGrids = maxGridsByCapital
-	}
+	notional, _ := budgetUsdt.Mul(decimal.NewFromInt(lev)).Float64()
+	idealGrids := marketdata.GridLevelsForRange(spanPct, notional)
 
 	actualStepPct := spanPct / float64(idealGrids)
-	if actualStepPct < minGridStepPct {
-		actualStepPct = minGridStepPct
-		idealGrids = int(math.Max(6, math.Round(spanPct/actualStepPct)))
-	}
-
 	stepPerLevel := span.Div(decimal.NewFromInt(int64(idealGrids)))
 
 	return AdaptiveMeshResult{

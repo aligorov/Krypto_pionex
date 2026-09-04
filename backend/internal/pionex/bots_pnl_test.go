@@ -104,6 +104,73 @@ func TestFinalProfitAccessor(t *testing.T) {
 	}
 }
 
+// TestSettledProfitSource pins the v2.0.75 provenance-aware chain: the same
+// figure is only trustworthy when the chain leg that produced it is complete
+// for the close class. The grid-only fallback on a native stop with residual
+// inventory is INCOMPLETE (prod XMR #672 / JTO #674: +0.22 stored while the
+// app's Total PnL read ≈ −2.5 — the position-close leg was silently dropped).
+func TestSettledProfitSource(t *testing.T) {
+	// The documented settled figure always wins.
+	exited := decodeOrderData(t, `{
+		"status": "canceled", "reasonBy": "loss_stop",
+		"profitExited": "-2.5", "profitReduce": "0.22", "closedBaseAmount": "1.4"
+	}`)
+	if got, src := exited.SettledProfit(); !got.Equal(mustDecimal(t, "-2.5")) || src != FinalProfitExited {
+		t.Fatalf("profitExited must win: got %s/%s", got, src)
+	}
+
+	// The full-total alias on a finished record (no profitExited): the app's
+	// Total PnL carrier — accepted for any close class.
+	totalAlias := decodeOrderData(t, `{
+		"status": "canceled", "reasonBy": "loss_stop",
+		"totalProfit": "-2.5", "profitReduce": "0.22", "closedBaseAmount": "1.4"
+	}`)
+	if got, src := totalAlias.SettledProfit(); !got.Equal(mustDecimal(t, "-2.5")) || src != FinalProfitTotalAlias {
+		t.Fatalf("total alias must carry the full total: got %s/%s", got, src)
+	}
+
+	// The XMR/JTO lie, made visible: no profitExited, no total, grid-only
+	// positive while inventory was closed — the source must say INCOMPLETE so
+	// the caller's honesty gate can refuse it.
+	residual := decodeOrderData(t, `{
+		"status": "canceled", "reasonBy": "loss_stop",
+		"profitReduce": "0.21770320", "fundingFeePayment": "0", "closedBaseAmount": "1.4"
+	}`)
+	got, src := residual.SettledProfit()
+	if src != FinalProfitGridResidual {
+		t.Fatalf("grid-only figure with closed inventory must be %s, got %s", FinalProfitGridResidual, src)
+	}
+	if !got.Equal(mustDecimal(t, "0.21770320")) {
+		t.Fatalf("grid-only figure must still expose its value, got %s", got)
+	}
+
+	// Grid + funding on a provably FLAT record is complete: no position, no
+	// closed inventory — there is no missing position-close leg.
+	flat := decodeOrderData(t, `{
+		"status": "canceled", "reasonBy": "user_cancel",
+		"profitReduce": "0.10", "fundingFeePayment": "-0.01"
+	}`)
+	if got, src := flat.SettledProfit(); !got.Equal(mustDecimal(t, "0.09")) || src != FinalProfitGridFlat {
+		t.Fatalf("flat grid+funding must be complete: got %s/%s", got, src)
+	}
+
+	// A live position also marks the grid leg incomplete.
+	live := decodeOrderData(t, `{
+		"status": "canceled", "profitReduce": "0.5", "position": "0.7"
+	}`)
+	if _, src := live.SettledProfit(); src != FinalProfitGridResidual {
+		t.Fatalf("residual position must mark the grid leg incomplete, got %s", src)
+	}
+
+	// Withdrawn-only and bare records keep their legs.
+	if got, src := decodeOrderData(t, `{"status":"canceled","profitWithdrawn":"1.5"}`).SettledProfit(); !got.Equal(mustDecimal(t, "1.5")) || src != FinalProfitWithdrawn {
+		t.Fatalf("withdrawn-only: got %s/%s", got, src)
+	}
+	if _, src := decodeOrderData(t, `{"status":"canceled"}`).SettledProfit(); src != FinalProfitNone {
+		t.Fatalf("bare record must be %s, got %s", FinalProfitNone, src)
+	}
+}
+
 // TestBotOrderFuturesGridData proves the finished-bot list entries decode
 // into the same typed payload as the order-detail endpoint, so final PnL is
 // recoverable when the detail endpoint refuses a finished grid.

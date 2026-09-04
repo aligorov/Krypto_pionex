@@ -430,6 +430,15 @@ func designStopFloorFrac() decimal.Decimal {
 	return decimal.NewFromFloat(marketdata.DynamicLossMinPct / 100)
 }
 
+// designStopCeilFrac is the ADAPTIVE_ATR stop CEILING as a fraction of the
+// budget×leverage notional — the upper bound of the legal stop range. The
+// tranche-2 per-bot cap budgets against THIS bound (v2.0.75): a designed bot
+// may legally store any stop in [floor, ceiling], so a floor-based cap
+// refuses exactly the wide-stop bots the top-up exists to save.
+func designStopCeilFrac() decimal.Decimal {
+	return decimal.NewFromFloat(marketdata.DynamicLossMaxPct / 100)
+}
+
 // DeriveDailyLossBreaker returns the daily-loss breaker implied by the fleet
 // design: maxActiveBots × the stop a designed bot STORES in steady state ×
 // breakerHeadroom. With tranches on, steady-state storage is the tranche-1
@@ -970,6 +979,48 @@ func (s *Service) CloseAllActiveBots(ctx context.Context, reason string) error {
 	return nil
 }
 
+// AccountEquitySummary is the wallet-truth epoch accounting: the operator's
+// headline "итоговый PnL" measured on the futures wallet itself, immune to
+// the fee blindness of every bot-level PnL field (v2.0.75).
+type AccountEquitySummary struct {
+	EpochStartedAt  time.Time       `json:"epochStartedAt"`
+	EpochPnLUSDT    decimal.Decimal `json:"epochPnlUsdt"`
+	EquityStartUSDT decimal.Decimal `json:"equityStartUsdt"`
+	EquityNowUSDT   decimal.Decimal `json:"equityNowUsdt"`
+	Snapshots       int             `json:"snapshots"`
+}
+
+// AccountEquityEpoch derives the wallet-truth epoch PnL from the equity
+// snapshot ledger: equity_now − equity_first_snapshot for the managed
+// account. No snapshots yet → nil, and the caller reports "not measured".
+func (s *Service) AccountEquityEpoch(ctx context.Context) (*AccountEquitySummary, error) {
+	accountID, err := s.resolveAccount(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if accountID == nil {
+		return nil, errors.New("no Pionex account configured")
+	}
+	summary := &AccountEquitySummary{}
+	if err := s.db.QueryRow(ctx, `
+		SELECT
+		  (SELECT equity_usdt  FROM account_equity_snapshots WHERE account_id = $1 ORDER BY captured_at ASC LIMIT 1),
+		  (SELECT captured_at  FROM account_equity_snapshots WHERE account_id = $1 ORDER BY captured_at ASC LIMIT 1),
+		  (SELECT equity_usdt  FROM account_equity_snapshots WHERE account_id = $1 ORDER BY captured_at DESC LIMIT 1),
+		  (SELECT COUNT(*)     FROM account_equity_snapshots WHERE account_id = $1)
+	`, *accountID).Scan(
+		&summary.EquityStartUSDT, &summary.EpochStartedAt,
+		&summary.EquityNowUSDT, &summary.Snapshots,
+	); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("load equity epoch: %w", err)
+	}
+	summary.EpochPnLUSDT = summary.EquityNowUSDT.Sub(summary.EquityStartUSDT)
+	return summary, nil
+}
+
 func (s *Service) scannerConfig(settings Settings) marketdata.ScanConfig {
 	return marketdata.ScanConfig{
 		Interval:            settings.CandleInterval,
@@ -988,6 +1039,9 @@ func (s *Service) scannerConfig(settings Settings) marketdata.ScanConfig {
 		BaseLeverage:        settings.Leverage,
 		AdaptiveLeverage:    settings.AdaptiveLeverageEnabled,
 		GridType:            mapGridType(settings.DensityGridEnabled),
+		// v2.0.75 margin-density doctrine: the scanner sizes the level count
+		// against the notional a slot actually commits.
+		NotionalPerBot: settings.BudgetUSDT.Mul(decimal.NewFromInt(int64(settings.Leverage))).InexactFloat64(),
 	}
 }
 
@@ -1852,15 +1906,6 @@ func sigmaDailyFromCandles(candles []pionex.KlineCandle) float64 {
 	return std * math.Sqrt(24) * 100
 }
 
-// lastATRPct reads the recent ATR% for a symbol from live klines.
-func (s *Service) lastATRPct(ctx context.Context, symbol string) float64 {
-	candles, err := s.publicAPI.GetKlines(ctx, symbol, "60M", 60)
-	if err != nil || len(candles) < 30 {
-		return 0
-	}
-	return marketdata.DetectRegime(candles).ATRPct
-}
-
 // manualInvestmentFloor is the smallest per-deploy investment override the
 // operator may hand in: below it a typo ($0.5 instead of $5) could pass every
 // native check and still be dust after fees.
@@ -1942,11 +1987,14 @@ func (s *Service) DeployManualBot(
 	lower, upper := input.Lower, input.Upper
 	row := input.Row
 	if row <= 0 && upper.GreaterThan(lower) && lower.GreaterThan(decimal.Zero) {
-		// ATR-derived level count for the operator's range (AI Kit count is
-		// applied automatically when the prefill was taken from the proposal).
+		// Margin-density level count for the operator's range (v2.0.75): the
+		// count follows the notional this deploy actually commits (investment
+		// override included); AI Kit count is applied automatically when the
+		// prefill was taken from the proposal.
 		mid := upper.Add(lower).Div(decimal.NewFromInt(2))
 		rangePct := upper.Sub(lower).Div(mid).InexactFloat64() * 100
-		row = marketdata.GridLevelsForRange(rangePct, s.lastATRPct(ctx, input.Symbol))
+		notional := investment.Mul(decimal.NewFromInt(int64(leverage))).InexactFloat64()
+		row = marketdata.GridLevelsForRange(rangePct, notional)
 	}
 	// Fall back to the latest scanner recommendation for missing fields.
 	if !upper.GreaterThan(lower) {
