@@ -97,11 +97,11 @@ func (worker *Worker) captureAccountEquity(ctx context.Context, settings Setting
 		worker.alertEquityCaptureFailure(ctx, "CLIENT_UNAVAILABLE", err.Error())
 		return
 	}
-	wallet, walletSource, walletErr := worker.fetchEquityWallet(ctx, client)
+	wallet, walletSource, walletErr, rawDetail := worker.fetchEquityWallet(ctx, client)
 	if walletErr != nil {
 		worker.logger.Warn("equity snapshot: account detail fetch failed",
 			"component", "autogrid_worker", "error", walletErr)
-		worker.alertEquityCaptureFailure(ctx, "FETCH_FAILED", walletErr.Error())
+		worker.alertEquityCaptureFailure(ctx, "FETCH_FAILED", walletErr.Error()+" | raw: "+rawDetail)
 		return
 	}
 	if wallet == nil {
@@ -112,7 +112,7 @@ func (worker *Worker) captureAccountEquity(ctx context.Context, settings Setting
 		// what the operator must see, once per hour, not never.
 		worker.logger.Warn("equity snapshot: no USDT wallet decoded (empty balances)")
 		worker.alertEquityCaptureFailure(ctx, "EMPTY_DECODE",
-			"account/detail вернул без USDT-строки (пустой balances или декод мимо полей)")
+			"account/detail вернул без USDT-строки; raw: "+rawDetail)
 		return
 	}
 
@@ -170,10 +170,10 @@ func (worker *Worker) captureAccountEquity(ctx context.Context, settings Setting
 // Both sources are Pionex-only and per the official spec (AGENTS.md rule 1).
 func (worker *Worker) fetchEquityWallet(
 	ctx context.Context, client *pionex.Client,
-) (*equityWallet, string, error) {
-	balances, err := client.GetFuturesAccountDetail(ctx)
+) (*equityWallet, string, error, string) {
+	balances, rawDetail, err := client.GetFuturesAccountDetailRaw(ctx)
 	if err != nil {
-		return nil, "", err
+		return nil, "", err, rawDetail
 	}
 	for i := range balances {
 		if strings.EqualFold(balances[i].Coin, "USDT") && balances[i].Assets.GreaterThan(decimal.Zero) {
@@ -182,13 +182,13 @@ func (worker *Worker) fetchEquityWallet(
 				available:     balances[i].Available,
 				unrealizedPnL: balances[i].UnrealizedPnL,
 				debts:         balances[i].Debts,
-			}, "account_detail", nil
+			}, "account_detail", nil, rawDetail
 		}
 	}
 	// Fallback: balances has no unrealizedPnL field; positions does.
 	walletBalances, balErr := client.GetFuturesBalances(ctx)
 	if balErr != nil {
-		return nil, "", fmt.Errorf("detail empty, balances fallback failed: %w", balErr)
+		return nil, "", fmt.Errorf("detail empty, balances fallback failed: %w", balErr), rawDetail
 	}
 	wallet := &equityWallet{}
 	found := false
@@ -202,19 +202,19 @@ func (worker *Worker) fetchEquityWallet(
 		}
 	}
 	if !found {
-		return nil, "", nil
+		return nil, "", nil, rawDetail
 	}
 	positions, posErr := client.GetFuturesPositions(ctx)
 	if posErr != nil {
 		// Positions only refine the floating leg; the equity without it is
 		// still the wallet truth minus the floating PnL — accept, but carry
 		// the failure into the source tag so audits see the degradation.
-		return wallet, "balances_no_positions", nil
+		return wallet, "balances_no_positions", nil, rawDetail
 	}
 	for _, position := range positions {
 		wallet.unrealizedPnL = wallet.unrealizedPnL.Add(position.UnrealizedPNL)
 	}
-	return wallet, "balances_positions", nil
+	return wallet, "balances_positions", nil, rawDetail
 }
 
 // alertEquityCaptureFailure makes a dying equity capture visible outside

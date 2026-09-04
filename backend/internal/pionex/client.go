@@ -512,9 +512,18 @@ func (b *FuturesDetailBalance) UnmarshalJSON(raw []byte) error {
 // the probe recovers it — an empty result here is reported by the caller as
 // an observable EQUITY_CAPTURE_FAILED instead of a silent empty wallet.
 func (c *Client) GetFuturesAccountDetail(ctx context.Context) ([]FuturesDetailBalance, error) {
+	balances, _, err := c.GetFuturesAccountDetailRaw(ctx)
+	return balances, err
+}
+
+// GetFuturesAccountDetailRaw additionally returns a bounded snippet of the
+// raw payload so an EMPTY_DECODE alert can carry the live shape (the spec
+// has deviated three times already: numbers-for-strings, `results` key,
+// unknown nesting) instead of a blind "no USDT row".
+func (c *Client) GetFuturesAccountDetailRaw(ctx context.Context) ([]FuturesDetailBalance, string, error) {
 	raw, err := c.doRaw(ctx, http.MethodGet, "/uapi/v1/account/detail", nil, nil, true, 5)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	var data struct {
 		Balances []FuturesDetailBalance `json:"balances"`
@@ -523,12 +532,27 @@ func (c *Client) GetFuturesAccountDetail(ctx context.Context) ([]FuturesDetailBa
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(raw, &data); err != nil {
-		return nil, fmt.Errorf("decode pionex response data: %w", err)
+		return nil, snippet(raw), fmt.Errorf("decode pionex response data: %w", err)
 	}
 	if len(data.Balances) > 0 {
-		return data.Balances, nil
+		return data.Balances, snippet(raw), nil
 	}
-	return data.Data.Balances, nil
+	return data.Data.Balances, snippet(raw), nil
+}
+
+// snippet bounds a raw payload for telemetry: response bodies carry amounts
+// only (no credentials), but keep it short and single-line.
+func snippet(raw []byte) string {
+	s := strings.Map(func(r rune) rune {
+		if r == '\n' || r == '\r' || r == '\t' {
+			return ' '
+		}
+		return r
+	}, string(raw))
+	if len(s) > 400 {
+		return s[:400] + "..."
+	}
+	return s
 }
 
 // doRaw performs a signed request and returns the undecoded envelope payload
