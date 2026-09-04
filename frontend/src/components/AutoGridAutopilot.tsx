@@ -1,6 +1,13 @@
 import { FormEvent, useCallback, useEffect, useMemo, useState } from 'react';
 import { api, describeError, getCachedAutoGrid, setCachedAutoGrid } from '../api';
-import type { Account, AutoGridPreset, AutoGridSettings, AutoGridState } from '../types';
+import type {
+  Account,
+  AutoGridPreset,
+  AutoGridSettings,
+  AutoGridState,
+  EquityEpochResponse,
+  EquityEpochSummary,
+} from '../types';
 
 interface Props {
   canOperate: boolean;
@@ -32,6 +39,26 @@ export default function AutoGridAutopilot({ canOperate, accountsHref }: Props) {
   const [presets, setPresets] = useState<AutoGridPreset[]>([]);
   const [busyPreset, setBusyPreset] = useState<string | null>(null);
   const [busyMode, setBusyMode] = useState<string | null>(null);
+  // Wallet-truth TOTAL PnL: snapshots land every 5 minutes on the worker,
+  // so a 60-second poll is far inside the data's own resolution.
+  const [equity, setEquity] = useState<EquityEpochSummary | null>(null);
+  const [equityAvailable, setEquityAvailable] = useState<boolean | null>(null);
+
+  const loadEquity = useCallback(async () => {
+    try {
+      const res = await api<EquityEpochResponse>('/api/autogrid/equity');
+      setEquity(res.summary);
+      setEquityAvailable(res.available);
+    } catch {
+      setEquityAvailable(null);
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadEquity();
+    const timer = window.setInterval(() => void loadEquity(), 60_000);
+    return () => window.clearInterval(timer);
+  }, [loadEquity]);
 
   async function switchMode(mode: 'PAPER' | 'REAL') {
     if (mode === 'REAL' && !window.confirm(
@@ -249,7 +276,8 @@ export default function AutoGridAutopilot({ canOperate, accountsHref }: Props) {
         </div>
       </div>
 
-      <div className="metric-grid">
+      <div className="metric-grid metric-grid-six">
+        <TotalPnlCard equity={equity} available={equityAvailable} />
         <Metric
           label={`Активных ботов (${state.activeBots.filter((bot) => bot.source === 'PAPER').length}P / ${state.activeBots.filter((bot) => bot.source === 'REAL').length}R)`}
           value={String(state.activeBots.length)}
@@ -430,6 +458,49 @@ function Metric({
       </div>
       <strong className={tone}>{value}</strong>
       {hint && <small className="muted">{hint}</small>}
+    </div>
+  );
+}
+
+// TotalPnlCard is the operator's headline number, the same "Total PnL" the
+// Pionex app shows: epoch PnL measured on the futures wallet itself
+// (equity_now − first snapshot) — the only figure that contains the
+// entry/exit/invest_in fees the per-bot PnL fields never see. The card is
+// the most prominent element of the summary row; when snapshots are not
+// being written it turns into the capture-pipeline alarm.
+function TotalPnlCard({ equity, available }: { equity: EquityEpochSummary | null; available: boolean | null }) {
+  if (!equity || available !== true) {
+    return (
+      <div className="metric-card metric-card-hero">
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
+          <span>TOTAL PnL (биржа)</span>
+          <span className="badge danger">снапшоты не пишутся</span>
+        </div>
+        <strong className="muted">—</strong>
+        <small className="muted">
+          Кошелёк не снапшотится: захват equity мёртв или ещё не написал первую
+          точку (событие EQUITY_CAPTURE_FAILED в журнале покажет причину).
+        </small>
+      </div>
+    );
+  }
+  const epochPnl = Number(equity.epochPnlUsdt) || 0;
+  const unrealized = Number(equity.exchangeUnrealizedPnlUsdt) || 0;
+  const capturedAt = equity.capturedAt ? new Date(equity.capturedAt).toLocaleTimeString() : '—';
+  return (
+    <div className="metric-card metric-card-hero">
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
+        <span>TOTAL PnL (биржа)</span>
+        <span className="badge neutral">снапшотов: {equity.snapshots}</span>
+      </div>
+      <strong className={epochPnl >= 0 ? 'positive' : 'negative'}>
+        {epochPnl >= 0 ? '+' : ''}{epochPnl.toFixed(2)} USDT
+      </strong>
+      <small className="muted">
+        Плавающий (биржа): {unrealized >= 0 ? '+' : ''}{unrealized.toFixed(2)} · equity сейчас{' '}
+        {(Number(equity.equityNowUsdt) || 0).toFixed(2)} / на старте{' '}
+        {(Number(equity.equityStartUsdt) || 0).toFixed(2)} · снапшот {capturedAt}
+      </small>
     </div>
   );
 }

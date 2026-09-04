@@ -459,16 +459,93 @@ type FuturesDetailBalance struct {
 	Debts              decimal.Decimal `json:"debts"`
 }
 
+// UnmarshalJSON decodes one balance row defensively. The official OpenAPI
+// declares every numeric field a string, but the live API has deviated from
+// the docs before (v2.0.74: leverage/row arrived as unquoted numbers where
+// the spec said strings), and shopspring's decimal rejects an empty string
+// outright. A single malformed field must not zero out the whole USDT row —
+// that produced the "empty wallet" silent no-op that left the equity ledger
+// at 0 rows for weeks (v2.0.75–v2.0.79 prod): string/number/null all decode,
+// missing keys stay zero.
+func (b *FuturesDetailBalance) UnmarshalJSON(raw []byte) error {
+	var probe struct {
+		Coin               string          `json:"coin"`
+		Assets             json.RawMessage `json:"assets"`
+		Free               json.RawMessage `json:"free"`
+		Frozen             json.RawMessage `json:"frozen"`
+		Transferable       json.RawMessage `json:"transferable"`
+		Available          json.RawMessage `json:"available"`
+		UnrealizedPnL      json.RawMessage `json:"unrealizedPnL"`
+		TotalInitialMargin json.RawMessage `json:"totalInitialMargin"`
+		Debts              json.RawMessage `json:"debts"`
+	}
+	if err := json.Unmarshal(raw, &probe); err != nil {
+		return err
+	}
+	b.Coin = probe.Coin
+	targets := []*decimal.Decimal{
+		&b.Assets, &b.Free, &b.Frozen, &b.Transferable,
+		&b.Available, &b.UnrealizedPnL, &b.TotalInitialMargin, &b.Debts,
+	}
+	sources := []json.RawMessage{
+		probe.Assets, probe.Free, probe.Frozen, probe.Transferable,
+		probe.Available, probe.UnrealizedPnL, probe.TotalInitialMargin, probe.Debts,
+	}
+	for i, source := range sources {
+		trimmed := strings.TrimSpace(string(source))
+		// Missing key, JSON null, and the empty string all mean "no value":
+		// the field stays zero instead of failing the whole row.
+		if trimmed == "" || trimmed == "null" || trimmed == `""` || trimmed == `''` {
+			continue
+		}
+		if err := json.Unmarshal(source, targets[i]); err != nil {
+			return fmt.Errorf("futures balance field %d: %w", i, err)
+		}
+	}
+	return nil
+}
+
 // GetFuturesAccountDetail returns the cross-margin balance list of GET
 // /uapi/v1/account/detail (official docs: AccountDetail.balances[]).
+// The primary decode follows the documented shape data.balances[]; if the
+// live payload nests the object one envelope deeper (data.data.balances[]),
+// the probe recovers it — an empty result here is reported by the caller as
+// an observable EQUITY_CAPTURE_FAILED instead of a silent empty wallet.
 func (c *Client) GetFuturesAccountDetail(ctx context.Context) ([]FuturesDetailBalance, error) {
-	var data struct {
-		Balances []FuturesDetailBalance `json:"balances"`
-	}
-	if err := c.do(ctx, http.MethodGet, "/uapi/v1/account/detail", nil, nil, true, 5, &data); err != nil {
+	raw, err := c.doRaw(ctx, http.MethodGet, "/uapi/v1/account/detail", nil, nil, true, 5)
+	if err != nil {
 		return nil, err
 	}
-	return data.Balances, nil
+	var data struct {
+		Balances []FuturesDetailBalance `json:"balances"`
+		Data     struct {
+			Balances []FuturesDetailBalance `json:"balances"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(raw, &data); err != nil {
+		return nil, fmt.Errorf("decode pionex response data: %w", err)
+	}
+	if len(data.Balances) > 0 {
+		return data.Balances, nil
+	}
+	return data.Data.Balances, nil
+}
+
+// doRaw performs a signed request and returns the undecoded envelope payload
+// (the `data` field) so callers can probe undocumented shape deviations.
+func (c *Client) doRaw(
+	ctx context.Context,
+	method, path string,
+	query url.Values,
+	body []byte,
+	private bool,
+	weight int,
+) (json.RawMessage, error) {
+	var raw json.RawMessage
+	if err := c.do(ctx, method, path, query, body, private, weight, &raw); err != nil {
+		return nil, err
+	}
+	return raw, nil
 }
 
 func (c *Client) do(

@@ -435,6 +435,27 @@ export interface AutoGridState {
   featureAvailability: Record<string, string>;
 }
 
+// Wallet-truth epoch accounting served by GET /api/autogrid/equity: the
+// operator's headline TOTAL PnL measured on the futures wallet itself
+// (equity_now − first snapshot), with the exchange's own unrealized PnL
+// and the capture time so staleness is visible at a glance.
+// available=false means the capture pipeline is not writing snapshots.
+export interface EquityEpochSummary {
+  epochStartedAt: string;
+  epochPnlUsdt: string;
+  equityStartUsdt: string;
+  equityNowUsdt: string;
+  snapshots: number;
+  exchangeUnrealizedPnlUsdt: string;
+  capturedAt: string;
+}
+
+export interface EquityEpochResponse {
+  available: boolean;
+  summary: EquityEpochSummary | null;
+  note: string;
+}
+
 export interface SpotGridAIStrategy {
   annualized: string;
   totalApr: string;

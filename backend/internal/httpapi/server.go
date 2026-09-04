@@ -941,8 +941,10 @@ func (s *Server) autoGridAIFill(w http.ResponseWriter, r *http.Request) {
 }
 
 // autoGridEquityEpoch reports the wallet-truth epoch PnL: futures wallet
-// equity now minus the first recorded snapshot. Null summary means "no
-// snapshots yet" — the measurement starts with the worker's first capture.
+// equity now minus the first recorded snapshot. available=false means "no
+// snapshots yet" — the capture pipeline is not writing the ledger (dead
+// fetch, empty decode or no account) and the UI must raise the alarm
+// instead of showing a fabricated zero.
 func (s *Server) autoGridEquityEpoch(w http.ResponseWriter, r *http.Request) {
 	summary, err := s.autogrid.AccountEquityEpoch(r.Context())
 	if err != nil {
@@ -950,8 +952,9 @@ func (s *Server) autoGridEquityEpoch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"summary": summary,
-		"note":    "epoch PnL measured on the futures wallet (equity_now − first snapshot); bot PnL fields never see entry/exit/invest_in fees",
+		"available": summary != nil,
+		"summary":   summary,
+		"note":      "epoch PnL measured on the futures wallet (equity_now − first snapshot); bot PnL fields never see entry/exit/invest_in fees",
 	})
 }
 

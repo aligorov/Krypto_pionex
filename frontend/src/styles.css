@@ -78,9 +78,15 @@ main { padding: 28px 32px 60px; max-width: 1540px; width: 100%; margin: 0 auto; 
 .kill-panel h2 { margin: 6px 0; font-size: 25px; letter-spacing: -.02em; }
 .kill-panel p { margin: 0; color: var(--muted); }
 .metric-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 14px; margin-bottom: 18px; }
+.metric-grid-six { grid-template-columns: repeat(6, 1fr); }
 .metric-card { padding: 20px; display: grid; gap: 12px; }
 .metric-card span { color: var(--muted); font-size: 12px; }
 .metric-card strong { font-size: 29px; letter-spacing: -.04em; }
+/* The operator's headline card (TOTAL PnL from the exchange wallet): the
+   most prominent figure of the autopilot summary row — larger number,
+   accent border, subtle lift over the sibling cards. */
+.metric-card-hero { border-color: rgba(101, 245, 190, .25); box-shadow: 0 0 0 1px rgba(101, 245, 190, .08), var(--shadow); }
+.metric-card-hero strong { font-size: 38px; }
 .two-column { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
 /* Grid items default to min-width:auto — a wide table inside a 1fr track
    inflates the track past the viewport instead of scrolling. */
