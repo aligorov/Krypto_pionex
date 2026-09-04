@@ -5,7 +5,10 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/shopspring/decimal"
 )
@@ -117,5 +120,87 @@ func TestAdjustFuturesGridBotContract(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("AdjustFuturesGridBot failed: %v", err)
+	}
+}
+
+// keepInvestment is a pointer on purpose: nil must OMIT the field (the
+// exchange default false = the floating-PnL gate applies), true must ship.
+func TestAdjustFuturesGridKeepInvestmentMarshaling(t *testing.T) {
+	raw, err := json.Marshal(AdjustFuturesGridParams{BUOrderID: "G", Type: "adjust_params"})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(raw), "keepInvestment") {
+		t.Fatalf("nil KeepInvestment must omit the field, got %s", raw)
+	}
+	keep := true
+	raw, err = json.Marshal(AdjustFuturesGridParams{BUOrderID: "G", Type: "adjust_params", KeepInvestment: &keep})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(raw), `"keepInvestment":true`) {
+		t.Fatalf("true KeepInvestment must ship, got %s", raw)
+	}
+	falseKeep := false
+	raw, err = json.Marshal(AdjustFuturesGridParams{BUOrderID: "G", Type: "adjust_params", KeepInvestment: &falseKeep})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(raw), `"keepInvestment":false`) {
+		t.Fatalf("explicit false KeepInvestment must ship, got %s", raw)
+	}
+}
+
+// The dry-run contract: same body as the live adjust, endpoint
+// .../adjustParamsCheck, and a refused check (result=false) surfaces as an
+// error carrying the exchange code — never a silent pass.
+func TestCheckAdjustFuturesGridBotContract(t *testing.T) {
+	var refused atomic.Bool
+	var lastBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/bot/orders/futuresGrid/adjustParamsCheck" {
+			t.Errorf("expected adjustParamsCheck path, got %s", r.URL.Path)
+		}
+		_ = json.NewDecoder(r.Body).Decode(&lastBody)
+		w.Header().Set("Content-Type", "application/json")
+		if refused.Load() {
+			json.NewEncoder(w).Encode(map[string]any{
+				"result": false, "code": "BOT_INVALID_ARGUMENT",
+				"message": "PROFIT_LESS_THAN_ZERO", "timestamp": time.Now().UnixMilli(),
+			})
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]any{
+			"result": true, "code": "200", "timestamp": time.Now().UnixMilli(),
+			"data": map[string]any{"min_investment": "5", "slippage": "0.1"},
+		})
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, "testKey", "testSecret")
+	bottom, top := decimal.NewFromInt(100), decimal.NewFromInt(120)
+	keep := true
+	result, err := client.CheckAdjustFuturesGridBot(context.Background(), AdjustFuturesGridParams{
+		BUOrderID: "GRID_1", Type: "adjust_params",
+		Bottom: &bottom, Top: &top, Row: 20, KeepInvestment: &keep,
+	})
+	if err != nil {
+		t.Fatalf("CheckAdjustFuturesGridBot failed: %v", err)
+	}
+	if lastBody["keepInvestment"] != true {
+		t.Fatalf("the check must validate the IDENTICAL body incl. keepInvestment, got %v", lastBody)
+	}
+	if !result.MinInvestment.Equal(decimal.NewFromInt(5)) {
+		t.Fatalf("check payload must decode, got %+v", result)
+	}
+
+	refused.Store(true)
+	if _, err := client.CheckAdjustFuturesGridBot(context.Background(), AdjustFuturesGridParams{
+		BUOrderID: "GRID_1", Type: "adjust_params",
+		Bottom: &bottom, Top: &top, Row: 20, KeepInvestment: &keep,
+	}); err == nil {
+		t.Fatal("a refused check must surface as an error")
+	} else if !strings.Contains(err.Error(), "PROFIT_LESS_THAN_ZERO") {
+		t.Fatalf("the refusal must carry the exchange reason, got %v", err)
 	}
 }

@@ -1671,6 +1671,11 @@ type AdjustBotInput struct {
 	Lower           decimal.Decimal `json:"lower,omitempty"`
 	Upper           decimal.Decimal `json:"upper,omitempty"`
 	Row             int             `json:"row,omitempty"`
+	// KeepInvestment (adjust_params only) ships the documented keepInvestment
+	// flag: a pure range transfer that skips the exchange PROFIT_LESS_THAN_ZERO
+	// gate and does NOT reset the investment amount. Non-nil true only; nil
+	// keeps the legacy green-only semantics.
+	KeepInvestment *bool `json:"keepInvestment,omitempty"`
 }
 
 // ErrNativeAdjustRefused marks an adjust that the EXCHANGE itself refused —
@@ -1745,6 +1750,18 @@ func (s *Service) AdjustBot(
 			}
 			if !input.Upper.GreaterThan(input.Lower) || !input.Lower.GreaterThan(decimal.Zero) {
 				return "", errors.New("adjust_params requires upper > lower > 0")
+			}
+			// v2.0.85 rescue shifts: keepInvestment=true moves the range
+			// without realizing PnL (the exchange skips its
+			// PROFIT_LESS_THAN_ZERO gate but still validates the range).
+			// Dry-run FIRST through the documented adjustParamsCheck: a
+			// refused check means the live call is a guaranteed rejection —
+			// nothing is sent and the error carries the exchange's reason.
+			if input.KeepInvestment != nil && *input.KeepInvestment {
+				params.KeepInvestment = input.KeepInvestment
+				if _, checkErr := client.CheckAdjustFuturesGridBot(ctx, params); checkErr != nil {
+					return "", fmt.Errorf("adjustParamsCheck refused keepInvestment shift: %w: %w", ErrNativeAdjustRefused, checkErr)
+				}
 			}
 		}
 		if err := client.AdjustFuturesGridBot(ctx, params); err != nil {

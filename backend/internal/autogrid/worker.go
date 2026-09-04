@@ -83,6 +83,12 @@ type Worker struct {
 	// dataAlarmAt dedups data-health alarms to one per feed per 24h
 	// (same single-goroutine argument as trancheTBRegime).
 	dataAlarmAt map[string]time.Time
+	// radarPriceTrail is the in-memory symbol→(ts,price) pair behind the
+	// v2.0.85 band-2 velocity trigger: two consecutive radar passes measure
+	// the speed toward the adverse edge (same single-goroutine argument as
+	// trancheTBRegime — radarPass runs on the manage loop). Deliberately not
+	// durable: it is a measurement, not a cooldown.
+	radarPriceTrail map[string]radarPricePoint
 }
 
 type trancheTBTrend struct {
@@ -122,6 +128,7 @@ func NewWorker(
 		owner:           fmt.Sprintf("autogrid-%d", time.Now().UnixNano()),
 		trancheTBRegime: make(map[string]trancheTBTrend),
 		dataAlarmAt:     make(map[string]time.Time),
+		radarPriceTrail: make(map[string]radarPricePoint),
 	}
 }
 
@@ -3436,26 +3443,37 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 					"component", "autogrid_worker", "bot_id", bot.id, "symbol", bot.symbol)
 				break
 			}
-			// v2.0.76 feasibility preflight, same floor as the radar: the live
-			// remote FLOATING PnL must clear the buffer or the exchange rejects
-			// adjust_params with BOT_INVALID_ARGUMENT/PROFIT_LESS_THAN_ZERO
-			// (v2.0.83: the gate is the floating leg — the exchange keys on pure
-			// floating PnL > 0, so banked grid profit cannot mask a sinking
-			// position, prod NEAR #688). Skipping the call removes the
-			// guaranteed-rejection spam; the break itself stays owned by the
-			// existing ladder — RANGE_BREAK_* closes on adverse regime,
+			// v2.0.85 "shift always" (same mode preflight as the radar): the
+			// live remote FLOATING PnL selects HOW the break shift ships —
+			// green → normal re-base; under water → keepInvestment rescue
+			// transfer (documented flag: pure range move, the exchange skips
+			// its PROFIT_LESS_THAN_ZERO gate but still validates the price
+			// range), dry-run adjustParamsCheck FIRST so a refused check never
+			// costs the live call. The break keeps its existing owners
+			// regardless — RANGE_BREAK_* closes on adverse regime,
 			// _NO_ADJUSTMENTS_LEFT on budget exhaustion, plus the anti-hunt
 			// structural stop and the max-loss stop keep running.
-			if remoteTotal := realized.Add(unrealized); !adjustShiftFeasible(unrealized) {
-				worker.manageShiftBlockedUnderwater(ctx, bot.id, bot.botNumber, bot.symbol,
-					decision.Reason, remoteTotal, price)
-				break
-			}
-			if err := client.AdjustFuturesGridBot(ctx, pionex.AdjustFuturesGridParams{
+			shiftMode := adjustShiftMode(unrealized)
+			adjustReq := pionex.AdjustFuturesGridParams{
 				BUOrderID: bot.remoteID, Type: "adjust_params",
 				ExtraMargin: false, OpenPrice: &price,
 				Bottom: &decision.NewLower, Top: &decision.NewUpper, Row: bot.rowNum,
-			}); err != nil {
+			}
+			if shiftMode == shiftModeKeepInvestment {
+				keepFlag := true
+				adjustReq.KeepInvestment = &keepFlag
+				if _, checkErr := client.CheckAdjustFuturesGridBot(ctx, adjustReq); checkErr != nil {
+					// The exchange already refused this exact payload: the
+					// live call is a guaranteed rejection, nothing is sent
+					// and the reason is durable in the logs (the break's
+					// exit ladder keeps owning the bot).
+					worker.logger.Error("manage range shift refused by adjustParamsCheck — live call skipped",
+						"component", "autogrid_worker", "bot_id", bot.id, "symbol", bot.symbol,
+						"mode", shiftMode, "reason", decision.Reason, "error", checkErr)
+					break
+				}
+			}
+			if err := client.AdjustFuturesGridBot(ctx, adjustReq); err != nil {
 				worker.logger.Error("adjust native grid range",
 					"component", "autogrid_worker", "bot_id", bot.id, "error", err)
 			} else {
@@ -3497,7 +3515,8 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 
 				totalPnL := realized.Add(unrealized)
 				if err := LogBotEvent(ctx, worker.db, bot.id, bot.botNumber, "REAL", bot.symbol, "ADJUST_RANGE", &price, &totalPnL, map[string]any{
-					"reason": decision.Reason, "new_lower": decision.NewLower.String(), "new_upper": decision.NewUpper.String(),
+					"reason": decision.Reason, "mode": shiftMode,
+					"new_lower": decision.NewLower.String(), "new_upper": decision.NewUpper.String(),
 				}); err != nil {
 					worker.logger.Warn("adjust-range event insert failed — durable cooldown not armed",
 						"component", "autogrid_worker", "bot_id", bot.id, "error", err)
@@ -3505,7 +3524,7 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 				_ = QueueTelegramEvent(ctx, worker.db, "ADJUST_RANGE", map[string]any{
 					"bot_number": bot.botNumber, "symbol": bot.symbol,
 					"lower_price": decision.NewLower.StringFixed(6), "upper_price": decision.NewUpper.StringFixed(6),
-					"reason": decision.Reason, "adjustments_count": bot.adjustments + 1,
+					"reason": decision.Reason, "mode": shiftMode, "adjustments_count": bot.adjustments + 1,
 				})
 			}
 		}
@@ -3639,47 +3658,6 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 	worker.captureBotAggregateEquity(ctx, *settings)
 
 	return clampInterval(settings.ManageIntervalSeconds), nil
-}
-
-// manageShiftBlockedUnderwater is the manage-path twin of the radar preflight
-// veto: a RANGE_BREAK range shift on an under-water REAL bot is a guaranteed
-// BOT_INVALID_ARGUMENT/PROFIT_LESS_THAN_ZERO rejection, so the exchange is
-// never asked. The bot is NOT force-closed — the break keeps its existing
-// owners (adverse-regime RANGE_BREAK_* close, _NO_ADJUSTMENTS_LEFT close on
-// budget exhaustion, the anti-hunt structural stop and the max-loss stop).
-// One durable SHIFT_BLOCKED_UNDERWATER event per bot per hour
-// (model_state marker, the tranche2SkipAt pattern).
-func (worker *Worker) manageShiftBlockedUnderwater(
-	ctx context.Context,
-	botID string,
-	botNumber int,
-	symbol, reason string,
-	total, price decimal.Decimal,
-) {
-	tag, err := worker.db.Exec(ctx, `
-		UPDATE grid_bots
-		SET model_state = jsonb_set(COALESCE(model_state, '{}'::jsonb), '{shiftBlockedAt}',
-			to_jsonb(to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'))),
-		    updated_at = NOW()
-		WHERE id = $1
-		  AND COALESCE((model_state->>'shiftBlockedAt')::TIMESTAMPTZ, '1970-01-01') < NOW() - INTERVAL '1 hour'
-	`, botID)
-	if err != nil {
-		worker.logger.Warn("manage: shift-blocked marker write failed",
-			"component", "autogrid_worker", "bot_id", botID, "error", err)
-		return
-	}
-	if tag.RowsAffected() != 1 {
-		return // deduped: the hour-old blocked event still speaks for this state
-	}
-	_ = LogBotEvent(ctx, worker.db, botID, botNumber, "REAL", symbol,
-		"SHIFT_BLOCKED_UNDERWATER", &price, &total, map[string]any{
-			"reason": reason, "total_pnl": total.StringFixed(4),
-		})
-	_ = QueueTelegramEvent(ctx, worker.db, "SHIFT_BLOCKED_UNDERWATER", map[string]any{
-		"bot_number": botNumber, "symbol": symbol, "reason": reason,
-		"total": total.StringFixed(2),
-	})
 }
 
 // reconcileUnknownSubmissions resolves grid bots whose create outcome is

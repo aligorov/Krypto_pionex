@@ -19,40 +19,46 @@ import (
 	"github.com/shopspring/decimal"
 )
 
-// v2.0.76 "shift on green" test battery. The exchange gates
-// /bot/orders/futuresGrid/adjustParams on the order's current profit
-// (BOT_INVALID_ARGUMENT / PROFIT_LESS_THAN_ZERO), so every shift path must
-// preflight locally: green bots shift (early at band 2), underwater bots
-// never hit the exchange and leave a durable blocked-event instead.
+// v2.0.85 "shift always, shift early" test battery. The exchange's NORMAL
+// adjust_params semantics gate on the order's pure floating PnL
+// (BOT_INVALID_ARGUMENT / PROFIT_LESS_THAN_ZERO), so a green bot shifts with
+// the re-base semantics while an under-water bot now ships the documented
+// keepInvestment=true transfer (pure range move, no PnL realization), dry-run
+// validated through adjustParamsCheck before the live call. The local
+// RADAR_SHIFT_BLOCKED_UNDERWATER / SHIFT_BLOCKED_UNDERWATER events are GONE:
+// the only remaining refusal is the exchange's own, carried by
+// RADAR_RECENTER_FAILED (radar) or the manage error log (manage).
 
-// (a, pure levels) The preflight floor: >= +$0.10 passes, everything below —
-// including the 0..0.10 drift band between reconcile and shift — is blocked.
-// v2.0.83: the figure under test is the FLOATING PnL, not the bot total.
-func TestAdjustShiftPreflightLevels(t *testing.T) {
-	if !adjustShiftFeasible(d("0.5")) {
-		t.Fatal("floating +$0.5 must pass the preflight")
+// (a, pure levels) The mode preflight: >= +$0.10 floating → normal re-base;
+// everything below — including the 0..0.10 drift band between reconcile and
+// shift — selects the keep_investment transfer. v2.0.83 figure under test:
+// the FLOATING PnL, not the bot total.
+func TestAdjustShiftModeLevels(t *testing.T) {
+	if m := adjustShiftMode(d("0.5")); m != shiftModeNormal {
+		t.Fatalf("floating +$0.5 must select normal, got %s", m)
 	}
-	if !adjustShiftFeasible(d("0.10")) {
-		t.Fatal("the floor itself must pass (>=, not >)")
+	if m := adjustShiftMode(d("0.10")); m != shiftModeNormal {
+		t.Fatalf("the floor itself must select normal (>=, not >), got %s", m)
 	}
-	if adjustShiftFeasible(d("0.09")) {
-		t.Fatal("floating inside the drift buffer must be blocked")
+	if m := adjustShiftMode(d("0.09")); m != shiftModeKeepInvestment {
+		t.Fatalf("floating inside the drift buffer must select keep_investment, got %s", m)
 	}
-	if adjustShiftFeasible(d("0")) {
-		t.Fatal("flat floating must be blocked — the exchange requires floating profit > 0")
+	if m := adjustShiftMode(d("0")); m != shiftModeKeepInvestment {
+		t.Fatalf("flat floating must select keep_investment, got %s", m)
 	}
-	if adjustShiftFeasible(d("-0.5")) {
-		t.Fatal("underwater floating must be blocked")
+	if m := adjustShiftMode(d("-0.5")); m != shiftModeKeepInvestment {
+		t.Fatalf("underwater floating must select keep_investment, got %s", m)
 	}
 }
 
-// (a-regress, the prod NEAR #688 shape) Banked grid profit must NOT mask a
-// sinking position: total +1.5 (realized +2.0, floating −0.5) cleared the
-// v2.0.76 total-based preflight and the exchange still refused
-// adjust_params with PROFIT_LESS_THAN_ZERO (2026-09-04 19:05Z). The v2.0.83
-// gate keys on the floating leg, so this exact bot must now be blocked
-// BEFORE the exchange call, with the durable blocked event as the trace.
-func TestRadarRealPreflightFloatingNotTotal(t *testing.T) {
+// (a) The prod NEAR #688 shape is the flagship of the new semantics: banked
+// grid profit +2.0 with floating −0.5 (total +1.5) used to be parked with a
+// RADAR_SHIFT_BLOCKED_UNDERWATER event. Now the shift FIRES as a rescue
+// transfer: adjustParamsCheck runs first (same body), the live adjust ships
+// keepInvestment=true, the local quote_investment / realized / unrealized
+// base stays untouched, and the ADJUST_RANGE event records
+// mode=keep_investment.
+func TestRadarRealKeepInvestmentUnderwaterShift(t *testing.T) {
 	h := newRadarRealHarness(t)
 	ctx := context.Background()
 	const symbol = "RADR_USDT_PERP"
@@ -69,52 +75,230 @@ func TestRadarRealPreflightFloatingNotTotal(t *testing.T) {
 	b.botID = botID
 	h.worker.radarMaybeRecenter(ctx, *h.settings, b, radarScores{Band: 3, Score: 0.80, DistToStopATR: 2.0})
 
-	if got := h.mock.adjustCount.Load(); got != 0 {
-		t.Fatalf("floating −0.5 must veto the exchange call even with total +1.5, got %d adjusts", got)
+	// Dry-run FIRST, then exactly one live call with the rescue flag.
+	if got := h.mock.checkCount.Load(); got != 1 {
+		t.Fatalf("keep-investment shift must dry-run adjustParamsCheck exactly once, got %d", got)
 	}
-	var blocked int
-	var totalPayload string
-	if err := h.pool.QueryRow(ctx, `
-		SELECT COUNT(*), COALESCE((SELECT details->>'total_pnl' FROM bot_execution_events
-			WHERE bot_id = $1 AND event_type = 'RADAR_SHIFT_BLOCKED_UNDERWATER'
-			ORDER BY created_at DESC LIMIT 1), '')
-		FROM bot_execution_events
-		WHERE bot_id = $1 AND event_type = 'RADAR_SHIFT_BLOCKED_UNDERWATER'
-	`, botID).Scan(&blocked, &totalPayload); err != nil || blocked != 1 {
-		t.Fatalf("exactly one blocked event expected, got %d (%v)", blocked, err)
+	if got := h.mock.adjustCount.Load(); got != 1 {
+		t.Fatalf("keep-investment shift must fire the live adjust exactly once, got %d", got)
 	}
-	if totalPayload != "1.5000" {
-		t.Fatalf("blocked event must carry the total (+1.5) for context, got %q", totalPayload)
+	if body := h.mock.adjust(); body["keepInvestment"] != true {
+		t.Fatalf("live adjust must ship keepInvestment=true, got %v", body["keepInvestment"])
 	}
-	var adjustments int
-	if err := h.pool.QueryRow(ctx, `SELECT adjustments_count FROM grid_bots WHERE id = $1`, botID).
-		Scan(&adjustments); err != nil || adjustments != 2 {
-		t.Fatalf("blocked shift must keep the budget, got %d (%v)", adjustments, err)
+	if body := h.mock.check(); body["keepInvestment"] != true {
+		t.Fatalf("adjustParamsCheck must validate the SAME body (keepInvestment=true), got %v", body["keepInvestment"])
+	}
+	if body := h.mock.check(); body["type"] != "adjust_params" || body["bottom"] != "93.5" || body["top"] != "113.5" {
+		t.Fatalf("check body must mirror the live geometry, got %v", body)
 	}
 
-	// The same bot with the floating leg recovered (+0.5) shifts again —
-	// the gate opens the moment pure floating goes green.
-	if _, err := h.pool.Exec(ctx, `
-		UPDATE grid_bots SET unrealized_pnl_usdt = 0.5 WHERE id = $1
-	`, botID); err != nil {
-		t.Fatalf("recover the floating leg: %v", err)
+	// Local accounting: bounds moved, budget spent — the investment base and
+	// both PnL legs stay exactly as the last reconcile left them.
+	var lower, upper, investment, realized, unrealized, antiHunt decimal.Decimal
+	var adjustments int
+	if err := h.pool.QueryRow(ctx, `
+		SELECT lower_price, upper_price, quote_investment,
+		       realized_pnl_usdt, unrealized_pnl_usdt,
+		       anti_hunt_stop_price, adjustments_count
+		FROM grid_bots WHERE id = $1
+	`, botID).Scan(&lower, &upper, &investment, &realized, &unrealized, &antiHunt, &adjustments); err != nil {
+		t.Fatalf("load bot after keep-shift: %v", err)
 	}
-	if _, err := h.pool.Exec(ctx, `
-		UPDATE grid_bots
-		SET model_state = jsonb_set(COALESCE(model_state,'{}'::jsonb), '{radarShiftBlockedAt}', '"1970-01-01T00:00:00Z"')
-		WHERE id = $1
-	`, botID); err != nil {
-		t.Fatalf("re-arm the blocked marker: %v", err)
+	if !lower.Equal(d("93.5")) || !upper.Equal(d("113.5")) {
+		t.Fatalf("keep-shift must move the bounds to [93.5, 113.5], got [%s, %s]", lower, upper)
 	}
+	if !investment.Equal(d("200")) {
+		t.Fatalf("keep-shift must NOT touch quote_investment, got %s", investment)
+	}
+	if !realized.Equal(d("2.0")) || !unrealized.Equal(d("-0.5")) {
+		t.Fatalf("keep-shift must NOT re-base the PnL legs, got realized %s unrealized %s", realized, unrealized)
+	}
+	if adjustments != 3 {
+		t.Fatalf("keep-shift must spend the budget like any shift, got %d", adjustments)
+	}
+	if !antiHunt.Equal(d("91.5")) {
+		t.Fatalf("anti-hunt must travel with the range (88 → 91.5), got %s", antiHunt)
+	}
+
+	var reason, mode, floating string
+	if err := h.pool.QueryRow(ctx, `
+		SELECT details->>'reason', details->>'mode', details->>'floating_pnl'
+		FROM bot_execution_events
+		WHERE bot_id = $1 AND event_type = 'ADJUST_RANGE' ORDER BY created_at DESC LIMIT 1
+	`, botID).Scan(&reason, &mode, &floating); err != nil {
+		t.Fatalf("keep-shift event must be logged: %v", err)
+	}
+	if reason != "RADAR_B3_RECENTER" || mode != shiftModeKeepInvestment {
+		t.Fatalf("event must be RADAR_B3_RECENTER/keep_investment, got %s/%s", reason, mode)
+	}
+	if floating != "-0.5000" {
+		t.Fatalf("event must record the floating leg that picked the mode, got %q", floating)
+	}
+	// The blocked event class is retired: nothing may write it anymore.
+	var blocked int
+	if err := h.pool.QueryRow(ctx, `
+		SELECT COUNT(*) FROM bot_execution_events
+		WHERE bot_id = $1 AND event_type = 'RADAR_SHIFT_BLOCKED_UNDERWATER'
+	`, botID).Scan(&blocked); err != nil || blocked != 0 {
+		t.Fatalf("RADAR_SHIFT_BLOCKED_UNDERWATER must be gone, got %d rows (%v)", blocked, err)
+	}
+	// The executed shift arms the durable cooldown like any radar action.
+	if _, ok := h.worker.radarLastActionAt(ctx, botID); !ok {
+		t.Fatal("an executed keep-shift must arm the durable radar cooldown")
+	}
+
+	// The durable cooldown now blocks an immediate second keep-shift — the
+	// old hourly-dedup of blocked events is replaced by the real action gate.
 	h.worker.radarMaybeRecenter(ctx, *h.settings, b, radarScores{Band: 3, Score: 0.80, DistToStopATR: 2.0})
 	if got := h.mock.adjustCount.Load(); got != 1 {
-		t.Fatalf("recovered floating (+0.5) must allow the shift, got %d adjusts", got)
+		t.Fatalf("cooldown must block the second shift, got %d adjusts", got)
 	}
 }
 
-// (b, pure geometry) Adverse-edge progress for the B2 early trigger: the
-// share of the range width already covered toward the edge the inventory
-// fears, clamped, zero for degenerate ranges.
+// (c) The dry-run is a real gate: when adjustParamsCheck itself refuses the
+// keep-transfer, the live call must NEVER fire and the refusal takes the
+// established RADAR_RECENTER_FAILED path with the exchange's reason — budget
+// and geometry untouched, cooldown unarmed.
+func TestRadarRealKeepInvestmentCheckRefused(t *testing.T) {
+	h := newRadarRealHarness(t)
+	ctx := context.Background()
+	const symbol = "RADR_USDT_PERP"
+	botID := h.seedRealBot(t, symbol, 2)
+	h.seedDwell(t, botID, symbol)
+	if _, err := h.pool.Exec(ctx, `
+		UPDATE grid_bots SET unrealized_pnl_usdt = -0.5 WHERE id = $1
+	`, botID); err != nil {
+		t.Fatalf("sink the bot: %v", err)
+	}
+	h.mock.failCheck.Store(true)
+
+	h.settings.StopForecastMode = "ACTIVE"
+	b := realRadarAction(symbol, decimal.NewFromFloat(103.5))
+	b.botID = botID
+	h.worker.radarMaybeRecenter(ctx, *h.settings, b, radarScores{Band: 3, Score: 0.80, DistToStopATR: 2.0})
+
+	if got := h.mock.checkCount.Load(); got != 1 {
+		t.Fatalf("the check must have been asked once, got %d", got)
+	}
+	if got := h.mock.adjustCount.Load(); got != 0 {
+		t.Fatalf("a refused check must veto the live adjust, got %d adjusts", got)
+	}
+	var failErr, failMode string
+	if err := h.pool.QueryRow(ctx, `
+		SELECT details->>'error', details->>'mode' FROM bot_execution_events
+		WHERE bot_id = $1 AND event_type = 'RADAR_RECENTER_FAILED' ORDER BY created_at DESC LIMIT 1
+	`, botID).Scan(&failErr, &failMode); err != nil {
+		t.Fatalf("the refusal must leave a RADAR_RECENTER_FAILED event: %v", err)
+	}
+	if !strings.Contains(failErr, "adjustParamsCheck refused") ||
+		!strings.Contains(failErr, "PROFIT_LESS_THAN_ZERO") {
+		t.Fatalf("failure event must carry the check refusal + exchange reason, got %q", failErr)
+	}
+	if failMode != shiftModeKeepInvestment {
+		t.Fatalf("failure event must record the attempted mode, got %q", failMode)
+	}
+	var lower, upper decimal.Decimal
+	var adjustments int
+	if err := h.pool.QueryRow(ctx, `
+		SELECT lower_price, upper_price, adjustments_count FROM grid_bots WHERE id = $1
+	`, botID).Scan(&lower, &upper, &adjustments); err != nil {
+		t.Fatalf("load bot: %v", err)
+	}
+	if !lower.Equal(d("90")) || !upper.Equal(d("110")) || adjustments != 2 {
+		t.Fatalf("refused check must change nothing, got [%s,%s] count %d", lower, upper, adjustments)
+	}
+	if _, ok := h.worker.radarLastActionAt(ctx, botID); ok {
+		t.Fatal("a refused check must not arm the durable radar cooldown")
+	}
+}
+
+// (a-paper) Paper parity of the keep lane: the simulated shift mirrors the
+// native keepInvestment semantics exactly — bounds and anti-hunt travel,
+// adjustments_count spends, but the investment base (quote_investment,
+// entry, realized/unrealized, mark) does NOT re-base. No exchange is asked
+// (paper has no native call); the event carries mode=keep_investment.
+func TestRadarPaperKeepInvestmentShift(t *testing.T) {
+	h := newRadarRealHarness(t)
+	ctx := context.Background()
+	const symbol = "RADR_PAPER_USDT_PERP"
+	var botID string
+	if err := h.pool.QueryRow(ctx, `
+		INSERT INTO paper_grid_bots (
+			settings_id, symbol, status, direction, grid_type,
+			lower_price, upper_price, grid_num, leverage, quote_investment,
+			entry_price, mark_price, pnl_target_usdt, max_loss_usdt,
+			realized_pnl_usdt, unrealized_pnl_usdt, anti_hunt_stop_price,
+			adjustments_count, opened_at
+		) VALUES (
+			$1, $2, 'RUNNING', 'LONG', 'ARITHMETIC',
+			90, 110, 10, 2, 200,
+			100, 100, 999, -999,
+			0.5, -0.5, 88,
+			0, NOW() - INTERVAL '2 hours'
+		)
+		RETURNING id
+	`, h.settings.ID, symbol).Scan(&botID); err != nil {
+		t.Fatalf("seed paper bot: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = h.pool.Exec(ctx, `DELETE FROM bot_execution_events WHERE bot_id = $1`, botID)
+		_, _ = h.pool.Exec(ctx, `DELETE FROM bot_risk_snapshots WHERE bot_id = $1`, botID)
+		_, _ = h.pool.Exec(ctx, `DELETE FROM paper_grid_bots WHERE id = $1`, botID)
+	})
+	h.seedDwell(t, botID, symbol)
+
+	h.settings.StopForecastMode = "ACTIVE"
+	b := radarInput{
+		botID: botID, botNumber: 501, botSource: "PAPER", symbol: symbol,
+		direction: "LONG", price: decimal.NewFromFloat(103.5),
+		lower: d("90"), upper: d("110"), atrEntryPct: 1.0,
+		total: decimal.Zero, inventorySide: 1,
+	}
+	h.worker.radarMaybeRecenter(ctx, *h.settings, b, radarScores{Band: 3, Score: 0.80, DistToStopATR: 2.0})
+
+	var lower, upper, entry, mark, investment, realized, unrealized, antiHunt decimal.Decimal
+	var adjustments int
+	if err := h.pool.QueryRow(ctx, `
+		SELECT lower_price, upper_price, entry_price, COALESCE(mark_price, 0),
+		       quote_investment, realized_pnl_usdt, unrealized_pnl_usdt,
+		       anti_hunt_stop_price, adjustments_count
+		FROM paper_grid_bots WHERE id = $1
+	`, botID).Scan(&lower, &upper, &entry, &mark, &investment, &realized, &unrealized, &antiHunt, &adjustments); err != nil {
+		t.Fatalf("load paper bot after keep-shift: %v", err)
+	}
+	if !lower.Equal(d("93.5")) || !upper.Equal(d("113.5")) {
+		t.Fatalf("keep-shift must move the paper bounds to [93.5, 113.5], got [%s, %s]", lower, upper)
+	}
+	if !antiHunt.Equal(d("91.5")) {
+		t.Fatalf("paper anti-hunt must travel with the range (88 → 91.5), got %s", antiHunt)
+	}
+	if !entry.Equal(d("100")) || !mark.Equal(d("100")) {
+		t.Fatalf("keep-shift must NOT re-anchor entry/mark, got entry %s mark %s", entry, mark)
+	}
+	if !investment.Equal(d("200")) || !realized.Equal(d("0.5")) || !unrealized.Equal(d("-0.5")) {
+		t.Fatalf("keep-shift must NOT re-base the paper ledger, got inv %s realized %s unrealized %s",
+			investment, realized, unrealized)
+	}
+	if adjustments != 1 {
+		t.Fatalf("keep-shift must spend the paper budget, got %d", adjustments)
+	}
+	var reason, mode, source string
+	if err := h.pool.QueryRow(ctx, `
+		SELECT details->>'reason', details->>'mode', bot_source FROM bot_execution_events
+		WHERE bot_id = $1 AND event_type = 'ADJUST_RANGE' ORDER BY created_at DESC LIMIT 1
+	`, botID).Scan(&reason, &mode, &source); err != nil ||
+		reason != "RADAR_B3_RECENTER" || mode != shiftModeKeepInvestment || source != "PAPER" {
+		t.Fatalf("paper keep-shift event must be PAPER/RADAR_B3_RECENTER/keep_investment, got %s/%s/%s (%v)",
+			source, reason, mode, err)
+	}
+	if _, ok := h.worker.radarLastActionAt(ctx, botID); !ok {
+		t.Fatal("an executed paper keep-shift must arm the durable radar cooldown")
+	}
+}
+
+// (b, pure geometry) Adverse-edge progress for the B2 early/velocity
+// triggers: the share of the range width already covered toward the edge the
+// inventory fears, clamped, zero for degenerate ranges.
 func TestRadarB2EarlyEdgeProgress(t *testing.T) {
 	lower, upper := d("90"), d("110")
 	// Long inventory fears the lower bound: 95 sits 75% of the way down.
@@ -142,71 +326,97 @@ func TestRadarB2EarlyEdgeProgress(t *testing.T) {
 	}
 }
 
-// (a-/c) B3 under water: the preflight must veto the exchange call, leave the
-// budget and bounds untouched, keep the bot RUNNING (the close decision stays
-// with the stop ladder/operator), write exactly one
-// RADAR_SHIFT_BLOCKED_UNDERWATER event per hour, and NOT arm the durable
-// radar cooldown — a blocked shift is a no-action, so the re-center becomes
-// eligible again the moment profit recovers.
-func TestRadarRealPreflightUnderwaterBlocked(t *testing.T) {
-	h := newRadarRealHarness(t)
-	ctx := context.Background()
-	const symbol = "RADR_USDT_PERP"
-	botID := h.seedRealBot(t, symbol, 2)
-	h.seedDwell(t, botID, symbol)
-	if _, err := h.pool.Exec(ctx, `
-		UPDATE grid_bots SET realized_pnl_usdt = -0.5, unrealized_pnl_usdt = -0.5 WHERE id = $1
-	`, botID); err != nil {
-		t.Fatalf("sink the bot under water (both legs): %v", err)
+// (d, pure speed math) The velocity ruler: ATR(15m) units per 15 minutes
+// toward the adverse edge, from two trail samples. Movement AWAY from the
+// edge, zero-gap repeats and unknown ATR read 0 — never fire.
+func TestRadarEdgeSpeedATRPer15m(t *testing.T) {
+	at := func(offsetMin float64) time.Time {
+		return time.UnixMilli(1_800_000_000_000).Add(time.Duration(offsetMin * float64(time.Minute)))
 	}
+	// Short inventory: rising toward the upper bound. Price 100 → 101 in 15m
+	// with ATR15 = 1% ≈ 1.01 → exactly 0.99 ATR/15m.
+	speed := radarEdgeSpeedATRPer15m(
+		radarPricePoint{at: at(0), price: d("100")},
+		radarPricePoint{at: at(15), price: d("101")},
+		1.0, -1)
+	if speed < 0.98 || speed > 1.0 {
+		t.Fatalf("1 pct rise per 15m at ATR 1 pct must read ~1 ATR/15m, got %v", speed)
+	}
+	// Same move compressed into 90s is 10× the pace.
+	speed = radarEdgeSpeedATRPer15m(
+		radarPricePoint{at: at(0), price: d("100")},
+		radarPricePoint{at: at(1.5), price: d("101")},
+		1.0, -1)
+	if speed < 9.8 || speed > 10.1 {
+		t.Fatalf("1 pct rise per 90s must read ~10 ATR/15m, got %v", speed)
+	}
+	// Long inventory: falling toward the lower bound is the adverse direction.
+	if speed := radarEdgeSpeedATRPer15m(
+		radarPricePoint{at: at(0), price: d("101")},
+		radarPricePoint{at: at(15), price: d("100")},
+		1.0, 1); speed < 0.98 || speed > 1.0 {
+		t.Fatalf("long-side adverse fall must read ~1 ATR/15m, got %v", speed)
+	}
+	// Moving AWAY from the edge reads 0.
+	if speed := radarEdgeSpeedATRPer15m(
+		radarPricePoint{at: at(0), price: d("100")},
+		radarPricePoint{at: at(15), price: d("101")},
+		1.0, 1); speed != 0 {
+		t.Fatalf("favorable move must read 0, got %v", speed)
+	}
+	// No ruler (ATR unknown), zero gap and flat inventory never measure.
+	if speed := radarEdgeSpeedATRPer15m(
+		radarPricePoint{at: at(0), price: d("100")},
+		radarPricePoint{at: at(15), price: d("101")},
+		0, -1); speed != 0 {
+		t.Fatalf("unknown ATR must read 0, got %v", speed)
+	}
+	if speed := radarEdgeSpeedATRPer15m(
+		radarPricePoint{at: at(15), price: d("101")},
+		radarPricePoint{at: at(15), price: d("101")},
+		1.0, -1); speed != 0 {
+		t.Fatalf("zero gap must read 0, got %v", speed)
+	}
+	if speed := radarEdgeSpeedATRPer15m(
+		radarPricePoint{at: at(0), price: d("100")},
+		radarPricePoint{at: at(15), price: d("101")},
+		1.0, 0); speed != 0 {
+		t.Fatalf("flat inventory has no adverse edge, got %v", speed)
+	}
+}
 
-	h.settings.StopForecastMode = "ACTIVE"
-	b := realRadarAction(symbol, decimal.NewFromFloat(103.5))
-	b.botID = botID
-	h.worker.radarMaybeRecenter(ctx, *h.settings, b, radarScores{Band: 3, Score: 0.80, DistToStopATR: 2.0})
-
-	if got := h.mock.adjustCount.Load(); got != 0 {
-		t.Fatalf("preflight must veto the exchange call for an underwater bot, got %d adjusts", got)
+// rememberRadarPrice trail semantics: first sample returns unusable, the
+// second returns the first as baseline, a same-pass repeat neither measures
+// nor overwrites, and a stale (>30m) baseline is refused.
+func TestRememberRadarPriceTrail(t *testing.T) {
+	worker := &Worker{}
+	now := time.Now().UTC()
+	if _, ok := worker.rememberRadarPrice("SYM", radarPricePoint{at: now, price: d("100")}); ok {
+		t.Fatal("the first sample has no baseline")
 	}
-	var blocked int
-	if err := h.pool.QueryRow(ctx, `
-		SELECT COUNT(*) FROM bot_execution_events
-		WHERE bot_id = $1 AND event_type = 'RADAR_SHIFT_BLOCKED_UNDERWATER'
-	`, botID).Scan(&blocked); err != nil || blocked != 1 {
-		t.Fatalf("exactly one blocked event expected, got %d (%v)", blocked, err)
+	prev, ok := worker.rememberRadarPrice("SYM", radarPricePoint{at: now.Add(90 * time.Second), price: d("101")})
+	if !ok || !prev.price.Equal(d("100")) {
+		t.Fatalf("the second sample must measure against the first, ok=%v prev=%v", ok, prev)
 	}
-	var adjustments int
-	var status string
-	if err := h.pool.QueryRow(ctx, `
-		SELECT adjustments_count, status FROM grid_bots WHERE id = $1
-	`, botID).Scan(&adjustments, &status); err != nil {
-		t.Fatalf("load bot: %v", err)
+	// Same-pass repeat (fresh guard): unusable, and the stored baseline
+	// survives for the next pass.
+	if _, ok := worker.rememberRadarPrice("SYM", radarPricePoint{at: now.Add(91 * time.Second), price: d("101")}); ok {
+		t.Fatal("a zero-gap repeat must not measure")
 	}
-	if adjustments != 2 || status != "RUNNING" {
-		t.Fatalf("blocked shift must keep budget and life: adjustments=%d status=%s", adjustments, status)
+	prev, ok = worker.rememberRadarPrice("SYM", radarPricePoint{at: now.Add(3 * time.Minute), price: d("101")})
+	if !ok || !prev.price.Equal(d("101")) {
+		t.Fatalf("the fresh-guarded point must remain the baseline, ok=%v prev=%v", ok, prev)
 	}
-	// The cooldown stays unarmed: no ADJUST_RANGE row exists for this bot.
-	if _, ok := h.worker.radarLastActionAt(ctx, botID); ok {
-		t.Fatal("a blocked shift must not arm the durable radar cooldown")
-	}
-
-	// Dedup: a second identical pass within the hour adds no second event.
-	h.worker.radarMaybeRecenter(ctx, *h.settings, b, radarScores{Band: 3, Score: 0.80, DistToStopATR: 2.0})
-	if err := h.pool.QueryRow(ctx, `
-		SELECT COUNT(*) FROM bot_execution_events
-		WHERE bot_id = $1 AND event_type = 'RADAR_SHIFT_BLOCKED_UNDERWATER'
-	`, botID).Scan(&blocked); err != nil || blocked != 1 {
-		t.Fatalf("blocked events must dedup to 1/h, got %d (%v)", blocked, err)
-	}
-	if got := h.mock.adjustCount.Load(); got != 0 {
-		t.Fatalf("deduped pass must still not touch the exchange, got %d adjusts", got)
+	// A stale baseline (downtime) is refused and replaced.
+	if _, ok := worker.rememberRadarPrice("SYM", radarPricePoint{at: now.Add(45 * time.Minute), price: d("101")}); ok {
+		t.Fatal("a >30m-old baseline must be refused as stale")
 	}
 }
 
 // (b) The early re-center: band 2, dwell 3, price 75% of the way to the
-// adverse edge, bot in profit — one native adjust_params, reason
-// RADAR_B2_EARLY_RECENTER, cooldown armed. Not far enough to the edge, or
-// far enough but under water: no exchange call at all.
+// adverse edge, bot in profit — one native adjust_params (normal semantics),
+// reason RADAR_B2_EARLY_RECENTER, cooldown armed. Not far enough to the edge:
+// no exchange call at all.
 func TestRadarRealB2EarlyRecenter(t *testing.T) {
 	h := newRadarRealHarness(t)
 	ctx := context.Background()
@@ -227,7 +437,7 @@ func TestRadarRealB2EarlyRecenter(t *testing.T) {
 			WHERE id = 1
 		`, telegramSavedEnabled, telegramSavedToken, telegramSavedChat, telegramSavedNotify)
 		_, _ = h.pool.Exec(context.Background(),
-			`DELETE FROM notification_outbox WHERE event_type = 'RADAR_B2_EARLY_RECENTER'`)
+			`DELETE FROM notification_outbox WHERE event_type IN ('RADAR_B2_EARLY_RECENTER','RADAR_B2_VELOCITY_RECENTER')`)
 	})
 	if _, err := h.pool.Exec(ctx, `
 		UPDATE telegram_settings
@@ -255,12 +465,17 @@ func TestRadarRealB2EarlyRecenter(t *testing.T) {
 	if body["type"] != "adjust_params" || body["bottom"] != "95" || body["top"] != "115" {
 		t.Fatalf("early re-center must ship adjust_params [95, 115] (width 20 at price 105), got %v", body)
 	}
-	var reason string
+	if _, has := body["keepInvestment"]; has {
+		t.Fatalf("green early shift must take the normal semantics, got %v", body["keepInvestment"])
+	}
+	var reason, mode string
 	if err := h.pool.QueryRow(ctx, `
-		SELECT details->>'reason' FROM bot_execution_events
+		SELECT details->>'reason', details->>'mode' FROM bot_execution_events
 		WHERE bot_id = $1 AND event_type = 'ADJUST_RANGE' ORDER BY created_at DESC LIMIT 1
-	`, botID).Scan(&reason); err != nil || reason != "RADAR_B2_EARLY_RECENTER" {
+	`, botID).Scan(&reason, &mode); err != nil || reason != "RADAR_B2_EARLY_RECENTER" {
 		t.Fatalf("event reason must be RADAR_B2_EARLY_RECENTER, got %q (%v)", reason, err)
+	} else if mode != shiftModeNormal {
+		t.Fatalf("green early shift event must carry mode=normal, got %q", mode)
 	}
 	// The early shift arms the durable cooldown like any radar action.
 	if _, ok := h.worker.radarLastActionAt(ctx, botID); !ok {
@@ -289,7 +504,8 @@ func TestRadarRealB2EarlyRecenter(t *testing.T) {
 		t.Fatalf("60%% edge progress must not early-shift, got %d adjusts", got)
 	}
 
-	// Far enough but under water: blocked, no exchange call, durable event.
+	// Far enough but UNDER WATER: v2.0.85 keeps shifting — the early lane
+	// ships keepInvestment, dry-run first, and the event records the mode.
 	wet := h.seedRealBot(t, symbol, 0)
 	h.seedBandSnapshots(t, wet, symbol, []float64{0.65, 0.65, 0.65})
 	if _, err := h.pool.Exec(ctx, `
@@ -301,28 +517,260 @@ func TestRadarRealB2EarlyRecenter(t *testing.T) {
 	bWet.botID = wet
 	bWet.inventorySide = -1
 	h.worker.radarMaybeRecenter(ctx, *h.settings, bWet, radarScores{Band: 2, Score: 0.65, DistToStopATR: 2.0})
-	if got := h.mock.adjustCount.Load(); got != 1 {
-		t.Fatalf("underwater early trigger must be blocked pre-exchange, got %d adjusts", got)
+	if got := h.mock.adjustCount.Load(); got != 2 {
+		t.Fatalf("underwater early trigger must keep-shift (not block), got %d adjusts", got)
 	}
-	var wetBlocked int
+	if body := h.mock.adjust(); body["keepInvestment"] != true {
+		t.Fatalf("underwater early shift must ship keepInvestment=true, got %v", body["keepInvestment"])
+	}
+	if got := h.mock.checkCount.Load(); got != 1 {
+		t.Fatalf("underwater early shift must dry-run the check once, got %d", got)
+	}
+	var wetReason, wetMode string
+	if err := h.pool.QueryRow(ctx, `
+		SELECT details->>'reason', details->>'mode' FROM bot_execution_events
+		WHERE bot_id = $1 AND event_type = 'ADJUST_RANGE' ORDER BY created_at DESC LIMIT 1
+	`, wet).Scan(&wetReason, &wetMode); err != nil ||
+		wetReason != "RADAR_B2_EARLY_RECENTER" || wetMode != shiftModeKeepInvestment {
+		t.Fatalf("underwater early event must be EARLY/keep_investment, got %s/%s (%v)",
+			wetReason, wetMode, err)
+	}
+}
+
+// (d) The velocity lane: band 2, price 55% of the way to the adverse edge,
+// trailing speed 0.8×ATR(15m)/15m, floating green — the shift fires after
+// ONE dwell tick with reason RADAR_B2_VELOCITY_RECENTER. A slow trail
+// (0.2×ATR/15m) at the same position waits for the established paths.
+func TestRadarRealB2VelocityRecenter(t *testing.T) {
+	h := newRadarRealHarness(t)
+	ctx := context.Background()
+	const symbol = "RADR_USDT_PERP"
+
+	// Telegram ON so the dedicated velocity template must render.
+	var telegramSavedEnabled, telegramSavedNotify bool
+	var telegramSavedToken, telegramSavedChat string
+	_ = h.pool.QueryRow(ctx, `
+		SELECT COALESCE(enabled,false), COALESCE(bot_token,''), COALESCE(chat_id,''),
+		       COALESCE(notify_range_adjust,false)
+		FROM telegram_settings WHERE id = 1
+	`).Scan(&telegramSavedEnabled, &telegramSavedToken, &telegramSavedChat, &telegramSavedNotify)
+	t.Cleanup(func() {
+		_, _ = h.pool.Exec(context.Background(), `
+			UPDATE telegram_settings
+			SET enabled = $1, bot_token = $2, chat_id = $3, notify_range_adjust = $4
+			WHERE id = 1
+		`, telegramSavedEnabled, telegramSavedToken, telegramSavedChat, telegramSavedNotify)
+		_, _ = h.pool.Exec(context.Background(),
+			`DELETE FROM notification_outbox WHERE event_type = 'RADAR_B2_VELOCITY_RECENTER'`)
+	})
+	if _, err := h.pool.Exec(ctx, `
+		UPDATE telegram_settings
+		SET enabled = true, bot_token = 'test-token', chat_id = '100500', notify_range_adjust = true
+		WHERE id = 1
+	`); err != nil {
+		t.Fatalf("enable telegram fixture: %v", err)
+	}
+
+	// Short inventory (fears the upper bound): price 101 = 55% of [90,110].
+	// ATR(15m) = 1% ≈ 1.01 at price 101; a rise of 0.8×ATR over the 15m
+	// baseline gap is exactly the 0.8×ATR/15m pace (threshold 0.6).
+	seed := func(atrMultiple float64) string {
+		botID := h.seedRealBot(t, symbol, 0)
+		// dwell 1: exactly ONE band-2 snapshot — the current tick.
+		if _, err := h.pool.Exec(ctx, `
+			INSERT INTO bot_risk_snapshots
+				(bot_id, bot_number, bot_source, symbol, mode, score, band, captured_at)
+			VALUES ($1, 500, 'REAL', $2, 'ACTIVE', 0.65, 2, NOW() - INTERVAL '1 minute')
+		`, botID, symbol); err != nil {
+			t.Fatalf("seed single band-2 snapshot: %v", err)
+		}
+		price := d("101")
+		atr, _ := price.Mul(d("0.01")).Float64()
+		h.worker.radarPriceTrail = map[string]radarPricePoint{
+			symbol: {at: time.Now().UTC().Add(-15 * time.Minute),
+				price: price.Sub(decimal.NewFromFloat(atrMultiple * atr))},
+		}
+		return botID
+	}
+
+	h.settings.StopForecastMode = "ACTIVE"
+
+	// FAST: 0.8×ATR/15m toward the edge at 55% progress, green base → fires
+	// on the first tick with the velocity reason.
+	fast := seed(0.8)
+	b := realRadarAction(symbol, decimal.NewFromFloat(101))
+	b.botID = fast
+	b.inventorySide = -1
+	h.worker.radarMaybeRecenter(ctx, *h.settings, b, radarScores{Band: 2, Score: 0.65, DistToStopATR: 2.0})
+	if got := h.mock.adjustCount.Load(); got != 1 {
+		t.Fatalf("a 0.8xATR/15m run at 55%% progress must fire after ONE tick, got %d adjusts", got)
+	}
+	fastBody := h.mock.adjust()
+	if fastBody["type"] != "adjust_params" || fastBody["bottom"] != "91" || fastBody["top"] != "111" {
+		t.Fatalf("velocity re-center must ship [91, 111] (width 20 at price 101), got %v", fastBody)
+	}
+	if _, has := fastBody["keepInvestment"]; has {
+		t.Fatalf("velocity lane requires the green base — normal semantics, got %v", fastBody["keepInvestment"])
+	}
+	var reason, mode string
+	if err := h.pool.QueryRow(ctx, `
+		SELECT details->>'reason', details->>'mode' FROM bot_execution_events
+		WHERE bot_id = $1 AND event_type = 'ADJUST_RANGE' ORDER BY created_at DESC LIMIT 1
+	`, fast).Scan(&reason, &mode); err != nil || reason != "RADAR_B2_VELOCITY_RECENTER" {
+		t.Fatalf("event reason must be RADAR_B2_VELOCITY_RECENTER, got %q (%v)", reason, err)
+	} else if mode != shiftModeNormal {
+		t.Fatalf("velocity event must carry mode=normal, got %q", mode)
+	}
+	// The dedicated telegram template renders, placeholder-free.
+	var payload string
+	if err := h.pool.QueryRow(ctx, `
+		SELECT payload::TEXT FROM notification_outbox
+		WHERE event_type = 'RADAR_B2_VELOCITY_RECENTER' ORDER BY created_at DESC LIMIT 1
+	`).Scan(&payload); err != nil {
+		t.Fatalf("velocity telegram outbox row missing: %v", err)
+	}
+	if strings.Contains(payload, "{{") || !strings.Contains(payload, symbol) {
+		t.Fatalf("velocity telegram must render fully and address the bot, got %s", payload)
+	}
+	if !strings.Contains(payload, "0.8×ATR") {
+		t.Fatalf("velocity telegram must carry the measured speed, got %s", payload)
+	}
+
+	// SLOW: 0.2×ATR/15m at the same 55% progress — below the 0.6 threshold,
+	// below the 0.70 early gate: nothing fires, the bot waits for the
+	// established paths.
+	slow := seed(0.2)
+	bSlow := realRadarAction(symbol, decimal.NewFromFloat(101))
+	bSlow.botID = slow
+	bSlow.inventorySide = -1
+	h.worker.radarMaybeRecenter(ctx, *h.settings, bSlow, radarScores{Band: 2, Score: 0.65, DistToStopATR: 2.0})
+	if got := h.mock.adjustCount.Load(); got != 1 {
+		t.Fatalf("a 0.2xATR/15m crawl at 55%% progress must NOT fire, got %d adjusts", got)
+	}
+
+	// SLOW but far (75%) with the full dwell 3: the OLD early path still
+	// fires — velocity is an additional lane, not a replacement.
+	old := h.seedRealBot(t, symbol, 0)
+	h.seedBandSnapshots(t, old, symbol, []float64{0.65, 0.65, 0.65})
+	oldPrice := decimal.NewFromFloat(105)
+	oldAtr, _ := oldPrice.Mul(d("0.01")).Float64()
+	h.worker.radarPriceTrail = map[string]radarPricePoint{
+		symbol: {at: time.Now().UTC().Add(-15 * time.Minute),
+			price: oldPrice.Sub(decimal.NewFromFloat(0.2 * oldAtr))},
+	}
+	bOld := realRadarAction(symbol, oldPrice)
+	bOld.botID = old
+	bOld.inventorySide = -1
+	h.worker.radarMaybeRecenter(ctx, *h.settings, bOld, radarScores{Band: 2, Score: 0.65, DistToStopATR: 2.0})
+	if got := h.mock.adjustCount.Load(); got != 2 {
+		t.Fatalf("the dwell-3 early path must still fire at 75%% progress, got %d adjusts", got)
+	}
+	var oldReason string
+	if err := h.pool.QueryRow(ctx, `
+		SELECT details->>'reason' FROM bot_execution_events
+		WHERE bot_id = $1 AND event_type = 'ADJUST_RANGE' ORDER BY created_at DESC LIMIT 1
+	`, old).Scan(&oldReason); err != nil || oldReason != "RADAR_B2_EARLY_RECENTER" {
+		t.Fatalf("old path must log RADAR_B2_EARLY_RECENTER, got %q (%v)", oldReason, err)
+	}
+}
+
+// (d-neg) Velocity is prevention, not rescue: an under-water base voids the
+// lane — a fast run at 55% with floating −0.5 fires nothing (the keep-lane
+// owns ≥70% and B3/B4, not the 55% window).
+func TestRadarRealB2VelocityRequiresGreenBase(t *testing.T) {
+	h := newRadarRealHarness(t)
+	ctx := context.Background()
+	const symbol = "RADR_USDT_PERP"
+	botID := h.seedRealBot(t, symbol, 0)
+	if _, err := h.pool.Exec(ctx, `
+		INSERT INTO bot_risk_snapshots
+			(bot_id, bot_number, bot_source, symbol, mode, score, band, captured_at)
+		VALUES ($1, 500, 'REAL', $2, 'ACTIVE', 0.65, 2, NOW() - INTERVAL '1 minute')
+	`, botID, symbol); err != nil {
+		t.Fatalf("seed single band-2 snapshot: %v", err)
+	}
+	if _, err := h.pool.Exec(ctx, `
+		UPDATE grid_bots SET unrealized_pnl_usdt = -0.5 WHERE id = $1
+	`, botID); err != nil {
+		t.Fatalf("sink the bot: %v", err)
+	}
+	price := d("101")
+	atr, _ := price.Mul(d("0.01")).Float64()
+	h.worker.radarPriceTrail = map[string]radarPricePoint{
+		symbol: {at: time.Now().UTC().Add(-15 * time.Minute),
+			price: price.Sub(decimal.NewFromFloat(0.8 * atr))},
+	}
+
+	h.settings.StopForecastMode = "ACTIVE"
+	b := realRadarAction(symbol, price)
+	b.botID = botID
+	b.inventorySide = -1
+	h.worker.radarMaybeRecenter(ctx, *h.settings, b, radarScores{Band: 2, Score: 0.65, DistToStopATR: 2.0})
+	if got := h.mock.adjustCount.Load(); got != 0 {
+		t.Fatalf("velocity lane must require the green base, got %d adjusts", got)
+	}
+	if _, ok := h.worker.radarLastActionAt(ctx, botID); ok {
+		t.Fatal("a voided velocity attempt must not arm the cooldown")
+	}
+}
+
+// (e) Regression: a green bot below band 2, or band 2 far from the edge,
+// never touches the exchange — the lanes only widen WHO shifts, never the
+// entry band.
+func TestRadarGreenLowBandFarDoesNothing(t *testing.T) {
+	h := newRadarRealHarness(t)
+	ctx := context.Background()
+	const symbol = "RADR_USDT_PERP"
+
+	// Band 1, far from the edge (30% progress), fast trail, green: nothing.
+	band1 := h.seedRealBot(t, symbol, 0)
+	h.seedBandSnapshots(t, band1, symbol, []float64{0.40, 0.40, 0.40})
+	price := d("97")
+	atr, _ := price.Mul(d("0.01")).Float64()
+	h.worker.radarPriceTrail = map[string]radarPricePoint{
+		symbol: {at: time.Now().UTC().Add(-15 * time.Minute),
+			price: price.Sub(decimal.NewFromFloat(0.8 * atr))},
+	}
+	h.settings.StopForecastMode = "ACTIVE"
+	b := realRadarAction(symbol, price)
+	b.botID = band1
+	b.inventorySide = -1 // 97 = 35% of the way up — far from the edge
+	h.worker.radarMaybeRecenter(ctx, *h.settings, b, radarScores{Band: 1, Score: 0.40, DistToStopATR: 2.0})
+	if got := h.mock.adjustCount.Load(); got != 0 {
+		t.Fatalf("band 1 must never shift, got %d adjusts", got)
+	}
+
+	// Band 2 but only halfway to the edge even with a fast trail: the
+	// velocity lane starts at 55%, the early lane at 70% — nothing.
+	band2 := h.seedRealBot(t, symbol, 0)
+	h.seedBandSnapshots(t, band2, symbol, []float64{0.65, 0.65, 0.65})
+	b.botID = band2
+	h.worker.radarMaybeRecenter(ctx, *h.settings, b, radarScores{Band: 2, Score: 0.65, DistToStopATR: 2.0})
+	if got := h.mock.adjustCount.Load(); got != 0 {
+		t.Fatalf("band 2 at 35%% progress must not shift, got %d adjusts", got)
+	}
+	var events int
 	if err := h.pool.QueryRow(ctx, `
 		SELECT COUNT(*) FROM bot_execution_events
-		WHERE bot_id = $1 AND event_type = 'RADAR_SHIFT_BLOCKED_UNDERWATER'
-	`, wet).Scan(&wetBlocked); err != nil || wetBlocked != 1 {
-		t.Fatalf("underwater early trigger must leave one blocked event, got %d (%v)", wetBlocked, err)
+		WHERE bot_id IN ($1, $2) AND event_type = 'ADJUST_RANGE'
+	`, band1, band2).Scan(&events); err != nil || events != 0 {
+		t.Fatalf("no ADJUST_RANGE events expected, got %d (%v)", events, err)
 	}
 }
 
 // manageExchangeMock serves one full REAL manage pass: per-bot order detail
 // (bounds, position, grid profit), public prices, a klines feed too short for
 // a regime (unknown = adverse both ways), empty funding history, and the
-// signed adjustParams/cancel slots whose call counts are the assertions.
+// signed adjustParamsCheck/adjustParams/cancel slots whose call counts and
+// captured bodies are the assertions.
 type manageExchangeMock struct {
 	server     *httptest.Server
 	adjustMu   sync.Mutex
 	cancelMu   sync.Mutex
 	adjustSeen int
+	checkSeen  int
 	cancelSeen int
+	lastAdjust map[string]any
 }
 
 func newManageExchangeMock(t *testing.T) *manageExchangeMock {
@@ -404,9 +852,25 @@ func newManageExchangeMock(t *testing.T) *manageExchangeMock {
 			"data": map[string]any{"balances": []map[string]any{}},
 		})
 	})
-	mux.HandleFunc("POST /api/v1/bot/orders/futuresGrid/adjustParams", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("POST /api/v1/bot/orders/futuresGrid/adjustParamsCheck", func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		mock.adjustMu.Lock()
+		mock.checkSeen++
+		mock.lastAdjust = body
+		mock.adjustMu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"result": true, "timestamp": time.Now().UnixMilli(),
+			"data":   map[string]any{"min_investment": "5"},
+		})
+	})
+	mux.HandleFunc("POST /api/v1/bot/orders/futuresGrid/adjustParams", func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
 		mock.adjustMu.Lock()
 		mock.adjustSeen++
+		mock.lastAdjust = body
 		mock.adjustMu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{"result": true, "timestamp": time.Now().UnixMilli()})
@@ -423,12 +887,22 @@ func newManageExchangeMock(t *testing.T) *manageExchangeMock {
 	return mock
 }
 
-// (d) Manage RANGE_BREAK shifts share the preflight: an under-water bot whose
-// break the matrix wants to follow with a shift (LONG up-break) never reaches
-// the exchange — one SHIFT_BLOCKED_UNDERWATER event, bot stays RUNNING —
-// while a break the matrix already closes (NEUTRAL down-break, adverse
-// regime) still cancels exactly as before.
-func TestManageRealRangeBreakPreflightAndBreakClose(t *testing.T) {
+func (m *manageExchangeMock) adjustBody() map[string]any {
+	m.adjustMu.Lock()
+	defer m.adjustMu.Unlock()
+	cp := make(map[string]any, len(m.lastAdjust))
+	for k, v := range m.lastAdjust {
+		cp[k] = v
+	}
+	return cp
+}
+
+// (d) Manage RANGE_BREAK shifts ship the mode too: an under-water bot whose
+// break the matrix wants to follow with a shift (LONG up-break, floating
+// −1.5) now transfers the range with keepInvestment — adjustParamsCheck first,
+// then the live call — while a break the matrix already closes (NEUTRAL
+// down-break, adverse regime) still cancels exactly as before.
+func TestManageRealRangeBreakKeepInvestmentAndBreakClose(t *testing.T) {
 	dbURL := integrationDatabaseURL(t)
 	ctx := context.Background()
 	pool, err := pgxpool.New(ctx, dbURL)
@@ -522,32 +996,42 @@ func TestManageRealRangeBreakPreflightAndBreakClose(t *testing.T) {
 		t.Fatalf("reconcile pass: %v (logs: %s)", err, rec.joined())
 	}
 
-	// The shift bot: preflight vetoed the RANGE_SHIFT_UP, nothing was sent.
+	// The shift bot: the under-water break now SHIPS — one keep-transfer.
 	mock.adjustMu.Lock()
-	adjustSeen := mock.adjustSeen
+	adjustSeen, checkSeen := mock.adjustSeen, mock.checkSeen
 	mock.adjustMu.Unlock()
-	if adjustSeen != 0 {
-		t.Fatalf("underwater break must not reach adjustParams, got %d calls", adjustSeen)
+	if adjustSeen != 1 || checkSeen != 1 {
+		t.Fatalf("underwater break must ship keepInvestment (check+adjust), got check=%d adjust=%d",
+			checkSeen, adjustSeen)
 	}
-	var shiftStatus, shiftReconciliation string
+	if body := mock.adjustBody(); body["keepInvestment"] != true {
+		t.Fatalf("manage keep-shift must ship keepInvestment=true, got %v", body["keepInvestment"])
+	}
+	var shiftStatus string
 	var shiftAdjustments int
 	if err := pool.QueryRow(ctx, `
-		SELECT status, reconciliation_state, adjustments_count FROM grid_bots WHERE id = $1
-	`, shiftBot).Scan(&shiftStatus, &shiftReconciliation, &shiftAdjustments); err != nil {
+		SELECT status, adjustments_count FROM grid_bots WHERE id = $1
+	`, shiftBot).Scan(&shiftStatus, &shiftAdjustments); err != nil {
 		t.Fatalf("load shift bot: %v", err)
 	}
-	if shiftStatus != "RUNNING" || shiftAdjustments != 0 {
-		t.Fatalf("blocked manage shift must leave the bot alive and budget intact: %s/%d",
+	if shiftStatus != "RUNNING" || shiftAdjustments != 1 {
+		t.Fatalf("executed keep-shift must stay RUNNING with budget spent: %s/%d",
 			shiftStatus, shiftAdjustments)
 	}
-	var blockedReason string
+	var shiftMode string
 	if err := pool.QueryRow(ctx, `
-		SELECT details->>'reason' FROM bot_execution_events
-		WHERE bot_id = $1 AND event_type = 'SHIFT_BLOCKED_UNDERWATER'
+		SELECT details->>'mode' FROM bot_execution_events
+		WHERE bot_id = $1 AND event_type = 'ADJUST_RANGE'
 		ORDER BY created_at DESC LIMIT 1
-	`, shiftBot).Scan(&blockedReason); err != nil || blockedReason != "RANGE_SHIFT_UP" {
-		t.Fatalf("SHIFT_BLOCKED_UNDERWATER with reason RANGE_SHIFT_UP expected, got %q (%v)",
-			blockedReason, err)
+	`, shiftBot).Scan(&shiftMode); err != nil || shiftMode != shiftModeKeepInvestment {
+		t.Fatalf("manage keep-shift event must carry mode=keep_investment, got %q (%v)", shiftMode, err)
+	}
+	var blocked int
+	if err := pool.QueryRow(ctx, `
+		SELECT COUNT(*) FROM bot_execution_events
+		WHERE bot_id = $1 AND event_type = 'SHIFT_BLOCKED_UNDERWATER'
+	`, shiftBot).Scan(&blocked); err != nil || blocked != 0 {
+		t.Fatalf("SHIFT_BLOCKED_UNDERWATER must be gone, got %d rows (%v)", blocked, err)
 	}
 
 	// The close bot: the adverse-regime break close still fires unchanged.

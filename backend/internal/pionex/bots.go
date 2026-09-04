@@ -98,6 +98,13 @@ func (c *Client) CheckFuturesGridParams(
 // (add quoteInvestment) or "adjust_params" (move bottom/top/row).
 // extraMargin and openPrice are REQUIRED by the official contract for every
 // type; openPrice is the current market price used to re-anchor the grid.
+//
+// KeepInvestment (adjust_params only) maps to the documented keepInvestment
+// flag: "only modify grid range/row without resetting the investment amount.
+// Overrides isReinvest..., skips the PnL check (PROFIT_LESS_THAN_ZERO), but
+// still validates the price range" — a pure range transfer with no PnL
+// realization. nil omits the field (exchange default false = the floating
+// PnL > 0 gate applies).
 type AdjustFuturesGridParams struct {
 	BUOrderID       string           `json:"buOrderId"`
 	Type            string           `json:"type"`
@@ -107,6 +114,20 @@ type AdjustFuturesGridParams struct {
 	Top             *decimal.Decimal `json:"top,omitempty"`
 	Row             int              `json:"row,omitempty"`
 	QuoteInvestment *decimal.Decimal `json:"quoteInvestment,omitempty"`
+	KeepInvestment  *bool            `json:"keepInvestment,omitempty"`
+}
+
+// FuturesGridAdjustCheckResult carries the optional payload of the documented
+// dry-run endpoint POST /api/v1/bot/orders/futuresGrid/adjustParamsCheck
+// (weight 1). The verdict itself is the envelope: a refused check returns
+// result=false (BOT_INVALID_ARGUMENT / PROFIT_LESS_THAN_ZERO / range
+// validation) and surfaces as *APIError, exactly like the live call — that is
+// the whole point of asking the check before committing the shift.
+type FuturesGridAdjustCheckResult struct {
+	MinInvestment      decimal.Decimal `json:"min_investment,omitempty"`
+	MinInvestmentCamel decimal.Decimal `json:"minInvestment,omitempty"`
+	Slippage           decimal.Decimal `json:"slippage,omitempty"`
+	EstimateFee        decimal.Decimal `json:"estimate_fee,omitempty"`
 }
 
 func (c *Client) AdjustFuturesGridBot(
@@ -118,6 +139,27 @@ func (c *Client) AdjustFuturesGridBot(
 		return fmt.Errorf("marshal futures grid adjust request: %w", err)
 	}
 	return c.do(ctx, http.MethodPost, "/api/v1/bot/orders/futuresGrid/adjustParams", nil, body, true, 1, nil)
+}
+
+// CheckAdjustFuturesGridBot is the dry-run twin of AdjustFuturesGridBot: the
+// documented adjustParamsCheck endpoint (weight 1) with the IDENTICAL body —
+// including keepInvestment — validates the move (range, row, PnL gate
+// overrides) without touching the live grid. A non-nil error means the
+// exchange already refused this exact payload, so the live call is a
+// guaranteed rejection and must not be sent.
+func (c *Client) CheckAdjustFuturesGridBot(
+	ctx context.Context,
+	params AdjustFuturesGridParams,
+) (*FuturesGridAdjustCheckResult, error) {
+	body, err := json.Marshal(params)
+	if err != nil {
+		return nil, fmt.Errorf("marshal futures grid adjust check request: %w", err)
+	}
+	var result FuturesGridAdjustCheckResult
+	if err := c.do(ctx, http.MethodPost, "/api/v1/bot/orders/futuresGrid/adjustParamsCheck", nil, body, true, 1, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
 }
 
 // BotOrder is an entry of the documented account-wide bot order list

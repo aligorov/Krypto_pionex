@@ -151,18 +151,19 @@ func QueueTelegramEvent(
 		tmpl = "⚠️ <b>Радар: эскейп отклонён биржей:</b> бот #{{bot_number}} {{symbol}} band {{band}} — {{error}}"
 	case "RADAR_B2_EARLY_RECENTER":
 		// v2.0.76 "shift on green": the preventive band-2 re-center fired
-		// while the profit preflight still passes — the only window the
-		// exchange will actually execute the shift (PROFIT_LESS_THAN_ZERO
-		// closes it the moment the bot goes under water).
+		// while the profit preflight still passes — the classic dwell-3
+		// window (v2.0.85: under water the shift now ships keepInvestment
+		// instead of being blocked; see RADAR_B2_VELOCITY_RECENTER for the
+		// one-tick lane).
 		shouldSend = notifyAdjust
 		tmpl = "🛡 <b>Радар: ранний ре-центр на зелёном (B2):</b> бот #{{bot_number}} {{symbol}} — цена прошла {{edge_progress_pct}}% пути к опасному краю, score {{score}}, total {{total}} USDT → [{{lower_price}}, {{upper_price}}]"
-	case "RADAR_SHIFT_BLOCKED_UNDERWATER":
-		// v2.0.76: the preflight vetoed a radar re-center because the bot is
-		// under water — the exchange would reject adjust_params
-		// (PROFIT_LESS_THAN_ZERO), so nothing was sent and the exit stays
-		// with the stop ladder / operator.
+	case "RADAR_B2_VELOCITY_RECENTER":
+		// v2.0.85 "shift early": the trajectory lane — from 55% of the way
+		// to the adverse edge, a price racing at ≥ 0.6×ATR(15м)/15м fires
+		// after ONE tick (dwell 1); the dwell-3 early window slips past on
+		// exactly these pairs. Requires a still-green base (normal shift).
 		shouldSend = notifyAdjust
-		tmpl = "⛔ <b>Радар: сдвиг заблокирован — бот под водой:</b> бот #{{bot_number}} {{symbol}} band {{band}} (score {{score}}), total {{total}} USDT — биржа отклоняет adjust_params при отрицательном профите; ждём стоп/оператора"
+		tmpl = "⚡ <b>Радар: скоростной ре-центр (B2 velocity):</b> бот #{{bot_number}} {{symbol}} — цена на {{edge_progress_pct}}% пути к краю, скорость {{speed_atr_15m}}×ATR/15м, score {{score}}, total {{total}} USDT → [{{lower_price}}, {{upper_price}}]"
 	case "RADAR_AUTOCLOSE":
 		// v2.0.84: the radar closed the bot itself (opt-in mode BAND3/STRICT).
 		// Queued BEFORE the close intent — the operator must see the why
@@ -170,11 +171,6 @@ func QueueTelegramEvent(
 		// the race.
 		shouldSend = notifyStop
 		tmpl = "🛑 <b>Радар: автозакрытие ({{mode}}):</b> бот #{{bot_number}} {{symbol}} — band {{band}} (score {{score}}), total {{total}} USDT — {{reason}}"
-	case "SHIFT_BLOCKED_UNDERWATER":
-		// v2.0.76 manage twin: a RANGE_BREAK shift was skipped for the same
-		// exchange-side reason instead of hammering a guaranteed rejection.
-		shouldSend = notifyAdjust
-		tmpl = "⛔ <b>Сдвиг диапазона заблокирован — бот под водой:</b> бот #{{bot_number}} {{symbol}} ({{reason}}), total {{total}} USDT — биржа не примет adjustParams; пробой остаётся за стопом/оператором"
 	case "STOP_FORECAST_SHADOW":
 		// v2.0.57: the radar's band transitions used to fall into the
 		// generic {{message}} fallback and shipped literal placeholders

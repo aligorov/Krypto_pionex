@@ -20,16 +20,20 @@ import (
 	"github.com/shopspring/decimal"
 )
 
-// adjustExchangeMock emulates the two native endpoints Service.AdjustBot
-// touches for a REAL range shift: the public ticker feed (openPrice) and
-// the signed adjustParams call, whose JSON body is captured so tests can
-// pin the exact geometry the radar shipped to the exchange.
+// adjustExchangeMock emulates the native endpoints Service.AdjustBot touches
+// for a REAL range shift: the public ticker feed (openPrice), the dry-run
+// adjustParamsCheck (v2.0.85 keepInvestment lane) and the signed adjustParams
+// call. The JSON bodies of both POSTs are captured so tests can pin the exact
+// geometry and flags the radar shipped to the exchange.
 type adjustExchangeMock struct {
 	server      *httptest.Server
 	failAdjust  atomic.Bool
+	failCheck   atomic.Bool
 	adjustCount atomic.Int64
+	checkCount  atomic.Int64
 	mu          sync.Mutex
 	lastAdjust  map[string]any
+	lastCheck   map[string]any
 }
 
 func newAdjustExchangeMock(t *testing.T) *adjustExchangeMock {
@@ -44,6 +48,32 @@ func newAdjustExchangeMock(t *testing.T) *adjustExchangeMock {
 				"tickers": []map[string]any{
 					{"symbol": "RADR_USDT_PERP", "close": "103.5"},
 				},
+			},
+		})
+	})
+	// The documented dry-run (weight 1): same body as the live adjust. In the
+	// mock it answers with the same envelope shape the exchange uses for a
+	// refused keep-transfer: result=false + PROFIT_LESS_THAN_ZERO-style code.
+	mux.HandleFunc("POST /api/v1/bot/orders/futuresGrid/adjustParamsCheck", func(w http.ResponseWriter, r *http.Request) {
+		mock.checkCount.Add(1)
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		mock.mu.Lock()
+		mock.lastCheck = body
+		mock.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		if mock.failCheck.Load() {
+			json.NewEncoder(w).Encode(map[string]any{
+				"result": false, "timestamp": time.Now().UnixMilli(),
+				"code": "BOT_INVALID_ARGUMENT", "message": "PROFIT_LESS_THAN_ZERO: grid profit is below zero",
+			})
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]any{
+			"result": true, "timestamp": time.Now().UnixMilli(),
+			"data": map[string]any{
+				"min_investment": "5",
+				"slippage":       "0.1",
 			},
 		})
 	})
@@ -76,6 +106,16 @@ func (m *adjustExchangeMock) adjust() map[string]any {
 	defer m.mu.Unlock()
 	cp := make(map[string]any, len(m.lastAdjust))
 	for k, v := range m.lastAdjust {
+		cp[k] = v
+	}
+	return cp
+}
+
+func (m *adjustExchangeMock) check() map[string]any {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cp := make(map[string]any, len(m.lastCheck))
+	for k, v := range m.lastCheck {
 		cp[k] = v
 	}
 	return cp
@@ -338,6 +378,14 @@ func TestRadarRealRecenterB3(t *testing.T) {
 	if body["row"] != float64(20) {
 		t.Fatalf("row must stay the existing grid_num 20, got %v", body["row"])
 	}
+	// v2.0.85 (b): the green bot (+$0.5 floating) must take the NORMAL
+	// semantics — no keepInvestment flag, no adjustParamsCheck dry-run.
+	if _, has := body["keepInvestment"]; has {
+		t.Fatalf("normal-mode shift must not ship keepInvestment, got %v", body["keepInvestment"])
+	}
+	if got := h.mock.checkCount.Load(); got != 0 {
+		t.Fatalf("normal-mode shift must skip the adjustParamsCheck dry-run, got %d checks", got)
+	}
 
 	var lower, upper, antiHunt decimal.Decimal
 	var adjustments int
@@ -358,15 +406,18 @@ func TestRadarRealRecenterB3(t *testing.T) {
 		t.Fatalf("anti-hunt must re-anchor to 91.5, got %s", antiHunt)
 	}
 
-	var reason, source string
+	var reason, source, evMode string
 	if err := h.pool.QueryRow(ctx, `
-		SELECT details->>'reason', bot_source FROM bot_execution_events
+		SELECT details->>'reason', bot_source, details->>'mode' FROM bot_execution_events
 		WHERE bot_id = $1 AND event_type = 'ADJUST_RANGE' ORDER BY created_at DESC LIMIT 1
-	`, botID).Scan(&reason, &source); err != nil {
+	`, botID).Scan(&reason, &source, &evMode); err != nil {
 		t.Fatalf("recenter event must be logged: %v", err)
 	}
 	if reason != "RADAR_B3_RECENTER" || source != "REAL" {
 		t.Fatalf("event must be REAL/RADAR_B3_RECENTER, got %s/%s", source, reason)
+	}
+	if evMode != shiftModeNormal {
+		t.Fatalf("green recenter event must carry mode=normal, got %q", evMode)
 	}
 }
 

@@ -28,16 +28,21 @@ import (
 //	B4     escape re-center, may exceed the budget by one — it replaces a
 //	       stop-loss, and a stop never asked the budget's permission
 //
-// v2.0.76 feasibility preflight: the exchange rejects adjust_params on any
-// bot whose current profit is negative (BOT_INVALID_ARGUMENT /
-// PROFIT_LESS_THAN_ZERO — the official futures-grid API spec gates the call
-// on floating PnL > 0 unless keepInvestment/reinvest is used; prod SNXXX #669
-// proved it live: band 3, dwell satisfied, shift refused, only Warn). Every
-// radar arm therefore checks the last-reconciled remote total FIRST and a
-// blocked shift becomes a durable RADAR_SHIFT_BLOCKED_UNDERWATER event (1/h
-// per bot) instead of a guaranteed rejection: the exchange is never asked,
-// the cooldown is not armed (no action happened) and the exit decision stays
-// with the stop ladder / operator.
+// v2.0.76 feasibility preflight → v2.0.85 "shift always, shift early". The
+// exchange's normal adjust_params semantics reject any bot whose floating
+// PnL ≤ 0 (BOT_INVALID_ARGUMENT / PROFIT_LESS_THAN_ZERO — the official
+// futures-grid API spec gates the call on floating PnL > 0; prod SNXXX #669
+// proved it live: band 3, dwell satisfied, shift refused, only Warn). v2.0.76
+// answered by parking under-water bots (RADAR_SHIFT_BLOCKED_UNDERWATER). The
+// operator directive for v2.0.85 is the opposite: IF a shift under water is
+// impossible, THEN shift EARLY — and under water it turns out POSSIBLE too:
+// the documented keepInvestment=true flag moves the range without resetting
+// the investment and skips the PnL check, so the preflight now selects a MODE
+// instead of vetoing (adjustShiftMode below): green → normal re-base, under
+// water → keep_investment rescue transfer, dry-run validated through the
+// documented adjustParamsCheck endpoint before the live call. The only
+// remaining refusal is the exchange's own — it lands in the durable
+// RADAR_RECENTER_FAILED path with the reason.
 //
 // Churn guard (v2.0.56 F5 calibration): a per-bot cooldown plus a dwell
 // requirement — the signal must sit over B3 for ≥3 consecutive snapshots
@@ -73,6 +78,26 @@ const (
 	// side and a shift is churn, above it the B3 trigger is imminent.
 	radarB2EarlyEdgeProgressMin = 0.70
 
+	// v2.0.85 "shift always, shift early" velocity trigger (FIX-2). The
+	// band-2 early window (70% + dwell 3, ~4.5 min at the ACTIVE cadence)
+	// slips past on fast pairs — the price crosses the remaining 30% of the
+	// range inside the dwell. The velocity lane arms on the TRAJECTORY
+	// instead of the dwell:
+	//   edge_progress ≥ 55%
+	//   speed toward the adverse edge ≥ 0.6 × ATR(15m) per 15 minutes
+	//   floating > +$0.10 (the base is still green — this is prevention, not
+	//   rescue; the underwater lane is FIX-1 keepInvestment)
+	//   dwell 1 — speed does not wait
+	// plus the shared cooldown/budget/age gates.
+	radarB2VelocityEdgeProgressMin = 0.55
+	radarB2VelocitySpeedATR15      = 0.6
+	// radarVelocityFreshWindow suppresses zero-gap samples when two bots on
+	// one symbol are scored in the same pass, and radarVelocityMaxAge caps
+	// how stale a baseline may be before the "speed" stops meaning anything
+	// (worker downtime must not fabricate velocity).
+	radarVelocityFreshWindow = 10 * time.Second
+	radarVelocityMaxAge      = 30 * time.Minute
+
 	// v2.0.84 radar auto-close gates. Every constant comes from the
 	// 2026-09-03T20:35Z..09-04T19:29Z REAL backtest (24 band>=3 episodes,
 	// 13 bots) that priced the policy — see migration 0042:
@@ -90,25 +115,41 @@ const (
 	radarAutocloseStrictDistATR = 0.5
 )
 
-// adjustShiftProfitFloor is the local feasibility floor for any native
-// adjust_params range shift. The exchange gate is the order's PURE FLOATING
-// PnL > 0 (PROFIT_LESS_THAN_ZERO; prod NEAR #688 2026-09-04 19:05Z: grid
-// profit +2 with floating −0.5 cleared the old total-based preflight and
-// the shift was refused anyway), so the preflight watches the same leg —
-// the floating (unrealized) figure from the last reconcile — and the +$0.10
-// buffer absorbs drift between the reconcile and the shift attempt so a
-// borderline bot is not shipped into a guaranteed rejection. The realized
-// grid profit never enters the decision.
+// adjustShiftProfitFloor is the local preference floor for the NORMAL
+// adjust_params semantics (re-base with PnL realization). The exchange gate
+// is the order's PURE FLOATING PnL > 0 (PROFIT_LESS_THAN_ZERO; prod NEAR #688
+// 2026-09-04 19:05Z: grid profit +2 with floating −0.5 cleared the old
+// total-based preflight and the shift was refused anyway), so the preflight
+// watches the same leg — the floating (unrealized) figure from the last
+// reconcile — and the +$0.10 buffer absorbs drift between the reconcile and
+// the shift attempt. The realized grid profit never enters the decision.
 var adjustShiftProfitFloor = decimal.NewFromFloat(0.10)
 
-// adjustShiftFeasible reports whether a native range shift is locally
-// executable. It is the single preflight both the radar arms and the manage
-// RANGE_BREAK path must clear before touching adjust_params — calling the
-// exchange below the floor can only produce PROFIT_LESS_THAN_ZERO. The
-// figure under test is the FLOATING PnL (unrealized leg of the last
-// reconcile), not the bot total.
-func adjustShiftFeasible(floatingPnL decimal.Decimal) bool {
-	return floatingPnL.GreaterThanOrEqual(adjustShiftProfitFloor)
+// Shift modes for a native range shift (v2.0.85 "shift always").
+const (
+	// shiftModeNormal is the legacy semantics: floating ≥ +$0.10, the
+	// exchange re-bases the grid (base/investment recalculated, floating PnL
+	// crystallizes into realized).
+	shiftModeNormal = "normal"
+	// shiftModeKeepInvestment is the documented keepInvestment=true rescue
+	// transfer: pure range move, the exchange skips its
+	// PROFIT_LESS_THAN_ZERO gate, the investment base and the local
+	// targets/stops arithmetic stay untouched. There is no longer a locally
+	// blocked state — an under-water bot is SHIFTED, not parked.
+	shiftModeKeepInvestment = "keep_investment"
+)
+
+// adjustShiftMode resolves HOW a native range shift must be shipped from the
+// last-reconciled FLOATING PnL: green (≥ +$0.10 buffer) → normal re-base;
+// anything below → keep_investment transfer. It is the single preflight both
+// the radar arms and the manage RANGE_BREAK path consult; the figure under
+// test is the FLOATING PnL (unrealized leg of the last reconcile), not the
+// bot total.
+func adjustShiftMode(floatingPnL decimal.Decimal) string {
+	if floatingPnL.GreaterThanOrEqual(adjustShiftProfitFloor) {
+		return shiftModeNormal
+	}
+	return shiftModeKeepInvestment
 }
 
 // radarB2EarlyEdgeProgress is the share of the range width the price has
@@ -134,6 +175,70 @@ func radarB2EarlyEdgeProgress(price, lower, upper decimal.Decimal, inventorySide
 		return 1
 	}
 	return progress
+}
+
+// radarPricePoint is one (ts, price) sample of the in-memory velocity trail.
+type radarPricePoint struct {
+	at    time.Time
+	price decimal.Decimal
+}
+
+// radarEdgeSpeedATRPer15m measures the price's speed TOWARD the adverse edge
+// in ATR(15m) units per 15 minutes from two consecutive trail samples:
+// long inventory falls toward its lower bound, short inventory rises toward
+// its upper. Moving away from the edge reads 0 — the trigger is directional.
+// atrPctEntry is the deploy-time ATR in % per 15m bar (radarInput.atrEntryPct);
+// without it (0/unknown) there is no ruler and the speed is unmeasurable.
+func radarEdgeSpeedATRPer15m(prev, cur radarPricePoint, atrPctEntry, inventorySide float64) float64 {
+	if inventorySide == 0 || atrPctEntry <= 0 {
+		return 0
+	}
+	if !prev.price.GreaterThan(decimal.Zero) || !cur.price.GreaterThan(decimal.Zero) {
+		return 0
+	}
+	minutes := cur.at.Sub(prev.at).Minutes()
+	if minutes <= 0 {
+		return 0
+	}
+	var edgeMove float64
+	if inventorySide > 0 {
+		edgeMove, _ = prev.price.Sub(cur.price).Float64() // falling = toward the lower bound
+	} else {
+		edgeMove, _ = cur.price.Sub(prev.price).Float64() // rising = toward the upper bound
+	}
+	if edgeMove <= 0 {
+		return 0
+	}
+	curPrice, _ := cur.price.Float64()
+	atr15 := curPrice * atrPctEntry / 100.0
+	if atr15 <= 0 {
+		return 0
+	}
+	return (edgeMove / minutes) * 15.0 / atr15
+}
+
+// rememberRadarPrice advances the in-memory symbol→(ts,price) trail and
+// returns the PREVIOUS point when it is a usable velocity baseline. The
+// trail is deliberately not durable and not a cooldown — it is a pure
+// measurement over two consecutive radar passes, so losing it on a restart
+// costs one pass of velocity sensitivity, nothing else. Same-pass repeats
+// (two bots on one symbol) and stale baselines (worker downtime) are not
+// measurements: the stored point is kept/refreshed but reported unusable.
+func (worker *Worker) rememberRadarPrice(symbol string, point radarPricePoint) (radarPricePoint, bool) {
+	if worker.radarPriceTrail == nil {
+		worker.radarPriceTrail = make(map[string]radarPricePoint)
+	}
+	prev, ok := worker.radarPriceTrail[symbol]
+	if ok && point.at.Sub(prev.at) < radarVelocityFreshWindow {
+		// The trail already carries this pass's price; keep it as baseline.
+		return radarPricePoint{}, false
+	}
+	worker.radarPriceTrail[symbol] = point
+	if !ok || prev.at.IsZero() || point.at.Sub(prev.at) > radarVelocityMaxAge ||
+		!prev.price.GreaterThan(decimal.Zero) {
+		return radarPricePoint{}, false
+	}
+	return prev, true
 }
 
 // radarActionCooldownFor is the dist-aware re-center window for one score:
@@ -249,49 +354,21 @@ func radarRecenterBudgetAllows(band, adjustments, maxAdjustmentsPerBot int) bool
 	return adjustments < maxAdjustmentsPerBot
 }
 
-// radarShiftBlockedUnderwater records the durable no-action decision when the
-// profit preflight vetoes a radar re-center: adjust_params on a bot with
-// negative profit is a guaranteed PROFIT_LESS_THAN_ZERO rejection, so the
-// exchange is not asked and the exit stays owned by the stop ladder or the
-// operator. One RADAR_SHIFT_BLOCKED_UNDERWATER event per bot per hour
-// (model_state marker, the tranche2SkipAt pattern). The radar cooldown is
-// deliberately NOT armed — no action happened — so the shift becomes
-// eligible again the moment profit recovers past the floor.
-func (worker *Worker) radarShiftBlockedUnderwater(ctx context.Context, b radarInput, rs radarScores, total decimal.Decimal) {
-	table := "grid_bots"
-	if b.botSource == "PAPER" {
-		table = "paper_grid_bots"
-	}
-	tag, err := worker.db.Exec(ctx, `
-		UPDATE `+table+`
-		SET model_state = jsonb_set(COALESCE(model_state, '{}'::jsonb), '{radarShiftBlockedAt}',
-			to_jsonb(to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'))),
-		    updated_at = NOW()
-		WHERE id = $1
-		  AND COALESCE((model_state->>'radarShiftBlockedAt')::TIMESTAMPTZ, '1970-01-01') < NOW() - INTERVAL '1 hour'
-	`, b.botID)
-	if err != nil {
-		worker.logger.Warn("stop-radar: shift-blocked marker write failed",
-			"component", "autogrid_worker", "symbol", b.symbol, "error", err)
-		return
-	}
-	if tag.RowsAffected() != 1 {
-		return // deduped: the hour-old blocked event still speaks for this state
-	}
-	_ = LogBotEvent(ctx, worker.db, b.botID, b.botNumber, b.botSource, b.symbol,
-		"RADAR_SHIFT_BLOCKED_UNDERWATER", &b.price, &total, map[string]any{
-			"band": rs.Band, "score": decimal.NewFromFloat(rs.Score).Round(4).String(),
-			"total_pnl": total.StringFixed(4),
-			"reason":    "PROFIT_LESS_THAN_ZERO_PREFLIGHT",
-		})
-	_ = QueueTelegramEvent(ctx, worker.db, "RADAR_SHIFT_BLOCKED_UNDERWATER", map[string]any{
-		"bot_number": b.botNumber, "symbol": b.symbol, "band": rs.Band,
-		"score": decimal.NewFromFloat(rs.Score).Round(3).String(), "total": total.StringFixed(2),
-	})
-}
-
-// radarMaybeRecenter executes the B2-early/B3/B4 action matrix for one bot.
+// radarMaybeRecenter executes the B2-early/B2-velocity/B3/B4 action matrix for
+// one bot.
 func (worker *Worker) radarMaybeRecenter(ctx context.Context, settings Settings, b radarInput, rs radarScores) {
+	// v2.0.85 velocity trail FIRST — before every gate — so two consecutive
+	// passes always leave a (ts,price) pair regardless of how early the bot
+	// bails out (band < 2 today, band 2 tomorrow: the baseline must exist by
+	// then, and losing one pass of history on restart is acceptable).
+	now := time.Now().UTC()
+	prevPoint, hasPrev := worker.rememberRadarPrice(b.symbol, radarPricePoint{at: now, price: b.price})
+	velocitySpeed := 0.0
+	if hasPrev {
+		velocitySpeed = radarEdgeSpeedATRPer15m(prevPoint, radarPricePoint{at: now, price: b.price},
+			b.atrEntryPct, b.inventorySide)
+	}
+
 	if settings.StopForecastMode != "ACTIVE" || rs.Band < 2 {
 		return
 	}
@@ -299,11 +376,23 @@ func (worker *Worker) radarMaybeRecenter(ctx context.Context, settings Settings,
 	// v2.0.76 "shift on green": band 2 arms the EARLY preventive re-center —
 	// but only when the price has already covered 70%+ of the way to the
 	// edge the inventory fears. B3 typically fires with the price at the stop
-	// and the bot under water, which the exchange refuses to shift; the B2
-	// window is exactly the span where the re-center is still executable.
+	// and the bot under water; the B2 window is where the re-center is still
+	// cheap. v2.0.85 FIX-2 adds the VELOCITY lane inside the same band 2:
+	// from 55% of the way to the edge, a price racing toward it at
+	// ≥ 0.6×ATR(15m)/15m fires after ONE tick — the dwell-3 window slips past
+	// on exactly those pairs. Velocity requires a green base (prevention,
+	// not rescue); under water the ≥70% early lane now shifts anyway through
+	// keepInvestment (FIX-1).
 	early := rs.Band == 2
-	if early && radarB2EarlyEdgeProgress(b.price, b.lower, b.upper, b.inventorySide) < radarB2EarlyEdgeProgressMin {
-		return
+	velocity := false
+	if early {
+		progress := radarB2EarlyEdgeProgress(b.price, b.lower, b.upper, b.inventorySide)
+		if hasPrev && progress >= radarB2VelocityEdgeProgressMin &&
+			velocitySpeed >= radarB2VelocitySpeedATR15 {
+			velocity = true
+		} else if progress < radarB2EarlyEdgeProgressMin {
+			return // too far from the edge for any band-2 lane
+		}
 	}
 
 	// Durable dist-aware cooldown: blocked while the bot's last radar
@@ -317,13 +406,19 @@ func (worker *Worker) radarMaybeRecenter(ctx context.Context, settings Settings,
 
 	// v2.0.56 (F5) dwell gate: act only on a signal that has persisted for
 	// ≥3 snapshots over the band's own threshold (B2 early dwells over B2,
-	// B3/B4 over B3) — a single spike is noise. Checked after the cooldown
-	// so the snapshot query only runs for cooldown-eligible bots.
+	// B3/B4 over B3) — a single spike is noise. The velocity lane is the
+	// documented exception (dwell 1): speed is itself the persistence proof,
+	// waiting 3 ticks is how fast pairs escape the window. Checked after the
+	// cooldown so the snapshot query only runs for cooldown-eligible bots.
 	dwellThreshold := bandB3
+	dwellTicks := radarDwellTicks
 	if early {
 		dwellThreshold = bandB2
 	}
-	if worker.radarDwellAtOrAbove(ctx, b.botID, dwellThreshold) < radarDwellTicks {
+	if velocity {
+		dwellTicks = 1
+	}
+	if worker.radarDwellAtOrAbove(ctx, b.botID, dwellThreshold) < dwellTicks {
 		return
 	}
 
@@ -331,7 +426,7 @@ func (worker *Worker) radarMaybeRecenter(ctx context.Context, settings Settings,
 	// band, durable cooldown, dwell) already ran; the arm differs only in
 	// execution — native adjust_params instead of a simulated range UPDATE.
 	if b.botSource == "REAL" {
-		worker.radarRecenterReal(ctx, settings, b, rs, early)
+		worker.radarRecenterReal(ctx, settings, b, rs, early, velocity, velocitySpeed)
 		return
 	}
 
@@ -375,20 +470,76 @@ func (worker *Worker) radarMaybeRecenter(ctx context.Context, settings Settings,
 		return
 	}
 
-	// v2.0.76 feasibility preflight, paper arm: the simulated shift must obey
-	// the same green-only policy the exchange enforces on REAL, or paper
-	// calibration keeps endorsing maneuvers the native fleet cannot execute.
-	// v2.0.83: the gate is the FLOATING leg — the exchange keys on pure
-	// floating PnL, a paper bot with banked grid profit and a sinking
-	// position must not "pass" (the NEAR #688 lesson).
-	paperTotal := bot.realized.Add(bot.unrealized)
-	if !adjustShiftFeasible(bot.unrealized) {
-		worker.radarShiftBlockedUnderwater(ctx, b, rs, paperTotal)
+	// v2.0.85 mode preflight, paper arm: the simulated shift must mirror the
+	// semantics the exchange applies on REAL, or paper calibration keeps
+	// endorsing maneuvers the native fleet executes differently. The FLOATING
+	// leg (v2.0.83, the NEAR #688 lesson) selects the mode: green → normal
+	// re-base with mark crystallization; under water → keep_investment
+	// transfer (bounds move, the investment base / entry / PnL legs stay).
+	// The velocity lane is prevention only and requires the normal mode.
+	mode := adjustShiftMode(bot.unrealized)
+	if velocity && mode != shiftModeNormal {
 		return
 	}
 
 	newLower, newUpper := recenterBounds(bot.lower, bot.upper, b.price)
+	newLevel := gridLevelForPrice(newLower, newUpper, bot.gridNum, b.price)
 
+	// keep_investment semantics: a pure range transfer — nothing re-bases,
+	// nothing crystallizes. quote_investment, entry, realized/unrealized and
+	// the mark all stay exactly as they were (the native twin keeps its
+	// investment on the exchange by contract); only the bounds, the grid
+	// level and the anti-hunt travel.
+	if mode == shiftModeKeepInvestment {
+		setClauses := ""
+		var extraArgs []any
+		if bot.antiHunt != nil && bot.antiHunt.GreaterThan(decimal.Zero) {
+			newStop := recenterStop(bot.direction, bot.lower, bot.upper, newLower, newUpper, *bot.antiHunt)
+			setClauses += fmt.Sprintf(", anti_hunt_stop_price = $%d", 5+len(extraArgs))
+			extraArgs = append(extraArgs, newStop)
+		}
+		if _, err := worker.db.Exec(ctx, `
+			UPDATE paper_grid_bots
+			SET lower_price = $2, upper_price = $3,
+			    adjustments_count = adjustments_count + 1,
+			    last_grid_level = $4`+setClauses+`
+			WHERE id = $1 AND status = 'RUNNING'
+		`, append([]any{b.botID, newLower, newUpper, newLevel}, extraArgs...)...); err != nil {
+			worker.logger.Warn("stop-radar: keep-investment recenter UPDATE failed",
+				"component", "autogrid_worker", "symbol", b.symbol, "error", err)
+			return
+		}
+		reason := radarRecenterReason(rs.Band, early, velocity)
+		total := bot.realized.Add(bot.unrealized)
+		worker.logger.Info("stop-radar recentered grid (keep investment)",
+			"component", "autogrid_worker", "symbol", b.symbol,
+			"band", rs.Band, "score", decimal.NewFromFloat(rs.Score).Round(4).String(),
+			"lower", newLower.String(), "upper", newUpper.String())
+		if err := LogBotEvent(ctx, worker.db, b.botID, b.botNumber, "PAPER", b.symbol, "ADJUST_RANGE", &b.price, &total, map[string]any{
+			"reason": reason, "action": "RADAR_RECENTER",
+			"mode":    shiftModeKeepInvestment,
+			"score":   decimal.NewFromFloat(rs.Score).Round(4).String(),
+			"band":    rs.Band,
+			"s1":      decimal.NewFromFloat(rs.S1).Round(3).String(),
+			"s2":      decimal.NewFromFloat(rs.S2).Round(3).String(),
+			"s3":      decimal.NewFromFloat(rs.S3).Round(3).String(),
+			"s4":      decimal.NewFromFloat(rs.S4).Round(3).String(),
+			"new_lower": newLower.String(), "new_upper": newUpper.String(),
+			"floating_pnl": bot.unrealized.StringFixed(4),
+		}); err != nil {
+			worker.logger.Warn("stop-radar: keep-investment recenter event insert failed — durable cooldown not armed",
+				"component", "autogrid_worker", "symbol", b.symbol, "error", err)
+		}
+		_ = QueueTelegramEvent(ctx, worker.db, "ADJUST_RANGE", map[string]any{
+			"bot_number": b.botNumber, "symbol": b.symbol,
+			"lower_price": newLower.StringFixed(6), "upper_price": newUpper.StringFixed(6),
+			"reason": reason, "mode": shiftModeKeepInvestment,
+			"score": decimal.NewFromFloat(rs.Score).Round(3).String(),
+		})
+		return
+	}
+
+	// Normal mode: re-base with crystallization.
 	// Crystallize the mark at the live price; a shift keeps the position,
 	// so the exit-fee component goes back in (paperMarkAtPrice contract).
 	markUnrealized, exitNotional := paperMarkAtPrice(paperSettleBot{
@@ -401,8 +552,6 @@ func (worker *Worker) radarMaybeRecenter(ctx context.Context, settings Settings,
 	if exitNotional.IsPositive() {
 		shiftRealized = shiftRealized.Add(exitNotional.Mul(feeRate))
 	}
-
-	newLevel := gridLevelForPrice(newLower, newUpper, bot.gridNum, b.price)
 
 	// v2.0.15 re-anchors: directional grids re-anchor entry (their mark is
 	// derived from entry each tick); the anti-hunt travels with the range.
@@ -435,13 +584,7 @@ func (worker *Worker) radarMaybeRecenter(ctx context.Context, settings Settings,
 		return
 	}
 
-	reason := "RADAR_B3_RECENTER"
-	if rs.Band >= 4 {
-		reason = "RADAR_B4_ESCAPE"
-	}
-	if early {
-		reason = "RADAR_B2_EARLY_RECENTER"
-	}
+	reason := radarRecenterReason(rs.Band, early, velocity)
 	total := bot.realized.Add(bot.unrealized)
 	worker.logger.Info("stop-radar recentered grid",
 		"component", "autogrid_worker", "symbol", b.symbol,
@@ -452,16 +595,21 @@ func (worker *Worker) radarMaybeRecenter(ctx context.Context, settings Settings,
 	// here would leave the next re-center un-gated on the following pass.
 	if err := LogBotEvent(ctx, worker.db, b.botID, b.botNumber, "PAPER", b.symbol, "ADJUST_RANGE", &b.price, &total, map[string]any{
 		"reason": reason, "action": "RADAR_RECENTER",
-		"score":     decimal.NewFromFloat(rs.Score).Round(4).String(),
-		"band":      rs.Band,
-		"s1":        decimal.NewFromFloat(rs.S1).Round(3).String(),
-		"s2":        decimal.NewFromFloat(rs.S2).Round(3).String(),
-		"s3":        decimal.NewFromFloat(rs.S3).Round(3).String(),
-		"s4":        decimal.NewFromFloat(rs.S4).Round(3).String(),
+		"mode":    shiftModeNormal,
+		"score":   decimal.NewFromFloat(rs.Score).Round(4).String(),
+		"band":    rs.Band,
+		"s1":      decimal.NewFromFloat(rs.S1).Round(3).String(),
+		"s2":      decimal.NewFromFloat(rs.S2).Round(3).String(),
+		"s3":      decimal.NewFromFloat(rs.S3).Round(3).String(),
+		"s4":      decimal.NewFromFloat(rs.S4).Round(3).String(),
 		"new_lower": newLower.String(), "new_upper": newUpper.String(),
 	}); err != nil {
 		worker.logger.Warn("stop-radar: recenter event insert failed — durable cooldown not armed",
 			"component", "autogrid_worker", "symbol", b.symbol, "error", err)
+	}
+	if velocity {
+		queueRadarB2VelocityTelegram(ctx, worker, b, rs, newLower, newUpper, velocitySpeed)
+		return
 	}
 	if early {
 		queueRadarB2EarlyTelegram(ctx, worker, b, rs, newLower, newUpper)
@@ -472,6 +620,21 @@ func (worker *Worker) radarMaybeRecenter(ctx context.Context, settings Settings,
 		"lower_price": newLower.StringFixed(6), "upper_price": newUpper.StringFixed(6),
 		"reason": reason, "score": decimal.NewFromFloat(rs.Score).Round(3).String(),
 	})
+}
+
+// radarRecenterReason picks the durable ADJUST_RANGE reason: the velocity lane
+// is the most specific, then the early lane, then the B4 escape, then B3.
+func radarRecenterReason(band int, early, velocity bool) string {
+	switch {
+	case velocity:
+		return "RADAR_B2_VELOCITY_RECENTER"
+	case early:
+		return "RADAR_B2_EARLY_RECENTER"
+	case band >= 4:
+		return "RADAR_B4_ESCAPE"
+	default:
+		return "RADAR_B3_RECENTER"
+	}
 }
 
 // queueRadarB2EarlyTelegram renders the early-re-center notification with its
@@ -489,19 +652,37 @@ func queueRadarB2EarlyTelegram(ctx context.Context, worker *Worker, b radarInput
 	})
 }
 
+// queueRadarB2VelocityTelegram renders the velocity-lane notification: the
+// one-tick trajectory catch is a third, faster class of preventive shift and
+// must be distinguishable from both the dwell-3 early re-center and the
+// B3/B4 escapes in the operator's feed.
+func queueRadarB2VelocityTelegram(ctx context.Context, worker *Worker, b radarInput, rs radarScores, newLower, newUpper decimal.Decimal, speedATR15 float64) {
+	progress := radarB2EarlyEdgeProgress(b.price, b.lower, b.upper, b.inventorySide)
+	_ = QueueTelegramEvent(ctx, worker.db, "RADAR_B2_VELOCITY_RECENTER", map[string]any{
+		"bot_number": b.botNumber, "symbol": b.symbol,
+		"lower_price": newLower.StringFixed(6), "upper_price": newUpper.StringFixed(6),
+		"score":             decimal.NewFromFloat(rs.Score).Round(3).String(),
+		"edge_progress_pct": decimal.NewFromFloat(progress * 100).Round(0).String(),
+		"speed_atr_15m":     decimal.NewFromFloat(speedATR15).Round(2).String(),
+		"total":             b.total.StringFixed(2),
+	})
+}
+
 // radarRecenterReal is the REAL arm of the radar action matrix (v2.0.72):
-// the same B2-early/B3/B4 geometry as paper (recenterBounds), executed
-// through Service.AdjustBot mode=adjust_params — the identical path the
-// manage loop's tranche/range shifts and the operator console use, so the
+// the same B2-early/B2-velocity/B3/B4 geometry as paper (recenterBounds),
+// executed through Service.AdjustBot mode=adjust_params — the identical path
+// the manage loop's tranche/range shifts and the operator console use, so the
 // exchange-side contract (live openPrice, row = existing grid_num,
-// status=RUNNING + settings guard) cannot drift between callers.
+// status=RUNNING + settings guard) cannot drift between callers. v2.0.85:
+// an under-water bot ships keepInvestment=true (pure range transfer, no PnL
+// realization, dry-run adjustParamsCheck first inside AdjustBot).
 //
 // Budget sharing with the manage path is structural, not duplicated: both
 // read and increment the same grid_bots.adjustments_count, so a manage
 // RANGE_BREAK shift and a radar re-center draw from one per-bot budget;
 // the durable cooldown below arms on bot_execution_events by bot_id, where
 // REAL ids already flow.
-func (worker *Worker) radarRecenterReal(ctx context.Context, settings Settings, b radarInput, rs radarScores, early bool) {
+func (worker *Worker) radarRecenterReal(ctx context.Context, settings Settings, b radarInput, rs radarScores, early, velocity bool, velocitySpeed float64) {
 	type realBot struct {
 		direction    string
 		lower, upper decimal.Decimal
@@ -544,38 +725,45 @@ func (worker *Worker) radarRecenterReal(ctx context.Context, settings Settings, 
 
 	newLower, newUpper := recenterBounds(bot.lower, bot.upper, b.price)
 
-	// v2.0.76 feasibility preflight (v2.0.83 floating-gate): the exchange
-	// rejects adjust_params unless the order's PURE FLOATING PnL is positive
-	// (BOT_INVALID_ARGUMENT/PROFIT_LESS_THAN_ZERO; prod NEAR #688: total +1.5
-	// with floating −0.5 cleared the old total preflight and the shift was
-	// still refused at 19:05Z 09-04). The gate therefore watches the floating
-	// leg of the last reconcile; the total rides along only in the blocked
-	// event. A blocked shift becomes the durable RADAR_SHIFT_BLOCKED_UNDERWATER
-	// decision instead of a guaranteed rejection; the exit stays with the stop
-	// ladder/operator.
-	if !adjustShiftFeasible(bot.floating) {
-		worker.radarShiftBlockedUnderwater(ctx, b, rs, bot.total)
+	// v2.0.85 mode preflight (the v2.0.83 floating-gate lesson stays): the
+	// exchange's normal adjust_params semantics require the order's PURE
+	// FLOATING PnL > 0 (BOT_INVALID_ARGUMENT/PROFIT_LESS_THAN_ZERO; prod NEAR
+	// #688: total +1.5 with floating −0.5 refused at 19:05Z 09-04). The mode
+	// therefore keys on the floating leg of the last reconcile: green →
+	// normal re-base; under water → keepInvestment rescue transfer (FIX-1),
+	// dry-run validated by adjustParamsCheck inside AdjustBot before the
+	// live call. No bot is parked anymore — if the exchange refuses even the
+	// keep transfer, the RADAR_RECENTER_FAILED path below carries the reason.
+	// The velocity lane is prevention only and requires the normal mode.
+	mode := adjustShiftMode(bot.floating)
+	if velocity && mode != shiftModeNormal {
 		return
 	}
+	keepInvestment := mode == shiftModeKeepInvestment
 
 	// AdjustBot increments adjustments_count only AFTER the native
-	// adjustParams succeeds — a failed adjust returns here with the budget
-	// and geometry untouched (Warn, never a phantom shift).
+	// adjustParams succeeds — a failed adjust (or a refused adjustParamsCheck
+	// dry-run) returns here with the budget and geometry untouched (Warn,
+	// never a phantom shift).
 	if _, err := worker.service.AdjustBot(ctx, worker.accounts, settings.ID, b.botID, AdjustBotInput{
-		Mode:  "adjust_params",
-		Lower: newLower,
-		Upper: newUpper,
-		Row:   bot.gridNum,
+		Mode:           "adjust_params",
+		Lower:          newLower,
+		Upper:          newUpper,
+		Row:            bot.gridNum,
+		KeepInvestment: &keepInvestment,
 	}); err != nil {
 		worker.logger.Warn("stop-radar: REAL recenter adjust_params failed — budget untouched",
-			"component", "autogrid_worker", "symbol", b.symbol, "error", err)
+			"component", "autogrid_worker", "symbol", b.symbol, "mode", mode, "error", err)
 		// v2.0.75 deaf-branch fix: the exchange rejecting adjustParams used
 		// to leave ONLY this Warn — no event, no telegram, no backoff, so the
 		// radar retried invisibly forever while the operator saw "радар
 		// молчал" (prod AXTIX #668: band-4 with satisfied dwell for 8h, zero
 		// actions, zero traces). One durable RADAR_RECENTER_FAILED event per
 		// hour (model_state marker, the tranche2SkipAt pattern) + a telegram
-		// line — the failure becomes a first-class signal.
+		// line — the failure becomes a first-class signal. v2.0.85: this is
+		// also the ONLY remaining refusal path — a keepInvestment transfer
+		// the exchange rejects in adjustParamsCheck lands here with the
+		// check's reason in the error.
 		tag, markErr := worker.db.Exec(ctx, `
 			UPDATE grid_bots
 			SET model_state = jsonb_set(COALESCE(model_state, '{}'::jsonb), '{radarFailAlertAt}',
@@ -588,6 +776,7 @@ func (worker *Worker) radarRecenterReal(ctx context.Context, settings Settings, 
 			_ = LogBotEvent(ctx, worker.db, b.botID, b.botNumber, "REAL", b.symbol,
 				"RADAR_RECENTER_FAILED", &b.price, nil, map[string]any{
 					"band": rs.Band, "score": decimal.NewFromFloat(rs.Score).Round(4).String(),
+					"mode":           mode,
 					"error":          err.Error(),
 					"proposed_lower": newLower.String(), "proposed_upper": newUpper.String(),
 				})
@@ -615,32 +804,37 @@ func (worker *Worker) radarRecenterReal(ctx context.Context, settings Settings, 
 		}
 	}
 
-	reason := "RADAR_B3_RECENTER"
-	if rs.Band >= 4 {
-		reason = "RADAR_B4_ESCAPE"
-	}
-	if early {
-		reason = "RADAR_B2_EARLY_RECENTER"
-	}
+	reason := radarRecenterReason(rs.Band, early, velocity)
 	worker.logger.Info("stop-radar recentered REAL grid",
 		"component", "autogrid_worker", "symbol", b.symbol,
 		"band", rs.Band, "score", decimal.NewFromFloat(rs.Score).Round(4).String(),
+		"mode", mode,
 		"lower", newLower.String(), "upper", newUpper.String())
 
 	// The event insert below ARMS the durable cooldown — a swallowed error
 	// here would leave the next re-center un-gated on the following pass.
+	// The mode detail (normal|keep_investment) records WHICH exchange
+	// semantics the shift used; after a keep_investment transfer the local
+	// quote_investment/targets/stops arithmetic deliberately stays on the old
+	// base (nothing re-based), while the bounds and the anti-hunt moved.
 	if err := LogBotEvent(ctx, worker.db, b.botID, b.botNumber, "REAL", b.symbol, "ADJUST_RANGE", &b.price, &bot.total, map[string]any{
 		"reason": reason, "action": "RADAR_RECENTER",
-		"score":     decimal.NewFromFloat(rs.Score).Round(4).String(),
-		"band":      rs.Band,
-		"s1":        decimal.NewFromFloat(rs.S1).Round(3).String(),
-		"s2":        decimal.NewFromFloat(rs.S2).Round(3).String(),
-		"s3":        decimal.NewFromFloat(rs.S3).Round(3).String(),
-		"s4":        decimal.NewFromFloat(rs.S4).Round(3).String(),
+		"mode":    mode,
+		"score":   decimal.NewFromFloat(rs.Score).Round(4).String(),
+		"band":    rs.Band,
+		"s1":      decimal.NewFromFloat(rs.S1).Round(3).String(),
+		"s2":      decimal.NewFromFloat(rs.S2).Round(3).String(),
+		"s3":      decimal.NewFromFloat(rs.S3).Round(3).String(),
+		"s4":      decimal.NewFromFloat(rs.S4).Round(3).String(),
 		"new_lower": newLower.String(), "new_upper": newUpper.String(),
+		"floating_pnl": bot.floating.StringFixed(4),
 	}); err != nil {
 		worker.logger.Warn("stop-radar: REAL recenter event insert failed — durable cooldown not armed",
 			"component", "autogrid_worker", "symbol", b.symbol, "error", err)
+	}
+	if velocity {
+		queueRadarB2VelocityTelegram(ctx, worker, b, rs, newLower, newUpper, velocitySpeed)
+		return
 	}
 	if early {
 		queueRadarB2EarlyTelegram(ctx, worker, b, rs, newLower, newUpper)
@@ -649,7 +843,8 @@ func (worker *Worker) radarRecenterReal(ctx context.Context, settings Settings, 
 	_ = QueueTelegramEvent(ctx, worker.db, "ADJUST_RANGE", map[string]any{
 		"bot_number": b.botNumber, "symbol": b.symbol,
 		"lower_price": newLower.StringFixed(6), "upper_price": newUpper.StringFixed(6),
-		"reason": reason, "score": decimal.NewFromFloat(rs.Score).Round(3).String(),
+		"reason": reason, "mode": mode,
+		"score":             decimal.NewFromFloat(rs.Score).Round(3).String(),
 		"adjustments_count": bot.adjustments + 1,
 	})
 }
@@ -687,10 +882,12 @@ func (worker *Worker) radarAutocloseLastAt(ctx context.Context, botID string) (t
 //   - NEVER close a bot in the green: floating >= 0 returns in every mode
 //     (prod counter-examples #651/#670/#675 flagged band3 in profit and all
 //     survived to profit);
-//   - shift priority: a green bot eligible for a re-center never reaches the
-//     close (the floating<0 gate is the exact inverse of the
-//     adjustShiftFeasible preflight — when a shift is possible the close is
-//     not, and vice versa);
+//   - shift priority, v2.0.85 form: under water is no longer the shift's
+//     inverse — a keepInvestment rescue transfer is always executable, so
+//     the re-center matrix runs FIRST (radarPass order) and the close must
+//     respect the SAME durable re-center cooldown: a bot that was just
+//     rescue-shifted is given its dist-aware window to prove the new range
+//     before any close is considered;
 //   - SHADOW stays observe-only: auto-close requires StopForecastMode ACTIVE,
 //     the 0029 contract;
 //   - parity: REAL and PAPER both exit through Service.RequestBotClose — the
@@ -769,6 +966,13 @@ func (worker *Worker) radarMaybeAutoclose(ctx context.Context, settings Settings
 	// Durable 1h per-bot cooldown (the RADAR_AUTOCLOSE event below arms it).
 	if lastAt, ok := worker.radarAutocloseLastAt(ctx, b.botID); ok &&
 		time.Since(lastAt) < radarAutocloseCooldown {
+		return
+	}
+	// Shift priority, v2.0.85: a rescue re-center (possibly keepInvestment,
+	// possibly only minutes ago) owns the bot for its dist-aware window —
+	// closing inside it would burn the shift we just paid for.
+	if lastAt, ok := worker.radarLastActionAt(ctx, b.botID); ok &&
+		time.Since(lastAt) < radarActionCooldownFor(rs.DistToStopATR) {
 		return
 	}
 
