@@ -2509,6 +2509,13 @@ func (worker *Worker) pinManagedAccount(ctx context.Context, settings *Settings)
 // 2026-08-30) and the liquidation stream (the Binance WS topic was
 // misnamed for the system's entire history, zero rows ever, cascade gate
 // inert). One alarm per feed per 24h; recovered feeds clear silently.
+//
+// v2.0.86: the economic calendar has two writers — the FRED releases
+// calendar (primary, 6h refresh of a ±14d window) and ForexFactory
+// (fallback, 429-backoff kept). The calendar counts as ALIVE when either
+// source has an event within the next 7 days, so a dead FF feed alone no
+// longer pages the operator while FRED keeps the gate armed. The alarm now
+// fires only when BOTH sources are stale/empty on the +7d window.
 func (worker *Worker) dataHealthCheck(ctx context.Context) {
 	alarm := func(key, message string) {
 		if last, ok := worker.dataAlarmAt[key]; ok && time.Since(last) < 24*time.Hour {
@@ -2520,13 +2527,15 @@ func (worker *Worker) dataHealthCheck(ctx context.Context) {
 			"message": message,
 		})
 	}
-	var futureEvents int
+	var freshEvents int
 	if err := worker.db.QueryRow(ctx, `
 		SELECT COUNT(*) FROM economic_events
-		WHERE event_time > NOW() AND (country = 'USD' OR country IS NULL OR country = '')
-	`).Scan(&futureEvents); err == nil && futureEvents == 0 {
+		WHERE event_time > NOW() AND event_time < NOW() + INTERVAL '7 days'
+		  AND (country = 'USD' OR country IS NULL OR country = '')
+		  AND source IN ('FRED', 'forexfactory')
+	`).Scan(&freshEvents); err == nil && freshEvents == 0 {
 		alarm("economic_events",
-			"Календарь USD пуст: нет будущих событий — эконом-гейт деплоя слеп (фетч ForexFactory мёртв?)")
+			"Календарь USD пуст: нет событий (FRED/ForexFactory) в окне +7д — эконом-гейт деплоя слеп (оба источника мертвы?)")
 	}
 	var lastLiq *time.Time
 	if err := worker.db.QueryRow(ctx, `

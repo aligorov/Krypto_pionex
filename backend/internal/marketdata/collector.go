@@ -67,6 +67,9 @@ type CollectorConfig struct {
 	FNGEndpoint          string
 	ForexFactoryEndpoint string
 	CoinGeckoBaseURL     string
+	// FREDBaseURL roots the FRED releases calendar (v2.0.86); default
+	// https://api.stlouisfed.org/fred. Overridable for tests.
+	FREDBaseURL string
 }
 
 // DefaultCollectorConfig returns the production configuration for a symbol list.
@@ -85,6 +88,7 @@ func DefaultCollectorConfig(symbols []string) CollectorConfig {
 		OKXBaseURL:           DefaultOKXBaseURL,
 		FNGEndpoint:          DefaultFNGEndpoint,
 		ForexFactoryEndpoint: DefaultForexFactoryEndpoint,
+		FREDBaseURL:          fredAPIRoot,
 	}
 }
 
@@ -127,6 +131,9 @@ func (cfg CollectorConfig) withDefaults() CollectorConfig {
 	}
 	if cfg.CoinGeckoBaseURL == "" {
 		cfg.CoinGeckoBaseURL = DefaultCoinGeckoBaseURL
+	}
+	if cfg.FREDBaseURL == "" {
+		cfg.FREDBaseURL = fredAPIRoot
 	}
 	return cfg
 }
@@ -299,6 +306,9 @@ func (c *Collector) Run(ctx context.Context) {
 		{"open_interest", c.cfg.OIInterval, c.collectOpenInterest},
 		{"sentiment", c.cfg.SentimentInterval, c.collectSentiment},
 		{"economic_events", c.cfg.EventsInterval, c.collectEconomicEvents},
+		// v2.0.86: FRED releases calendar is the primary USD economic
+		// calendar; ForexFactory above stays as fallback with its backoff.
+		{"econ_fred_calendar", fredCalendarInterval, c.collectFREDCalendar},
 		{"coingecko", c.cfg.CoinGeckoInterval, c.collectCoinGecko},
 		{"macro_fred", time.Hour, c.collectFRED},
 		{"macro_yahoo", time.Hour, c.collectYahoo},

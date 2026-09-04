@@ -25,7 +25,10 @@ import (
 //	GNews  : Google News RSS "Fed OR CPI OR FOMC when:6h" — zero quota.
 
 const (
-	fredBaseURL      = "https://api.stlouisfed.org/fred/series/observations"
+	// fredAPIRoot is the FRED REST root shared by every non-series endpoint
+	// (releases calendar in fred_calendar.go).
+	fredAPIRoot      = "https://api.stlouisfed.org/fred"
+	fredBaseURL      = fredAPIRoot + "/series/observations"
 	yahooChartURL    = "https://query1.finance.yahoo.com/v8/finance/chart/"
 	yahooChartURLAlt = "https://query2.finance.yahoo.com/v8/finance/chart/"
 	gnewsRSSURL      = "https://news.google.com/rss/search?q=Fed+OR+CPI+OR+FOMC+OR+%22rate+decision%22+when:6h&hl=en-US&gl=US&ceid=US:en"
@@ -226,10 +229,10 @@ type MacroSeriesPoint struct {
 // the collectors have actually persisted, so the operator sees the feed
 // working without waiting an hour.
 type MacroSourcesStatus struct {
-	HasKey     bool               `json:"hasKey"`
-	KeyLength  int                `json:"keyLength"`
-	UpdatedAt  *time.Time         `json:"updatedAt,omitempty"`
-	Series     []MacroSeriesPoint `json:"series"`
+	HasKey    bool               `json:"hasKey"`
+	KeyLength int                `json:"keyLength"`
+	UpdatedAt *time.Time         `json:"updatedAt,omitempty"`
+	Series    []MacroSeriesPoint `json:"series"`
 }
 
 func (s *Service) GetMacroSources(ctx context.Context) (MacroSourcesStatus, error) {
