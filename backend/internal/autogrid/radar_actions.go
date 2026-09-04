@@ -72,6 +72,22 @@ const (
 	// re-center may fire: below it the bot is not actually near its danger
 	// side and a shift is churn, above it the B3 trigger is imminent.
 	radarB2EarlyEdgeProgressMin = 0.70
+
+	// v2.0.84 radar auto-close gates. Every constant comes from the
+	// 2026-09-03T20:35Z..09-04T19:29Z REAL backtest (24 band>=3 episodes,
+	// 13 bots) that priced the policy — see migration 0042:
+	//   radarAutocloseCooldown 1h/bot: the re-center cooldown is dist-aware
+	//     (15m..2h) but a close is terminal — the window only guards
+	//     event-spam when RequestBotClose loses the race to a stop;
+	//   radarAutocloseStrictDistATR 0.5: the saved trades fired at dist
+	//     0.04-0.45 (SNXXX 0.06, APT 0.35, ICP 0.41, XMR 0.44) while the
+	//     biggest false-positive class (NEAR #670 recovering to +1.48) sat
+	//     at 0.62-0.78;
+	//   dwell 3 / age 30m reuse the re-center gates (radarDwellTicks,
+	//     radarMinBotAge) — the signal must persist and the bot must have a
+	//     history worth trusting.
+	radarAutocloseCooldown      = 1 * time.Hour
+	radarAutocloseStrictDistATR = 0.5
 )
 
 // adjustShiftProfitFloor is the local feasibility floor for any native
@@ -636,4 +652,151 @@ func (worker *Worker) radarRecenterReal(ctx context.Context, settings Settings, 
 		"reason": reason, "score": decimal.NewFromFloat(rs.Score).Round(3).String(),
 		"adjustments_count": bot.adjustments + 1,
 	})
+}
+
+// radarAutocloseLastAt is the durable auto-close cooldown source: the newest
+// RADAR_AUTOCLOSE event for the bot (the 0035 pattern — restart-proof). The
+// event is written BEFORE the close intent, so a close that loses the race to
+// a native stop still arms the hour: the operator sees one decision, not one
+// per pass.
+func (worker *Worker) radarAutocloseLastAt(ctx context.Context, botID string) (time.Time, bool) {
+	var at *time.Time
+	if err := worker.db.QueryRow(ctx, `
+		SELECT MAX(created_at)
+		FROM bot_execution_events
+		WHERE bot_id = $1 AND event_type = 'RADAR_AUTOCLOSE'
+	`, botID).Scan(&at); err != nil || at == nil {
+		return time.Time{}, false
+	}
+	return *at, true
+}
+
+// radarMaybeAutoclose (v2.0.84) closes a bot the radar is convinced is going
+// to its stop. Opt-in via autogrid_settings.radar_autoclose_mode:
+//
+//	OFF    default — the 2026-09-04 backtest put the entire BAND3 surplus on
+//	       one trade (SNXXX #669 +$10.2 of +$16.4 saved), so nothing fires
+//	       until the operator arms it;
+//	BAND3  band>=3 + under water (floating<0) + dwell>=3 + age>30m + 1h
+//	       per-bot cooldown;
+//	STRICT the BAND3 gates plus dist_to_stop < 0.5 ATR-sigma, and only when
+//	       the distance is actually known (S1>0 — a bot without an anchored
+//	       anti-hunt stop has no meaningful dist and must never fire).
+//
+// Invariants:
+//   - NEVER close a bot in the green: floating >= 0 returns in every mode
+//     (prod counter-examples #651/#670/#675 flagged band3 in profit and all
+//     survived to profit);
+//   - shift priority: a green bot eligible for a re-center never reaches the
+//     close (the floating<0 gate is the exact inverse of the
+//     adjustShiftFeasible preflight — when a shift is possible the close is
+//     not, and vice versa);
+//   - SHADOW stays observe-only: auto-close requires StopForecastMode ACTIVE,
+//     the 0029 contract;
+//   - parity: REAL and PAPER both exit through Service.RequestBotClose — the
+//     REAL arm gets STOP_REQUESTED + reconcile-cancel, the paper arm settles
+//     at the mark, one code path.
+//
+// The event is logged BEFORE the close so the ledger explains the decision
+// even when the close itself loses the race (the event also arms the 1h
+// cooldown — a swallowed close must not re-fire every pass).
+func (worker *Worker) radarMaybeAutoclose(ctx context.Context, settings Settings, b radarInput, rs radarScores) {
+	mode := settings.RadarAutoCloseMode
+	if mode != "BAND3" && mode != "STRICT" {
+		return // OFF / blank: the shipping default, operator opt-in only
+	}
+	if settings.StopForecastMode != "ACTIVE" {
+		return // SHADOW computes and warns, never touches the exit ladder
+	}
+	if rs.Band < 3 {
+		return
+	}
+
+	// Per-bot facts from the source of truth (status RUNNING filtered in the
+	// query itself — a close that won the race must not re-fire).
+	var floating, total decimal.Decimal
+	var createdAt time.Time
+	if b.botSource == "REAL" {
+		err := worker.db.QueryRow(ctx, `
+			SELECT COALESCE(unrealized_pnl_usdt, 0),
+			       COALESCE(realized_pnl_usdt, 0) + COALESCE(unrealized_pnl_usdt, 0),
+			       created_at
+			FROM grid_bots
+			WHERE id = $1 AND autogrid_settings_id = $2
+			  AND bu_order_id IS NOT NULL AND status = 'RUNNING'
+		`, b.botID, settings.ID).Scan(&floating, &total, &createdAt)
+		if err != nil {
+			return
+		}
+	} else {
+		err := worker.db.QueryRow(ctx, `
+			SELECT COALESCE(unrealized_pnl_usdt, 0),
+			       COALESCE(realized_pnl_usdt, 0) + COALESCE(unrealized_pnl_usdt, 0),
+			       opened_at
+			FROM paper_grid_bots
+			WHERE id = $1 AND settings_id = $2 AND status = 'RUNNING'
+		`, b.botID, settings.ID).Scan(&floating, &total, &createdAt)
+		if err != nil {
+			return
+		}
+	}
+
+	// The never-close-green invariant, every mode: the under-water leg is the
+	// FLOATING PnL — the same leg the exchange preflight watches. A bot with
+	// banked grid profit and a sinking position is exactly the rescue class
+	// the backtest says to keep (FARTCOIN #679: flagged under water at $0,
+	// closed green +$1.10 two hours later).
+	if !floating.IsNegative() {
+		return
+	}
+	// Same trust gate as the re-center arm: a bot younger than 30 minutes has
+	// no radar history worth trusting.
+	if time.Since(createdAt) < radarMinBotAge {
+		return
+	}
+	// Dwell: the band-3 signal must have persisted (shared gate with the
+	// re-center matrix — the flicker-tolerant counter over the last
+	// radarDwellTicks+1 snapshots).
+	if worker.radarDwellAtOrAbove(ctx, b.botID, bandB3) < radarDwellTicks {
+		return
+	}
+	// STRICT adds the proximity gate: only fire with a KNOWN distance under
+	// 0.5 ATR-sigma. S1<=0 means no anchored stop → dist_to_stop_atr is a
+	// default zero, not a measured "at the barrier" — never fire on it.
+	if mode == "STRICT" && (rs.S1 <= 0 || rs.DistToStopATR >= radarAutocloseStrictDistATR) {
+		return
+	}
+	// Durable 1h per-bot cooldown (the RADAR_AUTOCLOSE event below arms it).
+	if lastAt, ok := worker.radarAutocloseLastAt(ctx, b.botID); ok &&
+		time.Since(lastAt) < radarAutocloseCooldown {
+		return
+	}
+
+	reason := "RADAR_AUTOCLOSE_" + mode
+	// Event + telegram BEFORE the close: the ledger explains the decision
+	// even if the close itself loses the race to a native stop.
+	_ = LogBotEvent(ctx, worker.db, b.botID, b.botNumber, b.botSource, b.symbol,
+		"RADAR_AUTOCLOSE", &b.price, &total, map[string]any{
+			"mode": mode, "reason": reason,
+			"band": rs.Band, "score": decimal.NewFromFloat(rs.Score).Round(4).String(),
+			"dist_to_stop_atr": decimal.NewFromFloat(rs.DistToStopATR).Round(4).String(),
+			"floating_pnl":     floating.StringFixed(4),
+			"total_pnl":        total.StringFixed(4),
+		})
+	_ = QueueTelegramEvent(ctx, worker.db, "RADAR_AUTOCLOSE", map[string]any{
+		"bot_number": b.botNumber, "symbol": b.symbol, "band": rs.Band,
+		"score": decimal.NewFromFloat(rs.Score).Round(3).String(),
+		"total": total.StringFixed(2), "mode": mode, "reason": reason,
+	})
+
+	if _, err := worker.service.RequestBotClose(ctx, settings.ID, b.botID, reason); err != nil {
+		worker.logger.Warn("stop-radar: autoclose request failed — cooldown armed by the event",
+			"component", "autogrid_worker", "symbol", b.symbol, "error", err)
+		return
+	}
+	worker.logger.Info("stop-radar auto-closed bot",
+		"component", "autogrid_worker", "symbol", b.symbol,
+		"mode", mode, "band", rs.Band,
+		"score", decimal.NewFromFloat(rs.Score).Round(4).String(),
+		"total", total.StringFixed(4))
 }

@@ -293,6 +293,7 @@ export interface AutoGridSettings {
   adaptiveLeverageEnabled: boolean;
   densityGridEnabled: boolean;
   stopForecastMode: 'OFF' | 'SHADOW' | 'ACTIVE';
+  radarAutoCloseMode: 'OFF' | 'BAND3' | 'STRICT';
   candleInterval: string;
   scanMode?: string;
   lookbackCandles: number;

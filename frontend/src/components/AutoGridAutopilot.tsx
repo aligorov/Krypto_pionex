@@ -556,6 +556,9 @@ function SettingsSummary({ settings }: { settings: AutoGridSettings }) {
     ['Мин. объём 24ч', `${settings.minVolume24h} USDT`],
     ['Стоп-лосс', settings.stopLossMode],
     ['Стоп-радар', settings.stopForecastMode === 'OFF' ? 'выключен' : settings.stopForecastMode],
+    ['Радар: автозакрытие', settings.radarAutoCloseMode && settings.radarAutoCloseMode !== 'OFF'
+      ? settings.radarAutoCloseMode
+      : 'OFF'],
     ['Плотная сетка (geometric)', settings.densityGridEnabled ? 'да' : 'нет'],
     ['Адаптивное плечо', settings.adaptiveLeverageEnabled ? 'да' : 'нет'],
   ];
@@ -652,6 +655,7 @@ function SettingsForm({
           adaptiveLeverageEnabled: !!form.adaptiveLeverageEnabled,
           densityGridEnabled: !!form.densityGridEnabled,
           stopForecastMode: form.stopForecastMode || 'OFF',
+          radarAutoCloseMode: form.radarAutoCloseMode || 'OFF',
           aiKitEnabled: !!form.aiKitEnabled,
           aiAutotuneEnabled: !!form.aiAutotuneEnabled,
           maxActiveBots: numberField(String(form.maxActiveBots), 3),
@@ -878,6 +882,26 @@ function SettingsForm({
             <option value="OFF">Выключен</option>
             <option value="SHADOW">SHADOW — наблюдение</option>
             <option value="ACTIVE">ACTIVE — авто-ре-центры (PAPER)</option>
+          </select>
+        </div>
+        <div className="toggle-row">
+          <div>
+            <strong>Радар: автозакрытие ботов</strong>
+            <span>
+              Закрывать бота по сигналу стоп-радара (требует ACTIVE). BAND3 —
+              band 3+, бот под водой (floating&lt;0), сигнал держится 3 снапшота,
+              возраст 30м+, кулдаун 1ч; STRICT — то же плюс дистанция до стопа
+              &lt;0.5 ATR. Боты в плюсе не закрываются никогда. По умолчанию OFF —
+              бэктест 09-04: весь плюс политики дал один бот (SNXXX).
+            </span>
+          </div>
+          <select
+            value={form.radarAutoCloseMode || 'OFF'}
+            onChange={(event) => setForm((current) => ({ ...current, radarAutoCloseMode: event.target.value as AutoGridSettings['radarAutoCloseMode'] }))}
+          >
+            <option value="OFF">OFF — не закрывать</option>
+            <option value="BAND3">BAND3 — band3 + под водой</option>
+            <option value="STRICT">STRICT — + близко к стопу</option>
           </select>
         </div>
       </div>

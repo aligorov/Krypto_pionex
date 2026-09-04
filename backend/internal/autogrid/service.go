@@ -59,7 +59,12 @@ type Settings struct {
 	MaxAdjustmentsPerBot    int             `json:"maxAdjustmentsPerBot"`
 	TrancheDeployEnabled    bool            `json:"trancheDeployEnabled"`
 	StopForecastMode        string          `json:"stopForecastMode"` // OFF / SHADOW / ACTIVE (Phase-2)
-	AIKitEnabled            bool            `json:"aiKitEnabled"`
+	// RadarAutoCloseMode (v2.0.84): whether the stop-radar may CLOSE a bot
+	// itself. OFF (default — the 2026-09-04 backtest put the whole BAND3
+	// surplus on one SNXXX trade), BAND3 = band3+underwater+dwell+age gates,
+	// STRICT = BAND3 gates plus dist_to_stop < 0.5 ATR.
+	RadarAutoCloseMode string `json:"radarAutoCloseMode"` // OFF / BAND3 / STRICT
+	AIKitEnabled       bool   `json:"aiKitEnabled"`
 	AIAutotuneEnabled       bool            `json:"aiAutotuneEnabled"`
 	AIAutotuneInterval      int             `json:"aiAutotuneIntervalSeconds"`
 	LastAutotuneAt          *time.Time      `json:"lastAutotuneAt"`
@@ -102,6 +107,7 @@ type UpdateSettingsInput struct {
 	RangeBreakBufferPct     decimal.Decimal `json:"rangeBreakBufferPct"`
 	MaxAdjustmentsPerBot    int             `json:"maxAdjustmentsPerBot"`
 	StopForecastMode        string          `json:"stopForecastMode"`
+	RadarAutoCloseMode      string          `json:"radarAutoCloseMode"` // OFF / BAND3 / STRICT
 	AIKitEnabled            bool            `json:"aiKitEnabled"`
 	AIAutotuneEnabled       bool            `json:"aiAutotuneEnabled"`
 	AIAutotuneInterval      int             `json:"aiAutotuneIntervalSeconds"`
@@ -302,7 +308,8 @@ func (s *Service) GetSettings(ctx context.Context) (*Settings, error) {
 		       min_profit_factor, fee_bps, slippage_bps, paper_funding_rate_bps,
 		       pnl_target_mode, pnl_target_usdt, max_loss_usdt, manage_interval_seconds,
 		       range_break_buffer_pct, max_adjustments_per_bot,
-		       tranche_deploy_enabled, stop_forecast_mode, ai_kit_enabled,
+		       tranche_deploy_enabled, stop_forecast_mode, radar_autoclose_mode,
+		       ai_kit_enabled,
 		       ai_autotune_enabled, ai_autotune_interval_seconds,
 		       last_autotune_at, last_autotune_notes,
 		       last_error,
@@ -355,6 +362,18 @@ func (s *Service) UpdateSettings(
 			input.StopForecastMode = "OFF"
 		}
 	}
+	// Radar auto-close switch (v2.0.84): same preserve-on-omit contract. The
+	// column ships DEFAULT 'OFF' and an empty stored value means OFF — the
+	// mode is armed only by an explicit operator decision, never by a
+	// partial settings form.
+	switch input.RadarAutoCloseMode {
+	case "OFF", "BAND3", "STRICT":
+	default:
+		input.RadarAutoCloseMode = current.RadarAutoCloseMode
+		if input.RadarAutoCloseMode == "" {
+			input.RadarAutoCloseMode = "OFF"
+		}
+	}
 	// REAL without an explicit accountId used to hard-fail validation even
 	// when exactly one enabled verified account exists — both the operator UI
 	// flow and MCP callers (which omit accountId) hit this. When resolution is
@@ -388,6 +407,7 @@ func (s *Service) UpdateSettings(
 		    max_adjustments_per_bot = $29, ai_kit_enabled = $30,
 		    ai_autotune_enabled = $31, ai_autotune_interval_seconds = $32,
 		    tranche_deploy_enabled = $34, stop_forecast_mode = $35,
+		    radar_autoclose_mode = $36,
 		    last_error = NULL, updated_at = NOW()
 		WHERE scope_key = $1
 	`, DefaultScope, accountID, input.ExecutionMode, input.BudgetUSDT,
@@ -401,7 +421,7 @@ func (s *Service) UpdateSettings(
 		input.PnLTargetUSDT, input.MaxLossUSDT, input.ManageIntervalSeconds,
 		input.RangeBreakBufferPct, input.MaxAdjustmentsPerBot, input.AIKitEnabled,
 		input.AIAutotuneEnabled, input.AIAutotuneInterval, input.ScanMode,
-		current.TrancheDeployEnabled, input.StopForecastMode)
+		current.TrancheDeployEnabled, input.StopForecastMode, input.RadarAutoCloseMode)
 	if err != nil {
 		return nil, fmt.Errorf("update AutoGrid settings: %w", err)
 	}
@@ -1354,7 +1374,7 @@ func settingsScanTargets(item *Settings) []any {
 		&item.SlippageBps, &item.PaperFundingRateBps,
 		&item.PnLTargetMode, &item.PnLTargetUSDT, &item.MaxLossUSDT,
 		&item.ManageIntervalSeconds, &item.RangeBreakBufferPct,
-		&item.MaxAdjustmentsPerBot, &item.TrancheDeployEnabled, &item.StopForecastMode, &item.AIKitEnabled,
+		&item.MaxAdjustmentsPerBot, &item.TrancheDeployEnabled, &item.StopForecastMode, &item.RadarAutoCloseMode, &item.AIKitEnabled,
 		&item.AIAutotuneEnabled, &item.AIAutotuneInterval,
 		&item.LastAutotuneAt, &item.LastAutotuneNotes,
 		&item.LastError, &item.LastStartedAt,

@@ -538,6 +538,7 @@ type AutoGridSettingsUpdateInput struct {
 	ManageIntervalSeconds   int    `json:"manageIntervalSeconds"`
 	RangeBreakBufferPct     string `json:"rangeBreakBufferPct"`
 	MaxAdjustmentsPerBot    int    `json:"maxAdjustmentsPerBot"`
+	RadarAutoCloseMode      string `json:"radarAutoCloseMode,omitempty"` // OFF / BAND3 / STRICT
 	AIKitEnabled            bool   `json:"aiKitEnabled"`
 }
 
@@ -600,7 +601,9 @@ func registerAutoGridTools(
 		Name: "autogrid_settings_update",
 		Description: "Update AutoGrid execution settings (stopped autopilot only): mode, budget, " +
 			"per-bot PnL target and max loss, manage interval, scanner thresholds. All decimals are " +
-			"strings. Requires mcp:trade.",
+			"strings. radarAutoCloseMode: OFF (default) / BAND3 / STRICT — whether the stop-radar may " +
+			"close a bot itself (band>=3 + under water + dwell; STRICT adds dist_to_stop < 0.5 ATR). " +
+			"Requires mcp:trade.",
 		Annotations: writeHint,
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, input AutoGridSettingsUpdateInput) (*mcp.CallToolResult, DataOutput, error) {
 		if err := requireWrite(ctx, services, principal, "mcp:trade"); err != nil {
@@ -632,6 +635,16 @@ func registerAutoGridTools(
 				return nil, DataOutput{}, fmt.Errorf("invalid pnlTargetMode %q: must be DYNAMIC or FIXED", input.PnLTargetMode)
 			}
 			update.PnLTargetMode = mode
+		}
+		if input.RadarAutoCloseMode != "" {
+			// Explicit validation, not silent preserve: arming the radar's
+			// close arm is a deliberate operator decision — a typo like
+			// "BAND33" must fail loudly instead of quietly shipping OFF.
+			mode := strings.ToUpper(strings.TrimSpace(input.RadarAutoCloseMode))
+			if mode != "OFF" && mode != "BAND3" && mode != "STRICT" {
+				return nil, DataOutput{}, fmt.Errorf("invalid radarAutoCloseMode %q: must be OFF, BAND3 or STRICT", input.RadarAutoCloseMode)
+			}
+			update.RadarAutoCloseMode = mode
 		}
 		decimalFields := []struct {
 			raw  string

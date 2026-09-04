@@ -163,6 +163,13 @@ func QueueTelegramEvent(
 		// with the stop ladder / operator.
 		shouldSend = notifyAdjust
 		tmpl = "⛔ <b>Радар: сдвиг заблокирован — бот под водой:</b> бот #{{bot_number}} {{symbol}} band {{band}} (score {{score}}), total {{total}} USDT — биржа отклоняет adjust_params при отрицательном профите; ждём стоп/оператора"
+	case "RADAR_AUTOCLOSE":
+		// v2.0.84: the radar closed the bot itself (opt-in mode BAND3/STRICT).
+		// Queued BEFORE the close intent — the operator must see the why
+		// (band, score, total at the moment) even when the native stop wins
+		// the race.
+		shouldSend = notifyStop
+		tmpl = "🛑 <b>Радар: автозакрытие ({{mode}}):</b> бот #{{bot_number}} {{symbol}} — band {{band}} (score {{score}}), total {{total}} USDT — {{reason}}"
 	case "SHIFT_BLOCKED_UNDERWATER":
 		// v2.0.76 manage twin: a RANGE_BREAK shift was skipped for the same
 		// exchange-side reason instead of hammering a guaranteed rejection.

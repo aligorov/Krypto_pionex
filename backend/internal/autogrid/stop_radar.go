@@ -371,8 +371,12 @@ func (worker *Worker) radarPass(ctx context.Context, settings Settings, bots []r
 
 		// Phase B (v2.0.52): ACTIVE executes the matrix — a B3/B4 score
 		// re-centers the grid instead of donating the stop; in SHADOW the
-		// call below no-ops (mode gate inside).
+		// call below no-ops (mode gate inside). The auto-close arm (v2.0.84)
+		// runs after the shift: with floating<0 the shift preflight has
+		// already refused, so the close is the only lever left — and with
+		// floating>=0 the close's own never-green gate yields to the shift.
 		worker.radarMaybeRecenter(ctx, settings, b, rs)
+		worker.radarMaybeAutoclose(ctx, settings, b, rs)
 	}
 
 	// Bounded retention, batched like every other smart-data table.
