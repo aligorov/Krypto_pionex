@@ -549,8 +549,8 @@ func snippet(raw []byte) string {
 		}
 		return r
 	}, string(raw))
-	if len(s) > 400 {
-		return s[:400] + "..."
+	if len(s) > 2000 {
+		return s[:2000] + "..."
 	}
 	return s
 }

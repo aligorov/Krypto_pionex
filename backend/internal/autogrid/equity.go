@@ -1,6 +1,7 @@
 package autogrid
 
 import (
+	"encoding/json"
 	"context"
 	"errors"
 	"fmt"
@@ -111,8 +112,16 @@ func (worker *Worker) captureAccountEquity(ctx context.Context, settings Setting
 		// empty. Either way the ledger is not being written: that is exactly
 		// what the operator must see, once per hour, not never.
 		worker.logger.Warn("equity snapshot: no USDT wallet decoded (empty balances)")
+		positionsProbe := ""
+		if pos, posErr := client.GetFuturesPositions(ctx); posErr == nil {
+			probe, _ := json.Marshal(pos)
+			if len(probe) > 400 {
+				probe = probe[:400]
+			}
+			positionsProbe = " | positions: " + string(probe)
+		}
 		worker.alertEquityCaptureFailure(ctx, "EMPTY_DECODE",
-			"account/detail вернул без USDT-строки; raw: "+rawDetail)
+			"account/detail без USDT>0; raw: "+rawDetail+positionsProbe)
 		return
 	}
 
