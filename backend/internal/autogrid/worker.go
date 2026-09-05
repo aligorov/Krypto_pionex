@@ -609,19 +609,19 @@ func (worker *Worker) enrichCandidatesWithAIKit(
 		// fee-gate floor like every other density source: an unclamped AI
 		// count (spot grids of 100-500 levels over a narrow span) produced
 		// 0.08-0.13% steps that only died at the deploy gate — the whole
-		// fleet starved (prod 2026-09-05, zero deploys). Cap the adopted
-		// count at span / DefaultGridStepFloorPct so an adopted grid is
-		// born viable instead of born rejected.
+		// fleet starved (prod 2026-09-05, zero deploys). v2.0.93: the ceiling
+		// is the FULL margin-density doctrine count — GridLevelsForRange over
+		// the candidate span at the settings fees (FIX-A: the floor follows
+		// the operator's feeBps/slippageBps, not the pinned default) and the
+		// $8/level notional cap — so an adopted grid is born viable AND
+		// margin-dense (FIX-K: adoption floor is the doctrine's 6 levels, not
+		// the old 2).
 		spanPct := candidate.UpperPrice.Sub(candidate.LowerPrice).
 			Div(candidate.LowerPrice).InexactFloat64() * 100
-		maxLevels := int(math.Floor(spanPct / marketdata.DefaultGridStepFloorPct()))
-		adopted := strategy.GridCount
-		if adopted > maxLevels {
-			adopted = maxLevels
-		}
-		if adopted < 2 {
-			adopted = 2
-		}
+		notional := settings.BudgetUSDT.
+			Mul(decimal.NewFromInt(int64(settings.Leverage))).InexactFloat64()
+		adopted := clampAIGridCount(spanPct, notional,
+			decimalFloat(settings.FeeBps), decimalFloat(settings.SlippageBps), strategy.GridCount)
 		boundary := "AI_GRID_COUNT_ADOPTED_WITH_CLAMP_2_500_RANGE_STAYS_SCANNER_SR"
 		if strategy.GridCount != adopted {
 			boundary = fmt.Sprintf(
@@ -650,6 +650,24 @@ func (worker *Worker) enrichCandidatesWithAIKit(
 		enriched++
 	}
 	return nil
+}
+
+// clampAIGridCount folds an adopted native AI Kit level count into the
+// margin-density doctrine (v2.0.93 FIX-K): the ceiling is the doctrine count
+// for the candidate span — the fee-gate floor at the ACTUAL settings fees
+// (FIX-A) plus the $8-per-level notional cap — and the floor is the
+// doctrine's own 6 levels (a grid stays a grid), not the old 2. An adopted
+// grid is therefore born viable AND margin-dense.
+func clampAIGridCount(spanPct, notionalUSDT, feeBps, slippageBps float64, aiCount int) int {
+	ceiling := marketdata.GridLevelsForRange(spanPct, notionalUSDT, feeBps, slippageBps)
+	adopted := aiCount
+	if adopted > ceiling {
+		adopted = ceiling
+	}
+	if adopted < marketdata.GridLevelsMin {
+		adopted = marketdata.GridLevelsMin
+	}
+	return adopted
 }
 
 // computeBotTargets derives the per-bot PnL target and stop-out. In DYNAMIC
@@ -872,6 +890,19 @@ func (worker *Worker) deployPaper(
 	betaName, betaADX, betaSlope := worker.marketBetaRegime(ctx)
 	betaDown, betaUp := betaGateTrend(betaName, betaADX, betaSlope)
 	backtestGateOn := worker.backtestGateEnabled(ctx)
+	// v2.0.93 FIX-F (paper/REAL parity): the LLM-audit gate the REAL path
+	// runs since the "top-5 bypass" fix. Paper used to deploy unaudited
+	// candidates while REAL refused them — paper statistics then proved a
+	// pipeline REAL would have blocked, the exact failure the backtest-gate
+	// parity comment above describes. Fail-open when the LLM brain is not
+	// wired (worker.llm == nil — embedded/test builds): an absent reviewer
+	// must not wedge the whole paper fleet.
+	llmBrainEnabledPaper := false
+	if worker.llm != nil {
+		if llmSettings, err := worker.llm.GetSettings(ctx); err == nil {
+			llmBrainEnabledPaper = llmSettings.Enabled && strings.TrimSpace(llmSettings.APIKey) != ""
+		}
+	}
 	for _, candidate := range candidates {
 		if candidate.Decision != "ACCEPTED" {
 			continue
@@ -879,6 +910,13 @@ func (worker *Worker) deployPaper(
 		if !isEntryTimingFavorable(candidate) {
 			worker.rejectCandidate(ctx, candidate,
 				"вход-тайминг: текущая позиция в канале вне благоприятной зоны для этого направления", nil)
+			continue
+		}
+		// LLM audit gate (FIX-F): same rule, same text as the REAL branch.
+		if llmBrainEnabledPaper && candidate.ModelAssumptions["llmAuditId"] == nil {
+			worker.logger.Warn("skip paper deploy: no completed LLM audit for candidate",
+				"component", "autogrid_worker", "symbol", candidate.Symbol)
+			worker.rejectCandidate(ctx, candidate, "AI-аудит не завершён для этого кандидата (кап аудита/сбой LLM) — деплой заблокирован", nil)
 			continue
 		}
 		atrPct := 2.0
@@ -1147,7 +1185,8 @@ func (worker *Worker) deployPaper(
 		harGeo := worker.harGridGeometry(ctx, candidate.Symbol, decimalFloat(settings.FeeBps.Add(settings.SlippageBps)), geometryBudget.InexactFloat64())
 		mesh := ComputeAdaptiveMesh(
 			candidate.LowerPrice, candidate.UpperPrice, candidate.CurrentPrice,
-			atrPct, regime, geometryBudget, settings.Leverage, 0.30,
+			atrPct, regime, geometryBudget, settings.Leverage,
+			decimalFloat(settings.FeeBps), decimalFloat(settings.SlippageBps),
 		)
 		// Entry gate (v2.0.12): block deployment into an active volatility
 		// expansion — a fixed-step grid holds per-pair edge constant while
@@ -1227,6 +1266,12 @@ func (worker *Worker) deployPaper(
 			trend, mesh.LowerPrice, mesh.UpperPrice,
 			candidate.CurrentPrice, atrPrice, 1.5,
 		)
+		// v2.0.93 FIX-I (paper/REAL parity): the same ±2% boundary clamp the
+		// REAL deploy applies after ComputeAntiHuntStop. A degenerate ATR
+		// (near-zero reading) parks the raw stop INSIDE the range — a stop a
+		// grid immediately crosses — while REAL pushed it back out; paper
+		// then stored a stop its own distance check below had to reject.
+		antiHuntStop = ClampAntiHuntStopIntoBounds(trend, mesh.LowerPrice, mesh.UpperPrice, antiHuntStop)
 
 		// Pre-deploy distance check — same exam as REAL (v2.0.8 parity fix):
 		// deploying with price hugging the anti-hunt stop means an instant
@@ -1470,10 +1515,16 @@ func (worker *Worker) deployPaper(
 // immediately before real capital is committed. A full scan takes minutes,
 // so a direction decided at scan start can be stale — or outright wrong —
 // by deploy time. The planned trend must survive a fresh look.
+// cascadeShort (v2.0.93 FIX-H, paper-parity): inside the out-of-turn
+// cascade-short window a price flying >0.5 ATR between scan and deploy is
+// the very move the cascade scan exists to short — the drift gate would void
+// every candidate precisely in that window. The live price still re-anchors
+// the candidate; only an UNREADABLE price stays fail-closed even in cascade.
 func (worker *Worker) revalidateCandidateTrend(
 	ctx context.Context,
 	candidate *Candidate,
 	settings Settings,
+	cascadeShort bool,
 ) (bool, string) {
 	candles, err := worker.publicClient.GetKlines(ctx, candidate.Symbol, settings.CandleInterval, settings.LookbackCandles)
 	if err != nil || len(candles) < 30 {
@@ -1491,8 +1542,9 @@ func (worker *Worker) revalidateCandidateTrend(
 		// v2.0.12: the trend was re-checked — now also the PRICE. The scan
 		// price ages through the whole enrichment pipeline; geometry, entry
 		// and the anti-hunt stop must anchor to the live price, and a drift
-		// beyond half an ATR voids the candidate itself.
-		if fresh, ok := worker.revalidateFreshPrice(ctx, candidate, atrPct); ok {
+		// beyond half an ATR voids the candidate itself — except in the
+		// cascade-short window (FIX-H, mirror of the paper path's exemption).
+		if fresh, ok := worker.revalidateFreshPrice(ctx, candidate, atrPct); ok || (cascadeShort && fresh.IsPositive()) {
 			candidate.CurrentPrice = fresh
 		} else {
 			return false, fmt.Sprintf("price drifted beyond 0.5 ATR since scan (%s → %s)",
@@ -1660,11 +1712,33 @@ func (worker *Worker) deployReal(
 			worker.rejectCandidate(ctx, candidate, "entry gate: "+flushWhyReal, nil)
 			continue
 		}
-		if ok, reason := worker.revalidateCandidateTrend(ctx, &candidate, settings); !ok {
+		if ok, reason := worker.revalidateCandidateTrend(ctx, &candidate, settings, cascadeShort); !ok {
 			worker.logger.Info("skip real deploy after fresh trend revalidation",
 				"component", "autogrid_worker", "symbol", candidate.Symbol, "reason", reason)
 			worker.rejectCandidate(ctx, candidate, "ре-валидация тренда: "+reason, nil)
 			continue
+		}
+		// Order-book (DOM) gate (v2.0.93 FIX-G, paper-parity): a one-sided
+		// book against the entry direction vetoes the deploy — the REAL path
+		// is the one that pays real money for the tape's inventory and it ran
+		// WITHOUT the gate the paper fleet has had since v2.0.39. Fail-open on
+		// transport errors (advisory signal); cascade-short window exempt,
+		// exactly like the paper arm.
+		if bids, asks, derr := worker.publicClient.GetDepth(ctx, candidate.Symbol, 50); derr == nil &&
+			len(bids) > 0 && len(asks) > 0 && candidate.CurrentPrice.IsPositive() {
+			imbalance := depthImbalance(bids, asks, candidate.CurrentPrice, 1.5)
+			scannerTrendReal := strings.ToLower(strings.TrimSpace(candidate.RecommendedTrend))
+			againstEntry := (scannerTrendReal != "short" && imbalance < 0.25) || (scannerTrendReal == "short" && imbalance > 0.75)
+			if againstEntry && !cascadeShort {
+				side := "аски доминируют (продавцы)"
+				if scannerTrendReal == "short" {
+					side = "биды доминируют (покупатели)"
+				}
+				worker.rejectCandidate(ctx, candidate,
+					fmt.Sprintf("стакан: дисбаланс %.2f против направления — %s, вход отложен", imbalance, side),
+					map[string]any{"depthGate": map[string]any{"imbalance": imbalance, "vetoed": true}})
+				continue
+			}
 		}
 
 		// v2.0 Smart Direction: regime + funding + FNG → direction override.
@@ -1798,6 +1872,15 @@ func (worker *Worker) deployReal(
 				continue
 			}
 		}
+		// v2.0.27 sector cap (v2.0.93 FIX-G, REAL mirror): correlated clusters
+		// stop together — the paper fleet has been capped since the 2026-08-21
+		// audit while REAL stacked unbounded same-sector grids.
+		if sector := sectorForSymbol(candidate.Symbol); sector != "" &&
+			worker.sectorRealBotCount(ctx, *settings.AccountID, sector) >= maxBotsPerSector {
+			worker.rejectCandidate(ctx, candidate,
+				fmt.Sprintf("sector cap: в секторе %s уже %d ботов — коррелированный кластер, вход отложен", sector, maxBotsPerSector), nil)
+			continue
+		}
 		atrPct := 2.0
 		if val, ok := candidate.ModelAssumptions["atrPct"].(float64); ok && val > 0 {
 			atrPct = val
@@ -1840,7 +1923,8 @@ func (worker *Worker) deployReal(
 		geometryBudget := settings.BudgetUSDT
 		mesh := ComputeAdaptiveMesh(
 			candidate.LowerPrice, candidate.UpperPrice, candidate.CurrentPrice,
-			atrPct, regime, geometryBudget, settings.Leverage, 0.30,
+			atrPct, regime, geometryBudget, settings.Leverage,
+			decimalFloat(settings.FeeBps), decimalFloat(settings.SlippageBps),
 		)
 
 		// v2.0 HAR-RV geometry — the same sizing the paper fleet validates:
@@ -1966,17 +2050,11 @@ func (worker *Worker) deployReal(
 			candidate.CurrentPrice, atrPrice, 1.5,
 		).Round(int32(pricePrecision))
 
-		// Safety check on StopLoss positioning
-		if trend == "short" {
-			if antiHuntStop.LessThanOrEqual(upperPrice) {
-				antiHuntStop = upperPrice.Mul(decimal.NewFromFloat(1.02)).Round(int32(pricePrecision))
-			}
-		} else {
-			// LONG or NEUTRAL: stop must be below lower boundary
-			if antiHuntStop.GreaterThanOrEqual(lowerPrice) {
-				antiHuntStop = lowerPrice.Mul(decimal.NewFromFloat(0.98)).Round(int32(pricePrecision))
-			}
-		}
+		// Safety check on StopLoss positioning (v2.0.93: the shared
+		// ClampAntiHuntStopIntoBounds helper — paper deploy and the DGT
+		// re-center arms run the identical rule).
+		antiHuntStop = ClampAntiHuntStopIntoBounds(trend, lowerPrice, upperPrice, antiHuntStop).
+			Round(int32(pricePrecision))
 
 		// Pre-deploy distance check: the current price must have room to
 		// the anti-hunt stop BEFORE the bot opens — deploying with price
@@ -3258,7 +3336,58 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 				}
 			}
 		}
-		if !trancheBackoff && bot.trancheDeployed == 1 && bot.trancheBase != nil && bot.localStatus == "RUNNING" && price.IsPositive() {
+
+		// Behavior trace (v2.0.56 F7): REAL bots join the bot_telemetry
+		// series so underwater/recovery analytics cover the real fleet too.
+		// inventory_notional comes from the exchange-reported position;
+		// grid_level stays 0 (the real loop tracks no paper ladder), while
+		// funding_paid_usdt carries the reconciled cumulative column.
+		// Best-effort insert, same contract as the paper path.
+		if bot.localStatus == "RUNNING" {
+			inventoryNotional := decimal.Zero
+			if !remote.BUOrderData.Position.IsZero() && price.GreaterThan(decimal.Zero) {
+				inventoryNotional = remote.BUOrderData.Position.Abs().Mul(price)
+			}
+			_, _ = worker.db.Exec(ctx, `
+				INSERT INTO bot_telemetry
+					(bot_id, bot_number, symbol, price, realized_pnl, unrealized_pnl,
+					 total_pnl, grid_level, inventory_notional, adjustments_count, funding_paid_usdt)
+				VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+			`, bot.id, bot.botNumber, bot.symbol, price, realized, unrealized,
+				realized.Add(unrealized), 0, inventoryNotional, bot.adjustments, bot.fundingPaid)
+		}
+
+		peakNow := bot.peak
+		if current := realized.Add(unrealized); current.GreaterThan(peakNow) {
+			peakNow = current
+		}
+		decision := decideBotAction(botActionInput{
+			Direction:        bot.direction,
+			Lower:            bot.lower,
+			Upper:            bot.upper,
+			CurrentPrice:     price,
+			RealizedPNL:      realized,
+			UnrealizedPNL:    unrealized,
+			PeakPNL:          peakNow,
+			Budget:           bot.investment,
+			PnLTarget:        botTarget,
+			MaxLoss:          botMaxLoss,
+			RangeBreakBuffer: settings.RangeBreakBufferPct,
+			AdjustmentsLeft:  settings.MaxAdjustmentsPerBot - bot.adjustments,
+			Regime:           regime,
+			AntiHuntStop:     bot.antiHuntStop,
+		})
+		// v2.0.93 FIX-E (paper-canonical order): the tranche-2 pour runs AFTER
+		// the stop decision, not before it. The old order poured on the very
+		// tick that then closed or shifted the bot — real margin into a stop
+		// (wasted pour, doubled stop charged at exit) or into a range shift.
+		// The paper arm always had the decision-first order (its close/adjust
+		// branches `continue` past the tranche block); that order is canonical:
+		// on a conflicting tick the stop wins and the pour waits for a calm
+		// (HOLD) tick. The resync/self-heal reconciliation above stays BEFORE
+		// the decision — a doubled position must be judged against doubled
+		// stops, which is exactly what the refreshed locals provide.
+		if decision.Action == ActionHold && !trancheBackoff && bot.trancheDeployed == 1 && bot.trancheBase != nil && bot.localStatus == "RUNNING" && price.IsPositive() {
 			if base, bErr := decimal.NewFromString(*bot.trancheBase); bErr == nil && base.GreaterThan(bot.investment) {
 				entry := price
 				if bot.trancheEntry != nil {
@@ -3463,46 +3592,6 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 			}
 		}
 
-		// Behavior trace (v2.0.56 F7): REAL bots join the bot_telemetry
-		// series so underwater/recovery analytics cover the real fleet too.
-		// inventory_notional comes from the exchange-reported position;
-		// grid_level stays 0 (the real loop tracks no paper ladder), while
-		// funding_paid_usdt carries the reconciled cumulative column.
-		// Best-effort insert, same contract as the paper path.
-		if bot.localStatus == "RUNNING" {
-			inventoryNotional := decimal.Zero
-			if !remote.BUOrderData.Position.IsZero() && price.GreaterThan(decimal.Zero) {
-				inventoryNotional = remote.BUOrderData.Position.Abs().Mul(price)
-			}
-			_, _ = worker.db.Exec(ctx, `
-				INSERT INTO bot_telemetry
-					(bot_id, bot_number, symbol, price, realized_pnl, unrealized_pnl,
-					 total_pnl, grid_level, inventory_notional, adjustments_count, funding_paid_usdt)
-				VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-			`, bot.id, bot.botNumber, bot.symbol, price, realized, unrealized,
-				realized.Add(unrealized), 0, inventoryNotional, bot.adjustments, bot.fundingPaid)
-		}
-
-		peakNow := bot.peak
-		if current := realized.Add(unrealized); current.GreaterThan(peakNow) {
-			peakNow = current
-		}
-		decision := decideBotAction(botActionInput{
-			Direction:        bot.direction,
-			Lower:            bot.lower,
-			Upper:            bot.upper,
-			CurrentPrice:     price,
-			RealizedPNL:      realized,
-			UnrealizedPNL:    unrealized,
-			PeakPNL:          peakNow,
-			Budget:           bot.investment,
-			PnLTarget:        botTarget,
-			MaxLoss:          botMaxLoss,
-			RangeBreakBuffer: settings.RangeBreakBufferPct,
-			AdjustmentsLeft:  settings.MaxAdjustmentsPerBot - bot.adjustments,
-			Regime:           regime,
-			AntiHuntStop:     bot.antiHuntStop,
-		})
 		switch decision.Action {
 		case ActionCloseTakeProfit, ActionCloseStopLoss, ActionCloseRangeBreak, ActionCloseStructInvalid:
 			totalPnL := realized.Add(unrealized)
@@ -4573,29 +4662,50 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 			// level against the shifted bounds makes the first tick after the
 			// shift a no-op baseline (price sits at the new mid).
 			newLevel := gridLevelForPrice(decision.NewLower, decision.NewUpper, bot.gridNum, price)
-			// Crystallize the underwater inventory mark into realized. The
-			// paper model is stateless: without this the pre-shift inventory
-			// loss silently vanishes when the grid recenters. A real
-			// adjust_params keeps the position, so the exit-fee component
-			// charged into `unrealized` for close decisions is added BACK —
-			// no position is exited on a shift, and repeated shifts must not
-			// stack phantom exit fees (v2.0.13 audit fix).
-			shiftRealized := realized.Add(unrealized)
+			// v2.0.93 FIX-J (REAL parity, v2.0.85 "shift always"): HOW the
+			// shift ships follows the same floating-PnL preflight the REAL
+			// manage path uses (adjustShiftMode). Green (unrealized ≥ +$0.10)
+			// → normal re-base: the inventory mark crystallizes into realized.
+			// Under water → keep_investment semantics: a pure range move, the
+			// position is TRANSFERRED not exited — the floating loss carries
+			// forward as unrealized against the new bounds instead of being
+			// crystallized, mirroring the exchange's keepInvestment=true
+			// rescue transfer the REAL path ships. The paper model used to
+			// crystallize every shift, so an under-water paper bot banked its
+			// full floating loss at the moment of the rescue while its REAL
+			// twin kept the position alive.
+			shiftMode := adjustShiftMode(unrealized)
+			// The exit-fee component charged into `unrealized` for close
+			// decisions is added BACK either way — no position is exited on a
+			// shift, and repeated shifts must not stack phantom exit fees
+			// (v2.0.13 audit fix).
+			exitFeeBack := decimal.Zero
 			if exitNotional.IsPositive() {
-				shiftRealized = shiftRealized.Add(exitNotional.Mul(paperCloseFeeRate()))
+				exitFeeBack = exitNotional.Mul(paperCloseFeeRate())
+			}
+			shiftRealized := realized
+			carryUnrealized := decimal.Zero
+			if shiftMode == shiftModeNormal {
+				shiftRealized = realized.Add(unrealized).Add(exitFeeBack)
+			} else {
+				carryUnrealized = unrealized.Add(exitFeeBack)
 			}
 			// v2.0.15 re-anchors, applied as extra SET clauses after the
-			// fixed $1..$6 parameters:
-			//   1. directional grids re-anchor entry_price — their
-			//      unrealized is re-derived from entry every tick, so
-			//      without it each shift double-counts position PnL;
-			//   2. the anti-hunt stop moves with the range, preserving its
-			//      deploy-time distance-beyond-bound — a stale deploy stop
-			//      drifts away from the shifted bounds and protects nothing.
+			// fixed $1..$7 parameters:
+			//   1. directional grids re-anchor entry_price on a NORMAL
+			//      re-base — their unrealized is re-derived from entry every
+			//      tick, so without it each shift double-counts position PnL.
+			//      In keep_investment mode the entry stays: the transferred
+			//      position keeps its original basis (the REAL exchange
+			//      transfer moves bounds, not entries);
+			//   2. the anti-hunt stop moves with the range (both modes),
+			//      preserving its deploy-time distance-beyond-bound — a stale
+			//      deploy stop drifts away from the shifted bounds and
+			//      protects nothing.
 			setClauses := ""
 			var extraArgs []any
-			if bot.direction != "NEUTRAL" {
-				setClauses += fmt.Sprintf(", entry_price = $%d", 7+len(extraArgs))
+			if bot.direction != "NEUTRAL" && shiftMode == shiftModeNormal {
+				setClauses += fmt.Sprintf(", entry_price = $%d", 8+len(extraArgs))
 				extraArgs = append(extraArgs, price)
 			}
 			if bot.antiHuntStop != nil && bot.antiHuntStop.GreaterThan(decimal.Zero) {
@@ -4603,29 +4713,31 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 				if bot.direction == "SHORT" {
 					newStop = decision.NewUpper.Add(bot.antiHuntStop.Sub(bot.upper))
 				}
-				setClauses += fmt.Sprintf(", anti_hunt_stop_price = $%d", 7+len(extraArgs))
+				setClauses += fmt.Sprintf(", anti_hunt_stop_price = $%d", 8+len(extraArgs))
 				extraArgs = append(extraArgs, newStop)
 			}
 			_, _ = worker.db.Exec(ctx, `
 				UPDATE paper_grid_bots
 				SET lower_price = $2, upper_price = $3,
 				    adjustments_count = adjustments_count + 1,
-				    mark_price = $4, unrealized_pnl_usdt = 0,
-				    realized_pnl_usdt = $5, last_grid_level = $6`+setClauses+`
+				    mark_price = $4, unrealized_pnl_usdt = $5,
+				    realized_pnl_usdt = $6, last_grid_level = $7`+setClauses+`
 				WHERE id = $1
-			`, append([]any{bot.id, decision.NewLower, decision.NewUpper, price, shiftRealized, newLevel}, extraArgs...)...)
+			`, append([]any{bot.id, decision.NewLower, decision.NewUpper, price,
+				carryUnrealized, shiftRealized, newLevel}, extraArgs...)...)
 
 			worker.logger.Info("adjusted paper grid range on the fly",
-				"component", "autogrid_worker", "symbol", bot.symbol,
+				"component", "autogrid_worker", "symbol", bot.symbol, "mode", shiftMode,
 				"lower", decision.NewLower.String(), "upper", decision.NewUpper.String())
 
 			_ = LogBotEvent(ctx, worker.db, bot.id, bot.botNumber, "PAPER", bot.symbol, "ADJUST_RANGE", &price, &total, map[string]any{
-				"reason": decision.Reason, "new_lower": decision.NewLower.String(), "new_upper": decision.NewUpper.String(),
+				"reason": decision.Reason, "mode": shiftMode,
+				"new_lower": decision.NewLower.String(), "new_upper": decision.NewUpper.String(),
 			})
 			_ = QueueTelegramEvent(ctx, worker.db, "ADJUST_RANGE", map[string]any{
 				"bot_number": bot.botNumber, "symbol": bot.symbol,
 				"lower_price": decision.NewLower.StringFixed(6), "upper_price": decision.NewUpper.StringFixed(6),
-				"reason": decision.Reason, "adjustments_count": bot.adjustmentsCount + 1,
+				"reason": decision.Reason, "mode": shiftMode, "adjustments_count": bot.adjustmentsCount + 1,
 			})
 			continue
 		}

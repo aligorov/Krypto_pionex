@@ -539,7 +539,19 @@ type AutoGridSettingsUpdateInput struct {
 	RangeBreakBufferPct     string `json:"rangeBreakBufferPct"`
 	MaxAdjustmentsPerBot    int    `json:"maxAdjustmentsPerBot"`
 	RadarAutoCloseMode      string `json:"radarAutoCloseMode,omitempty"` // OFF / BAND3 / STRICT
-	AIKitEnabled            bool   `json:"aiKitEnabled"`
+	// v2.0.93 FIX-B: the switches below are ALL preserve-on-omit — every one
+	// of them used to be absent from this struct, so a partial MCP update
+	// silently killed the AI autotune (and friends) on every call. Omitted
+	// enums/pointers keep the stored value; provided values are validated
+	// loudly instead of quietly degrading to a default.
+	ScanMode             string `json:"scanMode,omitempty"`             // TOP_K (fast) or FULL
+	StopForecastMode     string `json:"stopForecastMode,omitempty"`     // OFF / SHADOW / ACTIVE
+	TrancheDeployEnabled *bool  `json:"trancheDeployEnabled,omitempty"` // tranche-1/2 capital contract
+	DgtRedeployEnabled   *bool  `json:"dgtRedeployEnabled,omitempty"`   // DGT break re-deploy
+	AIKitEnabled         *bool  `json:"aiKitEnabled,omitempty"`
+	AIAutotuneEnabled    *bool  `json:"aiAutotuneEnabled,omitempty"`
+	// 0 preserves the stored interval (service-side default fill).
+	AIAutotuneIntervalSeconds int `json:"aiAutotuneIntervalSeconds,omitempty"`
 }
 
 type AutoGridBotIDInput struct {
@@ -603,10 +615,22 @@ func registerAutoGridTools(
 			"per-bot PnL target and max loss, manage interval, scanner thresholds. All decimals are " +
 			"strings. radarAutoCloseMode: OFF (default) / BAND3 / STRICT — whether the stop-radar may " +
 			"close a bot itself (band>=3 + under water + dwell; STRICT adds dist_to_stop < 0.5 ATR). " +
-			"Requires mcp:trade.",
+			"v2.0.93: scanMode (TOP_K/FULL), stopForecastMode (OFF/SHADOW/ACTIVE), " +
+			"trancheDeployEnabled, dgtRedeployEnabled, aiKitEnabled, aiAutotuneEnabled and " +
+			"aiAutotuneIntervalSeconds are optional and PRESERVE the stored value when omitted — " +
+			"a partial update no longer silently kills the AI autotune. Requires mcp:trade.",
 		Annotations: writeHint,
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, input AutoGridSettingsUpdateInput) (*mcp.CallToolResult, DataOutput, error) {
 		if err := requireWrite(ctx, services, principal, "mcp:trade"); err != nil {
+			return nil, DataOutput{}, err
+		}
+		// Preserve-on-omit source of truth (FIX-B): the bool/int fields of
+		// UpdateSettingsInput are non-pointer, so an omitted MCP field must
+		// be backfilled from the stored settings before the update ships —
+		// otherwise every partial update flips the switch to its zero value
+		// (prod symptom: AI autotune killed on each MCP settings touch).
+		current, err := services.AutoGrid.GetSettings(ctx)
+		if err != nil {
 			return nil, DataOutput{}, err
 		}
 		update := autogrid.UpdateSettingsInput{
@@ -623,7 +647,11 @@ func registerAutoGridTools(
 			ScanIntervalSeconds:     input.ScanIntervalSeconds,
 			ManageIntervalSeconds:   input.ManageIntervalSeconds,
 			MaxAdjustmentsPerBot:    input.MaxAdjustmentsPerBot,
-			AIKitEnabled:            input.AIKitEnabled,
+			AIKitEnabled:            current.AIKitEnabled,
+			AIAutotuneEnabled:       current.AIAutotuneEnabled,
+			AIAutotuneInterval:      input.AIAutotuneIntervalSeconds,
+			TrancheDeployEnabled:    input.TrancheDeployEnabled,
+			DgtRedeployEnabled:      input.DgtRedeployEnabled,
 		}
 		if input.AccountID != "" {
 			accountID := input.AccountID
@@ -645,6 +673,28 @@ func registerAutoGridTools(
 				return nil, DataOutput{}, fmt.Errorf("invalid radarAutoCloseMode %q: must be OFF, BAND3 or STRICT", input.RadarAutoCloseMode)
 			}
 			update.RadarAutoCloseMode = mode
+		}
+		if input.ScanMode != "" {
+			// Loud validation on an explicit value (same doctrine as the radar
+			// switch); omitted keeps the stored mode service-side.
+			mode := strings.ToUpper(strings.TrimSpace(input.ScanMode))
+			if mode != "TOP_K" && mode != "FULL" {
+				return nil, DataOutput{}, fmt.Errorf("invalid scanMode %q: must be TOP_K or FULL", input.ScanMode)
+			}
+			update.ScanMode = mode
+		}
+		if input.StopForecastMode != "" {
+			mode := strings.ToUpper(strings.TrimSpace(input.StopForecastMode))
+			if mode != "OFF" && mode != "SHADOW" && mode != "ACTIVE" {
+				return nil, DataOutput{}, fmt.Errorf("invalid stopForecastMode %q: must be OFF, SHADOW or ACTIVE", input.StopForecastMode)
+			}
+			update.StopForecastMode = mode
+		}
+		if input.AIKitEnabled != nil {
+			update.AIKitEnabled = *input.AIKitEnabled
+		}
+		if input.AIAutotuneEnabled != nil {
+			update.AIAutotuneEnabled = *input.AIAutotuneEnabled
 		}
 		decimalFields := []struct {
 			raw  string

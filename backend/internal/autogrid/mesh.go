@@ -19,14 +19,18 @@ type AdaptiveMeshResult struct {
 }
 
 // ComputeAdaptiveMesh sizes the grid level count under the margin-density
-// doctrine (v2.0.75): step = max(0.25%, the step at which every level still
-// carries ≥ $8 of the budget×leverage notional), levels =
-// clamp(round(span/step), 6, 500). The old economics — a 0.80% "break-even"
-// step floor plus a 6..14 count clamp — starved every $200-notional 4%-span
-// deploy to 6 levels of 0.64-0.75%: three such live bots booked ZERO grid
-// profit in 8h while the dense deployments (0.22% step, 29-60 levels)
-// harvested everything. ATR/regime stay accepted for signature stability but
-// no longer drive density — only the margin does.
+// doctrine (v2.0.75): step = max(fee-gate floor at the ACTUAL costs, the step
+// at which every level still carries ≥ $8 of the budget×leverage notional),
+// levels = clamp(floor(span/step), 6, 500). The old economics — a 0.80%
+// "break-even" step floor plus a 6..14 count clamp — starved every
+// $200-notional 4%-span deploy to 6 levels of 0.64-0.75%: three such live
+// bots booked ZERO grid profit in 8h while the dense deployments (0.22% step,
+// 29-60 levels) harvested everything. ATR/regime stay accepted for signature
+// stability but no longer drive density — only the margin does. v2.0.93
+// FIX-A: the step floor is derived from the caller's feeBps/slippageBps
+// (the live settings), not the pinned fleet default — the density source and
+// the deploy-time fee-gate must read the same numbers. Unknown costs (≤ 0)
+// fall back to the documented default floor.
 func ComputeAdaptiveMesh(
 	lower decimal.Decimal,
 	upper decimal.Decimal,
@@ -35,11 +39,10 @@ func ComputeAdaptiveMesh(
 	regime string,
 	budgetUsdt decimal.Decimal,
 	leverage int,
-	minGridStepPct float64,
+	feeBps, slippageBps float64,
 ) AdaptiveMeshResult {
-	_ = atrPct         // density no longer follows volatility (see doc comment)
-	_ = regime         // and the regime step multiplier is retired with it
-	_ = minGridStepPct // the 0.25% economic floor supersedes caller guesses
+	_ = atrPct // density no longer follows volatility (see doc comment)
+	_ = regime // and the regime step multiplier is retired with it
 
 	if upper.LessThanOrEqual(lower) || currentPrice.LessThanOrEqual(decimal.Zero) {
 		return AdaptiveMeshResult{
@@ -62,7 +65,7 @@ func ComputeAdaptiveMesh(
 		lev = int64(leverage)
 	}
 	notional, _ := budgetUsdt.Mul(decimal.NewFromInt(lev)).Float64()
-	idealGrids := marketdata.GridLevelsForRange(spanPct, notional)
+	idealGrids := marketdata.GridLevelsForRange(spanPct, notional, feeBps, slippageBps)
 
 	actualStepPct := spanPct / float64(idealGrids)
 	stepPerLevel := span.Div(decimal.NewFromInt(int64(idealGrids)))
@@ -184,4 +187,27 @@ func ComputeAntiHuntStop(
 		}
 		return stop
 	}
+}
+
+// ClampAntiHuntStopIntoBounds (v2.0.93 FIX-I) pushes a degenerate anti-hunt
+// stop back OUTSIDE the grid bounds: SHORT stops sit ≥ upper×1.02, LONG/
+// NEUTRAL stops sit ≤ lower×0.98. A near-zero ATR reading parks the raw
+// 1.5-ATR stop INSIDE the range — a stop the grid immediately crosses. One
+// helper, all three computation sites (REAL deploy, paper deploy, DGT
+// re-center paper arm) — the paper arm used to skip the clamp its REAL twin
+// has always applied.
+func ClampAntiHuntStopIntoBounds(
+	direction string,
+	lower, upper, stop decimal.Decimal,
+) decimal.Decimal {
+	if strings.EqualFold(strings.TrimSpace(direction), "SHORT") {
+		if stop.LessThanOrEqual(upper) {
+			return upper.Mul(decimal.NewFromFloat(1.02))
+		}
+		return stop
+	}
+	if stop.GreaterThanOrEqual(lower) {
+		return lower.Mul(decimal.NewFromFloat(0.98))
+	}
+	return stop
 }

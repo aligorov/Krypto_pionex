@@ -137,44 +137,59 @@ const (
 	// MinGridLevelNotionalUSDT is the smallest acceptable per-level order
 	// notional (budget×leverage/levels).
 	MinGridLevelNotionalUSDT = 8.0
-	// gridLevelsMin/Max clamp the count: 6 keeps a grid a grid, 500 is the
-	// Pionex futures contract row ceiling.
-	gridLevelsMin = 6
-	gridLevelsMax = 500
+	// GridLevelsMin/Max clamp the count: 6 keeps a grid a grid, 500 is the
+	// Pionex futures contract row ceiling. Exported (v2.0.93): the AI Kit
+	// adoption clamp and any other density source must adopt the same floor
+	// the doctrine clamps to.
+	GridLevelsMin = 6
+	GridLevelsMax = 500
 )
 
 // GridLevelsForRange derives the grid level count for a span (%) under the
 // margin-density doctrine: the step is max(feeGateFloor, the step at which
 // every level still carries ≥ $8 of the budget×leverage notional), where
-// feeGateFloor = 2×RoundTripCostPct at the fleet-default fees — the density
-// floor and the v2.0.89 fee-gate MUST be the same constant: with the old
-// 0.25% floor vs the 0.28% gate, every candidate the density calculator
-// produced died at the gate by 0.03% and the fleet starved (prod
-// 2026-09-05: zero deploys, 46% of scan candidates rejected at the gate).
-// notional ≤ 0 (unknown) falls back to the pure step floor. floor() — not
-// round() — is load-bearing: rounding UP past notional/$8 would silently
-// shrink the per-level notional below the floor the whole formula exists
-// to protect.
-func GridLevelsForRange(rangePct, notionalUSDT float64) int {
+// feeGateFloor = 2×RoundTripCostPct at the ACTUAL fee/slippage pair the fleet
+// runs (v2.0.93 parameterization: the floor used to be pinned to the
+// fleet-default 5/2 bps, so an operator raising feeBps starved the fleet at a
+// gate the floor no longer matched — the gate and the density source MUST
+// read the same numbers). notional ≤ 0 (unknown) falls back to the pure step
+// floor; fee/slippage ≤ 0 (unknown) falls back to the fleet-default floor
+// (DefaultGridStepFloorPct). floor() — not round() — is load-bearing:
+// rounding UP past notional/$8 would silently shrink the per-level notional
+// below the floor the whole formula exists to protect.
+func GridLevelsForRange(rangePct, notionalUSDT, feeBps, slippageBps float64) int {
 	if rangePct <= 0 {
 		return 8
 	}
-	stepPct := DefaultGridStepFloorPct()
+	stepPct := FeeGateStepFloorPct(feeBps, slippageBps)
 	if notionalUSDT > 0 {
 		if minOrderStep := MinGridLevelNotionalUSDT * rangePct / notionalUSDT; minOrderStep > stepPct {
 			stepPct = minOrderStep
 		}
 	}
 	levels := math.Floor(rangePct / stepPct)
-	return int(clamp(levels, gridLevelsMin, gridLevelsMax))
+	return int(clamp(levels, GridLevelsMin, GridLevelsMax))
 }
 
-// DefaultGridStepFloorPct is the density step floor harmonized with the
-// fee-gate: 2× the round-trip cost at the fleet-default 5/2 bps = 0.28%.
-// GridLevelsForRange cannot read live settings (it is a pure function used
-// before settings load in some paths), so the default fee/slippage pair is
-// the contract; ValidateMinGridStep at deploy time re-checks against the
-// ACTUAL settings and remains the authority.
+// FeeGateStepFloorPct is the density step floor as a function of the ACTUAL
+// round-trip costs: 2× (fee + slippage) on both legs, in percent. It is the
+// same invariant ValidateMinGridStep and FeeGateRejection enforce — the
+// density floor and the deploy-time fee-gate are one number, derived from one
+// input. Unknown costs (fee+slippage ≤ 0) degrade to the fleet-default floor.
+func FeeGateStepFloorPct(feeBps, slippageBps float64) float64 {
+	if feeBps <= 0 && slippageBps <= 0 {
+		return DefaultGridStepFloorPct()
+	}
+	return 2.0 * RoundTripCostPct(feeBps, slippageBps)
+}
+
+// DefaultGridStepFloorPct is the DOCUMENTED FALLBACK of FeeGateStepFloorPct:
+// 2× the round-trip cost at the fleet-default 5/2 bps = 0.28%. It stays as
+// the contract for pure paths that genuinely have no live settings (and as
+// the degenerate-input floor inside FeeGateStepFloorPct); every real path
+// (scanner, mesh, AI Kit clamp, manual deploy, DGT re-center) passes its own
+// feeBps/slippageBps through so the density floor and the fee-gate can never
+// disagree again.
 func DefaultGridStepFloorPct() float64 {
 	return 2.0 * RoundTripCostPct(5, 2) // 0.28% at fleet defaults
 }

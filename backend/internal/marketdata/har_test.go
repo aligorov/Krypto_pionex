@@ -204,8 +204,10 @@ func TestForecastVolatilityFromCandles(t *testing.T) {
 }
 
 // Low volatility: daily vol < 1% → the range floor applies and max leverage
-// is allowed; the step must still cover 3× the fee (v2.0.75: and never dip
-// under the shared 0.25% density floor).
+// is allowed; the step must still cover 3× the fee (v2.0.93 FIX-A: and the
+// fee-gate density floor derived from the SAME feeBps — 2× round trip at the
+// one-way cost — instead of the pinned 0.28% default; at 5 bps one-way that
+// floor is 0.20%).
 func TestGridGeometryLowVol(t *testing.T) {
 	const feeBps = 5.0
 	g := ComputeGridGeometry(10, 0.42, feeBps, 0) // 10% annualized ≈ 0.52% daily
@@ -215,14 +217,17 @@ func TestGridGeometryLowVol(t *testing.T) {
 	if g.Leverage != 4 {
 		t.Fatalf("sub-3%% daily vol allows 4x leverage (v2.0.38 ladder), got %d", g.Leverage)
 	}
-	if g.GridCount != 10 { // 3% / 0.28% fee-gate-harmonized density floor
-		t.Fatalf("grid count = %d, want 10", g.GridCount)
+	if g.GridCount != 15 { // 3% / 0.20% fee-gate floor at 5 bps one-way
+		t.Fatalf("grid count = %d, want 15", g.GridCount)
 	}
-	if g.StepPct < 0.27 || g.StepPct > 0.31 {
-		t.Fatalf("step = %.4f%%, want ~0.30%%", g.StepPct)
+	if g.StepPct < 0.19 || g.StepPct > 0.22 {
+		t.Fatalf("step = %.4f%%, want ~0.20%%", g.StepPct)
 	}
 	if g.StepPct < 3*feeBps/100-1e-9 {
 		t.Fatalf("step %.4f%% must cover 3x fee (0.15%%)", g.StepPct)
+	}
+	if g.StepPct < FeeGateStepFloorPct(feeBps, 0)-1e-9 {
+		t.Fatalf("step %.4f%% must cover the fee-gate floor %.4f%%", g.StepPct, FeeGateStepFloorPct(feeBps, 0))
 	}
 	if g.StopPct != 1.5 {
 		t.Fatalf("stop = %.2f, want 1.5 (half the range)", g.StopPct)
@@ -276,13 +281,14 @@ func TestGridGeometryLeverageBands(t *testing.T) {
 }
 
 // Across fees and volatility regimes every geometry must keep its step
-// above 3× the fee (and above the shared 0.25% density floor) and its
-// count/range inside the clamps.
+// above 3× the fee AND above the fee-gate density floor derived from the
+// same feeBps (2× round trip = 4×feeBps/100 — the binding one of the two for
+// any positive fee), and its count/range inside the clamps.
 func TestGridGeometryStepCoversFees(t *testing.T) {
 	for _, feeBps := range []float64{2, 5, 10} {
 		minStep := 3 * feeBps / 100
-		if minStep < GridStepFloorPct {
-			minStep = GridStepFloorPct
+		if gateFloor := FeeGateStepFloorPct(feeBps, 0); minStep < gateFloor {
+			minStep = gateFloor
 		}
 		for _, annualVolPct := range []float64{5, 20, 45, 80, 150, 400} {
 			g := ComputeGridGeometry(annualVolPct, 0.3, feeBps, 0)

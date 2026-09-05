@@ -210,6 +210,47 @@ func newGridLifecyclePaperHarness(t *testing.T, prices map[string]string) *gridL
 		slog.New(slog.DiscardHandler))
 	worker.publicClient = pionex.NewClient(mock.server.URL, "test-key", "test-secret")
 
+	// v2.0.93 test-infra fix: the harness must pin the durable risk gates it
+	// needs instead of inheriting whatever earlier tests left in the shared
+	// row — migration 0001 seeds the kill switch ON, so running the DGT
+	// family in isolation (or after a test that re-armed it) silently blocked
+	// every re-deploy behind "kill switch is ACTIVE" (full-suite flake since
+	// v2.0.89 part B).
+	var savedKill bool
+	var savedSymCap, savedAcctCap, savedDaily, savedMaxLev, savedMaxBots string
+	if err := pool.QueryRow(context.Background(), `
+		SELECT kill_switch_enabled, max_symbol_exposure_usd::TEXT,
+		       max_account_exposure_usd::TEXT, max_daily_loss_usd::TEXT,
+		       max_leverage::TEXT, max_active_grid_bots::TEXT
+		FROM risk_settings WHERE id = 1
+	`).Scan(&savedKill, &savedSymCap, &savedAcctCap, &savedDaily, &savedMaxLev, &savedMaxBots); err != nil {
+		t.Fatalf("snapshot risk settings: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), `
+			UPDATE risk_settings
+			SET kill_switch_enabled = $2,
+			    max_symbol_exposure_usd = $3::NUMERIC,
+			    max_account_exposure_usd = $4::NUMERIC,
+			    max_daily_loss_usd = $5::NUMERIC,
+			    max_leverage = $6::INT,
+			    max_active_grid_bots = $7::INT
+			WHERE id = 1
+		`, savedKill, savedSymCap, savedAcctCap, savedDaily, savedMaxLev, savedMaxBots)
+	})
+	if _, err := pool.Exec(context.Background(), `
+		UPDATE risk_settings
+		SET kill_switch_enabled = false,
+		    max_symbol_exposure_usd = 100000,
+		    max_account_exposure_usd = 100000,
+		    max_daily_loss_usd = 100000,
+		    max_leverage = 10,
+		    max_active_grid_bots = 10
+		WHERE id = 1
+	`); err != nil {
+		t.Fatalf("pin risk gates: %v", err)
+	}
+
 	return &gridLifecyclePaperHarness{
 		pool: pool, worker: worker, service: service, mock: mock, settings: settings,
 	}
@@ -327,7 +368,13 @@ func TestPaperDgtRedeploysOnUpBreak(t *testing.T) {
 		SELECT id, lower_price, upper_price, quote_investment
 		FROM paper_grid_bots WHERE symbol = $1 AND status = 'RUNNING'
 	`, symbol).Scan(&newID, &newLower, &newUpper, &newInvestment); err != nil {
-		t.Fatalf("the DGT re-deploy must leave a fresh RUNNING bot: %v", err)
+		skipReason := ""
+		_ = h.pool.QueryRow(context.Background(), `
+			SELECT COALESCE(details->>'reason', '') FROM bot_execution_events
+			WHERE symbol = $1 AND event_type = 'DGT_REDEPLOY_SKIPPED'
+			ORDER BY created_at DESC LIMIT 1
+		`, symbol).Scan(&skipReason)
+		t.Fatalf("the DGT re-deploy must leave a fresh RUNNING bot: %v (skip reason: %q)", err, skipReason)
 	}
 	center := newLower.Add(newUpper).Div(decimal.NewFromInt(2))
 	if center.Sub(decimal.NewFromInt(130)).Abs().GreaterThan(decimal.NewFromFloat(0.01)) {

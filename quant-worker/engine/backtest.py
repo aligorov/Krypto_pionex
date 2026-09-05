@@ -8,8 +8,11 @@ class QuantBacktestEngine:
     maker/taker fee modeling, funding rate accounting, and Purged Walk-Forward OOS evaluation.
     """
 
-    def __init__(self, maker_fee: float = 0.0005, taker_fee: float = 0.0005, slippage: float = 0.0002,
+    def __init__(self, maker_fee: float = 0.0002, taker_fee: float = 0.0005, slippage: float = 0.0002,
                  funding_rate_8h: float = 0.0):
+        # v2.0.93: maker fee 0.0005 -> 0.0002 — the Pionex maker rebate tier
+        # the grid legs actually trade at; the old 5 bps overstates friction
+        # on every simulated round trip.
         self.maker_fee = maker_fee
         self.taker_fee = taker_fee
         self.slippage = slippage
@@ -219,11 +222,31 @@ class GridSimulator:
         }
 
 
-def derive_grid_params(candles, fee_bps=7.0, min_step_pct=0.6):
+def derive_grid_params(candles, fee_bps=7.0, min_step_pct=0.28):
     """
     Market-derived grid parameters for a training window: range from the
     10th-90th close percentile, level count from the fee floor. No hardcoded
     money amounts — everything comes from the window's own distribution.
+
+    v2.0.93 harmonization with the Go fleet (backend/internal/marketdata/
+    targets.go):
+      - min_step_pct 0.6 -> 0.28 — the same fee-gate density floor the Go
+        scanner/mesh/manual paths use (2x round trip at the 5/2 bps fleet
+        default), so the walk-forward grades the geometry the bot would
+        actually ship;
+      - fee_bps stays a parameter, default 7 (5 fee + 2 slippage, one-way
+        f+s like the Go settings pair);
+      - level clamp 2..100 -> 6..500 — the Go doctrine clamps (6 keeps a
+        grid a grid, 500 is the Pionex row ceiling).
+
+    DIVERGENCE (documented, deliberate): the range here is the p10-p90 close
+    percentile of the TRAINING window, while the Go scanner ships a
+    support/resistance ATR-buffered range (supportResistanceRange). The
+    percentile model is a different estimator on a different input (train
+    window vs live tape) — harmonizing the estimators would couple the OOS
+    grade to the deploy-time range source and defeat the walk-forward's
+    independence; the SHARED invariant is the step floor below, which is what
+    actually starves or feeds a grid.
     """
     closes = [c["close"] for c in candles]
     if len(closes) < 30:
@@ -237,7 +260,7 @@ def derive_grid_params(candles, fee_bps=7.0, min_step_pct=0.6):
     if mid <= 0 or upper <= lower:
         return None
     range_pct = (upper - lower) / mid * 100
-    levels = int(max(2, min(100, range_pct / max(min_step_pct, fee_bps / 100 * 1.2))))
+    levels = int(max(6, min(500, range_pct / max(min_step_pct, fee_bps / 100 * 1.2))))
     return {"lower": lower, "upper": upper, "levels": levels}
 
 
@@ -253,7 +276,12 @@ def walk_forward(engine, candles, train_bars=240, test_bars=60, purge_bars=6, in
     while start + train_bars + purge_bars + test_bars <= len(candles):
         train = candles[start : start + train_bars]
         test = candles[start + train_bars + purge_bars : start + train_bars + purge_bars + test_bars]
-        params = derive_grid_params(train)
+        params = derive_grid_params(
+            train,
+            # The engine's own fee model feeds the floor: (maker + slippage)
+            # in bps is the same one-way f+s pair the Go settings carry.
+            fee_bps=(engine.maker_fee + engine.slippage) * 1e4,
+        )
         if params:
             sim = GridSimulator(maker_fee=engine.maker_fee, taker_fee=engine.taker_fee, slippage=engine.slippage,
                                 funding_rate_8h=engine.funding_rate_8h, bar_hours=bar_hours)

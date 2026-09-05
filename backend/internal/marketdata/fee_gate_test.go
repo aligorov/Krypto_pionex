@@ -130,3 +130,51 @@ func TestScoreCandidateFeeGateWiring(t *testing.T) {
 			candidate.Decision, candidate.RejectionReason)
 	}
 }
+
+// v2.0.93 FIX-L: the level count AND the EV model are derived from the S/R
+// span the candidate actually persists — not the volatility-blend range that
+// used to feed the model while the shipped S/R geometry starved at the gate
+// (v2.0.92 patched the count at persist time; FIX-L derives it BEFORE the
+// model so the EV crossing math grades the shipping step). The observable
+// invariant, verdict-independent: the persisted GridNum equals the doctrine
+// count over the candidate's OWN persisted bounds at the scan's
+// fees/notional.
+func TestScoreCandidateGridNumFollowsShippingSpan(t *testing.T) {
+	symbol := feeGateTestSymbol()
+	ticker := pionex.TickerInfo{
+		Symbol: "TST_USDT",
+		Open:   decimal.NewFromInt(100),
+		Close:  decimal.NewFromInt(100),
+		Amount: decimal.NewFromInt(5_000_000),
+	}
+	candles := synthCandles(func(i int) float64 {
+		if i%2 == 0 {
+			return 102
+		}
+		return 98
+	}, 80)
+	volume := decimal.NewFromInt(5_000_000)
+
+	config := feeGateScanConfig()
+	config.FeeBps, config.SlippageBps = 5, 2
+	candidate, err := scoreCandidate(symbol, ticker, volume, candles, config)
+	if err != nil {
+		t.Fatalf("scoreCandidate: %v", err)
+	}
+	lower, upper := candidate.LowerPrice.InexactFloat64(), candidate.UpperPrice.InexactFloat64()
+	if upper <= lower {
+		t.Fatalf("degenerate S/R bounds %v..%v", lower, upper)
+	}
+	if candidate.GridNum < 1 {
+		t.Fatalf("candidate must carry a level count, got %d", candidate.GridNum)
+	}
+	// The count follows the SHIPPED span (span/lower is the scanner's own
+	// derivation formula), the scan's fees and the scan's notional — one
+	// geometry source, self-consistent by construction.
+	srSpanPct := (upper - lower) / lower * 100
+	want := GridLevelsForRange(srSpanPct, config.NotionalPerBot, config.FeeBps, config.SlippageBps)
+	if candidate.GridNum != want {
+		t.Fatalf("gridNum must follow the shipping S/R span doctrine count %d (span %.4f%%, %v notional, %v/%v bps), got %d",
+			want, srSpanPct, config.NotionalPerBot, config.FeeBps, config.SlippageBps, candidate.GridNum)
+	}
+}

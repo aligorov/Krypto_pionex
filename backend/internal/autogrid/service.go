@@ -117,9 +117,13 @@ type UpdateSettingsInput struct {
 	// value (the v2.0.16 pnl_target_mode blanking lesson — a partial form
 	// must not silently disarm the DGT re-deploy layer).
 	DgtRedeployEnabled *bool `json:"dgtRedeployEnabled"`
-	AIKitEnabled       bool  `json:"aiKitEnabled"`
-	AIAutotuneEnabled  bool  `json:"aiAutotuneEnabled"`
-	AIAutotuneInterval int   `json:"aiAutotuneIntervalSeconds"`
+	// TrancheDeployEnabled is optional in updates (v2.0.93 FIX-B): nil
+	// preserves the stored value — a partial MCP/UI form must not silently
+	// arm or disarm the tranche-1/tranche-2 capital contract.
+	TrancheDeployEnabled *bool `json:"trancheDeployEnabled"`
+	AIKitEnabled         bool  `json:"aiKitEnabled"`
+	AIAutotuneEnabled    bool  `json:"aiAutotuneEnabled"`
+	AIAutotuneInterval   int   `json:"aiAutotuneIntervalSeconds"`
 }
 
 type ScanRun struct {
@@ -374,7 +378,13 @@ func (s *Service) UpdateSettings(
 		}
 	}
 	if input.ScanMode != "FULL" && input.ScanMode != "TOP_K" {
-		input.ScanMode = "TOP_K"
+		// v2.0.93 FIX-B preserve-on-omit (the v2.0.16 lesson): an omitted
+		// scanMode keeps the stored one — it used to reset to TOP_K and a
+		// partial update silently cancelled the operator's FULL scan.
+		input.ScanMode = current.ScanMode
+		if input.ScanMode != "FULL" && input.ScanMode != "TOP_K" {
+			input.ScanMode = "TOP_K" // sane default for a blank column
+		}
 	}
 	// v2.0.16: an omitted mode must preserve the stored one — a partial MCP
 	// update (or any caller not sending the full form) used to blank
@@ -427,6 +437,12 @@ func (s *Service) UpdateSettings(
 	if input.DgtRedeployEnabled != nil {
 		dgtRedeploy = *input.DgtRedeployEnabled
 	}
+	// Tranche switch (v2.0.93 FIX-B): same preserve-on-omit contract — the
+	// stored capital contract survives partial forms untouched.
+	trancheDeploy := current.TrancheDeployEnabled
+	if input.TrancheDeployEnabled != nil {
+		trancheDeploy = *input.TrancheDeployEnabled
+	}
 	accountID := input.AccountID
 	if accountID != nil && strings.TrimSpace(*accountID) == "" {
 		accountID = nil
@@ -461,7 +477,7 @@ func (s *Service) UpdateSettings(
 		input.PnLTargetUSDT, input.MaxLossUSDT, input.ManageIntervalSeconds,
 		input.RangeBreakBufferPct, input.MaxAdjustmentsPerBot, input.AIKitEnabled,
 		input.AIAutotuneEnabled, input.AIAutotuneInterval, input.ScanMode,
-		current.TrancheDeployEnabled, input.StopForecastMode, input.RadarAutoCloseMode,
+		trancheDeploy, input.StopForecastMode, input.RadarAutoCloseMode,
 		dgtRedeploy)
 	if err != nil {
 		return nil, fmt.Errorf("update AutoGrid settings: %w", err)
@@ -1245,6 +1261,21 @@ func (s *Service) validateSettings(
 		input.MinProfitFactor.IsNegative() || input.FeeBps.IsNegative() ||
 		input.SlippageBps.IsNegative() {
 		return errors.New("invalid scanner risk thresholds")
+	}
+	// v2.0.93 FIX-A typo guard: the fee/slippage pair drives BOTH the deploy
+	// fee-gate and (since FIX-A) the density floor — a typo (0.5 bps instead
+	// of 5, or 500 instead of 50) no longer starves or floods the fleet
+	// silently. Pionex taker is 5 bps; 0.5..50 bps fee and 0..30 bps
+	// slippage bound every sane configuration.
+	if input.FeeBps.LessThan(decimal.NewFromFloat(0.5)) || input.FeeBps.GreaterThan(decimal.NewFromInt(50)) {
+		return fmt.Errorf(
+			"feeBps %s вне диапазона [0.5..50] — проверьте ввод (Pionex taker = 5 bps); пол плотности и fee-gate следуют этому значению",
+			input.FeeBps.String())
+	}
+	if input.SlippageBps.GreaterThan(decimal.NewFromInt(30)) {
+		return fmt.Errorf(
+			"slippageBps %s вне диапазона [0..30] — проверьте ввод; пол плотности и fee-gate следуют этому значению",
+			input.SlippageBps.String())
 	}
 	if input.PnLTargetMode == "" {
 		input.PnLTargetMode = "DYNAMIC"
@@ -2223,11 +2254,14 @@ func (s *Service) DeployManualBot(
 		// Margin-density level count for the operator's range (v2.0.75): the
 		// count follows the notional this deploy actually commits (investment
 		// override included); AI Kit count is applied automatically when the
-		// prefill was taken from the proposal.
+		// prefill was taken from the proposal. v2.0.93 FIX-A: the step floor
+		// is the fee-gate floor at the LIVE settings fees, so a derived row
+		// can never land under the bar the fee-gate below enforces.
 		mid := upper.Add(lower).Div(decimal.NewFromInt(2))
 		rangePct := upper.Sub(lower).Div(mid).InexactFloat64() * 100
 		notional := investment.Mul(decimal.NewFromInt(int64(leverage))).InexactFloat64()
-		row = marketdata.GridLevelsForRange(rangePct, notional)
+		row = marketdata.GridLevelsForRange(rangePct, notional,
+			settings.FeeBps.InexactFloat64(), settings.SlippageBps.InexactFloat64())
 	}
 	// Fall back to the latest scanner recommendation for missing fields.
 	if !upper.GreaterThan(lower) {
@@ -2295,6 +2329,21 @@ func (s *Service) DeployManualBot(
 				"cannot fetch live PERP price for %s: %w", input.Symbol, livePriceErr)
 		}
 		botTarget, botMaxLoss := s.computeManualTargets(ctx, targetSettings, input.Symbol, leverage)
+		// v2.0.93 FIX-D (AGENTS.md#5): the manual PAPER branch used to skip
+		// every durable risk gate the scan path and manual REAL run — no kill
+		// switch, no MaxLeverage, no exposure caps, no fleet stop envelope —
+		// a hand deploy could bypass the kill switch in paper exactly when
+		// the operator uses a manual deploy to test under stress. ValidateNewPaperGrid
+		// carries the kill-switch gate (paper exam, investment = the amount
+		// this deploy actually commits); the envelope reserves the FULL stop.
+		if err := s.risk.ValidateNewPaperGrid(ctx, input.Symbol, leverage, investment); err != nil {
+			return nil, "", err
+		}
+		if botMaxLoss != nil {
+			if reason := deployStopEnvelopeGate(ctx, s.db, s.risk, s.logger, settings.ID, *botMaxLoss); reason != "" {
+				return nil, "", errors.New(reason)
+			}
+		}
 		// v2.0.89 entry friction: same taker entry fee the scan deploys and
 		// the REAL ledger book — into realized (the wallet pays at fill) and
 		// the fee ledger column.

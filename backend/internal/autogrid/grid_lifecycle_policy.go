@@ -443,7 +443,8 @@ func (worker *Worker) dgtFreshGeometry(
 	stubUpper := spec.breakPrice.Add(half)
 	mesh = ComputeAdaptiveMesh(
 		stubLower, stubUpper, spec.breakPrice,
-		atrPct, "RANGE", spec.slotBudget, settings.Leverage, 0.30,
+		atrPct, "RANGE", spec.slotBudget, settings.Leverage,
+		decimalFloat(settings.FeeBps), decimalFloat(settings.SlippageBps),
 	)
 	harGeo = worker.harGridGeometry(ctx, spec.symbol,
 		decimalFloat(settings.FeeBps.Add(settings.SlippageBps)), spec.slotBudget.InexactFloat64())
@@ -687,6 +688,10 @@ func (worker *Worker) dgtRedeployPaper(ctx context.Context, settings Settings, s
 		spec.direction, mesh.LowerPrice, mesh.UpperPrice,
 		spec.breakPrice, atrPrice, 1.5,
 	)
+	// v2.0.93 FIX-I (paper/REAL parity): the ±2% boundary clamp the REAL DGT
+	// arm (below) and both deploy paths apply — a degenerate ATR must not
+	// park the paper re-center's stop inside its own range.
+	antiHuntStop = ClampAntiHuntStopIntoBounds(spec.direction, mesh.LowerPrice, mesh.UpperPrice, antiHuntStop)
 
 	// Entry friction parity: the fresh paper grid books its taker entry fee
 	// exactly like a deploy (v2.0.89 calibrated block).
@@ -836,13 +841,9 @@ func (worker *Worker) dgtRedeployReal(ctx context.Context, settings Settings, sp
 		spec.direction, lowerPrice, upperPrice,
 		spec.breakPrice, atrPrice, 1.5,
 	).Round(int32(pricePrecision))
-	if spec.direction == "SHORT" {
-		if antiHuntStop.LessThanOrEqual(upperPrice) {
-			antiHuntStop = upperPrice.Mul(decimal.NewFromFloat(1.02)).Round(int32(pricePrecision))
-		}
-	} else if antiHuntStop.GreaterThanOrEqual(lowerPrice) {
-		antiHuntStop = lowerPrice.Mul(decimal.NewFromFloat(0.98)).Round(int32(pricePrecision))
-	}
+	// The REAL DGT arm shares the deploy clamp via the same helper.
+	antiHuntStop = ClampAntiHuntStopIntoBounds(spec.direction, lowerPrice, upperPrice, antiHuntStop).
+		Round(int32(pricePrecision))
 
 	investAmount := spec.slotBudget
 	trancheOn := settings.TrancheDeployEnabled

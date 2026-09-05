@@ -75,7 +75,10 @@ def run_job(conn, job):
     engine = QuantBacktestEngine(
         maker_fee=0.0002,
         taker_fee=0.0005,
-        slippage=0.0002,
+        # v2.0.93: 0.0002 -> 0.0005 — close-cost alignment with the Go paper
+        # model (taker + slippage on the exit leg); the thinner slip made OOS
+        # stops look cheaper than the fleet's own close accounting.
+        slippage=0.0005,
         # Conservative baseline funding (1 bp / 8h on held notional): the
         # live paper loop feeds real cross-exchange rates, but the deploy
         # gate must price SOME funding drag — ignoring it overstated OOS

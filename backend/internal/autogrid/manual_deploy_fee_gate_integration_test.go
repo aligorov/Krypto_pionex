@@ -94,12 +94,15 @@ func TestManualDeployFeeGateParity(t *testing.T) {
 		t.Fatalf("PAPER 4%%/20-levels deploy must be refused by the same fee-gate, got %v", err)
 	}
 
-	// Derived row on a 2% span: GridLevelsForRange(2%, $1000 notional) →
-	// 8 levels × 0.25% — the density floor lands UNDER the 2× round-trip
-	// bar, so the manual deploy is refused too.
-	if err := deploy("CANFG3_USDT_PERP", "PAPER", 99, 101, 0); err == nil ||
+	// Derived row on a 1.5% span (v2.0.93 honest math): the density doctrine
+	// derives floor(1.5/0.28) = 5 → clamped UP to its 6-level grid floor, so
+	// the realized step is 0.25% — UNDER the 2× round-trip bar — and the
+	// manual deploy is refused. (A 2% span now derives 7×0.2857% and CLEARS
+	// the gate — the old "8 levels × 0.25%" expectation died with the
+	// v2.0.90 floor harmonization.)
+	if err := deploy("CANFG3_USDT_PERP", "PAPER", 99.25, 100.75, 0); err == nil ||
 		!strings.Contains(err.Error(), "fee-gate") {
-		t.Fatalf("derived-row 2%%-span deploy must be refused by the fee-gate, got %v", err)
+		t.Fatalf("derived-row 1.5%%-span deploy must be refused by the fee-gate, got %v", err)
 	}
 
 	// Nothing was written for any refused deploy.

@@ -308,12 +308,34 @@ func scoreCandidate(
 	regime := DetectRegime(sorted)
 	rangePct := clamp(math.Max(volatilityPct*2.5, 2.0), 2.0, 25.0)
 
-	// Grid level count: density scales with the margin (v2.0.75) — the
-	// 0.80% ATR-floored step starved every 4%-span deploy to 6 levels that
-	// never crossed; the count now comes from notional/level ≥ $8 with a
-	// 0.25% step floor.
-	gridNum := GridLevelsForRange(rangePct, config.NotionalPerBot)
-	gridStep := rangePct / 100 / float64(gridNum)
+	// Support/resistance bounds FIRST (v2.0.93 FIX-L): the persisted geometry
+	// ships these bounds, so the level count AND the EV model below must be
+	// derived from the S/R span, not the volatility-blend range. The old order
+	// derived gridNum from the (up to 25%) volatility range, modeled crossings
+	// on that step, then re-derived the count from the (usually 2.5× tighter)
+	// S/R span at persist time — the model graded a geometry that never
+	// existed while the shipped one starved at the fee-gate.
+	price := ticker.Close
+	priceFloat, _ := price.Float64()
+	lowerFloat, upperFloat := supportResistanceRange(sorted, priceFloat, volatilityPct)
+	rangeFraction := 0.0
+	if upperFloat > lowerFloat && upperFloat > 0 {
+		rangeFraction = (upperFloat - lowerFloat) / upperFloat / 2
+	}
+
+	// Grid level count: density scales with the margin (v2.0.75) — the count
+	// comes from notional/level ≥ $8 with the PARAMETERIZED fee-gate step
+	// floor (v2.0.93 FIX-A: config.FeeBps/SlippageBps, not the pinned fleet
+	// default). The count is derived from the S/R span that actually ships;
+	// the volatility-blend range is only the degenerate fallback when the S/R
+	// range is unreadable.
+	gridNum := GridLevelsForRange(rangePct, config.NotionalPerBot, config.FeeBps, config.SlippageBps)
+	modelSpanPct := rangePct
+	if srSpanPct := (upperFloat - lowerFloat) / lowerFloat * 100; srSpanPct > 0 {
+		gridNum = GridLevelsForRange(srSpanPct, config.NotionalPerBot, config.FeeBps, config.SlippageBps)
+		modelSpanPct = srSpanPct
+	}
+	gridStep := modelSpanPct / 100 / float64(gridNum)
 	friction := 2 * (config.FeeBps + config.SlippageBps) / 10_000
 
 	modelReturns := make([]float64, len(returns))
@@ -351,25 +373,12 @@ func scoreCandidate(
 	winRate, profitFactor := winRateAndProfitFactor(modelReturns)
 	turnover := float64(crossings) * 2 / float64(len(modelReturns))
 
-	price := ticker.Close
-	priceFloat, _ := price.Float64()
-	lowerFloat, upperFloat := supportResistanceRange(sorted, priceFloat, volatilityPct)
-	rangeFraction := 0.0
-	if upperFloat > lowerFloat && upperFloat > 0 {
-		rangeFraction = (upperFloat - lowerFloat) / upperFloat / 2
-	}
 	pricePrec := symbol.GetPricePrecision()
 	lower := decimal.NewFromFloat(lowerFloat).Round(int32(pricePrec))
 	upper := decimal.NewFromFloat(upperFloat).Round(int32(pricePrec))
-	// The persisted geometry must be self-consistent: gridNum above was
-	// derived from the volatility-blend range (up to 25%), while the
-	// persisted bounds come from supportResistanceRange — usually much
-	// narrower. A 13% range's level count spread over a 5% S/R span gives
-	// 0.11% steps that only die at the fee-gate (prod 2026-09-05: the whole
-	// scan starved). Re-derive the count from the span that actually ships.
-	if srSpanPct := (upperFloat - lowerFloat) / lowerFloat * 100; srSpanPct > 0 {
-		gridNum = GridLevelsForRange(srSpanPct, config.NotionalPerBot)
-	}
+	// v2.0.93 FIX-L: gridNum above is ALREADY derived from the S/R span the
+	// candidate persists (the re-derivation used to happen here, after the EV
+	// model had graded the volatility-span geometry instead).
 
 	leverage := config.BaseLeverage
 	if config.AdaptiveLeverage {

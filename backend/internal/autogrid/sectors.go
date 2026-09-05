@@ -39,6 +39,27 @@ func sectorForSymbol(symbol string) string {
 
 // sectorBotCount counts RUNNING paper bots whose symbol maps to the sector.
 func (worker *Worker) sectorBotCount(ctx context.Context, settingsID string, sector string) int {
+	return worker.sectorCount(ctx, sector, `
+		SELECT COUNT(*) FROM paper_grid_bots
+		WHERE settings_id = $1 AND status = 'RUNNING'
+		  AND symbol = ANY($2)
+	`, settingsID)
+}
+
+// sectorRealBotCount (v2.0.93 FIX-G) is the REAL arm of the sector cap: the
+// deployReal path used to run with NO cluster ceiling at all while paper was
+// capped since v2.0.27 — one −5% semis day could stack 6-8 correlated REAL
+// grids and fire their protective closes simultaneously.
+func (worker *Worker) sectorRealBotCount(ctx context.Context, accountID string, sector string) int {
+	return worker.sectorCount(ctx, sector, `
+		SELECT COUNT(*) FROM grid_bots
+		WHERE account_id = $1
+		  AND status IN ('PENDING_SUBMISSION', 'SUBMISSION_UNKNOWN', 'RUNNING', 'STOP_REQUESTED', 'STOPPING')
+		  AND symbol = ANY($2)
+	`, accountID)
+}
+
+func (worker *Worker) sectorCount(ctx context.Context, sector, query, id string) int {
 	symbols := make([]string, 0, len(symbolSectors))
 	for base, s := range symbolSectors {
 		if s == sector {
@@ -49,11 +70,7 @@ func (worker *Worker) sectorBotCount(ctx context.Context, settingsID string, sec
 		return 0
 	}
 	var count int
-	if err := worker.db.QueryRow(ctx, `
-		SELECT COUNT(*) FROM paper_grid_bots
-		WHERE settings_id = $1 AND status = 'RUNNING'
-		  AND symbol = ANY($2)
-	`, settingsID, symbols).Scan(&count); err != nil {
+	if err := worker.db.QueryRow(ctx, query, id, symbols).Scan(&count); err != nil {
 		return 0
 	}
 	return count

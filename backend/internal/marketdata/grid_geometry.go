@@ -56,11 +56,15 @@ func ComputeGridGeometry(forecastVolPct float64, harR2 float64, feeBps float64, 
 
 	// Step must clear fees: 2× for the round trip + 1× buffer.
 	// feeBps/100 converts basis points to percent. The absolute minimum is
-	// the harmonized fee-gate density floor (DefaultGridStepFloorPct) — cheaper fees must
-	// not produce sub-floor steps the rest of the fleet no longer makes.
+	// the fee-gate density floor derived from the SAME feeBps the caller
+	// passes (v2.0.93 FIX-A parameterization: 2× the round trip at this
+	// one-way fee+slippage pair) — cheaper fees must not produce sub-floor
+	// steps the rest of the fleet no longer makes, and pricier fees must
+	// raise the floor in lockstep with the deploy gate. Degenerate feeBps
+	// (≤ 0) degrades to the fleet-default floor inside FeeGateStepFloorPct.
 	minStepPct := feeBps * 3.0 / 100.0
-	if minStepPct < DefaultGridStepFloorPct() {
-		minStepPct = DefaultGridStepFloorPct()
+	if floorPct := FeeGateStepFloorPct(feeBps, 0); minStepPct < floorPct {
+		minStepPct = floorPct
 	}
 
 	// Leverage inversely proportional to volatility.
@@ -87,11 +91,11 @@ func ComputeGridGeometry(forecastVolPct float64, harR2 float64, feeBps float64, 
 	// margin-density doctrine — a thin-notional HAR forecast may legally
 	// land below 8 levels, and 100 was an arbitrary ceiling below the
 	// exchange's own 500.
-	if gridCount < gridLevelsMin {
-		gridCount = gridLevelsMin
+	if gridCount < GridLevelsMin {
+		gridCount = GridLevelsMin
 	}
-	if gridCount > gridLevelsMax {
-		gridCount = gridLevelsMax
+	if gridCount > GridLevelsMax {
+		gridCount = GridLevelsMax
 	}
 
 	// Stop at half the range below the lower bound: outside normal grid
