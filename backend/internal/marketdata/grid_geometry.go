@@ -56,11 +56,11 @@ func ComputeGridGeometry(forecastVolPct float64, harR2 float64, feeBps float64, 
 
 	// Step must clear fees: 2× for the round trip + 1× buffer.
 	// feeBps/100 converts basis points to percent. The absolute minimum is
-	// the shared 0.25% density floor (GridStepFloorPct) — cheaper fees must
+	// the harmonized fee-gate density floor (DefaultGridStepFloorPct) — cheaper fees must
 	// not produce sub-floor steps the rest of the fleet no longer makes.
 	minStepPct := feeBps * 3.0 / 100.0
-	if minStepPct < GridStepFloorPct {
-		minStepPct = GridStepFloorPct
+	if minStepPct < DefaultGridStepFloorPct() {
+		minStepPct = DefaultGridStepFloorPct()
 	}
 
 	// Leverage inversely proportional to volatility.

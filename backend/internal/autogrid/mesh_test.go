@@ -15,15 +15,17 @@ func TestComputeAdaptiveMeshDensityFromMargin(t *testing.T) {
 	budget := decimal.NewFromFloat(100)
 
 	// v2.0.75 margin-density doctrine: $100×2x = $200 notional on a 4% span
-	// → 16 levels × $12.50 (step 0.25%). The old 0.80% floor + 6..14 clamp
-	// starved this exact shape to 6 levels that never crossed.
+	// → 14 levels × $14.30 (step ≈0.286%). v2.0.90: the density floor is
+	// harmonized with the fee-gate (2× round-trip at 5/2 bps = 0.28%) —
+	// the old 0.25% floor produced geometry the fee-gate rejected by
+	// 0.03% and the fleet starved. 16→14 levels is the honest dense shape.
 	res := ComputeAdaptiveMesh(lower, upper, price, 0.50, "RANGE", budget, 2, 0.30)
-	if res.GridNum != 16 {
-		t.Errorf("expected 16 levels for $200 notional on a 4%% span, got %d", res.GridNum)
+	if res.GridNum != 14 {
+		t.Errorf("expected 14 levels for $200 notional on a 4%% span, got %d", res.GridNum)
 	}
 	step, _ := res.GridStepPct.Float64()
-	if step < 0.24 || step > 0.26 {
-		t.Errorf("expected ~0.25%% step, got %.4f%%", step)
+	if step < 0.27 || step > 0.30 {
+		t.Errorf("expected ~0.286%% step, got %.4f%%", step)
 	}
 	if perLevel := 200.0 / float64(res.GridNum); perLevel < marketdata.MinGridLevelNotionalUSDT {
 		t.Errorf("every level must carry ≥ $8, got %.2f", perLevel)

@@ -215,11 +215,11 @@ func TestGridGeometryLowVol(t *testing.T) {
 	if g.Leverage != 4 {
 		t.Fatalf("sub-3%% daily vol allows 4x leverage (v2.0.38 ladder), got %d", g.Leverage)
 	}
-	if g.GridCount != 12 { // 3% / 0.25% shared density floor
-		t.Fatalf("grid count = %d, want 12", g.GridCount)
+	if g.GridCount != 10 { // 3% / 0.28% fee-gate-harmonized density floor
+		t.Fatalf("grid count = %d, want 10", g.GridCount)
 	}
-	if math.Abs(g.StepPct-0.25) > 1e-9 {
-		t.Fatalf("step = %.4f%%, want 0.25%%", g.StepPct)
+	if g.StepPct < 0.27 || g.StepPct > 0.31 {
+		t.Fatalf("step = %.4f%%, want ~0.30%%", g.StepPct)
 	}
 	if g.StepPct < 3*feeBps/100-1e-9 {
 		t.Fatalf("step %.4f%% must cover 3x fee (0.15%%)", g.StepPct)
@@ -318,21 +318,21 @@ func TestComputeGridGeometryBudgetCap(t *testing.T) {
 		t.Fatalf("step must stay wide enough, got %.3f", g.StepPct)
 	}
 
-	// Средняя вола: 56%/год → daily 2.93% → 4x, range 7.32% → 29 уровней
-	// при шаге 0.25% — бюджетный кап 200×4/8 = 100 не связывающий.
+	// Средняя вола: 56%/год → daily 2.93% → 4x, range 7.32% → 26 уровней
+	// при шаге 0.28% (fee-gate harmonized) — бюджетный кап не связывающий.
 	g = ComputeGridGeometry(56, 0.11, 7, 200)
 	if g.Leverage != 4 {
 		t.Fatalf("σ=56%% must be 4x (v2.0.38 ladder), got %d", g.Leverage)
 	}
-	if g.GridCount != 29 {
-		t.Fatalf("mid vol must follow the step count 29, got %d", g.GridCount)
+	if g.GridCount != 26 {
+		t.Fatalf("mid vol must follow the step count 26, got %d", g.GridCount)
 	}
 
-	// Высокая вола + большой бюджет: 25% диапазон / 0.25% шаг = 100 уровней
+	// Высокая вола + большой бюджет: 25% диапазон / 0.28% шаг = 89 уровней
 	// (бюджетный кап 1000×2/8 = 250 его не касается).
 	g = ComputeGridGeometry(214, 0.12, 7, 1000)
-	if g.GridCount != 100 {
-		t.Fatalf("high vol with big budget stays at 100 levels, got %d", g.GridCount)
+	if g.GridCount != 89 {
+		t.Fatalf("high vol with big budget stays at 89 levels, got %d", g.GridCount)
 	}
 
 	// Крошечный бюджет не должен ронять уровни ниже структурного пола 6

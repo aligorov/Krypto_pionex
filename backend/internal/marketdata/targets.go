@@ -144,16 +144,22 @@ const (
 )
 
 // GridLevelsForRange derives the grid level count for a span (%) under the
-// margin-density doctrine: the step is max(0.25%, the step at which every
-// level still carries ≥ $8 of the budget×leverage notional). notional ≤ 0
-// (unknown) falls back to the pure step floor. floor() — not round() — is
-// load-bearing: rounding UP past notional/$8 would silently shrink the
-// per-level notional below the floor the whole formula exists to protect.
+// margin-density doctrine: the step is max(feeGateFloor, the step at which
+// every level still carries ≥ $8 of the budget×leverage notional), where
+// feeGateFloor = 2×RoundTripCostPct at the fleet-default fees — the density
+// floor and the v2.0.89 fee-gate MUST be the same constant: with the old
+// 0.25% floor vs the 0.28% gate, every candidate the density calculator
+// produced died at the gate by 0.03% and the fleet starved (prod
+// 2026-09-05: zero deploys, 46% of scan candidates rejected at the gate).
+// notional ≤ 0 (unknown) falls back to the pure step floor. floor() — not
+// round() — is load-bearing: rounding UP past notional/$8 would silently
+// shrink the per-level notional below the floor the whole formula exists
+// to protect.
 func GridLevelsForRange(rangePct, notionalUSDT float64) int {
 	if rangePct <= 0 {
 		return 8
 	}
-	stepPct := GridStepFloorPct
+	stepPct := DefaultGridStepFloorPct()
 	if notionalUSDT > 0 {
 		if minOrderStep := MinGridLevelNotionalUSDT * rangePct / notionalUSDT; minOrderStep > stepPct {
 			stepPct = minOrderStep
@@ -161,6 +167,16 @@ func GridLevelsForRange(rangePct, notionalUSDT float64) int {
 	}
 	levels := math.Floor(rangePct / stepPct)
 	return int(clamp(levels, gridLevelsMin, gridLevelsMax))
+}
+
+// DefaultGridStepFloorPct is the density step floor harmonized with the
+// fee-gate: 2× the round-trip cost at the fleet-default 5/2 bps = 0.28%.
+// GridLevelsForRange cannot read live settings (it is a pure function used
+// before settings load in some paths), so the default fee/slippage pair is
+// the contract; ValidateMinGridStep at deploy time re-checks against the
+// ACTUAL settings and remains the authority.
+func DefaultGridStepFloorPct() float64 {
+	return 2.0 * RoundTripCostPct(5, 2) // 0.28% at fleet defaults
 }
 
 // RoundTripCostPct returns the friction of ONE grid level round trip in

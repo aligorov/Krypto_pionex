@@ -142,12 +142,10 @@ func TestComputeDynamicTargetsScaleWithLeverage(t *testing.T) {
 // max(0.25%, the step at which every level still carries ≥ $8).
 func TestGridLevelsForRangeScalesWithNotional(t *testing.T) {
 	// $200 notional on a 4% span: step floor 0.25% binds (the $8-step is
-	// 8×4/200 = 0.16%) → 16 levels × $12.50 — the operator doctrine case.
-	if got := GridLevelsForRange(4, 200); got < 14 {
-		t.Fatalf("span 4%% at $200 notional must give ≥14 levels (16 expected), got %d", got)
-	}
-	if got := GridLevelsForRange(4, 200); got != 16 {
-		t.Fatalf("span 4%% at $200 notional = 4/0.25 = 16 levels, got %d", got)
+	// 8×4/200 = 0.16%) → 14 levels × $14.30 — step floor harmonized with the
+	// fee-gate (0.28%) in v2.0.90.
+	if got := GridLevelsForRange(4, 200); got != 14 {
+		t.Fatalf("span 4%% at $200 notional = 4/0.28 = 14 levels, got %d", got)
 	}
 	// $50 notional on the same span: the $8 floor binds (step 0.64%) →
 	// round(6.25) = 6 levels, each carrying ≥ $8.
@@ -173,7 +171,7 @@ func TestGridLevelsForRangeScalesWithNotional(t *testing.T) {
 		t.Fatalf("degenerate span must fall back to 8, got %d", got)
 	}
 	// Unknown notional follows the bare step floor.
-	if got := GridLevelsForRange(2, 0); got != 8 {
+	if got := GridLevelsForRange(2, 0); got != 7 {
 		t.Fatalf("span 2%% unknown notional = 2/0.25 = 8 levels, got %d", got)
 	}
 }
