@@ -605,13 +605,33 @@ func (worker *Worker) enrichCandidatesWithAIKit(
 			)
 			continue
 		}
+		// The AI Kit count is advisory geometry, but it must respect the
+		// fee-gate floor like every other density source: an unclamped AI
+		// count (spot grids of 100-500 levels over a narrow span) produced
+		// 0.08-0.13% steps that only died at the deploy gate — the whole
+		// fleet starved (prod 2026-09-05, zero deploys). Cap the adopted
+		// count at span / DefaultGridStepFloorPct so an adopted grid is
+		// born viable instead of born rejected.
+		spanPct := candidate.UpperPrice.Sub(candidate.LowerPrice).
+			Div(candidate.LowerPrice).InexactFloat64() * 100
+		maxLevels := int(math.Floor(spanPct / marketdata.DefaultGridStepFloorPct()))
+		adopted := strategy.GridCount
+		if adopted > maxLevels {
+			adopted = maxLevels
+		}
+		if adopted < 2 {
+			adopted = 2
+		}
+		boundary := "AI_GRID_COUNT_ADOPTED_WITH_CLAMP_2_500_RANGE_STAYS_SCANNER_SR"
+		if strategy.GridCount != adopted {
+			boundary = fmt.Sprintf(
+				"AI_GRID_COUNT_CLAMPED_TO_FEE_GATE_%d_OF_%d_RANGE_STAYS_SCANNER_SR",
+				adopted, strategy.GridCount)
+		}
 		if _, err := worker.db.Exec(ctx, `
 			UPDATE autogrid_candidates
 			SET model_assumptions = model_assumptions || $3::jsonb,
-			    grid_num = CASE
-					WHEN $4::INT BETWEEN 2 AND 500 THEN $4::INT
-					ELSE grid_num
-				END
+			    grid_num = $4::INT
 			WHERE id = $1 AND scan_id = $2
 		`, candidate.ID, scanID, map[string]any{
 			"aiKit": map[string]any{
@@ -622,9 +642,9 @@ func (worker *Worker) enrichCandidatesWithAIKit(
 				"spotLow":         strategy.Low,
 				"gridCount":       strategy.GridCount,
 				"gridCountSource": "pionex_ai_kit",
-				"boundary":        "AI_GRID_COUNT_ADOPTED_WITH_CLAMP_2_500_RANGE_STAYS_SCANNER_SR",
+				"boundary":        boundary,
 			},
-		}, strategy.GridCount); err != nil {
+		}, adopted); err != nil {
 			return fmt.Errorf("persist AI Kit advisory for %s: %w", candidate.Symbol, err)
 		}
 		enriched++
