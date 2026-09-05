@@ -94,14 +94,15 @@ func seedStoppedRealBot(t *testing.T, pool *pgxpool.Pool, accountID, settingsID,
 }
 
 // TestFinalProfitBackfillRewritesGridOnlyStops re-settles the two production
-// shapes through the 48h backfill loop:
+// shapes through the 30-day backfill loop:
 //
-//	XMR-class: finished record carries the FULL total (totalProfit −2.5, no
+//	XMR-class: finished record carries ONLY grid profit while inventory was
+//	           closed on a loss stop — the residual leg is RETIRED as a final
+//	           (v2.0.89) and with no telemetry trace there is nothing else to
+//	           price the close: realized goes NULL, marker 'none' (better
+//	           empty than a lie — the pre-fix chain stored +0.2177).
+//	JTO-class: finished record carries the FULL total (totalProfit −2.5, no
 //	           profitExited) → the stored +0.2177 lie becomes −2.5.
-//	JTO-class: finished record carries ONLY grid profit while inventory was
-//	           closed on a loss stop → the positive grid figure is REFUSED:
-//	           realized goes NULL (better empty than a lie) and the refusal
-//	           is marked on the row.
 func TestFinalProfitBackfillRewritesGridOnlyStops(t *testing.T) {
 	dbURL := integrationDatabaseURL(t)
 	ctx := context.Background()
@@ -219,8 +220,9 @@ func TestFinalProfitBackfillRewritesGridOnlyStops(t *testing.T) {
 		t.Fatalf("reconcile pass: %v", err)
 	}
 
-	// XMR-class: grid-only positive on a loss stop with closed inventory →
-	// REFUSED, realized NULL, refusal marked and warned.
+	// XMR-class: grid-only positive on a loss stop with closed inventory and
+	// no telemetry → the retired residual leg is not a final and nothing else
+	// can price the close: realized NULL, marker 'none'.
 	var xmrRealized *decimal.Decimal
 	var xmrSource string
 	if err := pool.QueryRow(ctx, `
@@ -230,13 +232,13 @@ func TestFinalProfitBackfillRewritesGridOnlyStops(t *testing.T) {
 		t.Fatalf("load XMR-class bot: %v", err)
 	}
 	if xmrRealized != nil {
-		t.Fatalf("the grid-only positive on a loss stop must be refused to NULL, got %s; logs: %s", *xmrRealized, rec.joined())
+		t.Fatalf("grid-only positive on a loss stop, no telemetry → NULL final, got %s; logs: %s", *xmrRealized, rec.joined())
 	}
-	if xmrSource != "refused_"+string(pionex.FinalProfitGridResidual) {
-		t.Fatalf("refusal must be marked on the row, got %q", xmrSource)
+	if xmrSource != string(pionex.FinalProfitNone) {
+		t.Fatalf("the no-figure settle must mark 'none', got %q", xmrSource)
 	}
-	if !rec.contains("backfill settle refused") {
-		t.Fatalf("refusal must Warn, logs: %s", rec.joined())
+	if !rec.contains("no exchange total and no telemetry") {
+		t.Fatalf("the no-figure settle must Warn, logs: %s", rec.joined())
 	}
 
 	// JTO-class: the full total from the alias → −2.5 replaces the lie.

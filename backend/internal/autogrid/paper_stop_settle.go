@@ -149,16 +149,24 @@ func paperCloseSettleTotal(bot paperSettleBot, price decimal.Decimal, settings S
 }
 
 // paperMarkAtPrice returns the bot's mark PnL at the given price with the
-// taker+slippage exit fee included (as a CLOSE would pay it), plus the
-// exit notional the fee was charged on. Grid SHIFTS use the second return
-// to add the fee back — a re-center keeps the position, so it must not pay
-// an exit (v2.0.13 audit rule, now shared by settle + radar re-centers).
+// taker+slippage close cost included (as a CLOSE would pay it — v2.0.89
+// calibrated composite, 10 bps on the open inventory), plus the exit notional
+// the fee was charged on. Grid SHIFTS use the second return to add the fee
+// back — a re-center keeps the position, so it must not pay an exit (v2.0.13
+// audit rule, now shared by settle + radar re-centers). The entry fee is NOT
+// amortized here: it was booked into realized once at deploy (paperEntryFee).
+// The pair baseline uses the v2.0.89 fill buffer (a touch is not a fill).
 func paperMarkAtPrice(bot paperSettleBot, price decimal.Decimal, settings Settings) (unrealized, exitNotional decimal.Decimal) {
-	feeRate := settings.FeeBps.Add(settings.SlippageBps).Div(decimal.NewFromInt(10000))
+	closeRate := paperCloseFeeRate()
 	unrealized = decimal.Zero
 	exitNotional = decimal.Zero
 	if bot.direction == "NEUTRAL" {
-		currentLevel := gridLevelForPrice(bot.lower, bot.upper, bot.gridNum, price)
+		rawLevel := gridLevelForPrice(bot.lower, bot.upper, bot.gridNum, price)
+		baseline := rawLevel
+		if bot.lastLevel != nil {
+			baseline = *bot.lastLevel
+		}
+		currentLevel := bufferedGridLevel(bot.lower, bot.upper, bot.gridNum, price, baseline)
 		previousLevel := currentLevel
 		if bot.lastLevel != nil {
 			previousLevel = *bot.lastLevel
@@ -171,17 +179,16 @@ func paperMarkAtPrice(bot paperSettleBot, price decimal.Decimal, settings Settin
 		exitNotional = inventoryNotional
 	} else if bot.entry.GreaterThan(decimal.Zero) {
 		notional := bot.investment.Mul(decimal.NewFromInt(int64(bot.leverage)))
-		entryCost := notional.Mul(feeRate)
 		exitNotional = notional
 		switch bot.direction {
 		case "LONG":
-			unrealized = notional.Mul(price.Div(bot.entry).Sub(decimal.NewFromInt(1))).Sub(entryCost)
+			unrealized = notional.Mul(price.Div(bot.entry).Sub(decimal.NewFromInt(1)))
 		case "SHORT":
-			unrealized = notional.Mul(decimal.NewFromInt(1).Sub(price.Div(bot.entry))).Sub(entryCost)
+			unrealized = notional.Mul(decimal.NewFromInt(1).Sub(price.Div(bot.entry)))
 		}
 	}
 	if exitNotional.IsPositive() {
-		unrealized = unrealized.Sub(exitNotional.Mul(feeRate))
+		unrealized = unrealized.Sub(exitNotional.Mul(closeRate))
 	}
 	return unrealized, exitNotional
 }

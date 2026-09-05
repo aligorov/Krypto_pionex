@@ -196,6 +196,21 @@ func TestReconcileAndManageIntegration(t *testing.T) {
 		llm.NewService(pool, slog.New(slog.DiscardHandler)),
 		slog.New(slog.DiscardHandler))
 
+	// v2.0.89: the mock flips terminal the moment the cancel lands, so the
+	// settle already runs in round 1 — the finished record carries no netted
+	// total (profitReduce only), and the telemetry-net-close estimate prices
+	// the close: 1.5 total on a flat position → final 1.5, close cost 0.
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO bot_telemetry
+			(bot_id, bot_number, symbol, captured_at, price, total_pnl, inventory_notional)
+		VALUES ($1, 0, 'TEST_USDT_PERP', NOW() - INTERVAL '30 seconds', 110, 1.5, 0)
+	`, botID); err != nil {
+		t.Fatalf("seed telemetry: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(ctx, `DELETE FROM bot_telemetry WHERE bot_id = $1`, botID)
+	})
+
 	// Round 1: the durable stop intent must submit the native cancel.
 	if _, err := worker.reconcileAndManage(ctx); err != nil {
 		t.Fatalf("reconcile round 1: %v", err)
@@ -214,10 +229,10 @@ func TestReconcileAndManageIntegration(t *testing.T) {
 	if realized == nil {
 		t.Fatal("realized PnL must be persisted")
 	}
-	// v2.0.74: realized mirrors the accumulated grid profit (profitReduce),
-	// not the withdrawn figure.
+	// The settle is the telemetry-net-close estimate of the mock's grid
+	// profit (1.5 on a flat position — no close cost, no exchange total).
 	if value, err := strconv.ParseFloat(*realized, 64); err != nil || value != 1.5 {
-		t.Fatalf("remote grid profit must persist as realized PnL 1.5, got %q", *realized)
+		t.Fatalf("terminal settle must persist the estimate 1.5, got %q", *realized)
 	}
 	// The loop verifies the remote state right after submitting the cancel in
 	// the same pass, so an exchange that confirms instantly (like the mock)

@@ -95,10 +95,14 @@ func (s *Service) PNLEpochStart(ctx context.Context) (time.Time, error) {
 // legs separate what the exchange settled (known) from telemetry-derived
 // estimates so the UI can mark the confidence.
 type EquityBreakdown struct {
-	// RunningPnL = Σ running (realized + floating) for epoch bots.
+	// RunningPnL = Σ running (realized + floating − entry fees) for epoch bots.
+	// v2.0.89: the entry-fee leg is subtracted here — the exchange's grid
+	// profit never carries the taker fee the wallet paid at deploy.
 	RunningPnL decimal.Decimal
 	// RunningFloating = Σ running unrealized (the "Floating PnL" leg).
 	RunningFloating decimal.Decimal
+	// RunningFeesPaid = Σ running fees_paid_usdt (entry fees at deploy/tranche).
+	RunningFeesPaid decimal.Decimal
 	// RunningInvestment = Σ running quote investment (the isolated margins).
 	RunningInvestment decimal.Decimal
 	// RunningBots = count of epoch bots in RUNNING/STOP_REQUESTED/STOPPING.
@@ -107,10 +111,15 @@ type EquityBreakdown struct {
 	ClosedKnown decimal.Decimal
 	// ClosedKnownBots counts those finals.
 	ClosedKnownBots int
+	// ClosedFeesPaid = Σ closed-of-epoch entry fees (close costs already ride
+	// INSIDE the telemetry_net_close finals — subtracting them here would
+	// double-count).
+	ClosedFeesPaid decimal.Decimal
 	// ClosedEstimated = Σ telemetry-fallback totals over closed epoch bots
-	// whose realized_pnl_usdt is NULL (refused settle) but which carry a
-	// telemetry trace. The last total before closed_at is the exchange truth
-	// minus the closing fees — close, and marked estimated.
+	// whose realized_pnl_usdt is NULL (no exchange total, no telemetry
+	// either is NOT estimated — see UnknownCount). The v2.0.89 fallback is
+	// the SAME telemetry-net-close estimate the settle paths write: last
+	// total minus taker+slippage close cost, stop-floored.
 	ClosedEstimated decimal.Decimal
 	// ClosedEstimatedBots counts those estimates.
 	ClosedEstimatedBots int
@@ -119,15 +128,15 @@ type EquityBreakdown struct {
 	UnknownCount int
 }
 
-// EpochPnL folds the breakdown into the operator's headline number.
+// EpochPnL folds the breakdown into the operator's headline number:
+// running + closed + fees (the fee legs enter the sums negative).
 func (b EquityBreakdown) EpochPnL() decimal.Decimal {
-	return b.RunningPnL.Add(b.ClosedKnown).Add(b.ClosedEstimated)
+	return b.RunningPnL.Add(b.ClosedKnown).Add(b.ClosedEstimated).Sub(b.ClosedFeesPaid)
 }
 
 // ComputeEquityBreakdown derives the epoch aggregate from grid_bots (+ the
-// bot_telemetry fallback for refused settles), scoped to one account.
-// Every query error is returned — the headline number must not degrade
-// silently.
+// telemetry estimate for NULL finals), scoped to one account. Every query
+// error is returned — the headline number must not degrade silently.
 func ComputeEquityBreakdown(
 	ctx context.Context, db *pgxpool.Pool, accountID string, epochStart time.Time,
 ) (EquityBreakdown, error) {
@@ -135,6 +144,7 @@ func ComputeEquityBreakdown(
 	if err := db.QueryRow(ctx, `
 		SELECT COALESCE(SUM(realized_pnl_usdt), 0),
 		       COALESCE(SUM(unrealized_pnl_usdt), 0),
+		       COALESCE(SUM(fees_paid_usdt), 0),
 		       COALESCE(SUM(quote_investment), 0),
 		       COUNT(*)
 		FROM grid_bots
@@ -145,17 +155,25 @@ func ComputeEquityBreakdown(
 		  AND status IN ('RUNNING', 'STOP_REQUESTED', 'STOPPING')
 	`, accountID, epochStart).Scan(
 		&breakdown.RunningPnL, &breakdown.RunningFloating,
-		&breakdown.RunningInvestment, &breakdown.RunningBots,
+		&breakdown.RunningFeesPaid, &breakdown.RunningInvestment, &breakdown.RunningBots,
 	); err != nil {
 		return breakdown, fmt.Errorf("equity breakdown: sum running legs: %w", err)
 	}
-	breakdown.RunningPnL = breakdown.RunningPnL.Add(breakdown.RunningFloating)
+	// The entry-fee leg (v2.0.89): the wallet paid it at deploy; no PnL
+	// figure the exchange reports ever carries it.
+	breakdown.RunningPnL = breakdown.RunningPnL.Add(breakdown.RunningFloating).Sub(breakdown.RunningFeesPaid)
 
-	// Closed legs: settled finals count directly; NULL finals (refused
-	// settle — the honesty gate NULLed a grid-only positive on a loss-class
-	// close) fall back to the last telemetry total before close.
+	// Closed legs: settled finals count directly (their fee component — the
+	// close cost — already rides inside telemetry_net_close estimates and
+	// inside the exchange's netted totals; only the ENTRY fee is subtracted
+	// again). NULL finals fall back to the same telemetry-net-close estimate
+	// the settle paths write.
 	closedRows, err := db.Query(ctx, `
-		SELECT id, realized_pnl_usdt, COALESCE(closed_at, updated_at)
+		SELECT id, realized_pnl_usdt, COALESCE(max_loss_usdt, 0),
+		       COALESCE(closed_reason, ''),
+		       COALESCE(fees_paid_usdt, 0)
+		         - COALESCE(NULLIF(model_state->>'closeCostUsdt','')::NUMERIC, 0),
+		       COALESCE(closed_at, updated_at)
 		FROM grid_bots
 		WHERE account_id = $1
 		  AND bu_order_id IS NOT NULL
@@ -167,24 +185,37 @@ func ComputeEquityBreakdown(
 		return breakdown, fmt.Errorf("equity breakdown: load closed epoch bots: %w", err)
 	}
 	type closedRef struct {
-		id     string
-		anchor *time.Time
+		id           string
+		maxLoss      decimal.Decimal
+		closedReason string
+		anchor       *time.Time
 	}
 	var unsettled []closedRef
 	for closedRows.Next() {
-		var id string
+		var ref closedRef
 		var realized *decimal.Decimal
-		var anchor *time.Time
-		if err := closedRows.Scan(&id, &realized, &anchor); err != nil {
+		var feesPaid decimal.Decimal
+		// The anchor MUST scan into ref.anchor: scanning it into a local
+		// and appending ref left ref.anchor nil, derefTime(nil) then dated
+		// the telemetry probe at year zero — every estimate silently
+		// became "unknown" (equity suite + closed-listing estimates red).
+		if err := closedRows.Scan(&ref.id, &realized, &ref.maxLoss,
+			&ref.closedReason, &feesPaid, &ref.anchor); err != nil {
 			closedRows.Close()
 			return breakdown, fmt.Errorf("equity breakdown: scan closed epoch bot: %w", err)
 		}
+		// fees_paid carries entry + close cost; the close-cost component
+		// (model_state.closeCostUsdt, written by every telemetry_net_close
+		// settle) is already netted inside the stored final — subtracting it
+		// here too would double-count it. NULLIF guards the markerless rows
+		// the pre-v2.0.89 chain settled.
+		breakdown.ClosedFeesPaid = breakdown.ClosedFeesPaid.Add(feesPaid)
 		if realized != nil {
 			breakdown.ClosedKnown = breakdown.ClosedKnown.Add(*realized)
 			breakdown.ClosedKnownBots++
 			continue
 		}
-		unsettled = append(unsettled, closedRef{id: id, anchor: anchor})
+		unsettled = append(unsettled, ref)
 	}
 	closedRows.Close()
 	if err := closedRows.Err(); err != nil {
@@ -192,62 +223,31 @@ func ComputeEquityBreakdown(
 	}
 
 	for _, ref := range unsettled {
-		estimate, err := lastTelemetryTotalBefore(ctx, db, ref.id, ref.anchor)
+		snap, err := lastTelemetrySnapshotBefore(ctx, db, ref.id, derefTime(ref.anchor))
 		if err != nil {
 			return breakdown, fmt.Errorf("equity breakdown: telemetry fallback for %s: %w", ref.id, err)
 		}
-		if estimate == nil {
+		if snap == nil {
 			// No telemetry at all: do NOT invent a figure — the bot is
 			// counted as unknown and stays out of the epoch sum.
 			breakdown.UnknownCount++
 			continue
 		}
-		breakdown.ClosedEstimated = breakdown.ClosedEstimated.Add(*estimate)
+		estimate, _ := terminalTelemetryEstimate(
+			snap.TotalPnl, snap.InventoryNotional, ref.maxLoss, ref.closedReason)
+		breakdown.ClosedEstimated = breakdown.ClosedEstimated.Add(estimate)
 		breakdown.ClosedEstimatedBots++
 	}
 	return breakdown, nil
 }
 
-// lastTelemetryTotalBefore implements the closed-bot telemetry fallback:
-// the freshest total within equityTelemetryFreshWindow before closed_at,
-// else the nearest earlier row. NULL anchor (no close time recorded) or no
-// row at all → nil (unknown).
-func lastTelemetryTotalBefore(
-	ctx context.Context, db *pgxpool.Pool, botID string, closedAt *time.Time,
-) (*decimal.Decimal, error) {
-	if closedAt == nil {
-		return nil, nil
+// derefTime maps a *time.Time anchor to the value, or the zero instant when
+// nil (a zero anchor simply matches no telemetry row).
+func derefTime(t *time.Time) time.Time {
+	if t == nil {
+		return time.Time{}
 	}
-	windowStart := closedAt.Add(-equityTelemetryFreshWindow)
-	var total decimal.Decimal
-	err := db.QueryRow(ctx, `
-		SELECT total_pnl FROM bot_telemetry
-		WHERE bot_id = $1
-		  AND captured_at BETWEEN $2 AND $3
-		ORDER BY captured_at DESC
-		LIMIT 1
-	`, botID, windowStart, *closedAt).Scan(&total)
-	if err == nil {
-		return &total, nil
-	}
-	if !errors.Is(err, pgx.ErrNoRows) {
-		return nil, fmt.Errorf("fresh telemetry probe: %w", err)
-	}
-	// Nothing fresh: the nearest earlier row is still the best exchange-truth
-	// proxy (it is the running total the manage loop marked from remote).
-	err = db.QueryRow(ctx, `
-		SELECT total_pnl FROM bot_telemetry
-		WHERE bot_id = $1 AND captured_at <= $2
-		ORDER BY captured_at DESC
-		LIMIT 1
-	`, botID, *closedAt).Scan(&total)
-	if err == nil {
-		return &total, nil
-	}
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, nil
-	}
-	return nil, fmt.Errorf("telemetry fallback probe: %w", err)
+	return *t
 }
 
 // captureBotAggregateEquity snapshots the fleet's bot-aggregate state into
@@ -362,6 +362,7 @@ func (worker *Worker) captureBotAggregateEquity(ctx context.Context, settings Se
 		"running_pnl_usdt", breakdown.RunningPnL.StringFixed(4),
 		"closed_known_usdt", breakdown.ClosedKnown.StringFixed(4),
 		"closed_estimated_usdt", breakdown.ClosedEstimated.StringFixed(4),
+		"fees_usdt", breakdown.RunningFeesPaid.Add(breakdown.ClosedFeesPaid).StringFixed(4),
 		"unknown_finals", breakdown.UnknownCount,
 		"wallet_usdt", walletAssets.StringFixed(4))
 	worker.recordEquitySnapshotHeartbeat(ctx, *accountID, breakdown)
@@ -397,6 +398,7 @@ func (worker *Worker) recordEquitySnapshotHeartbeat(
 		"running_investment":    breakdown.RunningInvestment.StringFixed(2),
 		"closed_known_usdt":     breakdown.ClosedKnown.StringFixed(4),
 		"closed_estimated_usdt": breakdown.ClosedEstimated.StringFixed(4),
+		"fees_usdt":             breakdown.RunningFeesPaid.Add(breakdown.ClosedFeesPaid).StringFixed(4),
 		"unknown_finals":        breakdown.UnknownCount,
 	}); err != nil {
 		worker.logger.Warn("equity snapshot: heartbeat event write failed",

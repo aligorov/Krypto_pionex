@@ -184,7 +184,18 @@ type ClosedBot struct {
 	Symbol          string           `json:"symbol"`
 	Direction       string           `json:"direction"`
 	QuoteInvestment decimal.Decimal  `json:"quoteInvestment"`
+	// RealizedPNLUSDT is NULL when the exchange refused to settle a final
+	// (the honesty gate NULLs a grid-only positive on a loss-class close).
+	// v2.0.88: the value is no longer COALESCEd to zero — a stop-loss that
+	// shows as "0.00" is the original «экран в плюсе, кошелёк в минусе»
+	// failure. Read EstimatedFinalUSDT / the UI "финал неизвестен" mark.
 	RealizedPNLUSDT *decimal.Decimal `json:"realizedPnlUsdt"`
+	// EstimatedFinalUSDT is the telemetry fallback for a NULL final: the
+	// last bot_telemetry total before close — the SAME figure the epoch PnL
+	// sums into closed_estimated, so the per-bot table and the headline
+	// aggregate can never disagree. nil when realized is known or no
+	// telemetry exists at all.
+	EstimatedFinalUSDT *decimal.Decimal `json:"estimatedFinalUsdt,omitempty"`
 	ClosedReason    *string          `json:"closedReason"`
 	Status          string           `json:"status"`
 	ClosedAt        *time.Time       `json:"closedAt"`
@@ -197,6 +208,7 @@ type State struct {
 	ActiveBots          []ActiveBot       `json:"activeBots"`
 	ClosedBots          []ClosedBot       `json:"closedBots"`
 	PnL                 PnLBreakdown      `json:"pnl"`
+	Epoch               *AccountEquitySummary `json:"epoch,omitempty"`
 	Exchange            *ExchangeSnapshot `json:"exchange,omitempty"`
 	MetricDefinitions   map[string]string `json:"metricDefinitions"`
 	FeatureAvailability map[string]string `json:"featureAvailability"`
@@ -204,6 +216,14 @@ type State struct {
 
 // PnLBreakdown keeps simulated and real money strictly separated: PAPER
 // numbers never mix into REAL totals on any screen.
+//
+// v2.0.88 WARNING: the Real legs are LEGACY known-realized sums — NULL
+// finals count as zero and floating legs of closed history are absent, so
+// Real.TotalUSDT can sit far above the wallet truth (the «PnL REAL 23.43
+// while stop-losses bled −19.39» case). No screen may render them as the
+// headline; the operator's REAL number is State.Epoch (AccountEquityEpoch).
+// Paper legs are full-history totals (realized+floating at close) and stay
+// honest for the simulation card.
 type PnLBreakdown struct {
 	Paper PnLSummary `json:"paper"`
 	Real  PnLSummary `json:"real"`
@@ -247,8 +267,13 @@ type Service struct {
 
 	balanceMu     sync.Mutex
 	balanceCached *ExchangeSnapshot
-	clientMu      sync.Mutex
-	clientCache   map[string]*clientCacheEntry
+	// epochMu/epochCache memoize the epoch summary (v2.0.88 «одна правда на
+	// экране»): the state payload and the /equity endpoint share ONE figure
+	// and the 5-second UI poll must not re-run the aggregate per hit.
+	epochMu    sync.Mutex
+	epochCache *epochCacheEntry
+	clientMu   sync.Mutex
+	clientCache map[string]*clientCacheEntry
 	publicAPI     *pionex.Client
 }
 
@@ -591,6 +616,19 @@ func (s *Service) State(ctx context.Context) (*State, error) {
 	state.PnL, err = s.breakdownPnL(ctx, settings.ID, state.ActiveBots)
 	if err != nil {
 		return nil, err
+	}
+	// v2.0.88 «одна правда на экране»: the epoch summary rides the SAME
+	// payload as the legacy breakdown, computed by the SAME
+	// AccountEquityEpoch the /api/autogrid/equity endpoint serves — every
+	// PnL card on every tab reads one figure and the UI cannot diverge from
+	// itself. Best-effort: an equity probe failure (no account, bad anchor)
+	// must not take the whole state down; the hero card renders its own
+	// «нет данных» state.
+	if epoch, epochErr := s.AccountEquityEpochCached(ctx); epochErr == nil {
+		state.Epoch = epoch
+	} else {
+		s.logger.Warn("state: epoch summary unavailable",
+			"component", "autogrid_service", "error", epochErr)
 	}
 	return state, nil
 }
@@ -1025,6 +1063,10 @@ type AccountEquitySummary struct {
 	ClosedEstimatedUSDT   decimal.Decimal `json:"closedEstimatedUsdt"`
 	ClosedEstimatedBots   int             `json:"closedEstimatedBots"`
 	UnknownCount          int             `json:"unknownCount"`
+	// FeesPaidUSDT (v2.0.89) = Σ epoch entry fees (running + closed), the leg
+	// the epoch PnL subtracts: the taker fee each deploy/tranche cost the
+	// wallet, which no exchange PnL figure carries.
+	FeesPaidUSDT decimal.Decimal `json:"feesPaidUsdt"`
 	// Snapshots counts bot_aggregate rows; CapturedAt is the newest capture
 	// so staleness is visible at a glance.
 	Snapshots  int       `json:"snapshots"`
@@ -1065,6 +1107,7 @@ func (s *Service) AccountEquityEpoch(ctx context.Context) (*AccountEquitySummary
 		ClosedEstimatedUSDT:   breakdown.ClosedEstimated,
 		ClosedEstimatedBots:   breakdown.ClosedEstimatedBots,
 		UnknownCount:          breakdown.UnknownCount,
+		FeesPaidUSDT:          breakdown.RunningFeesPaid.Add(breakdown.ClosedFeesPaid),
 	}
 	// Snapshot telemetry: pointer scan — zero rows must not 500 the card.
 	var capturedAt *time.Time
@@ -1080,6 +1123,43 @@ func (s *Service) AccountEquityEpoch(ctx context.Context) (*AccountEquitySummary
 	if capturedAt != nil {
 		summary.CapturedAt = *capturedAt
 	}
+	return summary, nil
+}
+
+// epochSummaryCacheTTL bounds how long one computed epoch summary serves
+// every surface. The manage pass refreshes the underlying PnL columns at its
+// own 15-60s cadence, so a 30s memo never hides a fresher truth while the
+// 5-second state polls of three UI tabs stop re-running the aggregate.
+const epochSummaryCacheTTL = 30 * time.Second
+
+// epochCacheEntry is the memoized epoch summary shared by the state payload
+// and the equity endpoint so both answer byte-identical figures.
+type epochCacheEntry struct {
+	at      time.Time
+	summary *AccountEquitySummary
+}
+
+// AccountEquityEpochCached is the shared-reads wrapper around
+// AccountEquityEpoch: inside the TTL every caller (state payload, equity
+// endpoint, MCP) gets the identical summary object, so two cards on screen
+// cannot disagree mid-poll. Errors are never cached — a failing probe stays
+// visible and retries on the next call.
+func (s *Service) AccountEquityEpochCached(ctx context.Context) (*AccountEquitySummary, error) {
+	s.epochMu.Lock()
+	if entry := s.epochCache; entry != nil && time.Since(entry.at) < epochSummaryCacheTTL {
+		summary := entry.summary
+		s.epochMu.Unlock()
+		return summary, nil
+	}
+	s.epochMu.Unlock()
+
+	summary, err := s.AccountEquityEpoch(ctx)
+	if err != nil {
+		return nil, err
+	}
+	s.epochMu.Lock()
+	s.epochCache = &epochCacheEntry{at: time.Now(), summary: summary}
+	s.epochMu.Unlock()
 	return summary, nil
 }
 
@@ -1396,13 +1476,31 @@ func mapGridType(density bool) string {
 
 func (s *Service) listClosedBots(ctx context.Context, settingsID string) ([]ClosedBot, error) {
 	items := make([]ClosedBot, 0)
+	// REAL rows keep realized_pnl_usdt NULL on refused settles — the
+	// COALESCE(realized,0) of pre-2.0.88 rendered every stop-loss as a flat
+	// "0.00" and let the closed table silently contradict the epoch
+	// headline. The LATERAL probe mirrors lastTelemetryTotalBefore: the
+	// freshest bot_telemetry total at-or-before close (the fresh-window
+	// preference of the Go fallback is automatic — DESC ordering takes the
+	// closest row), served through idx_bot_telemetry_bot_time. No telemetry
+	// → NULL estimate → the UI marks the final unknown.
 	rows, err := s.db.Query(ctx, `
-		SELECT id, COALESCE(bot_number, 0), symbol, direction, quote_investment,
-		       COALESCE(realized_pnl_usdt, 0), closed_reason, status, COALESCE(closed_at, updated_at)
-		FROM grid_bots
-		WHERE autogrid_settings_id = $1
-		  AND status IN ('STOPPED', 'CANCELLED', 'COMPLETED', 'LIQUIDATED', 'FAILED')
-		ORDER BY COALESCE(closed_at, updated_at) DESC
+		SELECT g.id, COALESCE(g.bot_number, 0), g.symbol, g.direction, g.quote_investment,
+		       g.realized_pnl_usdt, g.closed_reason, g.status,
+		       COALESCE(g.closed_at, g.updated_at),
+		       est.total_pnl
+		FROM grid_bots g
+		LEFT JOIN LATERAL (
+			SELECT t.total_pnl
+			FROM bot_telemetry t
+			WHERE t.bot_id = g.id
+			  AND t.captured_at <= COALESCE(g.closed_at, g.updated_at)
+			ORDER BY t.captured_at DESC
+			LIMIT 1
+		) est ON g.realized_pnl_usdt IS NULL
+		WHERE g.autogrid_settings_id = $1
+		  AND g.status IN ('STOPPED', 'CANCELLED', 'COMPLETED', 'LIQUIDATED', 'FAILED')
+		ORDER BY COALESCE(g.closed_at, g.updated_at) DESC
 		LIMIT 100
 	`, settingsID)
 	if err != nil {
@@ -1414,6 +1512,7 @@ func (s *Service) listClosedBots(ctx context.Context, settingsID string) ([]Clos
 		if err := rows.Scan(
 			&item.ID, &item.BotNumber, &item.Symbol, &item.Direction, &item.QuoteInvestment,
 			&item.RealizedPNLUSDT, &item.ClosedReason, &item.Status, &item.ClosedAt,
+			&item.EstimatedFinalUSDT,
 		); err != nil {
 			rows.Close()
 			return nil, fmt.Errorf("scan closed real AutoGrid bot: %w", err)
@@ -1422,6 +1521,8 @@ func (s *Service) listClosedBots(ctx context.Context, settingsID string) ([]Clos
 	}
 	rows.Close()
 
+	// PAPER finals are always settled by the simulator (realized+floating
+	// at close), so no estimate leg exists for them.
 	rows, err = s.db.Query(ctx, `
 		SELECT id, COALESCE(bot_number, 0), symbol, direction, quote_investment,
 		       COALESCE(realized_pnl_usdt, 0) + COALESCE(unrealized_pnl_usdt, 0), closed_reason, status, COALESCE(closed_at, updated_at)
@@ -1775,12 +1876,19 @@ func (s *Service) AdjustBot(
 				WHERE id = $1
 			`, botID, input.Lower, input.Upper, params.Row)
 		} else {
+			// v2.0.89 REAL ledger: every REAL invest_in (the tranche-2 pour
+			// AND manual top-ups) opens position notional pour × leverage and
+			// pays taker (0.05%) on it — booked in the same UPDATE that
+			// persists the pour, exactly-once with it. Paper pours pay no fee
+			// (paper is outside the fee ledger).
+			entryFee := pionex.EntryFeeUSDT(input.QuoteInvestment, botLeverage)
 			_, err = s.db.Exec(ctx, `
 				UPDATE grid_bots
 				SET quote_investment = quote_investment + $2,
+				    fees_paid_usdt = fees_paid_usdt + $3::NUMERIC,
 				    adjustments_count = adjustments_count + 1, updated_at = NOW()
 				WHERE id = $1
-			`, botID, input.QuoteInvestment)
+			`, botID, input.QuoteInvestment, entryFee)
 		}
 		if err != nil {
 			return "", fmt.Errorf("persist adjustment: %w", err)
@@ -1811,11 +1919,29 @@ func (s *Service) AdjustBot(
 	if !input.QuoteInvestment.GreaterThan(decimal.Zero) {
 		return "", errors.New("invest_in requires a positive quoteInvestment")
 	}
+	// v2.0.89 tranche friction: a paper pour pays the taker entry fee on the
+	// notional it adds — directional: pour × leverage; neutral: half the
+	// leveraged pour (the ladder fraction a live neutral grid holds).
+	var pourLeverage int
+	var pourDirection string
+	if err := s.db.QueryRow(ctx, `
+		SELECT leverage, direction
+		FROM paper_grid_bots WHERE id = $1 AND settings_id = $2 AND status = 'RUNNING'
+	`, botID, settingsID).Scan(&pourLeverage, &pourDirection); err != nil {
+		return "", fmt.Errorf("load paper bot for pour fee: %w", err)
+	}
+	if pourLeverage < 1 {
+		pourLeverage = 1
+	}
+	pourFee := paperPourEntryFee(pourDirection, input.QuoteInvestment, pourLeverage)
 	tag, err := s.db.Exec(ctx, `
 		UPDATE paper_grid_bots
-		SET quote_investment = quote_investment + $2, updated_at = NOW()
+		SET quote_investment = quote_investment + $2,
+		    realized_pnl_usdt = realized_pnl_usdt - $4::NUMERIC,
+		    fees_paid_usdt = fees_paid_usdt + $4::NUMERIC,
+		    updated_at = NOW()
 		WHERE id = $1 AND settings_id = $3 AND status = 'RUNNING'
-	`, botID, input.QuoteInvestment, settingsID)
+	`, botID, input.QuoteInvestment, settingsID, pourFee.Round(8).String())
 	if err != nil {
 		return "", fmt.Errorf("invest into paper bot: %w", err)
 	}
@@ -2139,19 +2265,27 @@ func (s *Service) DeployManualBot(
 				"cannot fetch live PERP price for %s: %w", input.Symbol, livePriceErr)
 		}
 		botTarget, botMaxLoss := s.computeManualTargets(ctx, targetSettings, input.Symbol, leverage)
+		// v2.0.89 entry friction: same taker entry fee the scan deploys and
+		// the REAL ledger book — into realized (the wallet pays at fill) and
+		// the fee ledger column.
+		manualEntryFee := paperEntryFee(dbDirection(trend), lower, upper, row,
+			investment, leverage, livePrice).Round(8).String()
 		var id string
 		if err := s.db.QueryRow(ctx, `
 			INSERT INTO paper_grid_bots (
 				settings_id, symbol, status, direction, grid_type,
 				lower_price, upper_price, grid_num, leverage, quote_investment,
 				entry_price, mark_price, model_state,
-				pnl_target_usdt, max_loss_usdt
+				pnl_target_usdt, max_loss_usdt,
+				realized_pnl_usdt, fees_paid_usdt
 			) VALUES (
 				$1, $2, 'RUNNING', $3, $4, $5, $6, $7, $8, $9, $10, $10,
 				jsonb_build_object('model', 'manual_deploy', 'rangeSource', $11::TEXT,
 					'pnlTargetSource', $12::TEXT,
+					'entryFeeUsdt', $15::TEXT,
 					'warning', 'paper PnL is not a native Pionex grid backtest'),
-				$13, $14
+				$13, $14,
+				-$15::NUMERIC, $15::NUMERIC
 			)
 			ON CONFLICT (settings_id, symbol) WHERE status = 'RUNNING'
 			DO NOTHING
@@ -2160,6 +2294,7 @@ func (s *Service) DeployManualBot(
 			lower, upper, row, leverage, investment,
 			livePrice, input.RangeSource, settings.PnLTargetMode,
 			botTarget, botMaxLoss,
+			manualEntryFee,
 		).Scan(&id); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				return nil, "", fmt.Errorf(
@@ -2252,6 +2387,14 @@ func (s *Service) DeployManualBot(
 				"an active %s grid bot already exists — close it first on the bots screen", input.Symbol)
 		}
 		return nil, "", createErr
+	}
+	// v2.0.89 round-trip fee ledger: same entry-fee booking as the scan
+	// deploys — the epoch formula subtracts Σ fees. Basis matches
+	// pionex.EntryFeeUSDT (taker 0.05% × investment × leverage).
+	if feeErr := recordRealEntryFee(ctx, s.db, gridID,
+		pionex.EntryFeeUSDT(investment, leverage), "entryFeeUsdt"); feeErr != nil {
+		s.logger.Error("entry fee booking failed — ledger fee leg incomplete for this deploy",
+			"component", "autogrid_service", "bot_id", gridID, "error", feeErr)
 	}
 	return &ActiveBot{ID: gridID, Source: "REAL", Symbol: input.Symbol,
 		Status: "RUNNING", Direction: dbDirection(trend),

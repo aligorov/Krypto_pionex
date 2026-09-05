@@ -5,7 +5,6 @@ import type {
   AutoGridPreset,
   AutoGridSettings,
   AutoGridState,
-  EquityEpochResponse,
   EquityEpochSummary,
 } from '../types';
 
@@ -39,27 +38,11 @@ export default function AutoGridAutopilot({ canOperate, accountsHref }: Props) {
   const [presets, setPresets] = useState<AutoGridPreset[]>([]);
   const [busyPreset, setBusyPreset] = useState<string | null>(null);
   const [busyMode, setBusyMode] = useState<string | null>(null);
-  // TOTAL PnL (bot aggregate): the manage pass refreshes the per-bot PnL
-  // columns every cycle and the snapshot ledger lands every 5 minutes, so a
-  // 60-second poll is far inside the data's own resolution.
-  const [equity, setEquity] = useState<EquityEpochSummary | null>(null);
-  const [equityAvailable, setEquityAvailable] = useState<boolean | null>(null);
-
-  const loadEquity = useCallback(async () => {
-    try {
-      const res = await api<EquityEpochResponse>('/api/autogrid/equity');
-      setEquity(res.summary);
-      setEquityAvailable(res.available);
-    } catch {
-      setEquityAvailable(null);
-    }
-  }, []);
-
-  useEffect(() => {
-    void loadEquity();
-    const timer = window.setInterval(() => void loadEquity(), 60_000);
-    return () => window.clearInterval(timer);
-  }, [loadEquity]);
+  // v2.0.88 «одна правда на экране»: the TOTAL PnL hero reads
+  // state.epoch — the same AccountEquityEpoch summary every other tab
+  // renders, carried by the /api/autogrid payload itself. No separate
+  // polling loop: two fetches of one number is how the screen diverged
+  // from itself in the first place.
 
   async function switchMode(mode: 'PAPER' | 'REAL') {
     if (mode === 'REAL' && !window.confirm(
@@ -277,8 +260,13 @@ export default function AutoGridAutopilot({ canOperate, accountsHref }: Props) {
         </div>
       </div>
 
-      <div className="metric-grid metric-grid-six">
-        <TotalPnlCard equity={equity} available={equityAvailable} />
+      {/* v2.0.88: одна REAL-правда на экране. Раньше здесь стояли «PnL REAL
+          (всего)» и «REAL реализованный» — независимые суммы realized, в
+          которых NULL-финалы стоп-лоссов считались нулём (+23.43 на экране
+          при минусе по кошельку). Теперь единственная REAL-карточка —
+          эпохальный агрегат ниже (тот же state.epoch, что на дашборде). */}
+      <div className="metric-grid">
+        <TotalPnlCard equity={state.epoch ?? null} />
         <Metric
           label={`Активных ботов (${state.activeBots.filter((bot) => bot.source === 'PAPER').length}P / ${state.activeBots.filter((bot) => bot.source === 'REAL').length}R)`}
           value={String(state.activeBots.length)}
@@ -299,16 +287,6 @@ export default function AutoGridAutopilot({ canOperate, accountsHref }: Props) {
               {clearingPaper ? '…' : 'Очистить'}
             </button>
           }
-        />
-        <Metric
-          label="PnL REAL (всего)"
-          value={`${pnl?.real.totalUsdt ?? '0'} USDT`}
-          tone={(Number(pnl?.real.totalUsdt) || 0) >= 0 ? 'positive' : 'negative'}
-        />
-        <Metric
-          label="REAL реализованный"
-          value={`${pnl?.real.realizedUsdt ?? '0'} USDT · ${pnl?.real.profitable ?? 0}/${pnl?.real.closedBots ?? 0}`}
-          tone={(Number(pnl?.real.realizedUsdt) || 0) >= 0 ? 'positive' : 'negative'}
         />
         <Metric
           label="Баланс биржи · спот (USDT)"
@@ -467,14 +445,16 @@ function Metric({
 // Pionex app shows: the epoch aggregate over bots (running grid profit +
 // funding + floating, plus closed-of-epoch finals) — the account endpoints
 // cannot see isolated-grid margins, so the bots themselves are the only
-// truth. The breakdown line splits the headline into running / closed /
-// telemetry-estimated legs; unknown finals (no data at all) are counted but
-// never invented. A failed fetch shows a neutral placeholder: an empty
-// account answer is the isolated-bot norm, not an alarm (v2.0.83).
-function TotalPnlCard({ equity, available }: { equity: EquityEpochSummary | null; available: boolean | null }) {
-  if (!equity || available !== true) {
+// truth. v2.0.88: fed from state.epoch so the autopilot hero, the dashboard
+// card and the /equity endpoint are ONE number. The breakdown line splits
+// the headline into closed / estimated / floating legs and names the
+// unknown stop-finals explicitly — counted, never invented. A missing
+// summary shows a neutral placeholder: no configured account or a failed
+// probe is a data gap, not zero (v2.0.83).
+function TotalPnlCard({ equity }: { equity: EquityEpochSummary | null }) {
+  if (!equity) {
     return (
-      <div className="metric-card metric-card-hero">
+      <div className="metric-card metric-card-hero" style={{ gridColumn: 'span 2' }}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
           <span>TOTAL PnL</span>
           <span className="badge neutral">нет данных</span>
@@ -493,9 +473,8 @@ function TotalPnlCard({ equity, available }: { equity: EquityEpochSummary | null
   };
   const epochPnl = Number(equity.epochPnlUsdt) || 0;
   const capturedAt = equity.capturedAt ? new Date(equity.capturedAt).toLocaleTimeString() : '—';
-  const unknown = equity.unknownCount > 0 ? ` · без данных: ${equity.unknownCount}` : '';
   return (
-    <div className="metric-card metric-card-hero">
+    <div className="metric-card metric-card-hero" style={{ gridColumn: 'span 2' }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
         <span>TOTAL PnL</span>
         <span className="badge neutral">снапшотов: {equity.snapshots}</span>
@@ -504,12 +483,12 @@ function TotalPnlCard({ equity, available }: { equity: EquityEpochSummary | null
         {epochPnl >= 0 ? '+' : ''}{epochPnl.toFixed(2)} USDT
       </strong>
       <small className="muted">
-        Работают: {fmt(equity.runningPnlUsdt)} ({equity.runningBots}) · Закрыты: {fmt(equity.closedKnownUsdt)} ·
-        Оценки: {fmt(equity.closedEstimatedUsdt)}{unknown}
+        Работают: {fmt(equity.runningPnlUsdt)} ({equity.runningBots}) · закрыты {fmt(equity.closedKnownUsdt)}{' '}
+        (оценки {fmt(equity.closedEstimatedUsdt)}) · плавающий {fmt(equity.runningFloatingUsdt)} ·
+        стоп-минусы неизвестны: {equity.unknownCount}
       </small>
       <small className="muted">
-        Плавающий: {fmt(equity.runningFloatingUsdt)} · в ботах{' '}
-        {(Number(equity.runningInvestmentUsdt) || 0).toFixed(0)} USDT · снапшот {capturedAt}
+        в ботах {(Number(equity.runningInvestmentUsdt) || 0).toFixed(0)} USDT · снапшот {capturedAt}
       </small>
     </div>
   );

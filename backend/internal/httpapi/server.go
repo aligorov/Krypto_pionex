@@ -946,8 +946,11 @@ func (s *Server) autoGridAIFill(w http.ResponseWriter, r *http.Request) {
 // floating) plus closed-of-epoch finals, with refused settles estimated
 // from telemetry. available=false only on real failures (no account, bad
 // epoch anchor, DB error); an empty epoch answers zeroes, never an alarm.
+// v2.0.88: served from the same memoized summary the /api/autogrid state
+// payload carries, so the dedicated endpoint and the state can never
+// diverge mid-poll.
 func (s *Server) autoGridEquityEpoch(w http.ResponseWriter, r *http.Request) {
-	summary, err := s.autogrid.AccountEquityEpoch(r.Context())
+	summary, err := s.autogrid.AccountEquityEpochCached(r.Context())
 	if err != nil {
 		s.fail(w, r, err)
 		return

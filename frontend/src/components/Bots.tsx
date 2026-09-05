@@ -9,6 +9,12 @@ interface Props {
 
 const closableStatuses = ['RUNNING', 'PENDING_SUBMISSION', 'SUBMISSION_UNKNOWN', 'STOP_REQUESTED'];
 
+// fmtSigned formats an epoch PnL leg: explicit sign, two decimals.
+const fmtSigned = (value: string | undefined) => {
+  const num = Number(value) || 0;
+  return `${num >= 0 ? '+' : ''}${num.toFixed(2)}`;
+};
+
 export default function Bots({ canOperate }: Props) {
   const [state, setState] = useState<AutoGridState | null>(() => getCachedAutoGrid<AutoGridState>());
   const [error, setError] = useState<string | null>(null);
@@ -186,10 +192,15 @@ export default function Bots({ canOperate }: Props) {
               {filteredClosedBots.length !== state.closedBots.length ? ` из ${state.closedBots.length}` : ''})
             </h3>
           </div>
+          {/* v2.0.88: REAL-нога заголовка — эпохальные закрытые ноги, не
+              realized-only сумма (NULL-финалы в ней считались нулём и
+              стоп-минусы исчезали из сводки). PAPER остаётся полной
+              историей симуляции. */}
           <span className="muted">
             PAPER: {state.pnl.paper.closedBots} закр. / {state.pnl.paper.realizedUsdt} USDT · REAL:{' '}
-            {state.pnl.real.closedBots} закр. / {state.pnl.real.realizedUsdt} USDT (прибыльных{' '}
-            {state.pnl.real.profitable})
+            {state.epoch
+              ? `закрыты ${fmtSigned(state.epoch.closedKnownUsdt)} (оценки ${fmtSigned(state.epoch.closedEstimatedUsdt)}) · стоп-минусы неизвестны: ${state.epoch.unknownCount}`
+              : 'агрегат эпохи недоступен'}
           </span>
         </div>
         {state.closedBots.length === 0 ? (
@@ -500,6 +511,28 @@ function ClosedBotRow({
   onOpenHistory: () => void;
 }) {
   const pnl = Number(bot.realizedPnlUsdt) || 0;
+  // v2.0.88: NULL-финал больше не прикидывается нулём. Биржа отказала в
+  // финале (стоп-класс закрытия) → показываем телеметрическую оценку
+  // (ровно та, что входит в «оценки» TOTAL PnL эпохи) или честную пометку
+  // «финал неизвестен», если телеметрии до закрытия нет.
+  const estimate = bot.estimatedFinalUsdt != null ? Number(bot.estimatedFinalUsdt) : null;
+  const finalCell = bot.realizedPnlUsdt != null ? (
+    <strong className={pnl > 0 ? 'positive' : pnl < 0 ? 'negative' : ''}>{bot.realizedPnlUsdt}</strong>
+  ) : estimate != null ? (
+    <strong
+      className={estimate >= 0 ? 'positive' : 'negative'}
+      title="Биржа не дала финальный PnL: оценка по последней телеметрии до закрытия (входит в «оценки» TOTAL PnL)"
+    >
+      ≈оценка {fmtSigned(bot.estimatedFinalUsdt ?? undefined)}
+    </strong>
+  ) : (
+    <span
+      className="muted"
+      title="Финальный PnL неизвестен: биржа не дала финал, телеметрии до закрытия нет (в TOTAL PnL не входит — только считается в «стоп-минусы неизвестны»)"
+    >
+      стоп, финал неизвестен
+    </span>
+  );
   return (
     <tr>
       <td>
@@ -518,9 +551,7 @@ function ClosedBotRow({
       </td>
       <td>{bot.direction}</td>
       <td>{bot.quoteInvestment}</td>
-      <td className={pnl > 0 ? 'positive' : pnl < 0 ? 'negative' : ''}>
-        <strong>{bot.realizedPnlUsdt ?? '—'}</strong>
-      </td>
+      <td>{finalCell}</td>
       <td>{bot.closedAt ? new Date(bot.closedAt).toLocaleString() : '—'}</td>
       <td>
         <button

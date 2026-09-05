@@ -293,10 +293,8 @@ func (b *BUOrderDataResponse) Investment() (decimal.Decimal, bool) {
 }
 
 // FinalProfitSource names the chain leg that produced a settled figure, so
-// callers can refuse chain legs that are provably incomplete for their close
-// class (v2.0.75: a native stop-loss showed +0.22 from the grid-only leg
-// while the app's Total PnL was −2.5 — the position-close leg was silently
-// dropped).
+// callers can distinguish the exchange's own netted totals from worker-side
+// estimates.
 type FinalProfitSource string
 
 const (
@@ -306,25 +304,39 @@ const (
 	// FinalProfitTotalAlias covers totalProfit/profit/pnl/realizedProfit —
 	// observed variants of the full-total carrier on finished records.
 	FinalProfitTotalAlias FinalProfitSource = "total_profit_alias"
-	// FinalProfitGridFlat is grid + funding on a provably flat position: with
-	// no residual inventory there IS no position-close leg, so the sum is the
-	// complete total.
+	// FinalProfitTelemetryNetClose is the WORKER-side estimate (v2.0.89), not
+	// an exchange field: last telemetry total minus the taker+slippage close
+	// cost (stop-floored). It exists so settle paths can record provenance
+	// uniformly; the client never returns it.
+	FinalProfitTelemetryNetClose FinalProfitSource = "telemetry_net_close"
+	// FinalProfitGridFlat is RETIRED as a settle source (v2.0.89): grid +
+	// funding on a flat position used to be accepted as a final, but the
+	// epoch reconciliation (wallet −31 vs ledger +3) proved the finished
+	// records' position/close fields unreliable — the "flat" verdict itself
+	// could lie. Kept only so historical model_state markers stay readable.
 	FinalProfitGridFlat FinalProfitSource = "grid_funding_flat"
-	// FinalProfitGridResidual is grid + funding while the record still shows
-	// inventory (position ≠ 0 or closedBaseAmount ≠ 0): the position-close
-	// PnL is NOT included. On a loss-class close this leg is a lie by
-	// construction and callers must gate it.
+	// FinalProfitGridResidual is REFUSED as a final everywhere (v2.0.89):
+	// grid + funding while the record still shows inventory drops the
+	// position-close leg, and on the 2026-09-03..05 REAL epoch exactly this
+	// leg reported +$20.48 across a fleet the wallet settled at −$31
+	// (FARTCOIN +2.35 on an ANTI_HUNT loss, CRV +6.01, SKYAI +2.48…).
+	// Kept only for historical marker readability.
 	FinalProfitGridResidual FinalProfitSource = "grid_funding_residual"
-	// FinalProfitWithdrawn is the withdrawn-profit carrier.
+	// FinalProfitWithdrawn is the withdrawn-profit carrier; also refused as
+	// a terminal final (v2.0.89) — it carries the same incompleteness.
 	FinalProfitWithdrawn FinalProfitSource = "profit_withdrawn"
-	// FinalProfitNone means no carrier carried anything.
+	// FinalProfitNone means no exchange-total carrier carried anything; the
+	// worker settles such terminals at the telemetry-net-close estimate.
 	FinalProfitNone FinalProfitSource = "none"
 )
 
 // SettledProfit returns the finished grid's settled total plus the chain leg
-// it came from. Priority: the exchange's own netted figures first (profitExited,
-// total-alias), then grid+funding — complete only when the record shows no
-// residual inventory — and withdrawn profit last.
+// it came from. v2.0.89 chain: the exchange's own netted figures ONLY —
+// profitExited first, then the total-alias. The grid+funding legs (flat,
+// residual) and withdrawn profit are no longer accepted as finals anywhere:
+// on the 2026-09-03..05 REAL epoch they overstated the fleet by >$20 against
+// the wallet. When this returns FinalProfitNone the caller settles from
+// telemetry (see autogrid.estimateTerminalFinal) or leaves the final NULL.
 func (b *BUOrderDataResponse) SettledProfit() (decimal.Decimal, FinalProfitSource) {
 	if b == nil {
 		return decimal.Zero, FinalProfitNone
@@ -334,16 +346,6 @@ func (b *BUOrderDataResponse) SettledProfit() (decimal.Decimal, FinalProfitSourc
 	}
 	if total := b.TotalProfit; !total.IsZero() {
 		return total, FinalProfitTotalAlias
-	}
-	gridPlusFunding := b.GridProfit().Add(b.FundingFeePayment())
-	if !gridPlusFunding.IsZero() {
-		if !b.Position.IsZero() || !b.ClosedBaseAmount.IsZero() {
-			return gridPlusFunding, FinalProfitGridResidual
-		}
-		return gridPlusFunding, FinalProfitGridFlat
-	}
-	if withdrawn := parseDecimalRaw(b.ProfitWithdrawnRaw); !withdrawn.IsZero() {
-		return withdrawn, FinalProfitWithdrawn
 	}
 	return decimal.Zero, FinalProfitNone
 }

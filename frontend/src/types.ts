@@ -395,7 +395,12 @@ export interface AutoGridClosedBot {
   symbol: string;
   direction: string;
   quoteInvestment: string;
+  // null = the exchange refused to settle a final (stop-class close);
+  // estimatedFinalUsdt then carries the telemetry estimate (same figure
+  // the epoch PnL sums into «оценки»), or is also absent when nothing is
+  // known at all.
   realizedPnlUsdt: string | null;
+  estimatedFinalUsdt?: string | null;
   closedReason: string | null;
   status: string;
   closedAt: string | null;
@@ -430,7 +435,15 @@ export interface AutoGridState {
   candidates: AutoGridCandidate[];
   activeBots: AutoGridBot[];
   closedBots: AutoGridClosedBot[];
+  // v2.0.88: legacy known-realized sums. pnl.real.totalUsdt hides NULL
+  // finals (counted as 0) and closed floating — it must NEVER be rendered
+  // as the operator's headline REAL number. The headline is epoch below.
   pnl: { paper: AutoGridPnLSummary; real: AutoGridPnLSummary };
+  // The one REAL truth (v2.0.88): the same AccountEquityEpoch summary the
+  // GET /api/autogrid/equity endpoint serves, memoized in the payload so
+  // every tab reads one figure. Absent only when the probe failed (no
+  // account / bad anchor) — the cards then show their «нет данных» state.
+  epoch?: EquityEpochSummary | null;
   exchange?: ExchangeSnapshot;
   metricDefinitions: Record<string, string>;
   featureAvailability: Record<string, string>;

@@ -18,49 +18,53 @@ import (
 	"github.com/shopspring/decimal"
 )
 
-// TestGateSettledProfitDualSource is the unit contract of the v2.0.78 honesty
-// gate: the close class is decided from BOTH the stored closed_reason and the
-// exchange's reasonBy, and residual legs on unknown closes fail closed.
+// TestGateSettledProfitDualSource is the unit contract of the v2.0.89 sanity
+// gate: the exchange-total legs (profitExited / total-alias) pass for every
+// close class EXCEPT the guarded anomaly — a POSITIVE total on a loss-class
+// close, decided from BOTH the stored closed_reason and the exchange's
+// reasonBy. Every other source (the retired grid+funding legs, withdrawn,
+// none) answers nil: those figures are never finals, the caller falls to the
+// telemetry-net-close estimate.
 func TestGateSettledProfitDualSource(t *testing.T) {
 	positive := decimal.NewFromFloat(0.2)
 	negative := decimal.NewFromFloat(-2.5)
 
-	// The prod FARTCOON shape: our manage stop (STOP_LOSS stored) comes back
-	// from the exchange as "user cancel" — the operator-class exchange reason
-	// alone must NOT launder the loss-class close open.
-	if got := gateSettledProfit(positive, pionex.FinalProfitGridResidual, "STOP_LOSS", "user cancel"); got != nil {
-		t.Fatalf("residual positive on a stored STOP_LOSS must refuse (user cancel at the exchange), got %s", *got)
+	// The prod FARTCOIN shape, on the TOTAL leg now: our manage stop
+	// (STOP_LOSS stored) comes back from the exchange as "user cancel" — the
+	// operator-class exchange reason alone must NOT launder the loss-class
+	// close open.
+	if got := gateSettledProfit(positive, pionex.FinalProfitTotalAlias, "STOP_LOSS", "user cancel"); got != nil {
+		t.Fatalf("positive total-alias on a stored STOP_LOSS must refuse (user cancel at the exchange), got %s", *got)
 	}
-	// Either source alone suffices.
-	if got := gateSettledProfit(positive, pionex.FinalProfitGridResidual, "", "loss_stop"); got != nil {
-		t.Fatalf("residual positive on exchange loss_stop must refuse, got %s", *got)
+	if got := gateSettledProfit(positive, pionex.FinalProfitExited, "STOP_LOSS", "user cancel"); got != nil {
+		t.Fatalf("positive profitExited on a stored STOP_LOSS must refuse, got %s", *got)
 	}
-	if got := gateSettledProfit(positive, pionex.FinalProfitGridResidual, "RANGE_BREAK_UP", ""); got != nil {
-		t.Fatalf("residual positive on stored RANGE_BREAK_UP (adverse SHORT) must refuse, got %s", *got)
+	// Either reason source alone suffices.
+	if got := gateSettledProfit(positive, pionex.FinalProfitTotalAlias, "", "loss_stop"); got != nil {
+		t.Fatalf("positive total-alias on exchange loss_stop must refuse, got %s", *got)
 	}
-	if got := gateSettledProfit(positive, pionex.FinalProfitGridResidual, "RANGE_SHIFT_DOWN_NO_ADJUSTMENTS_LEFT", ""); got != nil {
-		t.Fatalf("residual positive on RANGE_SHIFT_*_NO_ADJUSTMENTS_LEFT must refuse, got %s", *got)
+	if got := gateSettledProfit(positive, pionex.FinalProfitTotalAlias, "RANGE_SHIFT_DOWN_NO_ADJUSTMENTS_LEFT", ""); got != nil {
+		t.Fatalf("positive total-alias on RANGE_SHIFT_*_NO_ADJUSTMENTS_LEFT must refuse, got %s", *got)
 	}
-	if got := gateSettledProfit(positive, pionex.FinalProfitGridResidual, "RANGE_SHIFT_UP_NO_ADJUSTMENTS_LEFT", "user cancel"); got != nil {
-		t.Fatalf("residual positive on RANGE_SHIFT_UP_NO_ADJUSTMENTS_LEFT must refuse, got %s", *got)
+	// A KNOWN non-loss class keeps the exchange total.
+	if got := gateSettledProfit(positive, pionex.FinalProfitTotalAlias, "AUTOGRID_STOP", "user cancel"); got == nil || !got.Equal(positive) {
+		t.Fatalf("positive total on a known operator-class close must stay accepted, got %v", got)
 	}
-	// Unknown close class on both sources fails closed.
-	if got := gateSettledProfit(positive, pionex.FinalProfitGridResidual, "", "ALREADY_CLOSED"); got != nil {
-		t.Fatalf("residual positive on an unknown close class must refuse, got %s", *got)
-	}
-	if got := gateSettledProfit(positive, pionex.FinalProfitGridResidual, "ALREADY_CLOSED", ""); got != nil {
-		t.Fatalf("residual positive on a stored ALREADY_CLOSED must refuse, got %s", *got)
-	}
-	// A KNOWN non-loss class keeps the leg (the audit only extends loss/unknown).
-	if got := gateSettledProfit(positive, pionex.FinalProfitGridResidual, "AUTOGRID_STOP", "user cancel"); got == nil {
-		t.Fatal("residual positive on a known operator-class close must stay accepted")
-	}
-	// The full-chain leg is always accepted, loss-class or not.
+	// Negative totals always pass — the gate refuses lies, never losses.
 	if got := gateSettledProfit(negative, pionex.FinalProfitExited, "STOP_LOSS", "loss_stop"); got == nil || !got.Equal(negative) {
 		t.Fatalf("profitExited −2.5 must settle −2.5, got %v", got)
 	}
-	if got := gateSettledProfit(negative, pionex.FinalProfitGridResidual, "STOP_LOSS", "loss_stop"); got == nil || !got.Equal(negative) {
-		t.Fatalf("a negative residual must pass through (the gate only refuses lies, not losses), got %v", got)
+	// The retired legs are not the gate's business: nil for any figure.
+	for _, source := range []pionex.FinalProfitSource{
+		pionex.FinalProfitGridResidual, pionex.FinalProfitGridFlat,
+		pionex.FinalProfitWithdrawn, pionex.FinalProfitNone,
+	} {
+		if got := gateSettledProfit(negative, source, "STOP_LOSS", "loss_stop"); got != nil {
+			t.Fatalf("non-total source %s must never gate a final, got %s", source, *got)
+		}
+		if got := gateSettledProfit(positive, source, "AUTOGRID_STOP", "user cancel"); got != nil {
+			t.Fatalf("non-total source %s must never gate a final, got %s", source, *got)
+		}
 	}
 }
 
@@ -168,7 +172,7 @@ func newTerminalGateExchangeMock(t *testing.T) *terminalGateExchangeMock {
 
 // seedGateBot lands one STOP_REQUESTED REAL bot whose closed_reason is the
 // local manage-stop witness; the exchange answers "user cancel".
-func seedGateBot(t *testing.T, pool *pgxpool.Pool, accountID, settingsID, symbol, buOrderID, closedReason string) string {
+func seedGateBot(t *testing.T, pool *pgxpool.Pool, accountID, settingsID, symbol, buOrderID, closedReason string, maxLoss any) string {
 	t.Helper()
 	var botID string
 	if err := pool.QueryRow(context.Background(), `
@@ -177,31 +181,53 @@ func seedGateBot(t *testing.T, pool *pgxpool.Pool, accountID, settingsID, symbol
 			grid_type, lower_price, upper_price, grid_num, leverage,
 			quote_investment, extra_margin, request_fingerprint,
 			execution_mode, reconciliation_state, bu_order_id,
-			realized_pnl_usdt, unrealized_pnl_usdt, closed_reason, bot_number
+			realized_pnl_usdt, unrealized_pnl_usdt, closed_reason, max_loss_usdt, bot_number
 		) VALUES (
 			$1, $2, $3, 'STOP_REQUESTED', 'NEUTRAL',
 			'ARITHMETIC', 90, 110, 20, 2,
 			100, 0, $4, 'REAL', 'REMOTE_ID_PERSISTED', $5,
-			0, 0, $6, 888
+			0, 0, $6, $7, 888
 		)
 		RETURNING id
 	`, accountID, settingsID, symbol,
-		"itest-"+time.Now().Format("150405.000000000"), buOrderID, closedReason).Scan(&botID); err != nil {
+		"itest-"+time.Now().Format("150405.000000000"), buOrderID, closedReason, maxLoss).Scan(&botID); err != nil {
 		t.Fatalf("seed gate bot %s: %v", symbol, err)
 	}
 	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), `DELETE FROM bot_telemetry WHERE bot_id = $1::TEXT`, botID)
 		_, _ = pool.Exec(context.Background(), `DELETE FROM bot_execution_events WHERE bot_id = $1::TEXT`, botID)
 		_, _ = pool.Exec(context.Background(), `DELETE FROM grid_bots WHERE id = $1`, botID)
 	})
 	return botID
 }
 
+// seedGateTelemetry plants the last telemetry row the estimate ladder reads.
+func seedGateTelemetry(t *testing.T, pool *pgxpool.Pool, botID, total, inventory string) {
+	t.Helper()
+	if _, err := pool.Exec(context.Background(), `
+		INSERT INTO bot_telemetry
+			(bot_id, bot_number, symbol, captured_at, price, total_pnl, inventory_notional)
+		VALUES ($1, 888, 'GATE', NOW() - INTERVAL '30 seconds', 100, $2::NUMERIC, $3::NUMERIC)
+	`, botID, total, inventory); err != nil {
+		t.Fatalf("seed gate telemetry: %v", err)
+	}
+}
+
 // TestTerminalSettleGateConsultsStoredReason drives the terminal settle path
-// end to end: a bot our manage loop stopped (stored STOP_LOSS) whose exchange
-// record reports "user cancel" must NOT settle a positive grid-funding
-// residual — the stored reason is the only witness of the loss class. The
-// full-chain profitExited figure settles regardless; the shifted-out
-// NO_ADJUSTMENTS_LEFT close is loss-class through the stored reason too.
+// end to end under the v2.0.89 ladder:
+//
+//	Case 1 — a bot our manage loop stopped (stored STOP_LOSS, exchange answers
+//	"user cancel") whose record carries ONLY grid profit (no netted total):
+//	the retired residual leg is not a final; the telemetry-net-close estimate
+//	settles instead, and its close cost is booked into fees_paid_usdt.
+//
+//	Case 2 — the same bot shape with the full-chain profitExited −2.5 settles
+//	−2.5 (the gate refuses incomplete legs, never the exchange's own net).
+//
+//	Case 3 — the cascade shape: a NATIVE stop whose last telemetry mark still
+//	read positive while the stop executed; the estimate floors at
+//	−max_loss − close_cost (prod APT: stop executed at −12 with the last mark
+//	at −2.27, ICP/SUI: stops fired on positive marks).
 func TestTerminalSettleGateConsultsStoredReason(t *testing.T) {
 	dbURL := integrationDatabaseURL(t)
 	ctx := context.Background()
@@ -273,30 +299,38 @@ func TestTerminalSettleGateConsultsStoredReason(t *testing.T) {
 	worker.publicClient = pionex.NewClient(mock.server.URL, "", "")
 
 	// Case 1 (prod FARTCOIN): stored STOP_LOSS + exchange "user cancel" +
-	// positive residual +0.2 → refused to NULL, marker refused_*.
+	// residual grid profit +0.2 (no netted total) + telemetry total −1.0 on
+	// 200 inventory → estimate −1.0 − 0.2 = −1.2, close cost booked.
 	residualID := seedGateBot(t, pool, account.ID, settings.ID,
-		"GATEA_USDT_PERP", "GATE-A", "STOP_LOSS")
+		"GATEA_USDT_PERP", "GATE-A", "STOP_LOSS", nil)
+	seedGateTelemetry(t, pool, residualID, "-1.0", "200")
 	if _, err := worker.reconcileAndManage(ctx); err != nil {
 		t.Fatalf("reconcile pass 1: %v", err)
 	}
 	var realized *decimal.Decimal
 	var marker string
 	var status1, closed1 string
+	var feesPaid decimal.Decimal
+	var closeCostState *decimal.Decimal
 	if err := pool.QueryRow(ctx, `
 		SELECT realized_pnl_usdt, COALESCE(model_state->>'finalProfitSource',''),
-		       status, COALESCE(closed_reason,'')
+		       status, COALESCE(closed_reason,''), fees_paid_usdt,
+		       NULLIF(model_state->>'closeCostUsdt','')::NUMERIC
 		FROM grid_bots WHERE id = $1
-	`, residualID).Scan(&realized, &marker, &status1, &closed1); err != nil {
+	`, residualID).Scan(&realized, &marker, &status1, &closed1, &feesPaid, &closeCostState); err != nil {
 		t.Fatalf("load residual bot: %v", err)
 	}
-	if realized != nil {
-		t.Fatalf("user cancel + stored STOP_LOSS + residual +0.2 must settle NULL, got %s; logs: %s", *realized, rec.joined())
+	if realized == nil || !realized.Equal(decimal.NewFromFloat(-1.2)) {
+		t.Fatalf("no exchange total → telemetry_net_close = −1.0 − 0.001×200 = −1.2, got %v", realized)
 	}
-	if marker != "refused_"+string(pionex.FinalProfitGridResidual) {
-		t.Fatalf("refusal must be marked in the same UPDATE, got %q", marker)
+	if marker != string(pionex.FinalProfitTelemetryNetClose) {
+		t.Fatalf("estimate settle must mark telemetry_net_close, got %q", marker)
 	}
-	if !rec.contains("terminal settle refused") {
-		t.Fatalf("refusal must Warn, logs: %s", rec.joined())
+	if !feesPaid.Equal(decimal.NewFromFloat(0.2)) {
+		t.Fatalf("close cost 0.2 must be booked into fees_paid_usdt, got %s", feesPaid)
+	}
+	if closeCostState == nil || !closeCostState.Equal(decimal.NewFromFloat(0.2)) {
+		t.Fatalf("close cost must ride in model_state.closeCostUsdt, got %v", closeCostState)
 	}
 	if status1 != "STOPPED" || closed1 != "STOP_LOSS" {
 		t.Fatalf("stored closed_reason must survive the terminal persist, got %s/%s", status1, closed1)
@@ -305,7 +339,7 @@ func TestTerminalSettleGateConsultsStoredReason(t *testing.T) {
 	// Case 2: the same bot shape with the full-chain figure −2.5 settles −2.5
 	// (the gate refuses incomplete legs, never the exchange's own net).
 	exitedID := seedGateBot(t, pool, account.ID, settings.ID,
-		"GATEB_USDT_PERP", "GATE-B", "STOP_LOSS")
+		"GATEB_USDT_PERP", "GATE-B", "STOP_LOSS", nil)
 	mock.mu.Lock()
 	mock.profitExited = "-2.5"
 	mock.mu.Unlock()
@@ -314,10 +348,11 @@ func TestTerminalSettleGateConsultsStoredReason(t *testing.T) {
 	}
 	var exitedRealized decimal.Decimal
 	var exitedMarker string
+	var exitedFees decimal.Decimal
 	if err := pool.QueryRow(ctx, `
-		SELECT realized_pnl_usdt, COALESCE(model_state->>'finalProfitSource','')
+		SELECT realized_pnl_usdt, COALESCE(model_state->>'finalProfitSource',''), fees_paid_usdt
 		FROM grid_bots WHERE id = $1
-	`, exitedID).Scan(&exitedRealized, &exitedMarker); err != nil {
+	`, exitedID).Scan(&exitedRealized, &exitedMarker, &exitedFees); err != nil {
 		t.Fatalf("load exited bot: %v", err)
 	}
 	if !exitedRealized.Equal(decimal.NewFromFloat(-2.5)) {
@@ -326,29 +361,37 @@ func TestTerminalSettleGateConsultsStoredReason(t *testing.T) {
 	if exitedMarker != string(pionex.FinalProfitExited) {
 		t.Fatalf("settle must mark profit_exited, got %q", exitedMarker)
 	}
+	if !exitedFees.IsZero() {
+		t.Fatalf("an exchange-total settle books no close cost (already netted), got %s", exitedFees)
+	}
 
-	// Case 3: the shifted-out close is loss-class through the STORED reason
-	// even when the exchange answer is unclassified noise.
+	// Case 3: the cascade shape — native stop, stale positive mark, the floor
+	// at −max_loss − close_cost carries the mark-to-execution gap.
 	mock.mu.Lock()
 	mock.profitExited = ""
 	mock.mu.Unlock()
-	shiftID := seedGateBot(t, pool, account.ID, settings.ID,
-		"GATEC_USDT_PERP", "GATE-C", "RANGE_SHIFT_DOWN_NO_ADJUSTMENTS_LEFT")
+	cascadeID := seedGateBot(t, pool, account.ID, settings.ID,
+		"GATEC_USDT_PERP", "GATE-C", "STOP_LOSS_NATIVE", "4")
+	seedGateTelemetry(t, pool, cascadeID, "0.5", "100")
 	if _, err := worker.reconcileAndManage(ctx); err != nil {
 		t.Fatalf("reconcile pass 3: %v", err)
 	}
-	var shiftRealized *decimal.Decimal
-	var shiftMarker string
+	var cascadeRealized *decimal.Decimal
+	var cascadeMarker string
+	var cascadeFees decimal.Decimal
 	if err := pool.QueryRow(ctx, `
-		SELECT realized_pnl_usdt, COALESCE(model_state->>'finalProfitSource','')
+		SELECT realized_pnl_usdt, COALESCE(model_state->>'finalProfitSource',''), fees_paid_usdt
 		FROM grid_bots WHERE id = $1
-	`, shiftID).Scan(&shiftRealized, &shiftMarker); err != nil {
-		t.Fatalf("load shift bot: %v", err)
+	`, cascadeID).Scan(&cascadeRealized, &cascadeMarker, &cascadeFees); err != nil {
+		t.Fatalf("load cascade bot: %v", err)
 	}
-	if shiftRealized != nil {
-		t.Fatalf("RANGE_SHIFT_*_NO_ADJUSTMENTS_LEFT residual must settle NULL, got %s", *shiftRealized)
+	if cascadeRealized == nil || !cascadeRealized.Equal(decimal.NewFromFloat(-4.1)) {
+		t.Fatalf("native stop on a positive mark must floor at −max_loss − close_cost = −4.1, got %v", cascadeRealized)
 	}
-	if shiftMarker != "refused_"+string(pionex.FinalProfitGridResidual) {
-		t.Fatalf("shift refusal must be marked, got %q", shiftMarker)
+	if cascadeMarker != string(pionex.FinalProfitTelemetryNetClose) {
+		t.Fatalf("floored estimate must mark telemetry_net_close, got %q", cascadeMarker)
+	}
+	if !cascadeFees.Equal(decimal.NewFromFloat(0.1)) {
+		t.Fatalf("cascade close cost 0.1 must be booked, got %s", cascadeFees)
 	}
 }

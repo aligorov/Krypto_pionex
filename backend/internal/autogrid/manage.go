@@ -1,6 +1,7 @@
 package autogrid
 
 import (
+	"strings"
 	"time"
 
 	"github.com/shopspring/decimal"
@@ -241,6 +242,120 @@ func adjustDecision(input botActionInput, action, reason string) manageDecision 
 // pair and made paper systematically underreport the harvest REAL grids
 // keep (2026-08-20 external audit §2, verified against the official fee page).
 const pionexMakerFeeBps = 2.0
+
+// Paper-engine friction (v2.0.89). The calibrated rates live in the ONE
+// block in finalprofit.go (paperFillBufferPct / paperStopTakerBps /
+// paperStopSlippageBps / paperStopCostComposite):
+//
+//	calibrated vs REAL epoch 2026-09-03..05: wallet −31 vs uncalibrated
+//	paper +70/day — the uncalibrated simulator counted boundary-touch fills,
+// charged nothing at entry and closed stops at the mark. The three helpers
+// below are where those rates enter the engine.
+
+// paperCloseFeeRate is the per-dollar close cost a protective close pays on
+// the open inventory: taker 0.05% + slippage 0.05% = 10 bps.
+func paperCloseFeeRate() decimal.Decimal {
+	return paperStopCostComposite.Div(decimal.NewFromInt(10000))
+}
+
+// paperEntryFee prices the taker fee (0.05%) a fresh paper grid pays at
+// deploy on its INITIAL inventory notional — booked into realized at deploy
+// exactly like the exchange debits the wallet. Directional grids open the
+// full leveraged notional crossing the book; a neutral grid starts with the
+// uniform-ladder inventory at the deploy price (|levels from mid| ×
+// per-level notional — the same stateless ladder neutralGridPaperPNL marks).
+func paperEntryFee(
+	direction string,
+	lower, upper decimal.Decimal,
+	gridNum int,
+	investment decimal.Decimal,
+	leverage int,
+	deployPrice decimal.Decimal,
+) decimal.Decimal {
+	return paperInitialInventoryNotional(direction, lower, upper, gridNum, investment, leverage, deployPrice).
+		Mul(paperStopTakerBps).Div(decimal.NewFromInt(10000))
+}
+
+// paperPourEntryFee prices the taker fee an invest_in pour pays on the
+// notional it adds to a LIVE grid: directional pours add the full leveraged
+// margin; a neutral grid holds roughly half its ladder as inventory at any
+// time, so the pour's added inventory is priced at the half-notional
+// convention (deterministic — the paper row carries no live inventory
+// column; the manage-loop tranche path uses the actual mark instead).
+func paperPourEntryFee(direction string, investment decimal.Decimal, leverage int) decimal.Decimal {
+	if !investment.IsPositive() || leverage < 1 {
+		return decimal.Zero
+	}
+	notional := investment.Mul(decimal.NewFromInt(int64(leverage)))
+	if strings.ToUpper(direction) != "NEUTRAL" {
+		return notional.Mul(paperStopTakerBps).Div(decimal.NewFromInt(10000))
+	}
+	return notional.Div(decimal.NewFromInt(2)).Mul(paperStopTakerBps).Div(decimal.NewFromInt(10000))
+}
+
+// paperInitialInventoryNotional is the notional a fresh grid puts on at
+// entry (see paperEntryFee).
+func paperInitialInventoryNotional(
+	direction string,
+	lower, upper decimal.Decimal,
+	gridNum int,
+	investment decimal.Decimal,
+	leverage int,
+	deployPrice decimal.Decimal,
+) decimal.Decimal {
+	if !investment.IsPositive() || leverage < 1 {
+		return decimal.Zero
+	}
+	notional := investment.Mul(decimal.NewFromInt(int64(leverage)))
+	if strings.ToUpper(direction) != "NEUTRAL" {
+		return notional
+	}
+	if !upper.GreaterThan(lower) || gridNum < 2 || !deployPrice.GreaterThan(decimal.Zero) {
+		// No usable geometry: mid-deploy convention — half the notional, the
+		// below-mid half a neutral ladder starts holding.
+		return notional.Div(decimal.NewFromInt(2))
+	}
+	levelWidth := upper.Sub(lower).Div(decimal.NewFromInt(int64(gridNum)))
+	mid := upper.Add(lower).Div(decimal.NewFromInt(2))
+	halfLevels := decimal.NewFromInt(int64(gridNum)).Div(decimal.NewFromInt(2))
+	levelsFromMid := mid.Sub(deployPrice).Div(levelWidth)
+	if levelsFromMid.GreaterThan(halfLevels) {
+		levelsFromMid = halfLevels
+	}
+	if levelsFromMid.LessThan(halfLevels.Neg()) {
+		levelsFromMid = halfLevels.Neg()
+	}
+	perLevel := notional.Div(decimal.NewFromInt(int64(gridNum)))
+	return levelsFromMid.Abs().Mul(perLevel)
+}
+
+// bufferedGridLevel maps a price to its grid level with the fill buffer
+// (v2.0.89 friction calibration): a level counts as crossed only when the
+// price traded paperFillBufferPct (0.03%) BEYOND its boundary — a touch is
+// not a fill. The buffer is applied against the direction of movement since
+// the last observation (the ladder baseline), so a shallow boundary-kiss
+// oscillation books zero pairs while a genuine traverse still completes them.
+// Multi-level traverses keep working: the buffered price simply demands the
+// extra depth on the final, partially-traversed level.
+func bufferedGridLevel(
+	lower, upper decimal.Decimal,
+	gridNum int,
+	price decimal.Decimal,
+	lastLevel int,
+) int {
+	raw := gridLevelForPrice(lower, upper, gridNum, price)
+	if raw == lastLevel || !price.GreaterThan(decimal.Zero) {
+		return raw
+	}
+	buffer := paperFillBufferPct.Div(decimal.NewFromInt(100))
+	if raw < lastLevel {
+		// Downward move: pretend the price is buffer% higher — the dip must
+		// exceed the buffer before the lower level counts.
+		return gridLevelForPrice(lower, upper, gridNum, price.Mul(decimal.NewFromInt(1).Add(buffer)))
+	}
+	// Upward move: pretend the price is buffer% lower.
+	return gridLevelForPrice(lower, upper, gridNum, price.Mul(decimal.NewFromInt(1).Sub(buffer)))
+}
 
 // neutralGridPaperPNL simulates what a native neutral grid earns between two
 // observation points using leveraged ladder economics (v1.3.22):

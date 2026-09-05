@@ -33,7 +33,14 @@ export default function Overview({ onRefresh, canOperate }: Props) {
   }, [refresh]);
 
   const pnl = state?.pnl;
+  const epoch = state?.epoch ?? null;
   const exchange = state?.exchange;
+  // fmtSigned formats an epoch leg for the breakdown subline.
+  const fmtSigned = (value: string | undefined) => {
+    const num = Number(value) || 0;
+    return `${num >= 0 ? '+' : ''}${num.toFixed(2)}`;
+  };
+  const epochPnl = Number(epoch?.epochPnlUsdt) || 0;
 
   async function handleClearPaper() {
     if (!window.confirm('Сбросить историю и накопленный PnL симуляции (PAPER)? Завершенные боты будут удалены.')) {
@@ -81,10 +88,18 @@ export default function Overview({ onRefresh, canOperate }: Props) {
             </button>
           }
         />
+        {/* v2.0.88 «одна правда на экране»: раньше здесь светился
+            pnl.real.totalUsdt — realized-only, где NULL-финалы стоп-лоссов
+            считались нулём (+23.43 при реальном минусе). Теперь это тот же
+            эпохальный агрегат, что TOTAL PnL на вкладке автопилота
+            (state.epoch = AccountEquityEpoch), с breakdown-подстрокой. */}
         <Metric
-          label="PnL REAL"
-          value={`${pnl?.real.totalUsdt ?? '0'} USDT`}
-          tone={(Number(pnl?.real.totalUsdt) || 0) >= 0 ? 'positive' : 'negative'}
+          label="PnL REAL (эпоха)"
+          value={epoch ? `${fmtSigned(epoch.epochPnlUsdt)} USDT` : '—'}
+          tone={epoch ? (epochPnl >= 0 ? 'positive' : 'negative') : undefined}
+          hint={epoch
+            ? `закрыты ${fmtSigned(epoch.closedKnownUsdt)} (оценки ${fmtSigned(epoch.closedEstimatedUsdt)}) · плавающий ${fmtSigned(epoch.runningFloatingUsdt)} · стоп-минусы неизвестны: ${epoch.unknownCount}`
+            : 'агрегат эпохи недоступен: нет аккаунта или ошибка запроса (журнал: EQUITY_CAPTURE_FAILED)'}
         />
         <Metric
           label="Баланс биржи · спот (USDT)"

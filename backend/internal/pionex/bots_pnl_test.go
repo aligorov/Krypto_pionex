@@ -68,10 +68,13 @@ func TestGridProfitAccessor(t *testing.T) {
 	}
 }
 
-// TestFinalProfitAccessor pins the closed-grid chain: the exchange's settled
-// profitExited wins; without it the grid profit plus per-bot funding is the
-// figure; older exchange variants fall back to profitWithdrawn and the
-// legacy totalProfit chain in that order.
+// TestFinalProfitAccessor pins the v2.0.89 closed-grid chain: ONLY the
+// exchange's own netted totals survive — profitExited first, then the
+// totalProfit alias chain. The grid+funding legs and profitWithdrawn are
+// retired as finals (the 2026-09-03..05 REAL epoch settled +$20.48 of
+// fictional grid profit on a fleet the wallet closed at −$31), so a record
+// without a netted total answers zero and the caller falls to its telemetry
+// estimate.
 func TestFinalProfitAccessor(t *testing.T) {
 	settled := decodeOrderData(t, `{
 		"status": "canceled", "reasonBy": "user_cancel",
@@ -81,21 +84,28 @@ func TestFinalProfitAccessor(t *testing.T) {
 		t.Fatalf("FinalProfit = %s, want 0.42 (profitExited wins)", got)
 	}
 
-	noExited := decodeOrderData(t, `{
-		"status": "canceled", "profitReduce": "0.10", "fundingFeePayment": "-0.01"
+	totalAlias := decodeOrderData(t, `{
+		"status": "canceled", "totalProfit": "-2.5", "profitReduce": "0.22", "closedBaseAmount": "1.4"
 	}`)
-	if got := noExited.FinalProfit(); !got.Equal(mustDecimal(t, "0.09")) {
-		t.Fatalf("FinalProfit = %s, want 0.09 (grid + funding)", got)
-	}
-
-	withdrawn := decodeOrderData(t, `{"status": "canceled", "profitWithdrawn": "1.5"}`)
-	if got := withdrawn.FinalProfit(); !got.Equal(mustDecimal(t, "1.5")) {
-		t.Fatalf("FinalProfit = %s, want 1.5 (profitWithdrawn fallback)", got)
+	if got := totalAlias.FinalProfit(); !got.Equal(mustDecimal(t, "-2.5")) {
+		t.Fatalf("FinalProfit = %s, want -2.5 (totalProfit alias)", got)
 	}
 
 	legacyProfit := decodeOrderData(t, `{"status": "canceled", "profit": "2.5"}`)
 	if got := legacyProfit.FinalProfit(); !got.Equal(mustDecimal(t, "2.5")) {
 		t.Fatalf("FinalProfit = %s, want 2.5 (legacy profit chain)", got)
+	}
+
+	// Grid+funding and withdrawn-only records carry NO final anymore.
+	gridOnly := decodeOrderData(t, `{
+		"status": "canceled", "profitReduce": "0.10", "fundingFeePayment": "-0.01", "closedBaseAmount": "1.4"
+	}`)
+	if got := gridOnly.FinalProfit(); !got.IsZero() {
+		t.Fatalf("grid+funding must not be a final (v2.0.89), got %s", got)
+	}
+	withdrawn := decodeOrderData(t, `{"status": "canceled", "profitWithdrawn": "1.5"}`)
+	if got := withdrawn.FinalProfit(); !got.IsZero() {
+		t.Fatalf("profitWithdrawn must not be a final (v2.0.89), got %s", got)
 	}
 
 	empty := decodeOrderData(t, `{"status": "canceled"}`)
@@ -104,11 +114,12 @@ func TestFinalProfitAccessor(t *testing.T) {
 	}
 }
 
-// TestSettledProfitSource pins the v2.0.75 provenance-aware chain: the same
-// figure is only trustworthy when the chain leg that produced it is complete
-// for the close class. The grid-only fallback on a native stop with residual
-// inventory is INCOMPLETE (prod XMR #672 / JTO #674: +0.22 stored while the
-// app's Total PnL read ≈ −2.5 — the position-close leg was silently dropped).
+// TestSettledProfitSource pins the v2.0.89 provenance chain: profitExited and
+// the total-alias are the ONLY settled sources. The grid+funding legs (flat,
+// residual) and withdrawn profit return FinalProfitNone — the caller must
+// settle such terminals at its own telemetry-net-close estimate, never at the
+// exchange's partial figures (prod FARTCOIN +2.349 on an ANTI_HUNT loss while
+// the wallet bled).
 func TestSettledProfitSource(t *testing.T) {
 	// The documented settled figure always wins.
 	exited := decodeOrderData(t, `{
@@ -129,43 +140,26 @@ func TestSettledProfitSource(t *testing.T) {
 		t.Fatalf("total alias must carry the full total: got %s/%s", got, src)
 	}
 
-	// The XMR/JTO lie, made visible: no profitExited, no total, grid-only
-	// positive while inventory was closed — the source must say INCOMPLETE so
-	// the caller's honesty gate can refuse it.
-	residual := decodeOrderData(t, `{
-		"status": "canceled", "reasonBy": "loss_stop",
-		"profitReduce": "0.21770320", "fundingFeePayment": "0", "closedBaseAmount": "1.4"
-	}`)
-	got, src := residual.SettledProfit()
-	if src != FinalProfitGridResidual {
-		t.Fatalf("grid-only figure with closed inventory must be %s, got %s", FinalProfitGridResidual, src)
-	}
-	if !got.Equal(mustDecimal(t, "0.21770320")) {
-		t.Fatalf("grid-only figure must still expose its value, got %s", got)
-	}
-
-	// Grid + funding on a provably FLAT record is complete: no position, no
-	// closed inventory — there is no missing position-close leg.
-	flat := decodeOrderData(t, `{
-		"status": "canceled", "reasonBy": "user_cancel",
-		"profitReduce": "0.10", "fundingFeePayment": "-0.01"
-	}`)
-	if got, src := flat.SettledProfit(); !got.Equal(mustDecimal(t, "0.09")) || src != FinalProfitGridFlat {
-		t.Fatalf("flat grid+funding must be complete: got %s/%s", got, src)
+	// The retired legs: grid+funding with residual inventory, grid+funding on
+	// a flat record, a live position, withdrawn-only — all must answer NONE
+	// (the value stays readable through GridProfit/FundingFeePayment).
+	for name, payload := range map[string]string{
+		"grid-only with closed inventory": `{
+			"status": "canceled", "reasonBy": "loss_stop",
+			"profitReduce": "0.21770320", "fundingFeePayment": "0", "closedBaseAmount": "1.4"
+		}`,
+		"grid+funding flat": `{
+			"status": "canceled", "reasonBy": "user_cancel",
+			"profitReduce": "0.10", "fundingFeePayment": "-0.01"
+		}`,
+		"live position":  `{"status": "canceled", "profitReduce": "0.5", "position": "0.7"}`,
+		"withdrawn-only": `{"status":"canceled","profitWithdrawn":"1.5"}`,
+	} {
+		if got, src := decodeOrderData(t, payload).SettledProfit(); src != FinalProfitNone || !got.IsZero() {
+			t.Fatalf("%s must settle at NONE with zero figure (v2.0.89 retired legs), got %s/%s", name, got, src)
+		}
 	}
 
-	// A live position also marks the grid leg incomplete.
-	live := decodeOrderData(t, `{
-		"status": "canceled", "profitReduce": "0.5", "position": "0.7"
-	}`)
-	if _, src := live.SettledProfit(); src != FinalProfitGridResidual {
-		t.Fatalf("residual position must mark the grid leg incomplete, got %s", src)
-	}
-
-	// Withdrawn-only and bare records keep their legs.
-	if got, src := decodeOrderData(t, `{"status":"canceled","profitWithdrawn":"1.5"}`).SettledProfit(); !got.Equal(mustDecimal(t, "1.5")) || src != FinalProfitWithdrawn {
-		t.Fatalf("withdrawn-only: got %s/%s", got, src)
-	}
 	if _, src := decodeOrderData(t, `{"status":"canceled"}`).SettledProfit(); src != FinalProfitNone {
 		t.Fatalf("bare record must be %s, got %s", FinalProfitNone, src)
 	}

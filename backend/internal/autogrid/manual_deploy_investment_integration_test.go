@@ -495,6 +495,22 @@ func TestManualDeployRealInvestmentOverride(t *testing.T) {
 	if got := mock.lastCreateInvestment(); got != "50" {
 		t.Fatalf("native create payload must carry quoteInvestment 50, got %q", got)
 	}
+	// v2.0.89 round-trip fee ledger: the deploy books the taker entry fee on
+	// the opened notional (0.05% × 50 × lev 2 = 0.05) with the fee breakdown
+	// stamped in model_state.
+	var canaryFees, canaryEntryFeeMarker string
+	if err := pool.QueryRow(ctx, `
+		SELECT fees_paid_usdt::TEXT, COALESCE(model_state->>'entryFeeUsdt','')
+		FROM grid_bots WHERE symbol = 'CANRA_USDT_PERP' AND account_id = $1
+	`, account.ID).Scan(&canaryFees, &canaryEntryFeeMarker); err != nil {
+		t.Fatalf("load canary fee ledger: %v", err)
+	}
+	if canaryFees != "0.05000000" && canaryFees != "0.05" {
+		t.Fatalf("canary deploy fee must be 0.05 (0.05%% x 50 x 2), got %s", canaryFees)
+	}
+	if canaryEntryFeeMarker != "0.05" {
+		t.Fatalf("entry fee breakdown must ride in model_state.entryFeeUsdt, got %q", canaryEntryFeeMarker)
+	}
 
 	// Round 2: minimum rises to $60 — the comparison must use the canary's 50,
 	// not the fleet's 500 (a 500-basis comparison would wrongly pass).
