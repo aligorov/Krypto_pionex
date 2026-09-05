@@ -361,6 +361,15 @@ func scoreCandidate(
 	pricePrec := symbol.GetPricePrecision()
 	lower := decimal.NewFromFloat(lowerFloat).Round(int32(pricePrec))
 	upper := decimal.NewFromFloat(upperFloat).Round(int32(pricePrec))
+	// The persisted geometry must be self-consistent: gridNum above was
+	// derived from the volatility-blend range (up to 25%), while the
+	// persisted bounds come from supportResistanceRange — usually much
+	// narrower. A 13% range's level count spread over a 5% S/R span gives
+	// 0.11% steps that only die at the fee-gate (prod 2026-09-05: the whole
+	// scan starved). Re-derive the count from the span that actually ships.
+	if srSpanPct := (upperFloat - lowerFloat) / lowerFloat * 100; srSpanPct > 0 {
+		gridNum = GridLevelsForRange(srSpanPct, config.NotionalPerBot)
+	}
 
 	leverage := config.BaseLeverage
 	if config.AdaptiveLeverage {
