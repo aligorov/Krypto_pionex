@@ -452,8 +452,22 @@ func scoreCandidate(
 	if profitFactor < config.MinProfitFactor {
 		reasons = append(reasons, "model profit factor below limit")
 	}
-	if !ValidateMinGridStep(gridStep*100, config.FeeBps, config.SlippageBps) {
-		reasons = append(reasons, "grid step too narrow for trading fees")
+	// v2.0.89-A fee-gate (P1, best-practice research): the invariant
+	// «level step ≥ 2× round-trip costs» evaluated on the FINAL persisted
+	// geometry — the support/resistance span the candidate actually stores,
+	// divided by the density-derived level count (the only count there is:
+	// any AI Kit row clamp would land on this same GridNum). The old check
+	// compared the volatility MODEL span, which passed while the persisted
+	// S/R span ran ~2.5× tighter — a 7d prod audit put 46.5% of ACCEPTED
+	// candidates on sub-0.28% steps, grids that pay the feed more per
+	// traverse than they can harvest.
+	feeGateStepPct := gridStep * 100 // volatility-span fallback (degenerate S/R range)
+	if upperFloat > lowerFloat && lowerFloat > 0 {
+		srSpanPct := (upperFloat - lowerFloat) / ((upperFloat + lowerFloat) / 2) * 100
+		feeGateStepPct = GridStepPctForSpan(srSpanPct, gridNum)
+	}
+	if feeReason, violated := FeeGateRejection(feeGateStepPct, config.FeeBps, config.SlippageBps); violated {
+		reasons = append(reasons, feeReason)
 	}
 	if regime.IsSqueeze && recommendedTrend == "no_trend" {
 		reasons = append(reasons, "volatility squeeze: impending explosive breakout")
@@ -579,6 +593,17 @@ func scoreCandidate(
 			"confluence veto: Hurst %.2f > 0.55 — persistent trend regime, neutral grid would load one-sided inventory",
 			bundle.Hurst))
 	}
+	// Kaufman Efficiency Ratio gate (v2.0.89-A, P2): ER = |p_N − p_0| /
+	// Σ|p_i − p_{i−1}| over the SAME lookback candles the regime and ATR
+	// readings come from — zero extra API calls. ER > 0.60 means the tape is
+	// directional/effective: a NEUTRAL grid would harvest the trend's scraps
+	// while loading one-sided inventory, so the candidate is vetoed. The
+	// mean-reversion side (ER < 0.30) never blocks — it rides in
+	// model_assumptions (kaufmanER / kaufmanRegime) as calibration telemetry.
+	if recommendedTrend == "no_trend" && bundle.KaufmanER > KaufmanERTrendVeto {
+		reasons = append(reasons, fmt.Sprintf(
+			"Kaufman ER %.2f — направленное движение, сетка не входит", bundle.KaufmanER))
+	}
 
 	decision := "ACCEPTED"
 	if len(reasons) > 0 {
@@ -694,6 +719,8 @@ func scoreCandidate(
 			"atrPct":              regime.ATRPct,
 			"volatilityParkinson": volParkinson,
 			"hurst":               bundle.Hurst,
+			"kaufmanER":           bundle.KaufmanER,
+			"kaufmanRegime":       kaufmanRegimeLabel(bundle.KaufmanER),
 			"confluence": map[string]any{
 				"verdict":           confluence.Verdict,
 				"strength":          confluence.Strength,

@@ -64,16 +64,21 @@ type Settings struct {
 	// surplus on one SNXXX trade), BAND3 = band3+underwater+dwell+age gates,
 	// STRICT = BAND3 gates plus dist_to_stop < 0.5 ATR.
 	RadarAutoCloseMode string `json:"radarAutoCloseMode"` // OFF / BAND3 / STRICT
-	AIKitEnabled       bool   `json:"aiKitEnabled"`
-	AIAutotuneEnabled       bool            `json:"aiAutotuneEnabled"`
-	AIAutotuneInterval      int             `json:"aiAutotuneIntervalSeconds"`
-	LastAutotuneAt          *time.Time      `json:"lastAutotuneAt"`
-	LastAutotuneNotes       *string         `json:"lastAutotuneNotes"`
-	LastError               *string         `json:"lastError"`
-	LastStartedAt           *time.Time      `json:"lastStartedAt"`
-	LastStoppedAt           *time.Time      `json:"lastStoppedAt"`
-	CreatedAt               time.Time       `json:"createdAt"`
-	UpdatedAt               time.Time       `json:"updatedAt"`
+	// DgtRedeployEnabled (v2.0.89 part B, migration 0046): on a RANGE_BREAK_*
+	// close, immediately re-open the symbol as a fresh grid centered on the
+	// break price with the same slot capital (arXiv 2506.11921). One switch
+	// for BOTH paper and REAL — parity by directive.
+	DgtRedeployEnabled bool       `json:"dgtRedeployEnabled"`
+	AIKitEnabled       bool       `json:"aiKitEnabled"`
+	AIAutotuneEnabled  bool       `json:"aiAutotuneEnabled"`
+	AIAutotuneInterval int        `json:"aiAutotuneIntervalSeconds"`
+	LastAutotuneAt     *time.Time `json:"lastAutotuneAt"`
+	LastAutotuneNotes  *string    `json:"lastAutotuneNotes"`
+	LastError          *string    `json:"lastError"`
+	LastStartedAt      *time.Time `json:"lastStartedAt"`
+	LastStoppedAt      *time.Time `json:"lastStoppedAt"`
+	CreatedAt          time.Time  `json:"createdAt"`
+	UpdatedAt          time.Time  `json:"updatedAt"`
 }
 
 type UpdateSettingsInput struct {
@@ -108,9 +113,13 @@ type UpdateSettingsInput struct {
 	MaxAdjustmentsPerBot    int             `json:"maxAdjustmentsPerBot"`
 	StopForecastMode        string          `json:"stopForecastMode"`
 	RadarAutoCloseMode      string          `json:"radarAutoCloseMode"` // OFF / BAND3 / STRICT
-	AIKitEnabled            bool            `json:"aiKitEnabled"`
-	AIAutotuneEnabled       bool            `json:"aiAutotuneEnabled"`
-	AIAutotuneInterval      int             `json:"aiAutotuneIntervalSeconds"`
+	// DgtRedeployEnabled is optional in updates: nil preserves the stored
+	// value (the v2.0.16 pnl_target_mode blanking lesson — a partial form
+	// must not silently disarm the DGT re-deploy layer).
+	DgtRedeployEnabled *bool `json:"dgtRedeployEnabled"`
+	AIKitEnabled       bool  `json:"aiKitEnabled"`
+	AIAutotuneEnabled  bool  `json:"aiAutotuneEnabled"`
+	AIAutotuneInterval int   `json:"aiAutotuneIntervalSeconds"`
 }
 
 type ScanRun struct {
@@ -178,12 +187,12 @@ type ActiveBot struct {
 }
 
 type ClosedBot struct {
-	ID              string           `json:"id"`
-	BotNumber       int              `json:"botNumber"`
-	Source          string           `json:"source"`
-	Symbol          string           `json:"symbol"`
-	Direction       string           `json:"direction"`
-	QuoteInvestment decimal.Decimal  `json:"quoteInvestment"`
+	ID              string          `json:"id"`
+	BotNumber       int             `json:"botNumber"`
+	Source          string          `json:"source"`
+	Symbol          string          `json:"symbol"`
+	Direction       string          `json:"direction"`
+	QuoteInvestment decimal.Decimal `json:"quoteInvestment"`
 	// RealizedPNLUSDT is NULL when the exchange refused to settle a final
 	// (the honesty gate NULLs a grid-only positive on a loss-class close).
 	// v2.0.88: the value is no longer COALESCEd to zero — a stop-loss that
@@ -196,22 +205,22 @@ type ClosedBot struct {
 	// aggregate can never disagree. nil when realized is known or no
 	// telemetry exists at all.
 	EstimatedFinalUSDT *decimal.Decimal `json:"estimatedFinalUsdt,omitempty"`
-	ClosedReason    *string          `json:"closedReason"`
-	Status          string           `json:"status"`
-	ClosedAt        *time.Time       `json:"closedAt"`
+	ClosedReason       *string          `json:"closedReason"`
+	Status             string           `json:"status"`
+	ClosedAt           *time.Time       `json:"closedAt"`
 }
 
 type State struct {
-	Settings            Settings          `json:"settings"`
-	LastScan            *ScanRun          `json:"lastScan"`
-	Candidates          []Candidate       `json:"candidates"`
-	ActiveBots          []ActiveBot       `json:"activeBots"`
-	ClosedBots          []ClosedBot       `json:"closedBots"`
-	PnL                 PnLBreakdown      `json:"pnl"`
+	Settings            Settings              `json:"settings"`
+	LastScan            *ScanRun              `json:"lastScan"`
+	Candidates          []Candidate           `json:"candidates"`
+	ActiveBots          []ActiveBot           `json:"activeBots"`
+	ClosedBots          []ClosedBot           `json:"closedBots"`
+	PnL                 PnLBreakdown          `json:"pnl"`
 	Epoch               *AccountEquitySummary `json:"epoch,omitempty"`
-	Exchange            *ExchangeSnapshot `json:"exchange,omitempty"`
-	MetricDefinitions   map[string]string `json:"metricDefinitions"`
-	FeatureAvailability map[string]string `json:"featureAvailability"`
+	Exchange            *ExchangeSnapshot     `json:"exchange,omitempty"`
+	MetricDefinitions   map[string]string     `json:"metricDefinitions"`
+	FeatureAvailability map[string]string     `json:"featureAvailability"`
 }
 
 // PnLBreakdown keeps simulated and real money strictly separated: PAPER
@@ -270,11 +279,11 @@ type Service struct {
 	// epochMu/epochCache memoize the epoch summary (v2.0.88 «одна правда на
 	// экране»): the state payload and the /equity endpoint share ONE figure
 	// and the 5-second UI poll must not re-run the aggregate per hit.
-	epochMu    sync.Mutex
-	epochCache *epochCacheEntry
-	clientMu   sync.Mutex
+	epochMu     sync.Mutex
+	epochCache  *epochCacheEntry
+	clientMu    sync.Mutex
 	clientCache map[string]*clientCacheEntry
-	publicAPI     *pionex.Client
+	publicAPI   *pionex.Client
 }
 
 func NewService(db *pgxpool.Pool, riskEngine *risk.Engine) *Service {
@@ -334,7 +343,7 @@ func (s *Service) GetSettings(ctx context.Context) (*Settings, error) {
 		       pnl_target_mode, pnl_target_usdt, max_loss_usdt, manage_interval_seconds,
 		       range_break_buffer_pct, max_adjustments_per_bot,
 		       tranche_deploy_enabled, stop_forecast_mode, radar_autoclose_mode,
-		       ai_kit_enabled,
+		       dgt_redeploy_enabled, ai_kit_enabled,
 		       ai_autotune_enabled, ai_autotune_interval_seconds,
 		       last_autotune_at, last_autotune_notes,
 		       last_error,
@@ -412,6 +421,12 @@ func (s *Service) UpdateSettings(
 	if err := s.validateSettings(ctx, input); err != nil {
 		return nil, err
 	}
+	// DGT re-deploy switch: preserve-on-omit (nil input keeps the stored
+	// value) — same contract as the mode switches above.
+	dgtRedeploy := current.DgtRedeployEnabled
+	if input.DgtRedeployEnabled != nil {
+		dgtRedeploy = *input.DgtRedeployEnabled
+	}
 	accountID := input.AccountID
 	if accountID != nil && strings.TrimSpace(*accountID) == "" {
 		accountID = nil
@@ -432,7 +447,7 @@ func (s *Service) UpdateSettings(
 		    max_adjustments_per_bot = $29, ai_kit_enabled = $30,
 		    ai_autotune_enabled = $31, ai_autotune_interval_seconds = $32,
 		    tranche_deploy_enabled = $34, stop_forecast_mode = $35,
-		    radar_autoclose_mode = $36,
+		    radar_autoclose_mode = $36, dgt_redeploy_enabled = $37,
 		    last_error = NULL, updated_at = NOW()
 		WHERE scope_key = $1
 	`, DefaultScope, accountID, input.ExecutionMode, input.BudgetUSDT,
@@ -446,7 +461,8 @@ func (s *Service) UpdateSettings(
 		input.PnLTargetUSDT, input.MaxLossUSDT, input.ManageIntervalSeconds,
 		input.RangeBreakBufferPct, input.MaxAdjustmentsPerBot, input.AIKitEnabled,
 		input.AIAutotuneEnabled, input.AIAutotuneInterval, input.ScanMode,
-		current.TrancheDeployEnabled, input.StopForecastMode, input.RadarAutoCloseMode)
+		current.TrancheDeployEnabled, input.StopForecastMode, input.RadarAutoCloseMode,
+		dgtRedeploy)
 	if err != nil {
 		return nil, fmt.Errorf("update AutoGrid settings: %w", err)
 	}
@@ -1454,7 +1470,8 @@ func settingsScanTargets(item *Settings) []any {
 		&item.SlippageBps, &item.PaperFundingRateBps,
 		&item.PnLTargetMode, &item.PnLTargetUSDT, &item.MaxLossUSDT,
 		&item.ManageIntervalSeconds, &item.RangeBreakBufferPct,
-		&item.MaxAdjustmentsPerBot, &item.TrancheDeployEnabled, &item.StopForecastMode, &item.RadarAutoCloseMode, &item.AIKitEnabled,
+		&item.MaxAdjustmentsPerBot, &item.TrancheDeployEnabled, &item.StopForecastMode, &item.RadarAutoCloseMode,
+		&item.DgtRedeployEnabled, &item.AIKitEnabled,
 		&item.AIAutotuneEnabled, &item.AIAutotuneInterval,
 		&item.LastAutotuneAt, &item.LastAutotuneNotes,
 		&item.LastError, &item.LastStartedAt,
@@ -2245,6 +2262,19 @@ func (s *Service) DeployManualBot(
 	}
 	if row < 2 || row > 500 {
 		return nil, "", errors.New("grid row must be between 2 and 500")
+	}
+	// v2.0.89-A fee-gate (P1): the invariant «level step ≥ 2× round-trip
+	// costs» on the FINAL geometry — lower/upper over the row AFTER every
+	// fallback (explicit operator input, density derivation, candidate
+	// carry-over; an AI Kit prefill row lands here unchanged too). Placed
+	// BEFORE the mode branch on purpose: PAPER and REAL deploys share the
+	// same rule, the same numbers and the same text — parity by directive.
+	feeGateMid := lower.Add(upper).Div(decimal.NewFromInt(2))
+	feeGateSpanPct := upper.Sub(lower).Div(feeGateMid).InexactFloat64() * 100
+	if feeReason, violated := marketdata.FeeGateRejection(
+		marketdata.GridStepPctForSpan(feeGateSpanPct, row),
+		settings.FeeBps.InexactFloat64(), settings.SlippageBps.InexactFloat64()); violated {
+		return nil, "", errors.New(feeReason)
 	}
 	// A grid that does not bracket the live price cannot trade and would be
 	// closed by the management loop as a range break on its first cycle.

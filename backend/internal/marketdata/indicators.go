@@ -9,17 +9,18 @@ import "math"
 // voice (IFT-RSI), fair-price stretch (anchored VWAP) and volatility phase
 // (Keltner squeeze).
 type IndicatorBundle struct {
-	Hurst    float64              // DFA estimate, ~0.5 random walk; <0.45 mean-reverting, >0.58 trending
-	HurstOK  bool                 // enough data for a meaningful estimate
-	OBVDiv   OBVDivergence        // volume flow versus price pivots
-	IFT      IFTRSIResult         // early momentum turn (Vervoort inverse Fisher on RSI)
-	AVWAP    AVWAPResult          // stretch versus volume-weighted fair price since anchor
-	Keltner  KeltnerSqueeze       // volatility phase: squeeze / release direction
-	Fib      FibonacciRetracement // Fibonacci retracement levels & golden pocket detection
-	SR       SRAnalysisResult     // Multi-swing support & resistance shelves
-	MACD     MACDResult           // MACD (12, 26, 9) line, signal, histogram & crossovers
-	StochRSI StochRSIResult       // Stochastic RSI (14, 14, 3, 3) %K/%D and overbought/oversold crosses
-	RSIDiv   RSIDivergence        // RSI regular divergence versus price swings
+	Hurst     float64              // DFA estimate, ~0.5 random walk; <0.45 mean-reverting, >0.58 trending
+	HurstOK   bool                 // enough data for a meaningful estimate
+	KaufmanER float64              // Kaufman Efficiency Ratio: 0 pure chop .. 1 pure trend
+	OBVDiv    OBVDivergence        // volume flow versus price pivots
+	IFT       IFTRSIResult         // early momentum turn (Vervoort inverse Fisher on RSI)
+	AVWAP     AVWAPResult          // stretch versus volume-weighted fair price since anchor
+	Keltner   KeltnerSqueeze       // volatility phase: squeeze / release direction
+	Fib       FibonacciRetracement // Fibonacci retracement levels & golden pocket detection
+	SR        SRAnalysisResult     // Multi-swing support & resistance shelves
+	MACD      MACDResult           // MACD (12, 26, 9) line, signal, histogram & crossovers
+	StochRSI  StochRSIResult       // Stochastic RSI (14, 14, 3, 3) %K/%D and overbought/oversold crosses
+	RSIDiv    RSIDivergence        // RSI regular divergence versus price swings
 }
 
 // OBVDivergence detects a regular divergence between price pivots and the
@@ -85,7 +86,14 @@ func ComputeIndicatorBundle(s *Series) IndicatorBundle {
 	bundle := IndicatorBundle{
 		IFT: IFTRSIResult{Current: 0, Prev: 0},
 	}
-	if s == nil || s.Len() < 40 {
+	if s == nil {
+		return bundle
+	}
+	// Kaufman ER needs only two points — unlike the heavier confluence
+	// components it stays meaningful on the short windows (30-39 candles)
+	// the rest of the bundle refuses.
+	bundle.KaufmanER = KaufmanER(s.Close)
+	if s.Len() < 40 {
 		return bundle
 	}
 	bundle.Hurst, bundle.HurstOK = HurstDFA(s.Close)
@@ -100,6 +108,65 @@ func ComputeIndicatorBundle(s *Series) IndicatorBundle {
 	bundle.StochRSI = ComputeStochRSI(s.Close)
 	bundle.RSIDiv = DetectRSIDivergence(s.Close, 40)
 	return bundle
+}
+
+// Kaufman Efficiency Ratio band (v2.0.89-A, P2 research fix).
+const (
+	// KaufmanERTrendVeto: above this ER the tape is directional/effective
+	// and NEUTRAL grid candidates are vetoed — a range grid on an efficient
+	// market only harvests the trend's scraps while loading one-sided
+	// inventory.
+	KaufmanERTrendVeto = 0.60
+	// KaufmanERMeanReversion: below this ER the tape mean-reverts — the
+	// natural habitat of a range grid. Pure telemetry (model_assumptions
+	// kaufmanER / kaufmanRegime): it never blocks and never reshapes the
+	// score by design.
+	KaufmanERMeanReversion = 0.30
+)
+
+// KaufmanER computes the Kaufman Efficiency Ratio over the full window:
+//
+//	ER = |p_N − p_0| / Σ|p_i − p_{i−1}|
+//
+// The numerator is the net displacement, the denominator the total path
+// traveled. ER → 1 on a perfectly directional tape (every candle pushes the
+// same way), ER → 0 on a pure sawtooth that ends where it started. Computed
+// on the same lookback candles the scanner already fetches for the regime
+// and ATR readings — zero extra API calls.
+func KaufmanER(closes []float64) float64 {
+	n := len(closes)
+	if n < 2 {
+		return 0
+	}
+	netChange := math.Abs(closes[n-1] - closes[0])
+	path := 0.0
+	for i := 1; i < n; i++ {
+		path += math.Abs(closes[i] - closes[i-1])
+	}
+	if path <= 0 {
+		return 0
+	}
+	er := netChange / path
+	if er < 0 {
+		return 0
+	}
+	if er > 1 {
+		return 1 // float dust: net can exceed path by an ulp on monotone series
+	}
+	return er
+}
+
+// kaufmanRegimeLabel buckets the ER reading for the model_assumptions
+// telemetry: trending / mean_reversion / neutral.
+func kaufmanRegimeLabel(er float64) string {
+	switch {
+	case er > KaufmanERTrendVeto:
+		return "trending"
+	case er < KaufmanERMeanReversion:
+		return "mean_reversion"
+	default:
+		return "neutral"
+	}
 }
 
 // HurstDFA estimates the Hurst exponent with Detrended Fluctuation Analysis

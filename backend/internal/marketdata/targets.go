@@ -1,6 +1,7 @@
 package marketdata
 
 import (
+	"fmt"
 	"math"
 )
 
@@ -162,9 +163,45 @@ func GridLevelsForRange(rangePct, notionalUSDT float64) int {
 	return int(clamp(levels, gridLevelsMin, gridLevelsMax))
 }
 
-// ValidateMinGridStep checks if the grid step % is large enough to exceed
-// round-trip friction (taker/maker fee and slippage).
+// RoundTripCostPct returns the friction of ONE grid level round trip in
+// percent of price: two legs (buy + sell), each paying feeBps + slippageBps.
+// At the fleet defaults (5 bps fee / 2 bps slippage) that is
+// 2 × 7 / 100 = 0.14% — the level step must clear twice THAT.
+func RoundTripCostPct(feeBps, slippageBps float64) float64 {
+	return 2.0 * (feeBps + slippageBps) / 100.0 // bps → %, × 2 legs
+}
+
+// ValidateMinGridStep checks the v2.0.89 fee-gate invariant: the per-level
+// step must be at least 2× the round-trip cost (fee + slippage on both
+// legs). A grid whose step is below that bar pays the market more per
+// traverse than it can ever harvest from it — it is guaranteed to bleed on
+// commissions regardless of how often price oscillates.
 func ValidateMinGridStep(stepPct, feeBps, slippageBps float64) bool {
-	frictionPct := 2.0 * (feeBps + slippageBps) / 100.0 // Bps to percent
-	return stepPct >= frictionPct*1.5                   // Ensure at least 50% margin over friction
+	return stepPct >= 2.0*RoundTripCostPct(feeBps, slippageBps)
+}
+
+// FeeGateRejection is the shared fee-gate verdict (v2.0.89-A research fix,
+// P1). stepPct is the FINAL realized step of the grid — span_pct / grid_num
+// computed on the geometry that will actually be persisted/deployed, AFTER
+// every level-count clamp (density doctrine, AI Kit row, manual row). It
+// returns the operator-facing rejection reason when the 2× round-trip
+// invariant is violated, or ("", false) when the step clears the bar.
+func FeeGateRejection(stepPct, feeBps, slippageBps float64) (string, bool) {
+	roundTripPct := RoundTripCostPct(feeBps, slippageBps)
+	if stepPct >= 2.0*roundTripPct {
+		return "", false
+	}
+	return fmt.Sprintf(
+		"шаг уровня %.2f%% < 2× round-trip издержек %.2f%% — сетка гарантированно в минус на комиссиях (fee-gate)",
+		stepPct, roundTripPct), true
+}
+
+// GridStepPctForSpan is the realized per-level step of a grid: the span in
+// percent of midline divided by the FINAL level count. gridNum < 1 yields 0
+// (callers treat 0 as "no valid geometry" and the gate falls back).
+func GridStepPctForSpan(spanPct float64, gridNum int) float64 {
+	if gridNum < 1 || spanPct <= 0 {
+		return 0
+	}
+	return spanPct / float64(gridNum)
 }

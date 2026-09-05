@@ -32,6 +32,15 @@ func (m *mockMarketClient) GetKlines(ctx context.Context, symbol, interval strin
 	return synthCandles(func(i int) float64 { return 100 + 2*math.Sin(float64(i)/3) }, limit), nil
 }
 
+func squareWave(base, amplitude float64) func(i int) float64 {
+	return func(i int) float64 {
+		if i%2 == 0 {
+			return base + amplitude
+		}
+		return base - amplitude
+	}
+}
+
 func TestParkinsonVolatility(t *testing.T) {
 	candles := synthCandles(func(i int) float64 { return 100 + math.Sin(float64(i)) }, 50)
 	vol := parkinsonVolatility(candles, 24)
@@ -56,10 +65,15 @@ func TestScannerMultiTierPipeline(t *testing.T) {
 		{Symbol: "PUMP_USDT", Open: decimal.NewFromFloat(1), Close: decimal.NewFromFloat(2.5), Amount: decimal.NewFromFloat(8000000)},
 	}
 
+	// Alternating ±amplitude square waves (wicks from synthCandles keep the
+	// last close ~25-35% into the channel and RSI mid-band): the accept
+	// branch of this pipeline test stays live in the v2.0.89-A world where
+	// realistic fees reject these synthetic grids (exact fee-gate numbers
+	// are pinned in fee_gate_test.go).
 	klines := map[string][]pionex.KlineCandle{
-		"BTC_USDT": synthCandles(func(i int) float64 { return 60000 + 500*math.Sin(float64(i)/3) }, 80),
-		"ETH_USDT": synthCandles(func(i int) float64 { return 3000 + 40*math.Sin(float64(i)/4) }, 80),
-		"SOL_USDT": synthCandles(func(i int) float64 { return 150 + 3*math.Sin(float64(i)/2) }, 80),
+		"BTC_USDT": synthCandles(squareWave(60000, 250), 80),
+		"ETH_USDT": synthCandles(squareWave(3000, 40), 80),
+		"SOL_USDT": synthCandles(squareWave(150, 3), 80),
 	}
 
 	mock := &mockMarketClient{symbols: symbols, tickers: tickers, klines: klines}
@@ -76,10 +90,15 @@ func TestScannerMultiTierPipeline(t *testing.T) {
 		MinSharpe:           0.1,
 		MaxDrawdownPct:      25.0,
 		MinProfitFactor:     1.0,
-		FeeBps:              5.0,
-		SlippageBps:         5.0,
-		BaseLeverage:        2,
-		AdaptiveLeverage:    true,
+		// Zero friction keeps this PIPELINE test on the accept path: the
+		// v2.0.89-A fee-gate (2× round-trip, see fee_gate_test.go) would
+		// rightly reject these synthetic ~0.1-0.25%-step sawtooth grids at
+		// realistic 5/5 bps — its exact numbers are pinned in the dedicated
+		// fee-gate tests, not here.
+		FeeBps:           0.0,
+		SlippageBps:      0.0,
+		BaseLeverage:     2,
+		AdaptiveLeverage: true,
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -102,8 +121,10 @@ func TestScannerMultiTierPipeline(t *testing.T) {
 	}
 
 	// Verify that candidates have computed Choppiness and Parkinson metrics
+	acceptedCount := 0
 	for _, c := range candidates {
 		if c.Decision == "ACCEPTED" {
+			acceptedCount++
 			if c.Score <= 0 {
 				t.Fatalf("expected positive score for accepted candidate %s, got %f", c.Symbol, c.Score)
 			}
@@ -111,6 +132,12 @@ func TestScannerMultiTierPipeline(t *testing.T) {
 				t.Fatalf("expected positive grid count for %s, got %d", c.Symbol, c.GridNum)
 			}
 		}
+	}
+	// Non-vacuous accept branch: the zero-friction config must keep at
+	// least one candidate ACCEPTED (2026-09 probe: the old sine patterns
+	// ended at channel extremes and silently emptied this loop).
+	if acceptedCount == 0 {
+		t.Fatal("expected at least one ACCEPTED candidate under the frictionless config")
 	}
 }
 

@@ -55,8 +55,13 @@ const realFundingReconcileInterval = 30 * time.Minute
 // manual closes write 'MANUAL_CLOSE'/'MCP_MANUAL_CLOSE'. A missing entry
 // turns a routine fleet stop into N "protective closes" that freeze deploys
 // for an hour plus 2h per-symbol cooldowns.
+// v2.0.89 part B: GRID_AGED_HALF_LIFE joins the exempts — the OU half-life
+// rotation is a PLANNED thesis-expiry exit, not a death: it must neither
+// lock the symbol out of the scanner's next entry nor feed the portfolio
+// breaker (a synchronized age wave would otherwise freeze deploys for an
+// hour with zero protective meaning).
 const protectiveCloseExemptReasons = `'TAKE_PROFIT', 'TAKE_PROFIT_NATIVE', 'TRAILING_TAKE_PROFIT', 'BREAKEVEN_LOCK',
-	'RANGE_BREAK_UP_PROFIT_TAKE',
+	'RANGE_BREAK_UP_PROFIT_TAKE', 'GRID_AGED_HALF_LIFE',
 	'MANUAL_CLOSE', 'MCP_MANUAL_CLOSE', 'USER_CANCEL', 'ALREADY_CLOSED', 'EXTERNAL_CLOSE', 'REMOTE_FAILED',
 	'STOPPED', 'EMERGENCY_STOPPED', 'AUTOGRID_STOP', 'EMERGENCY_STOP',
 	'DELISTED_NO_PRICE'`
@@ -89,6 +94,11 @@ type Worker struct {
 	// trancheTBRegime — radarPass runs on the manage loop). Deliberately not
 	// durable: it is a measurement, not a cooldown.
 	radarPriceTrail map[string]radarPricePoint
+	// ouReadings caches the per-symbol OU half-life + fresh ATR reading the
+	// grid lifecycle policy shares between the half-life age rotation and
+	// the DGT re-deploy geometry (v2.0.89 part B). TTL 30m; same
+	// single-goroutine argument as trancheTBRegime — the manage loop owns it.
+	ouReadings map[string]ouSymbolReading
 }
 
 type trancheTBTrend struct {
@@ -129,6 +139,7 @@ func NewWorker(
 		trancheTBRegime: make(map[string]trancheTBTrend),
 		dataAlarmAt:     make(map[string]time.Time),
 		radarPriceTrail: make(map[string]radarPricePoint),
+		ouReadings:      make(map[string]ouSymbolReading),
 	}
 }
 
@@ -3063,6 +3074,49 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 		if price.IsZero() {
 			continue
 		}
+		// v2.0.89 part B — OU half-life age rotation (REAL arm, paper-parity):
+		// a bot older than clamp(2×HL, 4h, 48h) has outlived its fitted
+		// range. Close by market (STOP_REQUESTED + native cancel, the exact
+		// decision-close machinery below); the slot returns to the scanner,
+		// never to a DGT re-center. Placed before the break matrix so a stale
+		// range cannot hide behind a HOLD.
+		{
+			botAge := time.Since(bot.createdAt)
+			ageVerdict := gridAgeVerdictFor(worker.ouReadingForSymbol(ctx, bot.symbol, *settings), botAge)
+			if ageVerdict.rotate {
+				totalPnL := realized.Add(unrealized)
+				_, _ = worker.db.Exec(ctx, `
+					UPDATE grid_bots
+					SET status = 'STOP_REQUESTED', closed_reason = $2,
+					    model_state = jsonb_set(jsonb_set(COALESCE(model_state, '{}'::jsonb),
+					        '{halfLifeHours}', to_jsonb($3::FLOAT8)),
+					        '{maxAgeHours}', to_jsonb($4::FLOAT8)),
+					    updated_at = NOW()
+					WHERE id = $1 AND status = 'RUNNING'
+				`, bot.id, gridAgedHalfLifeReason, ageVerdict.halfLifeHours, ageVerdict.maxAgeHours)
+				if err := worker.cancelRealBot(ctx, client, bot.id, bot.remoteID, "autogrid "+gridAgedHalfLifeReason); err != nil {
+					worker.logger.Error("close REAL bot by half-life rotation",
+						"component", "autogrid_worker", "bot_id", bot.id, "error", err)
+				} else {
+					worker.logger.Info("REAL bot rotated by OU half-life",
+						"component", "autogrid_worker", "symbol", bot.symbol,
+						"age_hours", botAge.Hours(), "max_age_hours", ageVerdict.maxAgeHours)
+					pnlPct := decimal.Zero
+					if !bot.investment.IsZero() {
+						pnlPct = totalPnL.Div(bot.investment).Mul(decimal.NewFromInt(100)).Round(2)
+					}
+					_ = LogBotEvent(ctx, worker.db, bot.id, bot.botNumber, "REAL", bot.symbol,
+						gridAgedHalfLifeReason, &price, &totalPnL, map[string]any{
+							"reason": gridAgedHalfLifeReason, "pnlPct": pnlPct,
+							"age_hours":       botAge.Hours(),
+							"max_age_hours":   ageVerdict.maxAgeHours,
+							"half_life_hours": ageVerdict.halfLifeHours,
+						})
+					queueGridAgedTelegram(ctx, worker, "REAL", bot.botNumber, bot.symbol, ageVerdict, botAge)
+				}
+				continue
+			}
+		}
 		// Fetch the regime lazily: klines are only needed once price escapes
 		// the grid range, otherwise the decision is HOLD anyway.
 		regime := ""
@@ -3462,6 +3516,26 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 					"pnl_usdt": totalPnL.StringFixed(4), "pnl_pct": pnlPct.StringFixed(2),
 					"reason": decision.Reason,
 				})
+				// v2.0.89 part B — DGT break re-deploy (REAL arm, paper-parity):
+				// the native cancel was accepted; a RANGE_BREAK_* close QUEUES
+				// the re-deploy intent on the row. It executes from
+				// processDgtRealRedeployIntents the moment the parent settles
+				// terminal — centering the fresh grid on the break price with
+				// the same slot capital, through the same native lifecycle a
+				// deploy uses. When blocked or disabled the old scanner-owned
+				// behavior is exactly what remains.
+				if settings.DgtRedeployEnabled && dgtBreakRedeployReason(decision.Reason) {
+					worker.dgtQueueRealRedeploy(ctx, *settings, dgtRedeploySpec{
+						symbol:       bot.symbol,
+						direction:    bot.direction,
+						breakPrice:   price,
+						slotBudget:   slotCapital(bot.trancheBase, bot.investment),
+						oldBotID:     bot.id,
+						oldBotNumber: bot.botNumber,
+						atrFallback:  bot.atrEntry,
+						accountID:    bot.accountID,
+					})
+				}
 			}
 		case ActionAdjustUp, ActionAdjustDown:
 			if !price.GreaterThan(decimal.Zero) {
@@ -3685,6 +3759,12 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 	// truth by the passes above (running persist, terminal settle, 48h
 	// backfill). Self-throttled to 5 minutes by the snapshot table.
 	worker.captureBotAggregateEquity(ctx, *settings)
+
+	// v2.0.89 part B: execute queued DGT re-deploys whose parent row has
+	// settled terminal in this pass (or a previous one) — the REAL arm of
+	// the break re-start, AFTER every settle path had its chance to write
+	// the terminal state the intent gate keys on.
+	worker.processDgtRealRedeployIntents(ctx, *settings)
 
 	return clampInterval(settings.ManageIntervalSeconds), nil
 }
@@ -4335,6 +4415,53 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 			peakPnL = decimal.Zero
 		}
 
+		// v2.0.89 part B — OU half-life age rotation (paper arm): a bot
+		// older than clamp(2×HL, 4h, 48h) has outlived the range its mesh
+		// was fitted to. Soft rotation at the current mark; the slot returns
+		// to the SCANNER (plain recycle — never a DGT re-center here, the
+		// aged thesis says nothing about where to re-enter). Runs before the
+		// break matrix so a stale range cannot hide behind a HOLD.
+		{
+			ageVerdict := gridAgeVerdictFor(worker.ouReadingForSymbol(ctx, bot.symbol, settings), time.Since(bot.openedAt))
+			if ageVerdict.rotate {
+				_, err := worker.db.Exec(ctx, `
+					UPDATE paper_grid_bots
+					SET status = 'COMPLETED', closed_reason = $2,
+					    realized_pnl_usdt = $3, unrealized_pnl_usdt = 0,
+					    peak_pnl_usdt = GREATEST(peak_pnl_usdt, $3),
+					    mark_price = $4, last_grid_level = $5,
+					    model_state = jsonb_set(jsonb_set(COALESCE(model_state, '{}'::jsonb),
+					        '{halfLifeHours}', to_jsonb($6::FLOAT8)),
+					        '{maxAgeHours}', to_jsonb($7::FLOAT8)),
+					    closed_at = NOW(), updated_at = NOW()
+					WHERE id = $1 AND status = 'RUNNING'
+				`, bot.id, gridAgedHalfLifeReason, total, price, currentLevel,
+					ageVerdict.halfLifeHours, ageVerdict.maxAgeHours)
+				if err != nil {
+					return fmt.Errorf("close paper bot %s: %w", bot.symbol, err)
+				}
+				worker.logger.Info("paper bot rotated by OU half-life",
+					"component", "autogrid_worker", "symbol", bot.symbol,
+					"age_hours", time.Since(bot.openedAt).Hours(),
+					"max_age_hours", ageVerdict.maxAgeHours, "pnl", total.String())
+				recordCandidateOutcome(ctx, worker.db, bot.candidateID, total, gridAgedHalfLifeReason)
+				pnlPct := decimal.Zero
+				if !bot.investment.IsZero() {
+					pnlPct = total.Div(bot.investment).Mul(decimal.NewFromInt(100)).Round(2)
+				}
+				_ = LogBotEvent(ctx, worker.db, bot.id, bot.botNumber, "PAPER", bot.symbol,
+					gridAgedHalfLifeReason, &price, &total, map[string]any{
+						"reason": gridAgedHalfLifeReason, "pnlPct": pnlPct,
+						"age_hours":       time.Since(bot.openedAt).Hours(),
+						"max_age_hours":   ageVerdict.maxAgeHours,
+						"half_life_hours": ageVerdict.halfLifeHours,
+					})
+				queueGridAgedTelegram(ctx, worker, "PAPER", bot.botNumber, bot.symbol,
+					ageVerdict, time.Since(bot.openedAt))
+				continue
+			}
+		}
+
 		// Lazily detect regime only when price escapes the range
 		regime := ""
 		buffer := settings.RangeBreakBufferPct.Div(decimal.NewFromInt(100))
@@ -4396,6 +4523,25 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 				"pnl_usdt": total.StringFixed(4), "pnl_pct": pnlPct.StringFixed(2),
 				"reason": decision.Reason,
 			})
+			// v2.0.89 part B — DGT break re-deploy (paper arm): the settle
+			// above is done, the slot is free; a RANGE_BREAK_* close now
+			// re-opens the symbol IMMEDIATELY, centered on the break price
+			// with the same slot capital (arXiv 2506.11921). The re-deploy
+			// carries its own gate set (macro/econ/portfolio/risk/ladder) —
+			// see grid_lifecycle_policy.go; when it is blocked or disabled
+			// the old scanner-owned behavior is exactly what remains.
+			if settings.DgtRedeployEnabled && dgtBreakRedeployReason(decision.Reason) {
+				worker.dgtRedeployPaper(ctx, settings, dgtRedeploySpec{
+					symbol:       bot.symbol,
+					direction:    bot.direction,
+					breakPrice:   price,
+					slotBudget:   slotCapital(bot.trancheBase, bot.investment),
+					oldBotID:     bot.id,
+					oldBotNumber: bot.botNumber,
+					candidateID:  bot.candidateID,
+					atrFallback:  bot.atrEntry,
+				})
+			}
 			continue
 		}
 

@@ -178,6 +178,18 @@ func QueueTelegramEvent(
 		// moment the V4 calibration made band 3 reachable.
 		shouldSend = notifyAdjust
 		tmpl = "🛡 <b>Стоп-радар:</b> бот #{{bot_number}} {{symbol}} — band {{band}} (score {{score}}), total {{total}}"
+	case "DGT_REDEPLOY":
+		// v2.0.89 part B: the DGT break re-start fired — the grid follows
+		// the market (arXiv 2506.11921). Rides the bot-created channel: a
+		// new bot exists on the fleet.
+		shouldSend = notifyCreated
+		tmpl = "🔄 <b>DGT: пробой — сетка перезапущена центром {{center_price}}</b>, символ {{symbol}} (бот #{{bot_number}}, бюджет {{budget}} USDT, диапазон [{{lower_price}}, {{upper_price}}])"
+	case "GRID_AGED_HALF_LIFE":
+		// v2.0.89 part B: the OU half-life rotation — the fitted range
+		// statistically decayed; the slot returns to the scanner. A planned
+		// exit, not an alarm: the adjust channel carries it.
+		shouldSend = notifyAdjust
+		tmpl = "⏳ <b>Half-life ротация:</b> бот #{{bot_number}} {{symbol}} ({{bot_source}}) — возраст {{age_hours}}ч превысил {{max_age_hours}}ч (OU HL {{half_life_hours}}ч), слот свободен для сканера"
 	case "RANGE_ADJUST", "ADJUST_RANGE":
 		shouldSend = notifyAdjust
 		tmpl = tmplAdjust
