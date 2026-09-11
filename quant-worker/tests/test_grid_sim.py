@@ -82,17 +82,18 @@ def test_walk_forward_survives_trend_regime():
 
 
 def test_derive_grid_params_floor_harmonized_with_go_fleet():
-    """v2.0.93 FIX-C: min_step_pct 0.28 is the Go fee-gate density floor
-    (2x round trip at the 5/2 bps fleet default) and the level clamp is the
-    Go doctrine 6..500 — the walk-forward now grades the density the bot
-    would actually ship."""
+    """v2.0.94: min_step_pct 0.35 is the Go fee-gate density floor
+    (2.5x round trip at the 5/2 bps fleet default — the 2x floor was a
+    survival minimum; the weekly mining put every stop-out of the week in
+    the band it admits) and the level clamp is the Go doctrine 6..500 —
+    the walk-forward now grades the density the bot would actually ship."""
     candles = make_oscillator(low=100.0, high=120.0)
     for fee_bps in (0.0, 7.0, 50.0):
         params = derive_grid_params(candles, fee_bps=fee_bps)
         assert params is not None
         mid = (params["upper"] + params["lower"]) / 2
         range_pct = (params["upper"] - params["lower"]) / mid * 100
-        step_floor = max(0.28, fee_bps / 100 * 1.2)
+        step_floor = max(0.35, fee_bps / 100 * 5.0)
         assert params["levels"] == int(max(6, min(500, range_pct / step_floor))), (
             f"fee_bps={fee_bps}: levels must follow span/step-floor"
         )

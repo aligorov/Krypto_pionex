@@ -470,8 +470,9 @@ func scoreCandidate(
 	if profitFactor < config.MinProfitFactor {
 		reasons = append(reasons, "model profit factor below limit")
 	}
-	// v2.0.89-A fee-gate (P1, best-practice research): the invariant
-	// «level step ≥ 2× round-trip costs» evaluated on the FINAL persisted
+	// v2.0.89-A fee-gate (P1, best-practice research; floor 2.5× since
+	// v2.0.94): the invariant «level step ≥ StepFloorRoundTripMultiple ×
+	// round-trip costs» evaluated on the FINAL persisted
 	// geometry — the support/resistance span the candidate actually stores,
 	// divided by the density-derived level count (the only count there is:
 	// any AI Kit row clamp would land on this same GridNum). The old check
@@ -506,6 +507,27 @@ func scoreCandidate(
 		reasons = append(reasons, fmt.Sprintf(
 			"полутренд: ADX %.1f в мёртвой зоне нейтрала 24-32 (недельный аудит: −$61 против +$9) — вход отложен",
 			regime.ADX))
+	}
+
+	// v2.0.94 OU half-life entry gate: measure the regime's AR(1) mean-
+	// reversion half-life on the same closes the model reads. Weekly mining
+	// of 155 paper outcomes: neutral grids whose regime half-life measured
+	// < 2h averaged −$0.07/bot (net −$1.59 on 23) while 2–4h paid +$0.46,
+	// 4–6h +$1.22 and ≥6h +$1.37 — monotone. A regime that does not persist
+	// cannot amortize the round-trip friction before the OU rotation timer
+	// closes the grid; skipping it frees the slot for a persistent one.
+	// Applies to neutral grids only — directional theses do not rest on
+	// mean reversion. A non-fitting tape (trend/divergent, ok=false) is
+	// left to the Hurst/ADX vetoes upstream.
+	ouHalfLifeHours := 0.0
+	if hlSteps, ok := OUHalfLifeSteps(CandleCloses(sorted)); ok {
+		ouHalfLifeHours = hlSteps * CandleIntervalHours(config.Interval)
+	}
+	if recommendedTrend == "no_trend" && MinOUHalfLifeHours > 0 && ouHalfLifeHours > 0 &&
+		ouHalfLifeHours < MinOUHalfLifeHours {
+		reasons = append(reasons, fmt.Sprintf(
+			"OU half-life %.1fч < %.0fч — режим не живёт достаточно долго, чтобы окупить издержки (майнинг недели: HL<2ч = −$0.07/бот, HL≥2ч = +$0.46+)",
+			ouHalfLifeHours, MinOUHalfLifeHours))
 	}
 
 	// Anti-FOMO Overbought / Oversold protection. v2.0.14: the LONG/SHORT
@@ -739,6 +761,7 @@ func scoreCandidate(
 			"hurst":               bundle.Hurst,
 			"kaufmanER":           bundle.KaufmanER,
 			"kaufmanRegime":       kaufmanRegimeLabel(bundle.KaufmanER),
+			"ouHalfLifeHours":     ouHalfLifeHours,
 			"confluence": map[string]any{
 				"verdict":           confluence.Verdict,
 				"strength":          confluence.Strength,

@@ -205,9 +205,9 @@ func TestForecastVolatilityFromCandles(t *testing.T) {
 
 // Low volatility: daily vol < 1% → the range floor applies and max leverage
 // is allowed; the step must still cover 3× the fee (v2.0.93 FIX-A: and the
-// fee-gate density floor derived from the SAME feeBps — 2× round trip at the
-// one-way cost — instead of the pinned 0.28% default; at 5 bps one-way that
-// floor is 0.20%).
+// fee-gate density floor derived from the SAME feeBps — 2.5× round trip at
+// the one-way cost since v2.0.94 — instead of the pinned default; at 5 bps
+// one-way that floor is 0.25%).
 func TestGridGeometryLowVol(t *testing.T) {
 	const feeBps = 5.0
 	g := ComputeGridGeometry(10, 0.42, feeBps, 0) // 10% annualized ≈ 0.52% daily
@@ -217,11 +217,11 @@ func TestGridGeometryLowVol(t *testing.T) {
 	if g.Leverage != 4 {
 		t.Fatalf("sub-3%% daily vol allows 4x leverage (v2.0.38 ladder), got %d", g.Leverage)
 	}
-	if g.GridCount != 15 { // 3% / 0.20% fee-gate floor at 5 bps one-way
-		t.Fatalf("grid count = %d, want 15", g.GridCount)
+	if g.GridCount != 12 { // 3% / 0.25% fee-gate floor at 5 bps one-way (2.5×)
+		t.Fatalf("grid count = %d, want 12", g.GridCount)
 	}
-	if g.StepPct < 0.19 || g.StepPct > 0.22 {
-		t.Fatalf("step = %.4f%%, want ~0.20%%", g.StepPct)
+	if g.StepPct < 0.24 || g.StepPct > 0.26 {
+		t.Fatalf("step = %.4f%%, want ~0.25%%", g.StepPct)
 	}
 	if g.StepPct < 3*feeBps/100-1e-9 {
 		t.Fatalf("step %.4f%% must cover 3x fee (0.15%%)", g.StepPct)
@@ -324,21 +324,22 @@ func TestComputeGridGeometryBudgetCap(t *testing.T) {
 		t.Fatalf("step must stay wide enough, got %.3f", g.StepPct)
 	}
 
-	// Средняя вола: 56%/год → daily 2.93% → 4x, range 7.32% → 26 уровней
-	// при шаге 0.28% (fee-gate harmonized) — бюджетный кап не связывающий.
+	// Средняя вола: 56%/год → daily 2.93% → 4x, range 7.32% → 20 уровней
+	// при шаге 0.35% (fee-gate harmonized, 2.5× с v2.0.94) — бюджетный кап
+	// не связывающий.
 	g = ComputeGridGeometry(56, 0.11, 7, 200)
 	if g.Leverage != 4 {
 		t.Fatalf("σ=56%% must be 4x (v2.0.38 ladder), got %d", g.Leverage)
 	}
-	if g.GridCount != 26 {
-		t.Fatalf("mid vol must follow the step count 26, got %d", g.GridCount)
+	if g.GridCount != 20 {
+		t.Fatalf("mid vol must follow the step count 20, got %d", g.GridCount)
 	}
 
-	// Высокая вола + большой бюджет: 25% диапазон / 0.28% шаг = 89 уровней
+	// Высокая вола + большой бюджет: 25% диапазон / 0.35% шаг = 71 уровень
 	// (бюджетный кап 1000×2/8 = 250 его не касается).
 	g = ComputeGridGeometry(214, 0.12, 7, 1000)
-	if g.GridCount != 89 {
-		t.Fatalf("high vol with big budget stays at 89 levels, got %d", g.GridCount)
+	if g.GridCount != 71 {
+		t.Fatalf("high vol with big budget stays at 71 levels, got %d", g.GridCount)
 	}
 
 	// Крошечный бюджет не должен ронять уровни ниже структурного пола 6

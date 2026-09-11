@@ -141,13 +141,14 @@ func TestComputeDynamicTargetsScaleWithLeverage(t *testing.T) {
 // (budget×leverage), not with a fee-floor guess. The step is
 // max(fee-gate floor, the step at which every level still carries ≥ $8).
 // v2.0.93 FIX-A: the floor is derived from the caller's fee/slippage pair —
-// 5/2 bps (fleet default) → 0.28%.
+// 5/2 bps (fleet default) → 0.35% since v2.0.94 (2.5× round-trip).
 func TestGridLevelsForRangeScalesWithNotional(t *testing.T) {
-	// $200 notional on a 4% span: step floor 0.28% binds (the $8-step is
-	// 8×4/200 = 0.16%) → 14 levels × $14.30 — step floor harmonized with the
-	// fee-gate (0.28%) in v2.0.90.
-	if got := GridLevelsForRange(4, 200, 5, 2); got != 14 {
-		t.Fatalf("span 4%% at $200 notional = 4/0.28 = 14 levels, got %d", got)
+	// $200 notional on a 4% span: step floor 0.35% binds (the $8-step is
+	// 8×4/200 = 0.16%) → 11 levels × $18.20 — step floor harmonized with the
+	// fee-gate (0.35%) in v2.0.94; the mining showed the old 0.28% band
+	// carried every stop-out of the week.
+	if got := GridLevelsForRange(4, 200, 5, 2); got != 11 {
+		t.Fatalf("span 4%% at $200 notional = 4/0.35 = 11 levels, got %d", got)
 	}
 	// $50 notional on the same span: the $8 floor binds (step 0.64%) →
 	// round(6.25) = 6 levels, each carrying ≥ $8.
@@ -172,9 +173,11 @@ func TestGridLevelsForRangeScalesWithNotional(t *testing.T) {
 	if got := GridLevelsForRange(0, 200, 5, 2); got != 8 {
 		t.Fatalf("degenerate span must fall back to 8, got %d", got)
 	}
-	// Unknown notional follows the bare step floor.
-	if got := GridLevelsForRange(2, 0, 5, 2); got != 7 {
-		t.Fatalf("span 2%% unknown notional = 2/0.28 = 7 levels, got %d", got)
+	// Unknown notional follows the bare step floor: floor(2/0.35) = 5 clamps
+	// UP to the 6-level grid floor (born-clamped; its realized 0.33% step is
+	// then honestly rejected by the deploy-time fee-gate).
+	if got := GridLevelsForRange(2, 0, 5, 2); got != 6 {
+		t.Fatalf("span 2%% unknown notional clamps to 6 levels, got %d", got)
 	}
 }
 
@@ -184,19 +187,19 @@ func TestGridLevelsForRangeScalesWithNotional(t *testing.T) {
 // — different fees must now produce different floors, and unknown fees must
 // degrade to the documented default.
 func TestGridLevelsForRangeFloorFollowsFees(t *testing.T) {
-	// 20/10 bps: round trip 0.60%, fee-gate bar 1.20% → a 4% span cannot
-	// even fit 6 viable levels (floor(4/1.2)=3, clamped up to 6 by the
-	// doctrine's grid floor — the same honest born-clamped shape the 0.5%
-	// span produces at default fees).
+	// 20/10 bps: round trip 0.60%, fee-gate bar 1.50% (2.5× since v2.0.94) →
+	// a 4% span cannot even fit 6 viable levels (floor(4/1.5)=2, clamped up
+	// to 6 by the doctrine's grid floor — the same honest born-clamped shape
+	// the 0.5% span produces at default fees).
 	if got := GridLevelsForRange(4, 200, 20, 10); got != 6 {
 		t.Fatalf("span 4%% at 20/10 bps clamps to 6 levels, got %d", got)
 	}
-	// A span wide enough for the pricy floor: floor(12/1.2) = 10 levels,
-	// realized step exactly 1.20% — the geometry clears the fee-gate bar
+	// A span wide enough for the pricy floor: floor(12/1.5) = 8 levels,
+	// realized step exactly 1.50% — the geometry clears the fee-gate bar
 	// those same fees set (self-consistency of the parameterized floor).
 	pricyLevels := GridLevelsForRange(12, 200, 20, 10)
-	if pricyLevels != 10 {
-		t.Fatalf("span 12%% at 20/10 bps (floor 1.20%%) = 10 levels, got %d", pricyLevels)
+	if pricyLevels != 8 {
+		t.Fatalf("span 12%% at 20/10 bps (floor 1.50%%) = 8 levels, got %d", pricyLevels)
 	}
 	if step := GridStepPctForSpan(12, pricyLevels); !ValidateMinGridStep(step, 20, 10) {
 		t.Fatalf("derived geometry must clear its own fee-gate, step %.4f%%", step)
@@ -206,18 +209,18 @@ func TestGridLevelsForRangeFloorFollowsFees(t *testing.T) {
 	if got := GridLevelsForRange(4, 200, 2, 1); got != 25 {
 		t.Fatalf("span 4%% at 2/1 bps with $200 notional = 25 levels, got %d", got)
 	}
-	// Unknown fees (≤0) fall back to the documented fleet default (0.28%).
-	if got := GridLevelsForRange(4, 200, 0, 0); got != 14 {
-		t.Fatalf("unknown fees must keep the default floor (14 levels), got %d", got)
+	// Unknown fees (≤0) fall back to the documented fleet default (0.35%).
+	if got := GridLevelsForRange(4, 200, 0, 0); got != 11 {
+		t.Fatalf("unknown fees must keep the default floor (11 levels), got %d", got)
 	}
 	// The floor helper itself: same invariant FeeGateRejection enforces.
-	if got := FeeGateStepFloorPct(5, 2); got < 0.279 || got > 0.281 {
-		t.Fatalf("default-floor helper must yield 0.28%%, got %.4f", got)
+	if got := FeeGateStepFloorPct(5, 2); got < 0.349 || got > 0.351 {
+		t.Fatalf("default-floor helper must yield 0.35%%, got %.4f", got)
 	}
-	if got := FeeGateStepFloorPct(20, 10); got < 1.199 || got > 1.201 {
-		t.Fatalf("20/10 bps floor must yield 1.20%%, got %.4f", got)
+	if got := FeeGateStepFloorPct(20, 10); got < 1.499 || got > 1.501 {
+		t.Fatalf("20/10 bps floor must yield 1.50%%, got %.4f", got)
 	}
-	if got := FeeGateStepFloorPct(0, 0); got < 0.279 || got > 0.281 {
-		t.Fatalf("degenerate costs must yield the documented default 0.28%%, got %.4f", got)
+	if got := FeeGateStepFloorPct(0, 0); got < 0.349 || got > 0.351 {
+		t.Fatalf("degenerate costs must yield the documented default 0.35%%, got %.4f", got)
 	}
 }

@@ -15,17 +15,18 @@ func TestComputeAdaptiveMeshDensityFromMargin(t *testing.T) {
 	budget := decimal.NewFromFloat(100)
 
 	// v2.0.75 margin-density doctrine: $100×2x = $200 notional on a 4% span
-	// → 14 levels × $14.30 (step ≈0.286%). v2.0.90: the density floor is
-	// harmonized with the fee-gate (2× round-trip at 5/2 bps = 0.28%) —
-	// the old 0.25% floor produced geometry the fee-gate rejected by
-	// 0.03% and the fleet starved. 16→14 levels is the honest dense shape.
+	// → 11 levels × $18.20 (step ≈0.364%). v2.0.94: the density floor is
+	// harmonized with the fee-gate (2.5× round-trip at 5/2 bps = 0.35%) —
+	// the 2× floor admitted the band where every stop-out of the weekly
+	// mining lived (≤0.31% steps, avg +$0.24/bot vs +$0.93 in the band the
+	// new floor selects).
 	res := ComputeAdaptiveMesh(lower, upper, price, 0.50, "RANGE", budget, 2, 5, 2)
-	if res.GridNum != 14 {
-		t.Errorf("expected 14 levels for $200 notional on a 4%% span, got %d", res.GridNum)
+	if res.GridNum != 11 {
+		t.Errorf("expected 11 levels for $200 notional on a 4%% span, got %d", res.GridNum)
 	}
 	step, _ := res.GridStepPct.Float64()
-	if step < 0.27 || step > 0.30 {
-		t.Errorf("expected ~0.286%% step, got %.4f%%", step)
+	if step < 0.35 || step > 0.38 {
+		t.Errorf("expected ~0.364%% step, got %.4f%%", step)
 	}
 	if perLevel := 200.0 / float64(res.GridNum); perLevel < marketdata.MinGridLevelNotionalUSDT {
 		t.Errorf("every level must carry ≥ $8, got %.2f", perLevel)
@@ -51,10 +52,10 @@ func TestComputeAdaptiveMeshDensityFromMargin(t *testing.T) {
 
 // v2.0.93 FIX-A: the density floor follows the caller's fee/slippage pair —
 // the same numbers the deploy-time fee-gate reads. At 20/10 bps the fee-gate
-// bar is 1.20% (2× the 0.60% round trip), so a 12% span that carries 25
-// levels at the 5/2 fleet default collapses to 10; the operator raising fees
-// shrinks the fleet's density ceiling in lockstep instead of starving it at
-// a gate the floor no longer matches.
+// bar is 1.50% (2.5× the 0.60% round trip since v2.0.94), so a 12% span that
+// carries 25 levels at the 5/2 fleet default collapses to 8; the operator
+// raising fees shrinks the fleet's density ceiling in lockstep instead of
+// starving it at a gate the floor no longer matches.
 func TestComputeAdaptiveMeshFloorFollowsFees(t *testing.T) {
 	lower := decimal.NewFromFloat(94)
 	upper := decimal.NewFromFloat(106)
@@ -68,12 +69,12 @@ func TestComputeAdaptiveMeshFloorFollowsFees(t *testing.T) {
 		t.Fatalf("5/2 bps on a 12%% span at $200 notional = 25 levels, got %d", defaults.GridNum)
 	}
 	pricy := ComputeAdaptiveMesh(lower, upper, price, 0.50, "RANGE", budget, 2, 20, 10)
-	if pricy.GridNum != 10 {
-		t.Fatalf("20/10 bps bar 1.20%% → 10 levels on a 12%% span, got %d", pricy.GridNum)
+	if pricy.GridNum != 8 {
+		t.Fatalf("20/10 bps bar 1.50%% → 8 levels on a 12%% span, got %d", pricy.GridNum)
 	}
 	step, _ := pricy.GridStepPct.Float64()
-	if step < 1.20 {
-		t.Fatalf("pricy-fee step must clear the 1.20%% fee-gate bar, got %.4f%%", step)
+	if step < 1.50 {
+		t.Fatalf("pricy-fee step must clear the 1.50%% fee-gate bar, got %.4f%%", step)
 	}
 	if pricy.GridNum >= defaults.GridNum {
 		t.Fatalf("pricier fees must thin the grid: %d vs %d", pricy.GridNum, defaults.GridNum)
@@ -83,6 +84,38 @@ func TestComputeAdaptiveMeshFloorFollowsFees(t *testing.T) {
 	if unknown.GridNum != defaults.GridNum {
 		t.Fatalf("unknown fees must fall back to the default floor (%d levels), got %d",
 			defaults.GridNum, unknown.GridNum)
+	}
+}
+
+// v2.0.94 quality upgrade: a wide span (≥14%) on a quiet tape (ATR ≤2.5%)
+// takes ONE notch above base (cap 6) — the weekly mining put ZERO stop-outs
+// in the ≥14% span cohort while every stop of the week lived in ≤9% spans.
+// The narrow-span de-gir must keep priority, and a noisy tape must NOT
+// upgrade even on a wide span.
+func TestComputeDynamicLeverageQualityUpgrade(t *testing.T) {
+	up := ComputeDynamicLeverage(2.0, 4, 16.0)
+	if up.Leverage != 5 || up.IsScaleDown {
+		t.Fatalf("wide quiet span must upgrade 4x→5x, got %dx (%s)", up.Leverage, up.Reason)
+	}
+	// Hard cap at 6x even with a higher base.
+	capped := ComputeDynamicLeverage(1.0, 6, 20.0)
+	if capped.Leverage != 6 {
+		t.Fatalf("upgrade must cap at 6x, got %d", capped.Leverage)
+	}
+	// Noisy tape on a wide span: stays at base.
+	noisy := ComputeDynamicLeverage(3.5, 4, 16.0)
+	if noisy.Leverage != 4 {
+		t.Fatalf("ATR 3.5%% must not upgrade, got %d", noisy.Leverage)
+	}
+	// Narrow span still de-gears — the de-gir branch runs first.
+	degear := ComputeDynamicLeverage(2.0, 4, 5.0)
+	if degear.Leverage != 2 || !degear.IsScaleDown {
+		t.Fatalf("narrow span must still de-gear to 2x, got %d", degear.Leverage)
+	}
+	// Mid-zone span (7-14%): no upgrade, base leverage.
+	mid := ComputeDynamicLeverage(2.0, 4, 10.0)
+	if mid.Leverage != 4 {
+		t.Fatalf("mid-zone span must keep base 4x, got %d", mid.Leverage)
 	}
 }
 
@@ -126,13 +159,14 @@ func TestClampAntiHuntStopIntoBounds(t *testing.T) {
 // the span (fee-gate floor at the actual fees + the $8/level notional cap),
 // floor = the doctrine's 6 levels.
 func TestClampAIGridCount(t *testing.T) {
-	// A 4% span at $200 notional, 5/2 bps: doctrine count = 14. A spot AI
-	// count of 150 clamps down to 14 (born viable instead of born rejected).
-	if got := clampAIGridCount(4, 200, 5, 2, 150); got != 14 {
-		t.Fatalf("spot AI 150 over a 4%% span must clamp to the doctrine ceiling 14, got %d", got)
+	// A 4% span at $200 notional, 5/2 bps: doctrine count = 11 (v2.0.94
+	// 2.5× floor). A spot AI count of 150 clamps down to 11 (born viable
+	// instead of born rejected).
+	if got := clampAIGridCount(4, 200, 5, 2, 150); got != 11 {
+		t.Fatalf("spot AI 150 over a 4%% span must clamp to the doctrine ceiling 11, got %d", got)
 	}
 	// Pricier fees shrink the ceiling in lockstep (FIX-A parity): 20/10 bps
-	// → floor 1.20% → the 4% span clamps to the 6-level grid floor.
+	// → floor 1.50% → the 4% span clamps to the 6-level grid floor.
 	if got := clampAIGridCount(4, 200, 20, 10, 150); got != 6 {
 		t.Fatalf("pricy fees must collapse the ceiling to the 6-level floor, got %d", got)
 	}

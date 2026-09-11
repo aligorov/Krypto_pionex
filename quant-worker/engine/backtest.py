@@ -222,7 +222,7 @@ class GridSimulator:
         }
 
 
-def derive_grid_params(candles, fee_bps=7.0, min_step_pct=0.28):
+def derive_grid_params(candles, fee_bps=7.0, min_step_pct=0.35):
     """
     Market-derived grid parameters for a training window: range from the
     10th-90th close percentile, level count from the fee floor. No hardcoded
@@ -230,10 +230,12 @@ def derive_grid_params(candles, fee_bps=7.0, min_step_pct=0.28):
 
     v2.0.93 harmonization with the Go fleet (backend/internal/marketdata/
     targets.go):
-      - min_step_pct 0.6 -> 0.28 — the same fee-gate density floor the Go
-        scanner/mesh/manual paths use (2x round trip at the 5/2 bps fleet
-        default), so the walk-forward grades the geometry the bot would
-        actually ship;
+      - min_step_pct 0.6 -> 0.28 (v2.0.93) -> 0.35 (v2.0.94) — the same
+        fee-gate density floor the Go scanner/mesh/manual paths use
+        (2.5x round trip at the 5/2 bps fleet default; the 2x floor was a
+        survival minimum, the weekly mining of 155 paper outcomes showed
+        every stop-out of the week lived in the band it admits), so the
+        walk-forward grades the geometry the bot would actually ship;
       - fee_bps stays a parameter, default 7 (5 fee + 2 slippage, one-way
         f+s like the Go settings pair);
       - level clamp 2..100 -> 6..500 — the Go doctrine clamps (6 keeps a
@@ -260,7 +262,11 @@ def derive_grid_params(candles, fee_bps=7.0, min_step_pct=0.28):
     if mid <= 0 or upper <= lower:
         return None
     range_pct = (upper - lower) / mid * 100
-    levels = int(max(6, min(500, range_pct / max(min_step_pct, fee_bps / 100 * 1.2))))
+    # fee-derived floor mirrors the Go StepFloorRoundTripMultiple (2.5 x the
+    # round-trip cost: fee_bps here is one-way fee+slippage, so 2 legs x 2.5
+    # multiple = 5x one-way in bps, /100 -> percent).
+    fee_floor_pct = fee_bps / 100 * 5.0
+    levels = int(max(6, min(500, range_pct / max(min_step_pct, fee_floor_pct))))
     return {"lower": lower, "upper": upper, "levels": levels}
 
 

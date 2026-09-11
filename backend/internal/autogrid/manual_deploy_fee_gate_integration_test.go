@@ -12,7 +12,8 @@ import (
 )
 
 // TestManualDeployFeeGateParity pins the v2.0.89-A P1 fee-gate on the manual
-// deploy path: «level step ≥ 2× round-trip costs» on the FINAL geometry
+// deploy path: «level step ≥ StepFloorRoundTripMultiple × round-trip costs»
+// (2.5× = 0.35% since v2.0.94) on the FINAL geometry
 // (lower/upper over the row AFTER every fallback), evaluated BEFORE the
 // mode branch so PAPER and REAL behave identically — same rule, same
 // numbers, same text. Fleet fees pinned at 5/2 bps: round trip 0.14%,
@@ -94,12 +95,12 @@ func TestManualDeployFeeGateParity(t *testing.T) {
 		t.Fatalf("PAPER 4%%/20-levels deploy must be refused by the same fee-gate, got %v", err)
 	}
 
-	// Derived row on a 1.5% span (v2.0.93 honest math): the density doctrine
-	// derives floor(1.5/0.28) = 5 → clamped UP to its 6-level grid floor, so
-	// the realized step is 0.25% — UNDER the 2× round-trip bar — and the
-	// manual deploy is refused. (A 2% span now derives 7×0.2857% and CLEARS
-	// the gate — the old "8 levels × 0.25%" expectation died with the
-	// v2.0.90 floor harmonization.)
+	// Derived row on a 1.5% span (v2.0.93 honest math, v2.0.94 floor): the
+	// density doctrine derives floor(1.5/0.35) = 4 → clamped UP to its
+	// 6-level grid floor, so the realized step is 0.25% — UNDER the 2.5×
+	// round-trip bar — and the manual deploy is refused. (Under the v2.0.94
+	// floor even a 2% span derives 5→6 rows × 0.33% and is honestly refused;
+	// a viable derived grid needs a wider span.)
 	if err := deploy("CANFG3_USDT_PERP", "PAPER", 99.25, 100.75, 0); err == nil ||
 		!strings.Contains(err.Error(), "fee-gate") {
 		t.Fatalf("derived-row 1.5%%-span deploy must be refused by the fee-gate, got %v", err)
@@ -113,22 +114,24 @@ func TestManualDeployFeeGateParity(t *testing.T) {
 		t.Fatalf("refused deploys must leave no paper rows, got %d (%v)", refusedRows, err)
 	}
 
-	// Pass side: 4%/12 levels = 0.33% ≥ 0.28% — the PAPER deploy goes
-	// through and persists the operator's row untouched.
-	if err := deploy("CANFG4_USDT_PERP", "PAPER", 98, 102, 12); err != nil {
-		t.Fatalf("4%%/12-levels deploy must clear the fee-gate, got %v", err)
+	// Pass side (v2.0.94 floor 0.35% at 5/2 bps): 4%/10 levels = 0.40% — the
+	// PAPER deploy goes through and persists the operator's row untouched.
+	if err := deploy("CANFG4_USDT_PERP", "PAPER", 98, 102, 10); err != nil {
+		t.Fatalf("4%%/10-levels deploy must clear the fee-gate, got %v", err)
 	}
 	var persistedRow int
 	if err := pool.QueryRow(ctx, `
 		SELECT grid_num FROM paper_grid_bots WHERE symbol = 'CANFG4_USDT_PERP' AND status = 'RUNNING'
-	`).Scan(&persistedRow); err != nil || persistedRow != 12 {
-		t.Fatalf("fee-gate-passing deploy must persist row 12, got %d (%v)", persistedRow, err)
+	`).Scan(&persistedRow); err != nil || persistedRow != 10 {
+		t.Fatalf("fee-gate-passing deploy must persist row 10, got %d (%v)", persistedRow, err)
 	}
 
-	// Boundary documentation (5/2 bps): an explicit 6-row grid on a 2% span
-	// steps 0.33% — ABOVE the 0.28% bar — and is legal; the rejecting case
-	// on a 2% span is the density-derived 8 rows above.
-	if err := deploy("CANFG5_USDT_PERP", "PAPER", 99, 101, 6); err != nil {
-		t.Fatalf("2%%/6-levels (0.33%% step) must clear the 0.28%% bar at 5/2 bps, got %v", err)
+	// Boundary documentation (5/2 bps, v2.0.94): an explicit 5-row grid on a
+	// 2% span steps 0.40% — ABOVE the 0.35% bar — and is legal; the density
+	// doctrine itself can no longer produce a viable derived row this narrow
+	// (floor(2/0.35)=5 → clamp 6 → 0.33% refused), so only an explicit wide-
+	// stepped row clears.
+	if err := deploy("CANFG5_USDT_PERP", "PAPER", 99, 101, 5); err != nil {
+		t.Fatalf("2%%/5-levels (0.40%% step) must clear the 0.35%% bar at 5/2 bps, got %v", err)
 	}
 }

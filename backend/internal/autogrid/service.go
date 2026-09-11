@@ -2297,7 +2297,8 @@ func (s *Service) DeployManualBot(
 	if row < 2 || row > 500 {
 		return nil, "", errors.New("grid row must be between 2 and 500")
 	}
-	// v2.0.89-A fee-gate (P1): the invariant «level step ≥ 2× round-trip
+	// v2.0.89-A fee-gate (P1; floor 2.5× round-trip since v2.0.94): the
+	// invariant «level step ≥ StepFloorRoundTripMultiple × round-trip
 	// costs» on the FINAL geometry — lower/upper over the row AFTER every
 	// fallback (explicit operator input, density derivation, candidate
 	// carry-over; an AI Kit prefill row lands here unchanged too). Placed

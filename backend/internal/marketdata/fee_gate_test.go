@@ -8,9 +8,11 @@ import (
 	"github.com/shopspring/decimal"
 )
 
-// v2.0.89-A P1 fee-gate: the invariant «level step ≥ 2× round-trip costs».
+// v2.0.89-A P1 fee-gate: the invariant «level step ≥ StepFloorRoundTripMultiple
+// × round-trip costs» (multiple raised 2.0 → 2.5 in v2.0.94 on the weekly
+// mining: every stop-out of the week sat in the band the 2× floor admits).
 // Round-trip = 2 legs × (fee + slippage); at the fleet defaults 5/2 bps the
-// round trip costs 0.14% and the minimum viable step is 2 × 0.14 = 0.28%.
+// round trip costs 0.14% and the minimum viable step is 2.5 × 0.14 = 0.35%.
 func TestFeeGateRoundTripMath(t *testing.T) {
 	if rt := RoundTripCostPct(5, 2); rt < 0.139999 || rt > 0.140001 {
 		t.Fatalf("round-trip cost at 5/2 bps must be 0.14%%, got %.4f", rt)
@@ -21,8 +23,8 @@ func TestFeeGateRoundTripMath(t *testing.T) {
 }
 
 // The load-bearing numbers from the research: a 4% span over 20 levels steps
-// 0.20% < 0.28% → REJECT; the same span over 12 levels steps 0.33% ≥ 0.28% →
-// PASS. The boundary itself (step exactly 2× round trip) passes.
+// 0.20% < 0.35% → REJECT; the same span over 11 levels steps 0.36% ≥ 0.35% →
+// PASS. (The exact-boundary step is float-wobbly — see the NB below.)
 func TestFeeGateSpanOverLevels(t *testing.T) {
 	rejectStep := GridStepPctForSpan(4.0, 20)
 	if rejectStep < 0.1999 || rejectStep > 0.2001 {
@@ -38,19 +40,21 @@ func TestFeeGateSpanOverLevels(t *testing.T) {
 		}
 	}
 
-	passStep := GridStepPctForSpan(4.0, 12)
-	if passStep < 0.3332 || passStep > 0.3334 {
-		t.Fatalf("4%%/12 levels must step 0.33%%, got %.4f", passStep)
+	passStep := GridStepPctForSpan(4.0, 11)
+	if passStep < 0.3636 || passStep > 0.3637 {
+		t.Fatalf("4%%/11 levels must step 0.36%%, got %.4f", passStep)
 	}
 	if _, violated := FeeGateRejection(passStep, 5, 2); violated {
-		t.Fatal("4% span over 12 levels (0.33% step) must clear the fee-gate")
+		t.Fatal("4% span over 11 levels (0.36% step) must clear the fee-gate")
 	}
 	// Legacy validator follows the same doctrine now (was 1.5× friction).
-	if ValidateMinGridStep(0.20, 5, 2) {
-		t.Fatal("ValidateMinGridStep must refuse a 0.20% step at 5/2 bps")
+	// NB: the exact 0.35 boundary is float-wobbly (2.5×0.14 double =
+	// 0.35000000000000003), so the pair probes safely off both sides.
+	if ValidateMinGridStep(0.20, 5, 2) || ValidateMinGridStep(0.3499, 5, 2) {
+		t.Fatal("ValidateMinGridStep must refuse sub-floor steps at 5/2 bps")
 	}
-	if !ValidateMinGridStep(0.28, 5, 2) || !ValidateMinGridStep(0.3333, 5, 2) {
-		t.Fatal("ValidateMinGridStep must accept 0.28% and 0.33% steps at 5/2 bps")
+	if !ValidateMinGridStep(0.3501, 5, 2) || !ValidateMinGridStep(0.3636, 5, 2) {
+		t.Fatal("ValidateMinGridStep must accept above-floor steps at 5/2 bps")
 	}
 }
 

@@ -134,6 +134,16 @@ func ComputeDynamicTargets(input DynamicTargetsInput) DynamicTargets {
 const (
 	// GridStepFloorPct is the economic density floor for the grid step.
 	GridStepFloorPct = 0.25
+	// StepFloorRoundTripMultiple is how many round trips a level step must
+	// clear: the floor = multiple × RoundTripCostPct(fee, slip). v2.0.94
+	// raised it 2.0 → 2.5 (0.35% at the 5/2 bps fleet default) on the weekly
+	// mining of 155 paper outcomes: every one of the 8 stop-outs of the week
+	// (STRUCT_INVALID_ANTI_HUNT/RANGE_BREAK, −$14.87) sat in the ≤0.31% band
+	// this floor admits, avg +$0.24/bot — while the 0.31–0.45% band (the new
+	// floor's center) averaged +$0.93 with 1 loser and 0 stops. External
+	// consensus (Bitsgap/QuickNode/Quantpedia) is step ≥ 2–3× round-trip; the
+	// old 2× floor is a survival minimum, not a profitable one.
+	StepFloorRoundTripMultiple = 2.5
 	// MinGridLevelNotionalUSDT is the smallest acceptable per-level order
 	// notional (budget×leverage/levels).
 	MinGridLevelNotionalUSDT = 8.0
@@ -172,59 +182,63 @@ func GridLevelsForRange(rangePct, notionalUSDT, feeBps, slippageBps float64) int
 }
 
 // FeeGateStepFloorPct is the density step floor as a function of the ACTUAL
-// round-trip costs: 2× (fee + slippage) on both legs, in percent. It is the
-// same invariant ValidateMinGridStep and FeeGateRejection enforce — the
-// density floor and the deploy-time fee-gate are one number, derived from one
-// input. Unknown costs (fee+slippage ≤ 0) degrade to the fleet-default floor.
+// round-trip costs: StepFloorRoundTripMultiple × (fee + slippage) on both
+// legs, in percent. It is the same invariant ValidateMinGridStep and
+// FeeGateRejection enforce — the density floor and the deploy-time fee-gate
+// are one number, derived from one input. Unknown costs (fee+slippage ≤ 0)
+// degrade to the fleet-default floor.
 func FeeGateStepFloorPct(feeBps, slippageBps float64) float64 {
 	if feeBps <= 0 && slippageBps <= 0 {
 		return DefaultGridStepFloorPct()
 	}
-	return 2.0 * RoundTripCostPct(feeBps, slippageBps)
+	return StepFloorRoundTripMultiple * RoundTripCostPct(feeBps, slippageBps)
 }
 
 // DefaultGridStepFloorPct is the DOCUMENTED FALLBACK of FeeGateStepFloorPct:
-// 2× the round-trip cost at the fleet-default 5/2 bps = 0.28%. It stays as
+// 2.5× the round-trip cost at the fleet-default 5/2 bps = 0.35%. It stays as
 // the contract for pure paths that genuinely have no live settings (and as
 // the degenerate-input floor inside FeeGateStepFloorPct); every real path
 // (scanner, mesh, AI Kit clamp, manual deploy, DGT re-center) passes its own
 // feeBps/slippageBps through so the density floor and the fee-gate can never
 // disagree again.
 func DefaultGridStepFloorPct() float64 {
-	return 2.0 * RoundTripCostPct(5, 2) // 0.28% at fleet defaults
+	return StepFloorRoundTripMultiple * RoundTripCostPct(5, 2) // 0.35% at fleet defaults
 }
 
 // RoundTripCostPct returns the friction of ONE grid level round trip in
 // percent of price: two legs (buy + sell), each paying feeBps + slippageBps.
 // At the fleet defaults (5 bps fee / 2 bps slippage) that is
-// 2 × 7 / 100 = 0.14% — the level step must clear twice THAT.
+// 2 × 7 / 100 = 0.14% — the level step must clear
+// StepFloorRoundTripMultiple × THAT (2.5× = 0.35% since v2.0.94).
 func RoundTripCostPct(feeBps, slippageBps float64) float64 {
 	return 2.0 * (feeBps + slippageBps) / 100.0 // bps → %, × 2 legs
 }
 
-// ValidateMinGridStep checks the v2.0.89 fee-gate invariant: the per-level
-// step must be at least 2× the round-trip cost (fee + slippage on both
+// ValidateMinGridStep checks the v2.0.89 fee-gate invariant (floor raised to
+// 2.5× round-trip in v2.0.94): the per-level step must be at least
+// StepFloorRoundTripMultiple × the round-trip cost (fee + slippage on both
 // legs). A grid whose step is below that bar pays the market more per
 // traverse than it can ever harvest from it — it is guaranteed to bleed on
 // commissions regardless of how often price oscillates.
 func ValidateMinGridStep(stepPct, feeBps, slippageBps float64) bool {
-	return stepPct >= 2.0*RoundTripCostPct(feeBps, slippageBps)
+	return stepPct >= StepFloorRoundTripMultiple*RoundTripCostPct(feeBps, slippageBps)
 }
 
 // FeeGateRejection is the shared fee-gate verdict (v2.0.89-A research fix,
-// P1). stepPct is the FINAL realized step of the grid — span_pct / grid_num
-// computed on the geometry that will actually be persisted/deployed, AFTER
-// every level-count clamp (density doctrine, AI Kit row, manual row). It
-// returns the operator-facing rejection reason when the 2× round-trip
-// invariant is violated, or ("", false) when the step clears the bar.
+// P1; floor raised to 2.5× round-trip in v2.0.94). stepPct is the FINAL
+// realized step of the grid — span_pct / grid_num computed on the geometry
+// that will actually be persisted/deployed, AFTER every level-count clamp
+// (density doctrine, AI Kit row, manual row). It returns the operator-facing
+// rejection reason when the step-floor invariant is violated, or ("", false)
+// when the step clears the bar.
 func FeeGateRejection(stepPct, feeBps, slippageBps float64) (string, bool) {
 	roundTripPct := RoundTripCostPct(feeBps, slippageBps)
-	if stepPct >= 2.0*roundTripPct {
+	if stepPct >= StepFloorRoundTripMultiple*roundTripPct {
 		return "", false
 	}
 	return fmt.Sprintf(
-		"шаг уровня %.2f%% < 2× round-trip издержек %.2f%% — сетка гарантированно в минус на комиссиях (fee-gate)",
-		stepPct, roundTripPct), true
+		"шаг уровня %.2f%% < %.1f× round-trip издержек %.2f%% — сетка гарантированно в минус на комиссиях (fee-gate)",
+		stepPct, StepFloorRoundTripMultiple, roundTripPct), true
 }
 
 // GridStepPctForSpan is the realized per-level step of a grid: the span in

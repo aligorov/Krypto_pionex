@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/aligorov/pionex-bot/backend/internal/grid"
+	"github.com/aligorov/pionex-bot/backend/internal/marketdata"
 	"github.com/aligorov/pionex-bot/backend/internal/pionex"
 	"github.com/jackc/pgx/v5"
 	"github.com/shopspring/decimal"
@@ -101,69 +102,24 @@ func dgtBreakRedeployReason(reason string) bool {
 }
 
 // ouHalfLifeSteps fits the AR(1) regression Δp_t = a + b·p_{t-1} on the
-// close series and returns the Ornstein-Uhlenbeck half-life in STEP units:
-//
-//	b  = cov(p_{t-1}, Δp) / var(p_{t-1})
-//	HL = -ln(2) / ln(1+b)
-//
-// (the exact discrete-OU form; -ln(2)/b is the small-b approximation).
-// ok=false when the fit is impossible or the tape is NOT mean-reverting:
-// b ≥ 0 (trending) or b ≤ -1 (oscillating/divergent — not an OU process).
+// close series and returns the Ornstein-Uhlenbeck half-life in STEP units.
+// v2.0.94: the math lives in marketdata.OUHalfLifeSteps (shared with the
+// scanner entry gate); the marketdata 30-candle fit floor now GOVERNS both
+// callers (this file's local ouMinCandles=20 only pre-filters). ok=false
+// when the fit is impossible or the tape is NOT mean-reverting (b ≥ 0
+// trending, b ≤ -1 divergent).
 func ouHalfLifeSteps(prices []float64) (float64, bool) {
 	if len(prices) < ouMinCandles {
 		return 0, false
 	}
-	n := float64(len(prices) - 1)
-	var sumLag, sumDelta, sumLagDelta, sumLagSq float64
-	for i := 1; i < len(prices); i++ {
-		lag := prices[i-1]
-		delta := prices[i] - lag
-		sumLag += lag
-		sumDelta += delta
-		sumLagDelta += lag * delta
-		sumLagSq += lag * lag
-	}
-	cov := sumLagDelta - sumLag*sumDelta/n
-	varLag := sumLagSq - sumLag*sumLag/n
-	if varLag <= 0 {
-		return 0, false
-	}
-	b := cov / varLag
-	if b >= -1e-9 || b <= -1+1e-9 {
-		return 0, false
-	}
-	hl := -math.Ln2 / math.Log(1+b)
-	if math.IsNaN(hl) || math.IsInf(hl, 0) || hl <= 0 {
-		return 0, false
-	}
-	return hl, true
+	return marketdata.OUHalfLifeSteps(prices)
 }
 
 // candleIntervalHours converts the settings candle interval ("15M", "60M",
-// "4H", "1D"…) to its step length in hours; the default matches the 15m
-// scanner cadence when the string is unparseable.
+// "4H", "1D"…) to its step length in hours — delegated to the shared
+// marketdata helper (v2.0.94 single source of truth).
 func candleIntervalHours(interval string) float64 {
-	s := strings.ToUpper(strings.TrimSpace(interval))
-	num, start := 0, 0
-	for start < len(s) && s[start] >= '0' && s[start] <= '9' {
-		num = num*10 + int(s[start]-'0')
-		start++
-	}
-	if num == 0 {
-		num = 1
-	}
-	switch {
-	case strings.HasSuffix(s, "M") && !strings.HasSuffix(s, "MO"):
-		return float64(num) / 60.0
-	case strings.HasSuffix(s, "H"):
-		return float64(num)
-	case strings.HasSuffix(s, "D"):
-		return float64(num) * 24.0
-	case strings.HasSuffix(s, "W"):
-		return float64(num) * 168.0
-	default:
-		return 0.25
-	}
+	return marketdata.CandleIntervalHours(interval)
 }
 
 // ouSymbolReading is one cached per-symbol statistic bundle over the

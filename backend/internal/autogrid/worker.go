@@ -519,6 +519,52 @@ func (worker *Worker) noteDeployBlock(ctx context.Context, reason string) {
 	`, reason)
 }
 
+// losingSymbolStats is one row of the cumulative symbol-cooldown preload.
+type losingSymbolStats struct {
+	Closes  int
+	NetUSDT float64
+}
+
+// loadLosingSymbolCooldowns (v2.0.94) returns the repeat-loser cohort: symbols
+// whose paper ledger over the trailing 7 days shows 3+ completed closes with
+// a negative cumulative net, or 2 closes already −$2+ deep. Weekly mining of
+// the 155-outcome week: ENA (−$4.06/2), ZEC (−$2.75/3), XMR (−$2.68/4) and
+// SNXXX (−$2.38/5) drained −$11.9 of the −$32.5 gross loss purely by
+// re-entering after every half-life rotation — each individual close was a
+// well-behaved exit, so the per-close dist-aware cooldown never engaged.
+// The window rolls, so the block self-heals as old losses age out; both
+// deploy modes read the SAME paper ledger (the strategy's evidence base),
+// keeping paper statistics transferable to REAL. A preload failure disarms
+// the gate for this round (logs loudly) instead of wedging the fleet.
+func (worker *Worker) loadLosingSymbolCooldowns(ctx context.Context, settingsID string) map[string]losingSymbolStats {
+	cooled := map[string]losingSymbolStats{}
+	rows, err := worker.db.Query(ctx, `
+		SELECT symbol, COUNT(*)::int, COALESCE(SUM(realized_pnl_usdt), 0)::float8
+		FROM paper_grid_bots
+		WHERE settings_id = $1
+		  AND status = 'COMPLETED'
+		  AND closed_at > NOW() - INTERVAL '7 days'
+		GROUP BY symbol
+		HAVING (COUNT(*) >= 3 AND SUM(realized_pnl_usdt) < 0)
+		    OR (COUNT(*) >= 2 AND SUM(realized_pnl_usdt) <= -2.0)
+	`, settingsID)
+	if err != nil {
+		worker.logger.Warn("symbol cooldown preload failed — gate disarmed for this round",
+			"component", "autogrid_worker", "error", err)
+		worker.noteDeployBlock(ctx, "кулдаун проигрывающих символов не загружен (сбой БД) — гейт разоружён на этот раунд")
+		return cooled
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var symbol string
+		var stats losingSymbolStats
+		if err := rows.Scan(&symbol, &stats.Closes, &stats.NetUSDT); err == nil {
+			cooled[symbol] = stats
+		}
+	}
+	return cooled
+}
+
 // candidateConfluenceVerdict reads the persisted confluence verdict from
 // model_assumptions (NEUTRAL when absent).
 func candidateConfluenceVerdict(assumptions map[string]any) string {
@@ -903,8 +949,17 @@ func (worker *Worker) deployPaper(
 			llmBrainEnabledPaper = llmSettings.Enabled && strings.TrimSpace(llmSettings.APIKey) != ""
 		}
 	}
+	// v2.0.94 cumulative symbol cooldown: one preload, membership check per
+	// candidate — same gate, same text in the REAL loop below.
+	losingSymbols := worker.loadLosingSymbolCooldowns(ctx, settings.ID)
 	for _, candidate := range candidates {
 		if candidate.Decision != "ACCEPTED" {
+			continue
+		}
+		if st, cooled := losingSymbols[candidate.Symbol]; cooled {
+			worker.rejectCandidate(ctx, candidate, fmt.Sprintf(
+				"символьный кулдаун: %d закрытий, нетто −$%.2f за 7д — повторные входы заморожены до выхода окна из минуса",
+				st.Closes, -st.NetUSDT), nil)
 			continue
 		}
 		if !isEntryTimingFavorable(candidate) {
@@ -1669,9 +1724,18 @@ func (worker *Worker) deployReal(
 	// beta-drift/alt-drain vetoes protected paper only, the exact paths
 	// REAL capital would ride. Same context load as the paper round.
 	macroCtx := worker.loadMacroContext(ctx)
+	// v2.0.94 cumulative symbol cooldown — REAL mirror of the paper gate:
+	// the repeat-loser cohort is strategy-level evidence, not fleet-level.
+	losingSymbols := worker.loadLosingSymbolCooldowns(ctx, settings.ID)
 	for _, candidate := range candidates {
 		// Non-ACCEPTED rows already carry their scanner-time rejection reason.
 		if candidate.Decision != "ACCEPTED" {
+			continue
+		}
+		if st, cooled := losingSymbols[candidate.Symbol]; cooled {
+			worker.rejectCandidate(ctx, candidate, fmt.Sprintf(
+				"символьный кулдаун: %d закрытий, нетто −$%.2f за 7д — повторные входы заморожены до выхода окна из минуса",
+				st.Closes, -st.NetUSDT), nil)
 			continue
 		}
 		// Invariant: every deploy-loop skip must leave a reason on the

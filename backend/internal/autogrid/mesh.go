@@ -113,6 +113,27 @@ func ComputeDynamicLeverage(
 		}
 	}
 
+	// v2.0.94 quality upgrade: a wide span on a quiet tape takes ONE notch
+	// above base. Weekly mining of 155 paper outcomes (2026-09-04→11): the
+	// ≥14% span cohort closed 33 bots at avg +$0.78 with ZERO stop-outs —
+	// every stop of the week (8/8) lived in ≤9% spans where the grid sits
+	// inside the daily noise band. On a wide span the extra notional feeds
+	// the capture compounding instead of the tail. One notch, only below the
+	// 6x cap (a base ≥6 must not "upgrade" into a silent scale-down), quiet
+	// tape only (ATR ≤ 2.5% — the normal ladder would have kept full base
+	// leverage anyway); risk-engine maxLeverage still applies upstream.
+	if spanPct >= 14.0 && atrPct <= 2.5 && baseLev >= 2 && baseLev < 6 {
+		upgraded := baseLev + 1
+		if upgraded > 6 {
+			upgraded = 6
+		}
+		return DynamicLeverageResult{
+			Leverage:    upgraded,
+			Reason:      fmt.Sprintf("Широкий спан %.1f%% + тихий ATR %.1f%% — гир %dx (майнинг недели: 0 стопов на спанах ≥14%%)", spanPct, atrPct, upgraded),
+			IsScaleDown: false,
+		}
+	}
+
 	// Normal Volatility (ATR <= 4.0%): Keep full base leverage
 	if atrPct <= 4.0 {
 		return DynamicLeverageResult{
