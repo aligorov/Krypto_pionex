@@ -48,13 +48,21 @@ func TestFeeGateSpanOverLevels(t *testing.T) {
 		t.Fatal("4% span over 11 levels (0.36% step) must clear the fee-gate")
 	}
 	// Legacy validator follows the same doctrine now (was 1.5× friction).
-	// NB: the exact 0.35 boundary is float-wobbly (2.5×0.14 double =
-	// 0.35000000000000003), so the pair probes safely off both sides.
+	// v2.0.95: the EXACT boundary must pass — 2.5×0.14 is
+	// 0.35000000000000003 in double and the epsilon absorbs the last bit
+	// (prod 09-12: ACE/APT rejected with a displayed 0.35% step).
 	if ValidateMinGridStep(0.20, 5, 2) || ValidateMinGridStep(0.3499, 5, 2) {
 		t.Fatal("ValidateMinGridStep must refuse sub-floor steps at 5/2 bps")
 	}
-	if !ValidateMinGridStep(0.3501, 5, 2) || !ValidateMinGridStep(0.3636, 5, 2) {
-		t.Fatal("ValidateMinGridStep must accept above-floor steps at 5/2 bps")
+	if !ValidateMinGridStep(0.35, 5, 2) || !ValidateMinGridStep(0.3636, 5, 2) {
+		t.Fatal("ValidateMinGridStep must accept the exact 0.35% boundary and above-floor steps")
+	}
+	// Same epsilon contract in the gate itself: 4.9% over 14 levels = 0.35%
+	// exactly (the ACE prod case) must clear at 5/2 bps.
+	aceStep := GridStepPctForSpan(4.9, 14)
+	reason, violated := FeeGateRejection(aceStep, 5, 2)
+	if violated {
+		t.Fatalf("the exact-boundary 0.35%% step (ACE case, got %.17f) must clear the fee-gate, got %q", aceStep, reason)
 	}
 }
 
