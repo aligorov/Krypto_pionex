@@ -1484,6 +1484,67 @@ func (worker *Worker) deployPaper(
 			}
 		}
 
+		// v2.0.96 exchange-parity pre-flight («всё поведение paper — как на
+		// бирже»): PAPER used to open bots without ever asking Pionex, so the
+		// paper fleet could include grids the exchange would refuse — per-
+		// symbol minimum investment, grid-row limits, symbols under
+		// maintenance — and paper statistics then proved a fleet REAL can
+		// never run. The REAL path has run native checkParams since v2.0.67;
+		// paper now runs the SAME call with the SAME verdicts. Fail-open by
+		// design: a missing/unreachable account or a transient estimation
+		// failure is not a rejection and must not wedge the paper fleet —
+		// only the exchange's OWN refusals (min investment, forbidden symbol)
+		// reject the candidate, with the REAL path's texts.
+		if settings.AccountID != nil {
+			if paperClient, clientErr := worker.service.PrivateClient(ctx, worker.accounts, *settings.AccountID); clientErr == nil {
+				if base, quote, splitErr := SplitPionexPerp(candidate.Symbol); splitErr == nil {
+					// REAL maps the trend onto the exchange enum before its
+					// BUOrderData (neutral → no_trend); the paper gate must
+					// send the SAME value or the estimation judges a
+					// different bot than the one REAL would create.
+					checkTrend := trend
+					if checkTrend == "neutral" {
+						checkTrend = "no_trend"
+					}
+					futuresBase := base
+					if !strings.HasSuffix(futuresBase, ".PERP") && !strings.HasSuffix(futuresBase, "_PERP") {
+						futuresBase = fmt.Sprintf("%s.PERP", base)
+					}
+					paperParams := pionex.NativeFuturesGridCreateParams{
+						Base: futuresBase, Quote: quote,
+						BUOrderData: pionex.BUOrderData{
+							Top: mesh.UpperPrice, Bottom: mesh.LowerPrice,
+							Row: mesh.GridNum, GridType: mapGridType(settings.DensityGridEnabled),
+							Trend:           checkTrend,
+							Leverage:        botLev,
+							QuoteInvestment: investAmount.Round(2),
+						},
+					}
+					check, checkErr := paperClient.CheckFuturesGridParams(ctx, paperParams)
+					if checkErr != nil {
+						// Same symbol-state semantics as the REAL path: the
+						// create behind this check would be refused identically.
+						if isSymbolOperationForbiddenError(checkErr) {
+							worker.rejectCandidate(ctx, candidate,
+								"биржа запрещает операцию по символу (forbidden/maintenance) — деплой отложен", nil)
+							continue
+						}
+						worker.logger.Warn("paper parity checkParams unavailable, deploying without exchange validation",
+							"component", "autogrid_worker", "symbol", candidate.Symbol, "error", checkErr)
+					} else if check != nil && check.GetMinInvestment().GreaterThan(decimal.Zero) &&
+						investAmount.LessThan(check.GetMinInvestment()) {
+						worker.rejectCandidate(ctx, candidate, fmt.Sprintf(
+							"checkParams биржи: бюджет %s ниже минимальной инвестиции %s — paper-бот открылся бы, REAL нет (паритет)",
+							investAmount.Round(2), check.GetMinInvestment().StringFixed(2)), nil)
+						continue
+					}
+				}
+			} else {
+				worker.logger.Warn("paper parity checkParams client unavailable, deploying without exchange validation",
+					"component", "autogrid_worker", "symbol", candidate.Symbol, "error", clientErr)
+			}
+		}
+
 		var botID string
 		var botNumber int
 		// v2.0.89 entry friction: the taker fee on the initial inventory
