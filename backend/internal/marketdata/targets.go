@@ -214,6 +214,13 @@ func RoundTripCostPct(feeBps, slippageBps float64) float64 {
 	return 2.0 * (feeBps + slippageBps) / 100.0 // bps → %, × 2 legs
 }
 
+// stepFloorEpsilon absorbs the float representation of the boundary: at the
+// fleet defaults the bar is 2.5×0.14 = 0.35000000000000003 in double, so a
+// grid whose realized step is EXACTLY 0.35% must pass, not die on the last
+// bit (prod 2026-09-12: ACE/APT top-score candidates rejected with the
+// displayed "0.35% < 0.14%×2.5" — born-viable geometry starved on rounding).
+const stepFloorEpsilon = 1e-9
+
 // ValidateMinGridStep checks the v2.0.89 fee-gate invariant (floor raised to
 // 2.5× round-trip in v2.0.94): the per-level step must be at least
 // StepFloorRoundTripMultiple × the round-trip cost (fee + slippage on both
@@ -221,7 +228,7 @@ func RoundTripCostPct(feeBps, slippageBps float64) float64 {
 // traverse than it can ever harvest from it — it is guaranteed to bleed on
 // commissions regardless of how often price oscillates.
 func ValidateMinGridStep(stepPct, feeBps, slippageBps float64) bool {
-	return stepPct >= StepFloorRoundTripMultiple*RoundTripCostPct(feeBps, slippageBps)
+	return stepPct >= StepFloorRoundTripMultiple*RoundTripCostPct(feeBps, slippageBps)-stepFloorEpsilon
 }
 
 // FeeGateRejection is the shared fee-gate verdict (v2.0.89-A research fix,
@@ -233,7 +240,7 @@ func ValidateMinGridStep(stepPct, feeBps, slippageBps float64) bool {
 // when the step clears the bar.
 func FeeGateRejection(stepPct, feeBps, slippageBps float64) (string, bool) {
 	roundTripPct := RoundTripCostPct(feeBps, slippageBps)
-	if stepPct >= StepFloorRoundTripMultiple*roundTripPct {
+	if stepPct >= StepFloorRoundTripMultiple*roundTripPct-stepFloorEpsilon {
 		return "", false
 	}
 	return fmt.Sprintf(
