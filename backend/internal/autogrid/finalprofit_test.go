@@ -80,9 +80,9 @@ func TestPaperCloseFeeRate(t *testing.T) {
 }
 
 // TestPaperEntryFeeInitialInventory pins the entry-fee basis: directional
-// grids open the full leveraged notional at market; a neutral grid opens the
-// uniform-ladder inventory at the deploy price (≈ half notional at the range
-// edge, ≈ nothing at mid).
+// grids open the full leveraged notional at market (taker); a neutral grid
+// opens the uniform-ladder inventory through PASSIVE limit orders (maker —
+// v2.0.97 exchange truth, the same pionexMakerFeeBps the pair legs pay).
 func TestPaperEntryFeeInitialInventory(t *testing.T) {
 	// LONG $100 × 4x: full notional $400 → fee 0.05% = $0.20.
 	fee := paperEntryFee("LONG", dec(t, "90"), dec(t, "110"), 20,
@@ -92,25 +92,35 @@ func TestPaperEntryFeeInitialInventory(t *testing.T) {
 	}
 
 	// NEUTRAL deployed at the lower bound: half the ladder is inventory →
-	// notional $200 → fee $0.10.
+	// notional $200 → maker 0.02% = $0.04.
 	fee = paperEntryFee("NEUTRAL", dec(t, "90"), dec(t, "110"), 20,
 		dec(t, "100"), 4, dec(t, "90"))
-	if !fee.Equal(dec(t, "0.1")) {
-		t.Fatalf("neutral-at-edge entry fee = 0.0005 × 200 = 0.1, got %s", fee)
+	if !fee.Equal(dec(t, "0.04")) {
+		t.Fatalf("neutral-at-edge entry fee = 0.0002 × 200 = 0.04, got %s", fee)
 	}
 
-	// NEUTRAL deployed at mid: no inventory yet — no taker entry.
+	// NEUTRAL deployed at mid: no inventory yet — no entry fee.
 	fee = paperEntryFee("NEUTRAL", dec(t, "90"), dec(t, "110"), 20,
 		dec(t, "100"), 4, dec(t, "100"))
 	if !fee.IsZero() {
-		t.Fatalf("neutral-at-mid opens nothing at market, got %s", fee)
+		t.Fatalf("neutral-at-mid opens nothing, got %s", fee)
 	}
 
-	// No geometry → half-notional convention.
+	// No geometry → half-notional convention at the maker rate.
 	fee = paperEntryFee("NEUTRAL", decimal.Zero, decimal.Zero, 20,
 		dec(t, "100"), 4, decimal.Zero)
-	if !fee.Equal(dec(t, "0.1")) {
-		t.Fatalf("fallback = half notional 0.1, got %s", fee)
+	if !fee.Equal(dec(t, "0.04")) {
+		t.Fatalf("fallback = half notional at maker 0.04, got %s", fee)
+	}
+
+	// The pour mirrors the split: directional taker, neutral maker.
+	pour := paperPourEntryFee("LONG", dec(t, "100"), 4)
+	if !pour.Equal(dec(t, "0.2")) {
+		t.Fatalf("directional pour fee = 0.2, got %s", pour)
+	}
+	pour = paperPourEntryFee("NEUTRAL", dec(t, "100"), 4)
+	if !pour.Equal(dec(t, "0.04")) {
+		t.Fatalf("neutral pour fee = 0.0002 × 200 = 0.04, got %s", pour)
 	}
 }
 

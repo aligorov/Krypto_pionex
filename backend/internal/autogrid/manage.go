@@ -258,12 +258,17 @@ func paperCloseFeeRate() decimal.Decimal {
 	return paperStopCostComposite.Div(decimal.NewFromInt(10000))
 }
 
-// paperEntryFee prices the taker fee (0.05%) a fresh paper grid pays at
-// deploy on its INITIAL inventory notional — booked into realized at deploy
-// exactly like the exchange debits the wallet. Directional grids open the
-// full leveraged notional crossing the book; a neutral grid starts with the
-// uniform-ladder inventory at the deploy price (|levels from mid| ×
-// per-level notional — the same stateless ladder neutralGridPaperPNL marks).
+// paperEntryFee prices the entry fee a fresh paper grid pays at deploy on
+// its INITIAL inventory notional — booked into realized at deploy exactly
+// like the exchange debits the wallet. Rate follows the ACTUAL order type
+// (v2.0.97 exchange-truth fix): a neutral grid builds its ladder with
+// PASSIVE limit orders → maker 2 bps (the 2026-08-20 audit's own finding —
+// the old taker charge here contradicted pionexMakerFeeBps used on pair
+// legs); a directional grid opens its full notional at market → taker 5 bps.
+// Directional grids open the full leveraged notional crossing the book; a
+// neutral grid starts with the uniform-ladder inventory at the deploy price
+// (|levels from mid| × per-level notional — the same stateless ladder
+// neutralGridPaperPNL marks).
 func paperEntryFee(
 	direction string,
 	lower, upper decimal.Decimal,
@@ -273,24 +278,35 @@ func paperEntryFee(
 	deployPrice decimal.Decimal,
 ) decimal.Decimal {
 	return paperInitialInventoryNotional(direction, lower, upper, gridNum, investment, leverage, deployPrice).
-		Mul(paperStopTakerBps).Div(decimal.NewFromInt(10000))
+		Mul(paperEntryRateBps(direction)).Div(decimal.NewFromInt(10000))
 }
 
-// paperPourEntryFee prices the taker fee an invest_in pour pays on the
-// notional it adds to a LIVE grid: directional pours add the full leveraged
-// margin; a neutral grid holds roughly half its ladder as inventory at any
-// time, so the pour's added inventory is priced at the half-notional
-// convention (deterministic — the paper row carries no live inventory
-// column; the manage-loop tranche path uses the actual mark instead).
+// paperEntryRateBps is the entry fee rate by direction: maker for the
+// passive-limit neutral ladder, taker for market-entered directional grids.
+func paperEntryRateBps(direction string) decimal.Decimal {
+	if strings.EqualFold(strings.TrimSpace(direction), "NEUTRAL") {
+		return decimal.NewFromFloat(pionexMakerFeeBps)
+	}
+	return paperStopTakerBps
+}
+
+// paperPourEntryFee prices the entry fee an invest_in pour pays on the
+// notional it adds to a LIVE grid (same rate split as paperEntryFee — the
+// pour's neutral margin goes into new passive limits, directional margin
+// crosses the book). Directional pours add the full leveraged margin; a
+// neutral grid holds roughly half its ladder as inventory at any time, so
+// the pour's added inventory is priced at the half-notional convention
+// (deterministic — the paper row carries no live inventory column; the
+// manage-loop tranche path uses the actual mark instead).
 func paperPourEntryFee(direction string, investment decimal.Decimal, leverage int) decimal.Decimal {
 	if !investment.IsPositive() || leverage < 1 {
 		return decimal.Zero
 	}
 	notional := investment.Mul(decimal.NewFromInt(int64(leverage)))
-	if strings.ToUpper(direction) != "NEUTRAL" {
+	if strings.ToUpper(strings.TrimSpace(direction)) != "NEUTRAL" {
 		return notional.Mul(paperStopTakerBps).Div(decimal.NewFromInt(10000))
 	}
-	return notional.Div(decimal.NewFromInt(2)).Mul(paperStopTakerBps).Div(decimal.NewFromInt(10000))
+	return notional.Div(decimal.NewFromInt(2)).Mul(paperEntryRateBps("NEUTRAL")).Div(decimal.NewFromInt(10000))
 }
 
 // paperInitialInventoryNotional is the notional a fresh grid puts on at
