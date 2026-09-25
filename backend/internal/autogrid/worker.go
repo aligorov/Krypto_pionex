@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync"
 	"log/slog"
 	"math"
 	"net/http"
@@ -115,6 +116,12 @@ type Worker struct {
 	// runningRawLogged dedups the v2.0.101 raw-payload witness for RUNNING
 	// grids to one line per (bot, adjustments) pair.
 	runningRawLogged map[string]bool
+	// v2.0.102 event-driven supervision: the WS lane signals a sharp move on
+	// a fleet symbol and the main loop runs an out-of-band manage pass.
+	realtimeSignal chan string
+	realtimeMu     sync.RWMutex
+	realtimeWatch  map[string]realtimePoint
+	lastEventPass  time.Time
 }
 
 type trancheTBTrend struct {
@@ -156,6 +163,8 @@ func NewWorker(
 		dataAlarmAt:     make(map[string]time.Time),
 		radarPriceTrail: make(map[string]radarPricePoint),
 		ouReadings:      make(map[string]ouSymbolReading),
+		realtimeSignal:  make(chan string, 1),
+		realtimeWatch:   make(map[string]realtimePoint),
 	}
 }
 
@@ -215,6 +224,8 @@ func (worker *Worker) Run(ctx context.Context) {
 					reconcileTicker.Reset(time.Duration(seconds) * time.Second)
 				}
 			})
+		case symbol := <-worker.realtimeSignal:
+			worker.handleRealtimeSignal(symbol, reconcileTicker)
 		}
 	}
 }
@@ -4059,6 +4070,19 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 	// the break re-start, AFTER every settle path had its chance to write
 	// the terminal state the intent gate keys on.
 	worker.processDgtRealRedeployIntents(ctx, *settings)
+
+	// v2.0.102: refresh the event-driven trigger baselines from THIS pass's
+	// marks and the fleet's deploy-time ATRs, so the next sharp WS move is
+	// measured against what supervision last saw.
+	atrBySymbol := make(map[string]float64, len(bots))
+	for _, bot := range bots {
+		if bot.atrEntry > 0 && bot.atrEntry > atrBySymbol[bot.symbol] {
+			atrBySymbol[bot.symbol] = bot.atrEntry
+		}
+	}
+	if priceErr == nil && len(priceBySymbol) > 0 {
+		worker.rememberRealtimeBaselines(priceBySymbol, atrBySymbol)
+	}
 
 	return clampInterval(settings.ManageIntervalSeconds), nil
 }

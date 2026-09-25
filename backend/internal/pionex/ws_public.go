@@ -85,6 +85,9 @@ type PublicStream struct {
 	// (observability rule: every new endpoint gets a raw-payload snippet
 	// until trusted against the docs).
 	firstPayloadLogged map[string]struct{}
+	// onMark (v2.0.102) is the realtime consumer hook: invoked once per
+	// ingested INDEX push, outside stateMu. nil = no consumer.
+	onMark func(MarkUpdate)
 }
 
 // NewPublicStream builds a lane client for the public futures stream.
@@ -146,6 +149,16 @@ func (s *PublicStream) SetSymbols(symbols []string) {
 			s.logger.Debug("ws lane unsubscribe failed", "component", "pionex_ws", "symbol", sym, "error", err)
 		}
 	}
+}
+
+// SetMarkListener registers the realtime consumer invoked on every INDEX
+// push. The listener must not call back into the stream synchronously beyond
+// Mark()/Connected() (RLock-reentrant); signals should be shipped to a
+// channel and handled elsewhere.
+func (s *PublicStream) SetMarkListener(fn func(MarkUpdate)) {
+	s.stateMu.Lock()
+	s.onMark = fn
+	s.stateMu.Unlock()
 }
 
 // Mark returns the last INDEX push for a symbol.
@@ -409,7 +422,11 @@ func (s *PublicStream) ingestIndex(env wsEnvelope) {
 		if !logged {
 			s.firstPayloadLogged[sym] = struct{}{}
 		}
+		listener := s.onMark
 		s.stateMu.Unlock()
+		if listener != nil {
+			listener(update)
+		}
 		if !logged {
 			// Observability snippet: first live payload per symbol until the
 			// field shapes are trusted against the docs.

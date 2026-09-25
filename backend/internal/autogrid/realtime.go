@@ -32,6 +32,10 @@ func (worker *Worker) startWSLane(ctx context.Context) {
 	if worker.wsLane == nil {
 		worker.wsLane = pionex.NewPublicStream("", worker.logger)
 	}
+	// v2.0.102: every ingested mark feeds the event-driven trigger; the
+	// callback ships only a buffered-channel signal, all decisions stay on
+	// the manage goroutine.
+	worker.wsLane.SetMarkListener(worker.onRealtimeMark)
 	go worker.wsLane.Run(ctx)
 }
 
