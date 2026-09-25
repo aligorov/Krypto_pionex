@@ -144,18 +144,31 @@ func (worker *Worker) recheckPendingExchangeFinals(ctx context.Context, settings
 			client = resolved
 			clients[item.accountID] = client
 		}
-		finished := findFinishedGridRecord(ctx, client, item.remoteID)
+		finished, rawPayload := findFinishedGridRaw(ctx, client, item.remoteID)
 		if finished == nil {
 			// Stays pending — either the record has not surfaced yet or the
-			// list probe failed (findFinishedGridRecord logs its own
+			// list probe failed (findFinishedGridRaw logs its own
 			// visibility line). Next sweep retries within the window.
 			continue
 		}
 		settled, source := finished.SettledProfit()
 		if source == pionex.FinalProfitNone {
-			// The record exists but carries no settled total — waiting
-			// longer cannot improve on this; freeze the estimate.
-			worker.confirmTerminalFinal(ctx, item, source)
+			// v2.0.100: the record exists but carries none of the settle
+			// carriers. Log the RAW payload once per row — a live witness of
+			// the finished-record field shapes — and keep the row pending:
+			// totals have never been present on ANY of the 32 prod closures,
+			// so the next parser leg (unlock identity etc.) gets pinned from
+			// this exact line instead of from doc guesses. The 48h window
+			// still freezes what never resolves.
+			if worker.terminalRawLogged == nil {
+				worker.terminalRawLogged = make(map[string]bool)
+			}
+			if !worker.terminalRawLogged[item.id] {
+				worker.terminalRawLogged[item.id] = true
+				worker.logger.Warn("terminal final: finished record carries no settle carrier — raw payload witness",
+					"component", "autogrid_worker", "bot_number", item.botNumber,
+					"symbol", item.symbol, "raw", truncateForLog(string(rawPayload)))
+			}
 			continue
 		}
 		if gated := gateSettledProfit(settled, source, item.closedReason, strings.TrimSpace(finished.ReasonBy)); gated != nil {
@@ -221,4 +234,12 @@ func (worker *Worker) confirmTerminalFinal(ctx context.Context, item pendingTerm
 	worker.logger.Info("terminal final confirmed at telemetry estimate — finished record carries no exchange total",
 		"component", "autogrid_worker", "bot_number", item.botNumber, "symbol", item.symbol,
 		"estimate", item.currentRealized, "probe_source", string(source))
+}
+
+// truncateForLog keeps raw payload witnesses bounded in structured logs.
+func truncateForLog(s string) string {
+	if len(s) > 900 {
+		return s[:900]
+	}
+	return s
 }

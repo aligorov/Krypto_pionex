@@ -435,6 +435,14 @@ func scoreCandidate(
 	}
 
 	reasons := make([]string, 0)
+	// v2.0.100 non-ASCII symbol gate: Pionex lists CJK meme pairs (牛来,
+	// 龙虾…) whose symbols the futuresGrid create endpoint refuses outright
+	// (P_TRADING_BOT_INVALID_ARGUMENT "get symbol info failed") — burned two
+	// deploy slots on 09-25 (#1287, #1304). The candidate never reaches the
+	// deploy gate again.
+	if !isASCIISymbol(symbol.Symbol) {
+		reasons = append(reasons, "не-ASCII символ пары: биржа отклоняет create для CJK-тикеров (P_TRADING_BOT_INVALID_ARGUMENT)")
+	}
 	if volume.LessThan(config.MinVolume24h) {
 		reasons = append(reasons, "24h quote turnover below limit")
 	}
@@ -1020,4 +1028,15 @@ func neutralSemiTrendBlocked(trend string, adx float64) bool {
 // v2.0.39): entering after the move is a chase — 1W/3L in the ledger.
 func matureTrendLongDemoted(trend string, adx float64) bool {
 	return trend == "long" && adx >= 28.0
+}
+
+// isASCIISymbol reports whether the exchange symbol is pure printable
+// ASCII — the futuresGrid create endpoint cannot resolve non-ASCII tickers.
+func isASCIISymbol(symbol string) bool {
+	for i := 0; i < len(symbol); i++ {
+		if symbol[i] < 0x21 || symbol[i] > 0x7E {
+			return false
+		}
+	}
+	return true
 }

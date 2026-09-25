@@ -157,6 +157,12 @@ type BUOrderDataResponse struct {
 	ProfitExitedRaw      json.RawMessage `json:"profitExited"`
 	FundingFeePaymentRaw json.RawMessage `json:"fundingFeePayment"`
 	ClosedBaseAmountRaw  json.RawMessage `json:"closedBaseAmount"`
+	// v2.0.100: settlement amounts for the unlock-identity leg — the final
+	// USDT the wallet received back and the USDT actually invested. These
+	// are settlement figures (profitExited's class), NOT the position/close
+	// marks the epoch-2 reconciliation proved unreliable.
+	UnlockUsdtAmountRaw json.RawMessage `json:"unlockUsdtAmount"`
+	UsdtInvestmentRaw   json.RawMessage `json:"usdtInvestment"`
 	RiskStatus           string          `json:"riskStatus"`
 	LiquidationPriceRaw  json.RawMessage `json:"liquidationPrice"`
 
@@ -304,6 +310,15 @@ const (
 	// FinalProfitTotalAlias covers totalProfit/profit/pnl/realizedProfit —
 	// observed variants of the full-total carrier on finished records.
 	FinalProfitTotalAlias FinalProfitSource = "total_profit_alias"
+	// FinalProfitUnlockIdentity (v2.0.100) is the settlement identity
+	// unlockUsdtAmount − usdtInvestment: what the wallet received back minus
+	// what was actually put in. Needed because NOT ONE of the 32 REAL
+	// closures in prod history ever carried profitExited or a total alias —
+	// the app's «Общая прибыль» is app-computed (grid + trend), and the API
+	// finished record only exposes the settlement amounts. The identity is
+	// true by construction (both legs are settlement figures), guarded by a
+	// sanity band so a garbled payload can't write an absurd final.
+	FinalProfitUnlockIdentity FinalProfitSource = "unlock_identity"
 	// FinalProfitTelemetryNetClose is the WORKER-side estimate (v2.0.89), not
 	// an exchange field: last telemetry total minus the taker+slippage close
 	// cost (stop-floored). It exists so settle paths can record provenance
@@ -346,6 +361,18 @@ func (b *BUOrderDataResponse) SettledProfit() (decimal.Decimal, FinalProfitSourc
 	}
 	if total := b.TotalProfit; !total.IsZero() {
 		return total, FinalProfitTotalAlias
+	}
+	// v2.0.100 unlock identity: returned minus invested, only when both
+	// settlement legs are present, positive, and the net sits inside the
+	// sanity band (can't lose more than was invested; gains beyond 3× the
+	// investment in one grid lifetime are a payload garble, not a fill).
+	unlock := parseDecimalRaw(b.UnlockUsdtAmountRaw)
+	invested := parseDecimalRaw(b.UsdtInvestmentRaw)
+	if invested.IsPositive() && unlock.IsPositive() {
+		if net := unlock.Sub(invested); net.GreaterThanOrEqual(invested.Neg()) &&
+			net.LessThan(invested.Mul(decimal.NewFromInt(3))) {
+			return net, FinalProfitUnlockIdentity
+		}
 	}
 	return decimal.Zero, FinalProfitNone
 }

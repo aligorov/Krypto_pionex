@@ -108,6 +108,9 @@ type Worker struct {
 	// terminalReopenDone gates the one-time v2.0.99 upgrade heal that reopens
 	// estimate-class finals the old binary froze as confirmed.
 	terminalReopenDone bool
+	// terminalRawLogged dedups the v2.0.100 raw-payload witness to one line
+	// per pending row (single manage goroutine → plain map).
+	terminalRawLogged map[string]bool
 }
 
 type trancheTBTrend struct {
@@ -4178,8 +4181,17 @@ func (worker *Worker) reconcileUnknownSubmissions(ctx context.Context, client *p
 // when the record is absent or the listing fails; callers must treat nil as
 // "unknown", never as "zero profit".
 func findFinishedGridRecord(ctx context.Context, client *pionex.Client, buOrderID string) *pionex.BUOrderDataResponse {
+	data, _ := findFinishedGridRaw(ctx, client, buOrderID)
+	return data
+}
+
+// findFinishedGridRaw also returns the record's raw buOrderData payload so
+// the re-check sweep can log a live witness of the finished-record field
+// shapes (the docs' FuturesGridOrderData has already drifted from the live
+// API once — the raw line pins the truth for the next parser change).
+func findFinishedGridRaw(ctx context.Context, client *pionex.Client, buOrderID string) (*pionex.BUOrderDataResponse, []byte) {
 	if strings.TrimSpace(buOrderID) == "" {
-		return nil
+		return nil, nil
 	}
 	token := ""
 	// v2.0.99: the finished history only grows (epoch-2 + epoch-4 closures),
@@ -4191,7 +4203,7 @@ func findFinishedGridRecord(ctx context.Context, client *pionex.Client, buOrderI
 		if listErr != nil {
 			slog.Warn("finished-grid list probe failed — terminal final may fall back to estimate",
 				"component", "autogrid_worker", "page", page, "error", listErr)
-			return nil
+			return nil, nil
 		}
 		for _, order := range orders {
 			if order.BUOrderID == buOrderID {
@@ -4199,19 +4211,19 @@ func findFinishedGridRecord(ctx context.Context, client *pionex.Client, buOrderI
 				if decodeErr != nil {
 					slog.Warn("finished-grid record decode failed",
 						"component", "autogrid_worker", "bu_order_id", buOrderID, "error", decodeErr)
-					return nil
+					return nil, nil
 				}
-				return data
+				return data, order.BUOrderData
 			}
 		}
 		if next == "" {
-			return nil
+			return nil, nil
 		}
 		token = next
 	}
 	slog.Warn("finished-grid record not found within paging depth",
 		"component", "autogrid_worker", "bu_order_id", buOrderID, "pages_scanned", 30)
-	return nil
+	return nil, nil
 }
 
 // fleetStopEnvelope returns Σ stored max_loss_usdt across the WHOLE risk

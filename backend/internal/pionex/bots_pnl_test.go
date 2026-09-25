@@ -194,3 +194,38 @@ func TestBotOrderFuturesGridData(t *testing.T) {
 		t.Fatal("record without buOrderData must fail decoding, not fabricate profits")
 	}
 }
+
+// v2.0.100 unlock-identity leg: returned minus invested when both settlement
+// amounts are present — and none of the 32 prod finished records ever
+// carried profitExited/totalProfit, so this leg is the exchange-truth
+// carrier in practice.
+func TestSettledProfitUnlockIdentity(t *testing.T) {
+	unlocked := decodeOrderData(t, `{
+		"status": "canceled", "reasonBy": "user_cancel",
+		"unlockUsdtAmount": "51.66", "usdtInvestment": "50",
+		"profitReduce": "2.01"
+	}`)
+	got, src := unlocked.SettledProfit()
+	if !got.Equal(mustDecimal(t, "1.66")) || src != FinalProfitUnlockIdentity {
+		t.Fatalf("unlock identity must carry the ARB #1286 netted +1.66: got %s/%s", got, src)
+	}
+
+	// Sanity band: a garbled unlock far beyond 3× investment must NOT settle.
+	garbled := decodeOrderData(t, `{
+		"status": "canceled", "reasonBy": "user_cancel",
+		"unlockUsdtAmount": "500", "usdtInvestment": "50"
+	}`)
+	if got, src := garbled.SettledProfit(); src != FinalProfitNone {
+		t.Fatalf("out-of-band unlock must not settle: got %s/%s", got, src)
+	}
+
+	// Missing legs stay NONE — the caller keeps the telemetry estimate and
+	// the sweep logs the raw payload witness.
+	missing := decodeOrderData(t, `{
+		"status": "canceled", "reasonBy": "user_cancel",
+		"usdtInvestment": "50", "profitReduce": "2.01"
+	}`)
+	if got, src := missing.SettledProfit(); src != FinalProfitNone {
+		t.Fatalf("missing unlock leg must be NONE: got %s/%s", got, src)
+	}
+}
