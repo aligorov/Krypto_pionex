@@ -102,6 +102,12 @@ type Worker struct {
 	// nil until startWSLane, all consumers nil-check.
 	ouReadings map[string]ouSymbolReading
 	wsLane     *pionex.PublicStream
+	// terminalRecheckAt throttles the v2.0.99 finished-record re-check sweep
+	// (single manage goroutine → plain field).
+	terminalRecheckAt time.Time
+	// terminalReopenDone gates the one-time v2.0.99 upgrade heal that reopens
+	// estimate-class finals the old binary froze as confirmed.
+	terminalReopenDone bool
 }
 
 type trancheTBTrend struct {
@@ -2579,11 +2585,11 @@ func (worker *Worker) cancelRealBot(
 			_, _ = worker.db.Exec(ctx, `
 				UPDATE grid_bots
 				SET status = 'STOPPED', closed_reason = 'ALREADY_CLOSED',
-				    reconciliation_state = 'REMOTE_TERMINAL_CONFIRMED',
+				    reconciliation_state = $2,
 				    closed_at = NOW(), last_reconciled_at = NOW(), last_error = NULL, updated_at = NOW()
 				WHERE id = $1
-			`, botID)
-			worker.logger.Info("Pionex grid already closed remotely, marked STOPPED",
+			`, botID, TerminalFinalPendingExchange)
+			worker.logger.Info("Pionex grid already closed remotely, marked STOPPED pending exchange final",
 				"component", "autogrid_worker", "bot_id", botID, "remote_id", remoteID)
 			return nil
 		}
@@ -2911,6 +2917,9 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 	// v2.0.98: keep the real-time lane's INDEX subscriptions aligned with the
 	// RUNNING fleet before the pass samples prices.
 	worker.syncWSSubscriptions(ctx, *settings)
+	// v2.0.99: overwrite estimate-class terminal finals with the exchange's
+	// netted total once the finished record surfaces (throttled internally).
+	worker.recheckPendingExchangeFinals(ctx, *settings)
 	var count int
 	if err := worker.db.QueryRow(ctx, `
 		SELECT COUNT(*) FROM grid_bots
@@ -3055,10 +3064,20 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 				decision := worker.settleTerminalFinal(ctx, bot.id, time.Now(),
 					bot.maxLoss, bot.closedReason, exchangeReason, settled, source)
 				finalRealizedArg := decision.final
+				// v2.0.99: a telemetry-estimate final is NOT the exchange's
+				// truth — the finished-list record can be missing at cancel
+				// time (finalization lag, paging depth, list error) and the
+				// estimate then diverges from the app's netted total (ARB
+				// #1286: ours +2.23 vs exchange +1.66). Such rows land in
+				// TERMINAL_FINAL_PENDING_EXCHANGE and a bounded re-check
+				// sweep overwrites the estimate with the exchange total when
+				// the record surfaces. Only a real exchange total confirms
+				// terminally.
+				reconState := pendingOrConfirmedRecon(decision.marker)
 				if _, err := worker.db.Exec(ctx, `
 					UPDATE grid_bots
 					SET status = 'STOPPED', closed_reason = $2,
-					    reconciliation_state = 'REMOTE_TERMINAL_CONFIRMED',
+					    reconciliation_state = $7,
 					    realized_pnl_usdt = CASE WHEN $4::BOOLEAN THEN NULL ELSE COALESCE($3, realized_pnl_usdt) END,
 					    unrealized_pnl_usdt = 0,
 					    fees_paid_usdt = fees_paid_usdt + $6::NUMERIC,
@@ -3069,14 +3088,15 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 					    closed_at = NOW(), last_reconciled_at = NOW(), last_error = NULL, updated_at = NOW()
 					WHERE id = $1
 				`, bot.id, closedReason, finalRealizedArg, finalRealizedArg == nil,
-					decision.marker, decision.closeCost); err != nil {
+					decision.marker, decision.closeCost, reconState); err != nil {
 					worker.logger.Error("persist already-closed grid state",
 						"component", "autogrid_worker", "bot_id", bot.id, "error", err)
 				}
 				worker.logger.Info("Pionex grid not found or already closed on exchange, marked STOPPED",
 					"component", "autogrid_worker", "symbol", bot.symbol, "bot_id", bot.id,
 					"final_pnl_persisted", finalRealizedArg != nil,
-					"final_profit_source", decision.marker, "close_cost", decision.closeCost)
+					"final_profit_source", decision.marker, "close_cost", decision.closeCost,
+					"reconciliation_state", reconState)
 				continue
 			}
 			if _, err := worker.db.Exec(ctx, `
@@ -3225,11 +3245,14 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 			settled, source := remote.BUOrderData.SettledProfit()
 			decision := worker.settleTerminalFinal(ctx, bot.id, time.Now(),
 				bot.maxLoss, bot.closedReason, closedReason, settled, source)
+			// v2.0.99: estimate-class finals stay re-checkable until the
+			// exchange's finished record confirms the netted total.
+			terminalRecon := pendingOrConfirmedRecon(decision.marker)
 			if _, err := worker.db.Exec(ctx, `
 				UPDATE grid_bots
 				SET status = $2,
 				    closed_reason = COALESCE(NULLIF(closed_reason, ''), $3),
-				    reconciliation_state = 'REMOTE_TERMINAL_CONFIRMED',
+				    reconciliation_state = $8,
 				    last_remote_status = $4, realized_pnl_usdt = $5,
 				    unrealized_pnl_usdt = 0, closed_at = NOW(),
 				    fees_paid_usdt = fees_paid_usdt + $7::NUMERIC,
@@ -3240,7 +3263,7 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 				    last_reconciled_at = NOW(), last_error = NULL, updated_at = NOW()
 				WHERE id = $1
 			`, bot.id, status, closedReason, remoteStatus, decision.final,
-				decision.marker, decision.closeCost); err != nil {
+				decision.marker, decision.closeCost, terminalRecon); err != nil {
 				worker.logger.Error("persist terminal grid state",
 					"component", "autogrid_worker", "bot_id", bot.id, "error", err)
 			}
@@ -3957,7 +3980,7 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 				UPDATE grid_bots
 				SET realized_pnl_usdt = CASE WHEN $3::BOOLEAN THEN NULL ELSE $2::NUMERIC END,
 				    unrealized_pnl_usdt = 0,
-				    reconciliation_state = 'REMOTE_TERMINAL_CONFIRMED',
+				    reconciliation_state = $6,
 				    fees_paid_usdt = fees_paid_usdt + $5::NUMERIC,
 				    model_state = jsonb_set(
 				        CASE WHEN $5::NUMERIC = 0 THEN COALESCE(model_state, '{}'::jsonb)
@@ -3965,7 +3988,8 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 				        '{finalProfitSource}', to_jsonb($4::TEXT)),
 				    updated_at = NOW()
 				WHERE id = $1
-			`, item.id, decision.final, decision.final == nil, decision.marker, decision.closeCost); err != nil {
+			`, item.id, decision.final, decision.final == nil, decision.marker, decision.closeCost,
+				pendingOrConfirmedRecon(decision.marker)); err != nil {
 				worker.logger.Error("backfill closed grid final PnL",
 					"component", "autogrid_worker", "bot_id", item.id, "error", err)
 			}
@@ -4158,15 +4182,23 @@ func findFinishedGridRecord(ctx context.Context, client *pionex.Client, buOrderI
 		return nil
 	}
 	token := ""
-	for page := 0; page < 10; page++ {
+	// v2.0.99: the finished history only grows (epoch-2 + epoch-4 closures),
+	// and a record the paging never reaches silently downgrades the terminal
+	// final to a telemetry estimate. 30 pages with per-error visibility
+	// instead of the silent nil the old loop returned.
+	for page := 0; page < 30; page++ {
 		orders, next, listErr := client.ListBotOrders(ctx, "finished", token)
 		if listErr != nil {
+			slog.Warn("finished-grid list probe failed — terminal final may fall back to estimate",
+				"component", "autogrid_worker", "page", page, "error", listErr)
 			return nil
 		}
 		for _, order := range orders {
 			if order.BUOrderID == buOrderID {
 				data, decodeErr := order.FuturesGridData()
 				if decodeErr != nil {
+					slog.Warn("finished-grid record decode failed",
+						"component", "autogrid_worker", "bu_order_id", buOrderID, "error", decodeErr)
 					return nil
 				}
 				return data
@@ -4177,6 +4209,8 @@ func findFinishedGridRecord(ctx context.Context, client *pionex.Client, buOrderI
 		}
 		token = next
 	}
+	slog.Warn("finished-grid record not found within paging depth",
+		"component", "autogrid_worker", "bu_order_id", buOrderID, "pages_scanned", 30)
 	return nil
 }
 
