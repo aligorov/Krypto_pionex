@@ -98,7 +98,10 @@ type Worker struct {
 	// grid lifecycle policy shares between the half-life age rotation and
 	// the DGT re-deploy geometry (v2.0.89 part B). TTL 30m; same
 	// single-goroutine argument as trancheTBRegime — the manage loop owns it.
+	// wsLane is the v2.0.98 advisory public WebSocket (INDEX markPrice) —
+	// nil until startWSLane, all consumers nil-check.
 	ouReadings map[string]ouSymbolReading
+	wsLane     *pionex.PublicStream
 }
 
 type trancheTBTrend struct {
@@ -150,6 +153,7 @@ func (worker *Worker) Run(ctx context.Context) {
 	defer commandTicker.Stop()
 	defer scheduleTicker.Stop()
 	defer reconcileTicker.Stop()
+	worker.startWSLane(ctx)
 	worker.sweepRestartGhosts(ctx)
 	// Drift self-heal: an operator editing N/budget/leverage directly in the
 	// DB bypasses Service.UpdateSettings; re-derive the AUTO breaker once at
@@ -2904,6 +2908,9 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 	// must not depend on it: real bots carry their own account_id and are
 	// managed regardless (orphaned bots must still receive stop requests).
 	worker.pinManagedAccount(ctx, settings)
+	// v2.0.98: keep the real-time lane's INDEX subscriptions aligned with the
+	// RUNNING fleet before the pass samples prices.
+	worker.syncWSSubscriptions(ctx, *settings)
 	var count int
 	if err := worker.db.QueryRow(ctx, `
 		SELECT COUNT(*) FROM grid_bots
@@ -5019,6 +5026,11 @@ func (worker *Worker) priceMap(ctx context.Context) (map[string]decimal.Decimal,
 	// official PnL reference per Pionex docs — fetched for the whole PERP
 	// universe in one public call. Last-trade tickers stay as the fallback:
 	// an indexes outage must not wedge supervision.
+	//
+	// v2.0.98: the real-time lane overlays fresh WebSocket marks on top of
+	// whichever REST snapshot landed — subscribed symbols get a mark that is
+	// seconds old instead of seconds-plus-interval, and a REST outage falls
+	// back to lane marks alone before the tickers fallback.
 	prices := make(map[string]decimal.Decimal, 512)
 	if indexes, err := worker.publicClient.GetIndexes(ctx, ""); err == nil {
 		for _, idx := range indexes {
@@ -5031,9 +5043,13 @@ func (worker *Worker) priceMap(ctx context.Context) (map[string]decimal.Decimal,
 				prices[trimmed+".PERP"] = idx.MarkPrice
 			}
 		}
-		if len(prices) > 0 {
-			return prices, nil
-		}
+	} else {
+		worker.logger.Debug("indexes fetch failed, trying tickers fallback",
+			"component", "autogrid_worker", "error", err)
+	}
+	worker.overlayWSMarks(prices)
+	if len(prices) > 0 {
+		return prices, nil
 	}
 	tickers, err := worker.publicClient.GetTickers(ctx, "", "PERP")
 	if err != nil {
