@@ -2,6 +2,7 @@ package autogrid
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -111,6 +112,9 @@ type Worker struct {
 	// terminalRawLogged dedups the v2.0.100 raw-payload witness to one line
 	// per pending row (single manage goroutine → plain map).
 	terminalRawLogged map[string]bool
+	// runningRawLogged dedups the v2.0.101 raw-payload witness for RUNNING
+	// grids to one line per (bot, adjustments) pair.
+	runningRawLogged map[string]bool
 }
 
 type trancheTBTrend struct {
@@ -3128,6 +3132,28 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 			price, ok = priceBySymbol[trimmed]
 			if !ok || price.IsZero() {
 				price = priceBySymbol[trimmed+"_PERP"]
+			}
+		}
+		// v2.0.101 running-payload witness: after a range shift the API
+		// re-bases positionOpenPrice (AAVE #1288: payload float −0.47 while
+		// the app nets −1.52 from the true inventory cost ~158.6 vs payload
+		// ~154.7) — supervision and the operator see an understated loss
+		// until the true-cost field is pinned. Log the RAW running payload
+		// once per bot after each adjustment so the next parser change is
+		// driven by a live witness, not doc guesses.
+		if bot.adjustments > 0 {
+			witnessKey := fmt.Sprintf("%s:%d", bot.id, bot.adjustments)
+			if worker.runningRawLogged == nil {
+				worker.runningRawLogged = make(map[string]bool)
+			}
+			if !worker.runningRawLogged[witnessKey] {
+				worker.runningRawLogged[witnessKey] = true
+				if rawBytes, rawErr := json.Marshal(remote.BUOrderData); rawErr == nil {
+					worker.logger.Warn("adjusted running grid raw payload witness",
+						"component", "autogrid_worker", "bot_number", bot.botNumber,
+						"symbol", bot.symbol, "adjustments", bot.adjustments,
+						"raw", truncateForLog(string(rawBytes)))
+				}
 			}
 		}
 		// v2.0.74: realized must mirror the app's "Grid Profit" — the
