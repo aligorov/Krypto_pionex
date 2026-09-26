@@ -651,6 +651,14 @@ function SettingsForm({
           manageIntervalSeconds: numberField(String(form.manageIntervalSeconds), 60),
           maxAdjustmentsPerBot: numberField(String(form.maxAdjustmentsPerBot), 3),
           aiAutotuneIntervalSeconds: numberField(String(form.aiAutotuneIntervalSeconds ?? 3600), 3600),
+          wickShieldEnabled: !!form.wickShieldEnabled,
+          wickGraceSec: form.wickGraceSec ? numberField(String(form.wickGraceSec), 90) : 90,
+          fleetMaxNetDeltaUsdt: dec(form.fleetMaxNetDeltaUsdt ?? '1200'),
+          universeScanCap: numberField(String(form.universeScanCap ?? 250), 250),
+          gaussianDensityEnabled: !!form.gaussianDensityEnabled,
+          orderbookProfilerEnabled: !!form.orderbookProfilerEnabled,
+          knifePauseEnabled: !!form.knifePauseEnabled,
+          minDepthCushionRatio: dec(form.minDepthCushionRatio ?? '50'),
         }),
       });
       await onSaved();
