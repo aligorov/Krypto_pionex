@@ -158,6 +158,7 @@ export default function Candidates({ canOperate: _canOperate }: Props) {
               upperPrice={Number(selectedForChart.upperPrice)}
               currentPrice={Number(selectedForChart.currentPrice)}
               gridCount={selectedForChart.gridNum}
+              gridType="GEOMETRIC"
               direction={selectedForChart.recommendedTrend?.toUpperCase() || 'NEUTRAL'}
               onClose={() => setSelectedForChart(null)}
             />
