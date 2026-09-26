@@ -705,8 +705,8 @@ func (worker *Worker) radarRecenterReal(ctx context.Context, settings Settings, 
 		SELECT direction, lower_price, upper_price, grid_num,
 		       NULLIF(anti_hunt_stop_price, 0),
 		       COALESCE(adjustments_count, 0), created_at,
-		       COALESCE(unrealized_pnl_usdt, 0),
-		       COALESCE(realized_pnl_usdt, 0) + COALESCE(unrealized_pnl_usdt, 0)
+		       COALESCE(supervision_floor_pnl_usdt, unrealized_pnl_usdt, 0),
+		       COALESCE(realized_pnl_usdt, 0) + COALESCE(supervision_floor_pnl_usdt, unrealized_pnl_usdt, 0)
 		FROM grid_bots
 		WHERE id = $1 AND autogrid_settings_id = $2
 		  AND bu_order_id IS NOT NULL AND status = 'RUNNING'
@@ -927,8 +927,8 @@ func (worker *Worker) radarMaybeAutoclose(ctx context.Context, settings Settings
 	var createdAt time.Time
 	if b.botSource == "REAL" {
 		err := worker.db.QueryRow(ctx, `
-			SELECT COALESCE(unrealized_pnl_usdt, 0),
-			       COALESCE(realized_pnl_usdt, 0) + COALESCE(unrealized_pnl_usdt, 0),
+			SELECT COALESCE(supervision_floor_pnl_usdt, unrealized_pnl_usdt, 0),
+			       COALESCE(realized_pnl_usdt, 0) + COALESCE(supervision_floor_pnl_usdt, unrealized_pnl_usdt, 0),
 			       created_at
 			FROM grid_bots
 			WHERE id = $1 AND autogrid_settings_id = $2

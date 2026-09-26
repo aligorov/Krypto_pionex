@@ -862,7 +862,7 @@ func newManageExchangeMock(t *testing.T) *manageExchangeMock {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
 			"result": true, "timestamp": time.Now().UnixMilli(),
-			"data":   map[string]any{"min_investment": "5"},
+			"data": map[string]any{"min_investment": "5"},
 		})
 	})
 	mux.HandleFunc("POST /api/v1/bot/orders/futuresGrid/adjustParams", func(w http.ResponseWriter, r *http.Request) {

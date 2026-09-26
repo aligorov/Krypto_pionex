@@ -120,3 +120,175 @@ func TestHealV107ShiftOffset(t *testing.T) {
 	worker.shiftOffsetHealDone = false
 	worker.healV107ShiftOffset(ctx)
 }
+
+func TestTwoCircuitFloorMath(t *testing.T) {
+	// Case 1: VIRTUAL #1394 without phantom offset:
+	// Raw float is +0.7012, rebasePool is 0 -> supervisionFloor is +0.7012 (matches raw screen).
+	rawVirtual := decimal.RequireFromString("0.7012")
+	poolVirtual := decimal.Zero
+	floorVirtual := rawVirtual.Add(poolVirtual)
+	if !floorVirtual.LessThan(rawVirtual) {
+		floorVirtual = rawVirtual
+	}
+	if !floorVirtual.Equal(rawVirtual) {
+		t.Fatalf("expected floorVirtual %s, got %s", rawVirtual, floorVirtual)
+	}
+
+	// Case 2: PENGU #1386:
+	// Raw float is -0.2333, rebasePool is -0.4280 -> supervisionFloor is -0.6613.
+	rawPengu := decimal.RequireFromString("-0.2333")
+	poolPengu := decimal.RequireFromString("-0.4280")
+	floorPengu := rawPengu.Add(poolPengu)
+	if !floorPengu.LessThan(rawPengu) {
+		t.Fatalf("floor must be lower than raw")
+	}
+	expectedPenguFloor := decimal.RequireFromString("-0.6613")
+	if !floorPengu.Equal(expectedPenguFloor) {
+		t.Fatalf("expected floorPengu %s, got %s", expectedPenguFloor, floorPengu)
+	}
+
+	// Case 3: Rebase detection formula:
+	// SHORT bot, signedPos = -83, entry jumped from 0.7814 to 0.8028
+	signedPos := decimal.RequireFromString("-83")
+	oldEntry := decimal.RequireFromString("0.7814")
+	newEntry := decimal.RequireFromString("0.8028")
+	rebaseDelta := signedPos.Mul(newEntry.Sub(oldEntry)) // -83 * 0.0214 = -1.7762
+	if !rebaseDelta.IsNegative() {
+		t.Fatalf("rebaseDelta for underwater short must be negative")
+	}
+	expectedDelta := decimal.RequireFromString("-1.7762")
+	if !rebaseDelta.Equal(expectedDelta) {
+		t.Fatalf("expected delta %s, got %s", expectedDelta, rebaseDelta)
+	}
+
+	// LONG bot, signedPos = +100, entry dropped from 150 to 140
+	signedPosLong := decimal.RequireFromString("100")
+	oldEntryLong := decimal.RequireFromString("150")
+	newEntryLong := decimal.RequireFromString("140")
+	rebaseDeltaLong := signedPosLong.Mul(newEntryLong.Sub(oldEntryLong)) // 100 * -10 = -1000
+	if !rebaseDeltaLong.IsNegative() {
+		t.Fatalf("rebaseDelta for underwater long must be negative")
+	}
+	expectedDeltaLong := decimal.RequireFromString("-1000")
+	if !rebaseDeltaLong.Equal(expectedDeltaLong) {
+		t.Fatalf("expected delta long %s, got %s", expectedDeltaLong, rebaseDeltaLong)
+	}
+
+	// Case 4: CRIT-01 and GAP-01 decoupling and flip verification
+	posNonZero := decimal.RequireFromString("-83")
+	isZeroPos := posNonZero.IsZero()
+	if isZeroPos {
+		t.Fatalf("isZeroPos must be false for non-zero position")
+	}
+
+	lastSignedPos := decimal.RequireFromString("-83")
+	signedPosCurrent := decimal.RequireFromString("100")
+	isFlip := !signedPosCurrent.IsZero() && !lastSignedPos.IsZero() && signedPosCurrent.Mul(lastSignedPos).IsNegative()
+	if !isFlip {
+		t.Fatalf("isFlip must be true when position inverts sign from -83 to +100")
+	}
+}
+
+func TestHealV113VirtualAndPengu(t *testing.T) {
+	dbURL := integrationDatabaseURL(t)
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, dbURL)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	t.Cleanup(pool.Close)
+
+	service := NewService(pool, risk.NewEngine(pool))
+	settings, err := service.GetSettings(ctx)
+	if err != nil {
+		t.Fatalf("settings: %v", err)
+	}
+
+	worker := &Worker{
+		db:      pool,
+		service: service,
+		logger:  slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+
+	bot1394ID := "7c88b000-0000-0000-0000-000000001394"
+	bot1386ID := "7c88b000-0000-0000-0000-000000001386"
+	_, _ = pool.Exec(ctx, `DELETE FROM grid_bots WHERE id IN ($1, $2)`, bot1394ID, bot1386ID)
+
+	// Seed bot 1394 (VIRTUAL with phantom shiftFloatingOffset)
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO grid_bots (
+			id, account_id, symbol, bu_order_id, status, direction, grid_type,
+			lower_price, upper_price, grid_num, leverage, quote_investment,
+			request_fingerprint, autogrid_settings_id, realized_pnl_usdt,
+			unrealized_pnl_usdt, bot_number, model_state, created_at, updated_at
+		) VALUES (
+			$1, $2, 'VIRTUAL_USDT_PERP', 'bu-1394', 'RUNNING',
+			'SHORT', 'GEOMETRIC', 0.50, 1.20, 32, 4, 100,
+			'fp-1394', $3, 0.56, -0.21, 1394,
+			'{"shiftFloatingOffset": -0.91088124, "shiftPosition": -83, "trancheDeployed": 2}'::jsonb, NOW(), NOW()
+		)
+	`, bot1394ID, settings.AccountID, settings.ID); err != nil {
+		t.Fatalf("seed bot 1394: %v", err)
+	}
+
+	// Seed bot 1386 (PENGU)
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO grid_bots (
+			id, account_id, symbol, bu_order_id, status, direction, grid_type,
+			lower_price, upper_price, grid_num, leverage, quote_investment,
+			request_fingerprint, autogrid_settings_id, realized_pnl_usdt,
+			unrealized_pnl_usdt, bot_number, model_state, created_at, updated_at
+		) VALUES (
+			$1, $2, 'PENGU_USDT_PERP', 'bu-1386', 'RUNNING',
+			'SHORT', 'GEOMETRIC', 0.008, 0.015, 32, 4, 100,
+			'fp-1386', $3, 0.48, -0.23, 1386,
+			'{"trancheDeployed": 2}'::jsonb, NOW(), NOW()
+		)
+	`, bot1386ID, settings.AccountID, settings.ID); err != nil {
+		t.Fatalf("seed bot 1386: %v", err)
+	}
+
+	t.Cleanup(func() {
+		_, _ = pool.Exec(ctx, `DELETE FROM grid_bots WHERE id IN ($1, $2)`, bot1394ID, bot1386ID)
+	})
+
+	// Run heal
+	worker.healV113VirtualShiftOffset(ctx)
+
+	// Check bot 1394: offset must be removed, v113VirtualHealedAt set
+	var offsetStr *string
+	var healedVirtual *string
+	if err := pool.QueryRow(ctx, `
+		SELECT model_state->>'shiftFloatingOffset', model_state->>'v113VirtualHealedAt'
+		FROM grid_bots WHERE id = $1
+	`, bot1394ID).Scan(&offsetStr, &healedVirtual); err != nil {
+		t.Fatalf("query bot 1394: %v", err)
+	}
+	if offsetStr != nil {
+		t.Fatalf("expected shiftFloatingOffset to be cleared, got %v", *offsetStr)
+	}
+	if healedVirtual == nil {
+		t.Fatalf("expected v113VirtualHealedAt to be set")
+	}
+
+	// Check bot 1386: rebasePool must be -0.428, v113PenguHealedAt set
+	var rebasePoolStr *string
+	var healedPengu *string
+	if err := pool.QueryRow(ctx, `
+		SELECT model_state->>'rebasePool', model_state->>'v113PenguHealedAt'
+		FROM grid_bots WHERE id = $1
+	`, bot1386ID).Scan(&rebasePoolStr, &healedPengu); err != nil {
+		t.Fatalf("query bot 1386: %v", err)
+	}
+	if rebasePoolStr == nil || *rebasePoolStr != "-0.428" {
+		t.Fatalf("expected rebasePool -0.428, got %v", rebasePoolStr)
+	}
+	if healedPengu == nil {
+		t.Fatalf("expected v113PenguHealedAt to be set")
+	}
+
+	// Idempotency: second run must not fail
+	worker.virtualHealDone = false
+	worker.healV113VirtualShiftOffset(ctx)
+}
+

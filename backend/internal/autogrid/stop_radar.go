@@ -104,7 +104,7 @@ func (worker *Worker) realRadarInputs(ctx context.Context, settings Settings, pr
 		SELECT id, COALESCE(bot_number, 0), symbol, direction,
 		       lower_price, upper_price, NULLIF(anti_hunt_stop_price, 0),
 		       COALESCE(NULLIF(model_state->>'atrPctEntry','')::FLOAT8, 0),
-		       COALESCE(realized_pnl_usdt, 0) + COALESCE(unrealized_pnl_usdt, 0)
+		       COALESCE(realized_pnl_usdt, 0) + COALESCE(supervision_floor_pnl_usdt, unrealized_pnl_usdt, 0)
 		FROM grid_bots
 		WHERE autogrid_settings_id = $1 AND bu_order_id IS NOT NULL
 		  AND status = 'RUNNING'

@@ -61,6 +61,7 @@ func (worker *Worker) recheckPendingExchangeFinals(ctx context.Context, settings
 	// (the ARB #1286 class that already shipped before this fix).
 	worker.healV103UnlockIdentity(ctx)
 	worker.healV107ShiftOffset(ctx)
+	worker.healV113VirtualShiftOffset(ctx)
 
 	if !worker.terminalReopenDone {
 		worker.terminalReopenDone = true
@@ -213,6 +214,7 @@ func (worker *Worker) applyExchangeFinal(ctx context.Context, item pendingTermin
 		UPDATE grid_bots
 		SET realized_pnl_usdt = $2::NUMERIC,
 		    unrealized_pnl_usdt = 0,
+		    supervision_floor_pnl_usdt = 0,
 		    reconciliation_state = 'REMOTE_TERMINAL_CONFIRMED',
 		    model_state = COALESCE(model_state, '{}'::jsonb)
 		        || jsonb_build_object('finalProfitSource', to_jsonb($3::TEXT),
@@ -283,6 +285,7 @@ func (worker *Worker) healV103UnlockIdentity(ctx context.Context) {
 		UPDATE grid_bots
 		SET realized_pnl_usdt = NULL,
 		    unrealized_pnl_usdt = 0,
+		    supervision_floor_pnl_usdt = 0,
 		    reconciliation_state = $1,
 		    model_state = (COALESCE(model_state, '{}'::jsonb)
 		        || jsonb_build_object(
@@ -336,6 +339,57 @@ func (worker *Worker) healV107ShiftOffset(ctx context.Context) {
 	if tag.RowsAffected() > 0 {
 		worker.logger.Warn("v2.0.107 shift offset heal: seeded true inventory offset for AAVE #1288",
 			"component", "autogrid_worker", "rows", tag.RowsAffected())
+	}
+}
+
+// healV113VirtualShiftOffset clears the phantom shiftFloatingOffset on VIRTUAL #1394
+// (where Pionex itself net-rebased entry on adjust) and seeds the rebasePool for
+// PENGU #1386 (where tranche-2 invest_in rebased positionOpenPrice, hiding loss from risk engine).
+// Durable once-ever keys: v113VirtualHealedAt, v113PenguHealedAt.
+func (worker *Worker) healV113VirtualShiftOffset(ctx context.Context) {
+	if worker.virtualHealDone {
+		return
+	}
+	tagVirtual, err := worker.db.Exec(ctx, `
+		UPDATE grid_bots
+		SET model_state = (COALESCE(model_state, '{}'::jsonb)
+		        || jsonb_build_object(
+		           'v113VirtualHealedAt', NOW()
+		        ))
+		        - 'shiftFloatingOffset' - 'shiftPosition',
+		    updated_at = NOW()
+		WHERE bot_number = 1394
+		  AND status = 'RUNNING'
+		  AND NOT (COALESCE(model_state, '{}'::jsonb) ? 'v113VirtualHealedAt')
+	`)
+	if err != nil {
+		worker.logger.Warn("v2.0.113 virtual shift offset heal failed — will retry next pass", "component", "autogrid_worker", "error", err)
+		return
+	}
+	tagPengu, err := worker.db.Exec(ctx, `
+		UPDATE grid_bots
+		SET model_state = (COALESCE(model_state, '{}'::jsonb)
+		        || jsonb_build_object(
+		           'rebasePool', -0.4280,
+		           'v113PenguHealedAt', NOW()
+		        )),
+		    updated_at = NOW()
+		WHERE bot_number = 1386
+		  AND status = 'RUNNING'
+		  AND NOT (COALESCE(model_state, '{}'::jsonb) ? 'v113PenguHealedAt')
+	`)
+	if err != nil {
+		worker.logger.Warn("v2.0.113 pengu rebase pool heal failed — will retry next pass", "component", "autogrid_worker", "error", err)
+		return
+	}
+	worker.virtualHealDone = true
+	if tagVirtual.RowsAffected() > 0 {
+		worker.logger.Warn("v2.0.113 heal: cleared phantom shiftFloatingOffset for VIRTUAL #1394",
+			"component", "autogrid_worker", "rows", tagVirtual.RowsAffected())
+	}
+	if tagPengu.RowsAffected() > 0 {
+		worker.logger.Warn("v2.0.113 heal: seeded rebasePool for PENGU #1386",
+			"component", "autogrid_worker", "rows", tagPengu.RowsAffected())
 	}
 }
 

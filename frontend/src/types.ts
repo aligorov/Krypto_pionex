@@ -381,6 +381,7 @@ export interface AutoGridBot {
   quoteInvestment: string;
   realizedPnlUsdt: string | null;
   unrealizedPnlUsdt: string | null;
+  supervisionFloorUsdt?: string | null;
   reconciliationState: string;
   adjustmentsCount: number;
   pnlTargetUsdt: string | null;

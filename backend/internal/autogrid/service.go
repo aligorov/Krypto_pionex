@@ -178,6 +178,7 @@ type ActiveBot struct {
 	QuoteInvestment     decimal.Decimal  `json:"quoteInvestment"`
 	RealizedPNLUSDT     *decimal.Decimal `json:"realizedPnlUsdt"`
 	UnrealizedPNLUSDT   *decimal.Decimal `json:"unrealizedPnlUsdt"`
+	SupervisionFloorUSDT *decimal.Decimal `json:"supervisionFloorUsdt,omitempty"`
 	ReconciliationState string           `json:"reconciliationState"`
 	AdjustmentsCount    int              `json:"adjustmentsCount"`
 	PnLTargetUSDT       *decimal.Decimal `json:"pnlTargetUsdt"`
@@ -1397,7 +1398,7 @@ func (s *Service) listActiveBots(ctx context.Context, settingsID string) ([]Acti
 		       lower_price, upper_price, grid_num, leverage, quote_investment,
 		       reconciliation_state, adjustments_count,
 		       pnl_target_usdt, max_loss_usdt,
-		       realized_pnl_usdt, unrealized_pnl_usdt,
+		       realized_pnl_usdt, unrealized_pnl_usdt, supervision_floor_pnl_usdt,
 		       anti_hunt_stop_price, struct_context->>'entryPrice',
 		       updated_at
 		FROM grid_bots
@@ -1408,27 +1409,27 @@ func (s *Service) listActiveBots(ctx context.Context, settingsID string) ([]Acti
 	if err != nil {
 		return nil, fmt.Errorf("list real AutoGrid bots: %w", err)
 	}
-	var entryPriceStr *string
 	for rows.Next() {
 		var item ActiveBot
 		item.Source = "REAL"
-		if entryPriceStr != nil {
-			if ep, err := decimal.NewFromString(*entryPriceStr); err == nil {
-				item.EntryPrice = &ep
-			}
-		}
+		var entryPriceStr *string
 		if err := rows.Scan(
 			&item.ID, &item.BotNumber, &item.AccountID, &item.BUOrderID, &item.Symbol,
 			&item.Status, &item.Direction, &item.GridType, &item.LowerPrice,
 			&item.UpperPrice, &item.GridNum, &item.Leverage,
 			&item.QuoteInvestment, &item.ReconciliationState,
 			&item.AdjustmentsCount, &item.PnLTargetUSDT, &item.MaxLossUSDT,
-			&item.RealizedPNLUSDT, &item.UnrealizedPNLUSDT,
+			&item.RealizedPNLUSDT, &item.UnrealizedPNLUSDT, &item.SupervisionFloorUSDT,
 			&item.AntiHuntStop, &entryPriceStr,
 			&item.UpdatedAt,
 		); err != nil {
 			rows.Close()
 			return nil, fmt.Errorf("scan real AutoGrid bot: %w", err)
+		}
+		if entryPriceStr != nil {
+			if ep, err := decimal.NewFromString(*entryPriceStr); err == nil {
+				item.EntryPrice = &ep
+			}
 		}
 		items = append(items, item)
 	}
@@ -1921,36 +1922,17 @@ func (s *Service) AdjustBot(
 			return "", fmt.Errorf("%w: %w", ErrNativeAdjustRefused, err)
 		}
 		if input.Mode == "adjust_params" {
-			setShiftOffset := ""
-			var extraArgs []any
-			if input.KeepInvestment != nil && *input.KeepInvestment {
-				offset := currentUnrealized
-				if input.CurrentUnrealized != nil {
-					offset = *input.CurrentUnrealized
-				}
-				pos := decimal.Zero
-				if input.CurrentPosition != nil {
-					pos = *input.CurrentPosition
-				} else if remoteOrder, getErr := client.GetFuturesGridBot(ctx, *buOrderID); getErr == nil && remoteOrder != nil {
-					pos = remoteOrder.BUOrderData.Position
-					if botDirection == "SHORT" && pos.IsPositive() {
-						pos = pos.Neg()
-					}
-				}
-				setShiftOffset = `, model_state = jsonb_set(
-					jsonb_set(
-						COALESCE(model_state, '{}'::jsonb),
-						'{shiftFloatingOffset}', to_jsonb($5::NUMERIC)),
-					'{shiftPosition}', to_jsonb($6::NUMERIC))`
-				extraArgs = append(extraArgs, offset, pos)
-			}
-			query := fmt.Sprintf(`
+			// v2.0.113: Range shifts no longer write shiftFloatingOffset to model_state.
+			// Any positionOpenPrice re-basing by Pionex is detected dynamically across passes
+			// by the reconcile loop and absorbed into rebasePool for the supervision circuit,
+			// preserving raw 1:1 screen parity on the display circuit.
+			query := `
 				UPDATE grid_bots
 				SET lower_price = $2, upper_price = $3, grid_num = $4,
-				    adjustments_count = adjustments_count + 1%s, updated_at = NOW()
+				    adjustments_count = adjustments_count + 1, updated_at = NOW()
 				WHERE id = $1
-			`, setShiftOffset)
-			_, err = s.db.Exec(ctx, query, append([]any{botID, input.Lower, input.Upper, params.Row}, extraArgs...)...)
+			`
+			_, err = s.db.Exec(ctx, query, botID, input.Lower, input.Upper, params.Row)
 		} else {
 			// v2.0.89 REAL ledger: every REAL invest_in (the tranche-2 pour
 			// AND manual top-ups) opens position notional pour × leverage and

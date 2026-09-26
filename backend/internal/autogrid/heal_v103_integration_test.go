@@ -32,9 +32,9 @@ func TestHealV103UnlockIdentity(t *testing.T) {
 	}
 
 	worker := &Worker{
-		db:       pool,
-		service:  service,
-		logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+		db:      pool,
+		service: service,
+		logger:  slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
 
 	seed := func(t *testing.T, id, marker string, guarded bool) {

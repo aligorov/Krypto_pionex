@@ -118,6 +118,9 @@ type Worker struct {
 	// inventory cost-basis offset for bots that shifted range under earlier
 	// versions (AAVE #1288).
 	shiftOffsetHealDone bool
+	// virtualHealDone gates the one-time v2.0.113 heal that clears the
+	// phantom shiftFloatingOffset on VIRTUAL #1394 (where Pionex itself net-rebased entry).
+	virtualHealDone bool
 	// terminalRawLogged dedups the v2.0.100 raw-payload witness to one line
 	// per pending row (single manage goroutine → plain map).
 	terminalRawLogged map[string]bool
@@ -3016,7 +3019,11 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 		       NULLIF(model_state->>'trancheIntentAt',''),
 		       COALESCE(funding_paid_usdt, 0), last_funding_reconcile_at,
 		       COALESCE(NULLIF(model_state->>'shiftFloatingOffset','')::NUMERIC, 0),
-		       COALESCE(NULLIF(model_state->>'shiftPosition','')::NUMERIC, 0)
+		       COALESCE(NULLIF(model_state->>'shiftPosition','')::NUMERIC, 0),
+		       COALESCE(supervision_floor_pnl_usdt, unrealized_pnl_usdt, 0),
+		       COALESCE(NULLIF(model_state->>'rebasePool','')::NUMERIC, 0),
+		       NULLIF(model_state->>'payloadEntryMark','')::NUMERIC,
+		       NULLIF(model_state->>'payloadSignedPos','')::NUMERIC
 		FROM grid_bots
 		WHERE autogrid_settings_id = $1 AND bu_order_id IS NOT NULL
 		  AND status IN ('RUNNING', 'STOP_REQUESTED', 'STOPPING')
@@ -3046,6 +3053,10 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 		lastFundingReconcileAt                                  *time.Time
 		shiftFloatingOffset                                     decimal.Decimal
 		shiftPosition                                           decimal.Decimal
+		supervisionFloor                                        decimal.Decimal
+		rebasePool                                              decimal.Decimal
+		lastEntryMark                                           *decimal.Decimal
+		lastSignedPos                                           *decimal.Decimal
 	}
 	bots := make([]managedBot, 0)
 	for rows.Next() {
@@ -3061,6 +3072,7 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 			&item.atrEntry, &item.trancheFailAt, &item.trancheIntentAt,
 			&item.fundingPaid, &item.lastFundingReconcileAt,
 			&item.shiftFloatingOffset, &item.shiftPosition,
+			&item.supervisionFloor, &item.rebasePool, &item.lastEntryMark, &item.lastSignedPos,
 		); err != nil {
 			rows.Close()
 			return clampInterval(settings.ManageIntervalSeconds), err
@@ -3150,6 +3162,7 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 					    reconciliation_state = $7,
 					    realized_pnl_usdt = CASE WHEN $4::BOOLEAN THEN NULL ELSE COALESCE($3, realized_pnl_usdt) END,
 					    unrealized_pnl_usdt = 0,
+					    supervision_floor_pnl_usdt = 0,
 					    fees_paid_usdt = fees_paid_usdt + $6::NUMERIC,
 					    model_state = jsonb_set(
 					        CASE WHEN $6::NUMERIC = 0 THEN COALESCE(model_state, '{}'::jsonb)
@@ -3222,13 +3235,25 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 		// v2.0.74: realized must mirror the app's "Grid Profit" — the
 		// exchange's accumulated realized grid profit (profitReduce), NOT
 		// profitWithdrawn, which stays 0 while a futures grid compounds its
-		// profit internally. unrealized stays the position's floating PnL at
-		// the mark price, matching the app's "Floating PnL". total
-		// (realized+unrealized) then reconciles with the app's "Total PnL".
+		// profit internally.
+		//
+		// v2.0.113 two-circuit PnL architecture:
+		// 1. Display/TG circuit (unrealized): raw exchange floating PnL using the
+		//    exchange payload's PositionOpenPrice. Restores 1:1 screen parity for VIRTUAL
+		//    and future shifts without phantom offsets.
+		// 2. Risk/Supervision circuit (supervisionFloor): conservative floor = min(raw, raw + rebasePool)
+		//    detects jumps in positionOpenPrice (>1% across passes from shifts or tranche-2 invest_in),
+		//    absorbing lost historical basis into rebasePool so stops and radar never suffer from
+		//    false optimism on underwater positions (the PENGU #1386 class).
 		realized := remote.BUOrderData.GridProfit()
 		unrealized := decimal.Zero
-		if !remote.BUOrderData.Position.IsZero() && price.GreaterThan(decimal.Zero) {
-			position := remote.BUOrderData.Position
+		supervisionFloor := decimal.Zero
+		currentEntry := remote.BUOrderData.PositionOpenPrice
+
+		isZeroPos := remote.BUOrderData.Position.IsZero()
+		var signedPos decimal.Decimal
+		if !isZeroPos {
+			signedPos = remote.BUOrderData.Position
 			// Pionex may report the grid position as an unsigned magnitude
 			// even for short grids. If a SHORT reports a positive position,
 			// treat it as a magnitude and negate: profit for a short is
@@ -3236,40 +3261,79 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 			// short bot's PnL (closing winners, holding losers). A signed
 			// feed (negative position) already encodes the side and passes
 			// through unchanged.
-			if bot.direction == "SHORT" && position.IsPositive() {
-				position = position.Neg()
+			if bot.direction == "SHORT" && signedPos.IsPositive() {
+				signedPos = signedPos.Neg()
 			}
-			unrealized = position.Mul(price.Sub(remote.BUOrderData.PositionOpenPrice))
+		}
 
-			// v2.0.107: Range shifts with keepInvestment carry inventory across
-			// grid re-basings. The exchange API re-bases positionOpenPrice to the
-			// shift price, discarding the historical cost basis of the open position.
-			// The carried floating PnL is preserved in model_state.shiftFloatingOffset
-			// and scales with the remaining position.
-			if !bot.shiftFloatingOffset.IsZero() {
-				if !bot.shiftPosition.IsZero() {
-					ratio := position.Div(bot.shiftPosition)
-					if ratio.IsPositive() {
-						if ratio.GreaterThan(decimal.NewFromInt(1)) {
-							ratio = decimal.NewFromInt(1)
-						}
-						unrealized = unrealized.Add(bot.shiftFloatingOffset.Mul(ratio))
-					}
-				} else {
-					unrealized = unrealized.Add(bot.shiftFloatingOffset)
-				}
+		// Point Д.4: Zero position or sign flip clears pool, mark, and legacy offsets.
+		isFlip := false
+		if !signedPos.IsZero() {
+			if bot.lastSignedPos != nil && !bot.lastSignedPos.IsZero() && signedPos.Mul(*bot.lastSignedPos).IsNegative() {
+				isFlip = true
+			} else if !bot.shiftPosition.IsZero() && signedPos.Mul(bot.shiftPosition).IsNegative() {
+				isFlip = true
 			}
-		} else if remote.BUOrderData.Position.IsZero() && !bot.shiftFloatingOffset.IsZero() {
-			// Position is flat — all inventory was closed into realized grid profit.
-			// Cleanly remove the offset from model_state.
-			_, _ = worker.db.Exec(ctx, `
-				UPDATE grid_bots
-				SET model_state = model_state - 'shiftFloatingOffset' - 'shiftPosition',
-				    updated_at = NOW()
-				WHERE id = $1
-			`, bot.id)
+		}
+
+		if isZeroPos || isFlip {
+			// Inventory closed into realized grid profit (or flipped side).
+			// Strip legacy offsets, rebasePool, entry mark, and signed pos.
 			bot.shiftFloatingOffset = decimal.Zero
 			bot.shiftPosition = decimal.Zero
+			bot.rebasePool = decimal.Zero
+			bot.lastEntryMark = nil
+			bot.lastSignedPos = nil
+		}
+
+		if !isZeroPos {
+			// Raw unrealized matches the exchange app's Floating PnL using the payload's PositionOpenPrice
+			if currentEntry.GreaterThan(decimal.Zero) && price.GreaterThan(decimal.Zero) {
+				unrealized = signedPos.Mul(price.Sub(currentEntry))
+			}
+
+			// Point Д.1 & Д.5: Rebase detection across passes (> 1% jump on non-flip)
+			if !isFlip && bot.lastEntryMark != nil && bot.lastEntryMark.IsPositive() && currentEntry.IsPositive() {
+				jump := currentEntry.Sub(*bot.lastEntryMark).Div(*bot.lastEntryMark).Abs()
+				if jump.GreaterThan(decimal.NewFromFloat(0.01)) {
+					// The exchange re-based positionOpenPrice. The lost floating PnL is signedPos * (newEntry - oldEntry)
+					rebaseDelta := signedPos.Mul(currentEntry.Sub(*bot.lastEntryMark))
+					if rebaseDelta.IsNegative() {
+						bot.rebasePool = bot.rebasePool.Add(rebaseDelta)
+						worker.logger.Info("absorbed positionOpenPrice rebase into supervision pool",
+							"component", "autogrid_worker",
+							"bot_number", bot.botNumber, "symbol", bot.symbol,
+							"old_entry", bot.lastEntryMark.String(), "new_entry", currentEntry.String(),
+							"rebase_delta", rebaseDelta.StringFixed(4), "rebase_pool", bot.rebasePool.StringFixed(4))
+					}
+				}
+			}
+
+			// Point Д.1: payloadEntryMark and payloadSignedPos are tracked EVERY pass
+			bot.lastEntryMark = &currentEntry
+			bot.lastSignedPos = &signedPos
+
+			// Legacy v2.0.107 shift offset for rows that predate rebasePool (e.g. AAVE #1288)
+			legacyShiftOffset := decimal.Zero
+			if !bot.shiftFloatingOffset.IsZero() && !bot.shiftPosition.IsZero() {
+				ratio := signedPos.Div(bot.shiftPosition)
+				if ratio.IsPositive() {
+					if ratio.GreaterThan(decimal.NewFromInt(1)) {
+						ratio = decimal.NewFromInt(1)
+					}
+					legacyShiftOffset = bot.shiftFloatingOffset.Mul(ratio)
+				}
+			}
+
+			// Point Б: Conservative floor = min(raw, raw + rebasePool + legacyShiftOffset)
+			floorCandidate := unrealized.Add(bot.rebasePool).Add(legacyShiftOffset)
+			if floorCandidate.LessThan(unrealized) {
+				supervisionFloor = floorCandidate
+			} else {
+				supervisionFloor = unrealized
+			}
+		} else {
+			supervisionFloor = decimal.Zero
 		}
 
 		// REAL funding reconciliation: prefer the exchange's per-bot
@@ -3376,7 +3440,7 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 				    closed_reason = COALESCE(NULLIF(closed_reason, ''), $3),
 				    reconciliation_state = $8,
 				    last_remote_status = $4, realized_pnl_usdt = $5,
-				    unrealized_pnl_usdt = 0, closed_at = NOW(),
+				    unrealized_pnl_usdt = 0, supervision_floor_pnl_usdt = 0, closed_at = NOW(),
 				    fees_paid_usdt = fees_paid_usdt + $7::NUMERIC,
 				    model_state = jsonb_set(
 				        CASE WHEN $7::NUMERIC = 0 THEN COALESCE(model_state, '{}'::jsonb)
@@ -3406,6 +3470,20 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 		if bot.localStatus == "RUNNING" {
 			persistedReconciliation = "REST_AUTHORITATIVE_OK"
 		}
+		var entryMarkParam *decimal.Decimal
+		if bot.lastEntryMark != nil && bot.lastEntryMark.IsPositive() {
+			entryMarkParam = bot.lastEntryMark
+		}
+		var rebasePoolParam *decimal.Decimal
+		if !bot.rebasePool.IsZero() {
+			rebasePoolParam = &bot.rebasePool
+		}
+		var signedPosParam *decimal.Decimal
+		if bot.lastSignedPos != nil && !bot.lastSignedPos.IsZero() {
+			signedPosParam = bot.lastSignedPos
+		}
+		clearKeys := isZeroPos || isFlip
+
 		if _, err := worker.db.Exec(ctx, `
 			UPDATE grid_bots
 			SET status = CASE
@@ -3418,12 +3496,24 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 				END,
 			    last_remote_status = $4, realized_pnl_usdt = $5,
 			    unrealized_pnl_usdt = $6,
+			    supervision_floor_pnl_usdt = $7,
 			    peak_pnl_usdt = GREATEST(COALESCE(peak_pnl_usdt, 0), $5::NUMERIC + $6::NUMERIC),
 			    trough_pnl_usdt = LEAST(COALESCE(trough_pnl_usdt, 0), $5::NUMERIC + $6::NUMERIC),
+			    model_state = CASE
+					WHEN $8::BOOLEAN THEN
+						COALESCE(model_state, '{}'::jsonb) - 'shiftFloatingOffset' - 'shiftPosition' - 'rebasePool' - 'payloadEntryMark' - 'payloadSignedPos'
+					ELSE
+						(COALESCE(model_state, '{}'::jsonb) - 'rebasePool' - 'payloadEntryMark' - 'payloadSignedPos')
+						|| jsonb_strip_nulls(jsonb_build_object(
+							'payloadEntryMark', $9::NUMERIC,
+							'rebasePool', $10::NUMERIC,
+							'payloadSignedPos', $11::NUMERIC
+						))
+				END,
 			    last_reconciled_at = NOW(),
 			    last_error = NULL, updated_at = NOW()
 			WHERE id = $1
-		`, bot.id, bot.localStatus, persistedReconciliation, remoteStatus, realized, unrealized); err != nil {
+		`, bot.id, bot.localStatus, persistedReconciliation, remoteStatus, realized, unrealized, supervisionFloor, clearKeys, entryMarkParam, rebasePoolParam, signedPosParam); err != nil {
 			// The PnL persist must never fail silently: v2.0.45 lost every
 			// REAL mark for weeks exactly because this error was swallowed.
 			worker.logger.Error("persist remote grid truth and PnL",
@@ -3653,7 +3743,7 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 			Upper:            bot.upper,
 			CurrentPrice:     price,
 			RealizedPNL:      realized,
-			UnrealizedPNL:    unrealized,
+			UnrealizedPNL:    supervisionFloor,
 			PeakPNL:          peakNow,
 			Budget:           bot.investment,
 			PnLTarget:        botTarget,
@@ -3949,7 +4039,7 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 			// regardless — RANGE_BREAK_* closes on adverse regime,
 			// _NO_ADJUSTMENTS_LEFT on budget exhaustion, plus the anti-hunt
 			// structural stop and the max-loss stop keep running.
-			shiftMode := adjustShiftMode(unrealized)
+			shiftMode := adjustShiftMode(supervisionFloor)
 			adjustReq := pionex.AdjustFuturesGridParams{
 				BUOrderID: bot.remoteID, Type: "adjust_params",
 				ExtraMargin: false, OpenPrice: &price,
@@ -3993,24 +4083,15 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 				// still fires on exchange success regardless: it is what arms
 				// the durable radar cooldown, and the exchange has already
 				// moved the range.
-				setShift := ""
-				if shiftMode == shiftModeKeepInvestment {
-					shiftPos := remote.BUOrderData.Position
-					if bot.direction == "SHORT" && shiftPos.IsPositive() {
-						shiftPos = shiftPos.Neg()
-					}
-					setShift = fmt.Sprintf(`, model_state = jsonb_set(
-						jsonb_set(
-							COALESCE(model_state, '{}'::jsonb),
-							'{shiftFloatingOffset}', to_jsonb($%d::NUMERIC)),
-						'{shiftPosition}', to_jsonb($%d::NUMERIC))`,
-						4+len(stopArg), 5+len(stopArg))
-					stopArg = append(stopArg, unrealized, shiftPos)
-				}
+				//
+				// v2.0.113: Range shifts no longer write shiftFloatingOffset to model_state.
+				// Any positionOpenPrice re-basing by Pionex is detected dynamically across passes
+				// by the reconcile loop and absorbed into rebasePool for the supervision circuit,
+				// preserving raw 1:1 screen parity on the display circuit.
 				if tag, persistErr := worker.db.Exec(ctx, `
 					UPDATE grid_bots
 					SET lower_price = $2, upper_price = $3,
-					    adjustments_count = adjustments_count + 1`+setStop+setShift+`, updated_at = NOW()
+					    adjustments_count = adjustments_count + 1`+setStop+`, updated_at = NOW()
 					WHERE id = $1
 				`, append([]any{bot.id, decision.NewLower, decision.NewUpper}, stopArg...)...); persistErr != nil || tag.RowsAffected() != 1 {
 					worker.logger.Error("adjusted native grid range, but local range persist failed — next reconcile resyncs from remote truth",
@@ -4126,6 +4207,7 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 				UPDATE grid_bots
 				SET realized_pnl_usdt = CASE WHEN $3::BOOLEAN THEN NULL ELSE $2::NUMERIC END,
 				    unrealized_pnl_usdt = 0,
+				    supervision_floor_pnl_usdt = 0,
 				    reconciliation_state = $6,
 				    fees_paid_usdt = fees_paid_usdt + $5::NUMERIC,
 				    model_state = jsonb_set(

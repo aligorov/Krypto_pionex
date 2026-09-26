@@ -313,6 +313,7 @@ function BotRow({
   const [adjustError, setAdjustError] = useState<string | null>(null);
   const realized = Number(bot.realizedPnlUsdt) || 0;
   const unrealized = Number(bot.unrealizedPnlUsdt) || 0;
+  const supervisionFloor = bot.supervisionFloorUsdt ? Number(bot.supervisionFloorUsdt) : null;
   const total = realized + unrealized;
   const pnlClass = (value: number) => (value > 0 ? 'positive' : value < 0 ? 'negative' : '');
 
@@ -407,7 +408,14 @@ function BotRow({
         </td>
         <td>{bot.quoteInvestment}</td>
         <td className={pnlClass(realized)}>{bot.realizedPnlUsdt ?? '—'}</td>
-        <td className={pnlClass(unrealized)}>{bot.unrealizedPnlUsdt ?? '—'}</td>
+        <td className={pnlClass(unrealized)}>
+          <div>{bot.unrealizedPnlUsdt ?? '—'}</div>
+          {supervisionFloor !== null && Math.abs(supervisionFloor - unrealized) > 0.15 && (
+            <div style={{ fontSize: '0.70rem', color: '#94a3b8' }} title="Консервативный пол риска для надзора и стопов">
+              пол: {supervisionFloor.toFixed(2)}
+            </div>
+          )}
+        </td>
         <td className={pnlClass(total)}><strong>{total.toFixed(4)}</strong></td>
         <td>{bot.adjustmentsCount}</td>
         <td>
