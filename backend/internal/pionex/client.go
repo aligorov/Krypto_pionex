@@ -362,19 +362,23 @@ func (b *BUOrderDataResponse) SettledProfit() (decimal.Decimal, FinalProfitSourc
 	if total := b.TotalProfit; !total.IsZero() {
 		return total, FinalProfitTotalAlias
 	}
-	// v2.0.100 unlock identity: returned minus invested, only when both
-	// settlement legs are present, positive, and the net sits inside the
-	// sanity band (can't lose more than was invested; gains beyond 3× the
-	// investment in one grid lifetime are a payload garble, not a fill).
-	unlock := parseDecimalRaw(b.UnlockUsdtAmountRaw)
-	invested := parseDecimalRaw(b.UsdtInvestmentRaw)
-	if invested.IsPositive() && unlock.IsPositive() {
-		if net := unlock.Sub(invested); net.GreaterThanOrEqual(invested.Neg()) &&
-			net.LessThan(invested.Mul(decimal.NewFromInt(3))) {
-			return net, FinalProfitUnlockIdentity
-		}
-	}
+	// v2.0.105: the unlock identity is NOT computed here. The client cannot
+	// know the bot's FINAL invested amount — the exchange's usdtInvestment
+	// field goes stale across invest_in/adjust_params (ARB #1286: returned
+	// 101.67 at our final 100 while the field still read 50, and the
+	// v2.0.100-103 ladder here wrote +51.67 instead of +1.67 into the money
+	// ledger). The identity now lives in autogrid's re-check sweep, which
+	// pairs unlockUsdtAmount with OUR quote_investment.
 	return decimal.Zero, FinalProfitNone
+}
+
+// UnlockUsdtAmount exposes the settlement figure the autogrid-side identity
+// pairs with our own final investment (v2.0.105).
+func (b *BUOrderDataResponse) UnlockUsdtAmount() decimal.Decimal {
+	if b == nil {
+		return decimal.Zero
+	}
+	return parseDecimalRaw(b.UnlockUsdtAmountRaw)
 }
 
 // FinalProfit returns just the settled figure (provenance-free). New callers

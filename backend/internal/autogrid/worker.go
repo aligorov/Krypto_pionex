@@ -110,6 +110,10 @@ type Worker struct {
 	// terminalReopenDone gates the one-time v2.0.99 upgrade heal that reopens
 	// estimate-class finals the old binary froze as confirmed.
 	terminalReopenDone bool
+	// terminalIdentityHealDone gates the one-time v2.0.105 heal that NULLs
+	// the unlock_identity finals written with the exchange's stale
+	// usdtInvestment divisor.
+	terminalIdentityHealDone bool
 	// terminalRawLogged dedups the v2.0.100 raw-payload witness to one line
 	// per pending row (single manage goroutine → plain map).
 	terminalRawLogged map[string]bool

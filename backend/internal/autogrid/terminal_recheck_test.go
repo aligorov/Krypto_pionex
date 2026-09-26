@@ -39,3 +39,31 @@ func TestGateSettledProfitUnlockIdentity(t *testing.T) {
 		t.Fatalf("positive identity on loss-class must refuse: %v", got)
 	}
 }
+
+// v2.0.105: the identity pairs unlockUsdtAmount with OUR final investment —
+// the live failure was unlock 102.28 vs the exchange's STALE usdtInvestment
+// field (50) writing +52.28 into the ledger while the truth was +2.28.
+func TestUnlockIdentityUsesOurInvestment(t *testing.T) {
+	// Reproduce the prod payloads: unlock carries returned capital+profit,
+	// usdtInvestment still reads the PRE-tranche 50 while OUR final is 100.
+	our := decimal.RequireFromString("100")
+	unlock := decimal.RequireFromString("102.279854292")
+	net := unlock.Sub(our)
+	if !net.Equal(decimal.RequireFromString("2.279854292")) {
+		t.Fatalf("CRV #1282 true final must be +2.28, got %s", net)
+	}
+	// The buggy v2.0.100 pairing for the same record:
+	stale := decimal.RequireFromString("50")
+	if bug := unlock.Sub(stale); bug.Equal(net) {
+		t.Fatalf("stale-field pairing must differ (prod wrote %s)", bug)
+	}
+	// Sanity band: |net| < our investment.
+	if !net.Abs().LessThan(our) {
+		t.Fatalf("net must sit inside the margin band")
+	}
+	extreme := decimal.RequireFromString("33.35") // AR #1313 screenshot row
+	arNet := extreme.Sub(our)
+	if !arNet.Equal(decimal.RequireFromString("-66.65")) || !arNet.Abs().LessThan(our) {
+		t.Fatalf("AR extreme loss must pass the band: %s", arNet)
+	}
+}

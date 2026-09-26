@@ -195,37 +195,31 @@ func TestBotOrderFuturesGridData(t *testing.T) {
 	}
 }
 
-// v2.0.100 unlock-identity leg: returned minus invested when both settlement
-// amounts are present — and none of the 32 prod finished records ever
-// carried profitExited/totalProfit, so this leg is the exchange-truth
-// carrier in practice.
-func TestSettledProfitUnlockIdentity(t *testing.T) {
-	unlocked := decodeOrderData(t, `{
-		"status": "canceled", "reasonBy": "user_cancel",
-		"unlockUsdtAmount": "51.66", "usdtInvestment": "50",
-		"profitReduce": "2.01"
-	}`)
-	got, src := unlocked.SettledProfit()
-	if !got.Equal(mustDecimal(t, "1.66")) || src != FinalProfitUnlockIdentity {
-		t.Fatalf("unlock identity must carry the ARB #1286 netted +1.66: got %s/%s", got, src)
-	}
-
-	// Sanity band: a garbled unlock far beyond 3× investment must NOT settle.
-	garbled := decodeOrderData(t, `{
-		"status": "canceled", "reasonBy": "user_cancel",
-		"unlockUsdtAmount": "500", "usdtInvestment": "50"
-	}`)
-	if got, src := garbled.SettledProfit(); src != FinalProfitNone {
-		t.Fatalf("out-of-band unlock must not settle: got %s/%s", got, src)
-	}
-
-	// Missing legs stay NONE — the caller keeps the telemetry estimate and
-	// the sweep logs the raw payload witness.
-	missing := decodeOrderData(t, `{
-		"status": "canceled", "reasonBy": "user_cancel",
-		"usdtInvestment": "50", "profitReduce": "2.01"
-	}`)
-	if got, src := missing.SettledProfit(); src != FinalProfitNone {
-		t.Fatalf("missing unlock leg must be NONE: got %s/%s", got, src)
+// v2.0.105: the client NEVER settles from the unlock fields. The record's
+// own usdtInvestment goes stale across invest_in/adjust_params (ARB #1286
+// returned 101.67 at our final 100 while the field still read 50 — the
+// v2.0.100-104 client leg wrote +51.67 instead of +1.67 into prod). The
+// identity now lives in autogrid, paired with OUR final quote_investment;
+// this test pins the client to NONE so the mistake cannot return.
+func TestSettledProfitUnlockFieldsNeverSettle(t *testing.T) {
+	for name, payload := range map[string]string{
+		"ARB live payload": `{
+			"status": "canceled", "reasonBy": "user_cancel",
+			"unlockUsdtAmount": "101.669207503", "usdtInvestment": "50",
+			"profitReduce": "2.01"
+		}`,
+		"missing unlock": `{
+			"status": "canceled", "reasonBy": "user_cancel",
+			"usdtInvestment": "50", "profitReduce": "2.01"
+		}`,
+	} {
+		rec := decodeOrderData(t, payload)
+		got, src := rec.SettledProfit()
+		if src != FinalProfitNone {
+			t.Fatalf("%s: unlock fields must NOT settle client-side: got %s/%s", name, got, src)
+		}
+		if name == "ARB live payload" && !rec.UnlockUsdtAmount().Equal(mustDecimal(t, "101.669207503")) {
+			t.Fatalf("UnlockUsdtAmount accessor must expose the raw figure for the autogrid pairing")
+		}
 	}
 }
