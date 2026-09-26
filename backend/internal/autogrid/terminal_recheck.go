@@ -279,7 +279,6 @@ func (worker *Worker) healV103UnlockIdentity(ctx context.Context) {
 	if worker.terminalIdentityHealDone {
 		return
 	}
-	worker.terminalIdentityHealDone = true
 	tag, err := worker.db.Exec(ctx, `
 		UPDATE grid_bots
 		SET realized_pnl_usdt = NULL,
@@ -296,9 +295,13 @@ func (worker *Worker) healV103UnlockIdentity(ctx context.Context) {
 		  AND NOT (COALESCE(model_state, '{}'::jsonb) ? 'v103UnlockBug')
 	`, TerminalFinalPendingExchange)
 	if err != nil {
-		worker.logger.Warn("v2.0.105 identity heal failed", "component", "autogrid_worker", "error", err)
+		// Flag stays false: a transient DB error retries on the next manage
+		// pass instead of skipping the heal for the whole process lifetime
+		// (the exact silent-skip shape that shipped the phantom card).
+		worker.logger.Warn("v2.0.105 identity heal failed — will retry next pass", "component", "autogrid_worker", "error", err)
 		return
 	}
+	worker.terminalIdentityHealDone = true
 	if tag.RowsAffected() > 0 {
 		worker.logger.Warn("v2.0.105 identity heal: reopened buggy unlock_identity finals",
 			"component", "autogrid_worker", "rows", tag.RowsAffected())
@@ -312,7 +315,6 @@ func (worker *Worker) healV107ShiftOffset(ctx context.Context) {
 	if worker.shiftOffsetHealDone {
 		return
 	}
-	worker.shiftOffsetHealDone = true
 	tag, err := worker.db.Exec(ctx, `
 		UPDATE grid_bots
 		SET model_state = (COALESCE(model_state, '{}'::jsonb)
@@ -324,12 +326,13 @@ func (worker *Worker) healV107ShiftOffset(ctx context.Context) {
 		    updated_at = NOW()
 		WHERE bot_number = 1288
 		  AND status = 'RUNNING'
-		  AND NOT (COALESCE(model_state, '{}'::jsonb) ? 'shiftFloatingOffset')
+		  AND NOT (COALESCE(model_state, '{}'::jsonb) ? 'v107AaveHealedAt')
 	`)
 	if err != nil {
-		worker.logger.Warn("v2.0.107 shift offset heal failed", "component", "autogrid_worker", "error", err)
+		worker.logger.Warn("v2.0.107 shift offset heal failed — will retry next pass", "component", "autogrid_worker", "error", err)
 		return
 	}
+	worker.shiftOffsetHealDone = true
 	if tag.RowsAffected() > 0 {
 		worker.logger.Warn("v2.0.107 shift offset heal: seeded true inventory offset for AAVE #1288",
 			"component", "autogrid_worker", "rows", tag.RowsAffected())
