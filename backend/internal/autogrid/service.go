@@ -1824,7 +1824,9 @@ type AdjustBotInput struct {
 	// flag: a pure range transfer that skips the exchange PROFIT_LESS_THAN_ZERO
 	// gate and does NOT reset the investment amount. Non-nil true only; nil
 	// keeps the legacy green-only semantics.
-	KeepInvestment *bool `json:"keepInvestment,omitempty"`
+	KeepInvestment    *bool            `json:"keepInvestment,omitempty"`
+	CurrentUnrealized *decimal.Decimal `json:"currentUnrealized,omitempty"`
+	CurrentPosition   *decimal.Decimal `json:"currentPosition,omitempty"`
 }
 
 // ErrNativeAdjustRefused marks an adjust that the EXCHANGE itself refused —
@@ -1849,16 +1851,18 @@ func (s *Service) AdjustBot(
 	var buOrderID *string
 	var accountID *string
 	var botSymbol string
+	var botDirection string
 	var botLeverage int
 	var currentLower, currentUpper decimal.Decimal
 	var currentRow int
+	var currentUnrealized decimal.Decimal
 	if err := s.db.QueryRow(ctx, `
-		SELECT bu_order_id, account_id, symbol, COALESCE(leverage, 1),
-		       lower_price, upper_price, grid_num
+		SELECT bu_order_id, account_id, symbol, direction, COALESCE(leverage, 1),
+		       lower_price, upper_price, grid_num, COALESCE(unrealized_pnl_usdt, 0)
 		FROM grid_bots
 		WHERE id = $1 AND autogrid_settings_id = $2 AND status = 'RUNNING'
-	`, botID, settingsID).Scan(&buOrderID, &accountID, &botSymbol, &botLeverage,
-		&currentLower, &currentUpper, &currentRow); err == nil {
+	`, botID, settingsID).Scan(&buOrderID, &accountID, &botSymbol, &botDirection, &botLeverage,
+		&currentLower, &currentUpper, &currentRow, &currentUnrealized); err == nil {
 		if buOrderID == nil || *buOrderID == "" {
 			return "", errors.New("real bot has no remote buOrderId yet")
 		}
@@ -1917,12 +1921,36 @@ func (s *Service) AdjustBot(
 			return "", fmt.Errorf("%w: %w", ErrNativeAdjustRefused, err)
 		}
 		if input.Mode == "adjust_params" {
-			_, err = s.db.Exec(ctx, `
+			setShiftOffset := ""
+			var extraArgs []any
+			if input.KeepInvestment != nil && *input.KeepInvestment {
+				offset := currentUnrealized
+				if input.CurrentUnrealized != nil {
+					offset = *input.CurrentUnrealized
+				}
+				pos := decimal.Zero
+				if input.CurrentPosition != nil {
+					pos = *input.CurrentPosition
+				} else if remoteOrder, getErr := client.GetFuturesGridBot(ctx, *buOrderID); getErr == nil && remoteOrder != nil {
+					pos = remoteOrder.BUOrderData.Position
+					if botDirection == "SHORT" && pos.IsPositive() {
+						pos = pos.Neg()
+					}
+				}
+				setShiftOffset = `, model_state = jsonb_set(
+					jsonb_set(
+						COALESCE(model_state, '{}'::jsonb),
+						'{shiftFloatingOffset}', to_jsonb($5::NUMERIC)),
+					'{shiftPosition}', to_jsonb($6::NUMERIC))`
+				extraArgs = append(extraArgs, offset, pos)
+			}
+			query := fmt.Sprintf(`
 				UPDATE grid_bots
 				SET lower_price = $2, upper_price = $3, grid_num = $4,
-				    adjustments_count = adjustments_count + 1, updated_at = NOW()
+				    adjustments_count = adjustments_count + 1%s, updated_at = NOW()
 				WHERE id = $1
-			`, botID, input.Lower, input.Upper, params.Row)
+			`, setShiftOffset)
+			_, err = s.db.Exec(ctx, query, append([]any{botID, input.Lower, input.Upper, params.Row}, extraArgs...)...)
 		} else {
 			// v2.0.89 REAL ledger: every REAL invest_in (the tranche-2 pour
 			// AND manual top-ups) opens position notional pour × leverage and

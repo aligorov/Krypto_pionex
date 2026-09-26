@@ -740,17 +740,22 @@ func (worker *Worker) radarRecenterReal(ctx context.Context, settings Settings, 
 		return
 	}
 	keepInvestment := mode == shiftModeKeepInvestment
+	var curUnrealized *decimal.Decimal
+	if keepInvestment {
+		curUnrealized = &bot.floating
+	}
 
 	// AdjustBot increments adjustments_count only AFTER the native
 	// adjustParams succeeds — a failed adjust (or a refused adjustParamsCheck
 	// dry-run) returns here with the budget and geometry untouched (Warn,
 	// never a phantom shift).
 	if _, err := worker.service.AdjustBot(ctx, worker.accounts, settings.ID, b.botID, AdjustBotInput{
-		Mode:           "adjust_params",
-		Lower:          newLower,
-		Upper:          newUpper,
-		Row:            bot.gridNum,
-		KeepInvestment: &keepInvestment,
+		Mode:              "adjust_params",
+		Lower:             newLower,
+		Upper:             newUpper,
+		Row:               bot.gridNum,
+		KeepInvestment:    &keepInvestment,
+		CurrentUnrealized: curUnrealized,
 	}); err != nil {
 		worker.logger.Warn("stop-radar: REAL recenter adjust_params failed — budget untouched",
 			"component", "autogrid_worker", "symbol", b.symbol, "mode", mode, "error", err)

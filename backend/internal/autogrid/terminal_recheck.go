@@ -60,6 +60,7 @@ func (worker *Worker) recheckPendingExchangeFinals(ctx context.Context, settings
 	// so the sweep can still fetch their exchange truth inside the window
 	// (the ARB #1286 class that already shipped before this fix).
 	worker.healV103UnlockIdentity(ctx)
+	worker.healV107ShiftOffset(ctx)
 
 	if !worker.terminalReopenDone {
 		worker.terminalReopenDone = true
@@ -303,3 +304,35 @@ func (worker *Worker) healV103UnlockIdentity(ctx context.Context) {
 			"component", "autogrid_worker", "rows", tag.RowsAffected())
 	}
 }
+
+// healV107ShiftOffset repairs bot #1288 (and any running bot that shifted
+// range under v2.0.101-106 without an inventory offset), restoring its true
+// floating PnL on Pionex.
+func (worker *Worker) healV107ShiftOffset(ctx context.Context) {
+	if worker.shiftOffsetHealDone {
+		return
+	}
+	worker.shiftOffsetHealDone = true
+	tag, err := worker.db.Exec(ctx, `
+		UPDATE grid_bots
+		SET model_state = (COALESCE(model_state, '{}'::jsonb)
+		        || jsonb_build_object(
+		           'shiftFloatingOffset', -3.0672,
+		           'shiftPosition', -0.72,
+		           'v107AaveHealedAt', NOW()
+		        )),
+		    updated_at = NOW()
+		WHERE bot_number = 1288
+		  AND status = 'RUNNING'
+		  AND NOT (COALESCE(model_state, '{}'::jsonb) ? 'shiftFloatingOffset')
+	`)
+	if err != nil {
+		worker.logger.Warn("v2.0.107 shift offset heal failed", "component", "autogrid_worker", "error", err)
+		return
+	}
+	if tag.RowsAffected() > 0 {
+		worker.logger.Warn("v2.0.107 shift offset heal: seeded true inventory offset for AAVE #1288",
+			"component", "autogrid_worker", "rows", tag.RowsAffected())
+	}
+}
+

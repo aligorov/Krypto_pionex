@@ -114,6 +114,10 @@ type Worker struct {
 	// the unlock_identity finals written with the exchange's stale
 	// usdtInvestment divisor.
 	terminalIdentityHealDone bool
+	// shiftOffsetHealDone gates the one-time v2.0.107 heal that seeds the
+	// inventory cost-basis offset for bots that shifted range under earlier
+	// versions (AAVE #1288).
+	shiftOffsetHealDone bool
 	// terminalRawLogged dedups the v2.0.100 raw-payload witness to one line
 	// per pending row (single manage goroutine → plain map).
 	terminalRawLogged map[string]bool
@@ -2977,7 +2981,9 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 		       COALESCE(NULLIF(model_state->>'atrPctEntry','')::FLOAT8, 0),
 		       NULLIF(model_state->>'trancheFailAt',''),
 		       NULLIF(model_state->>'trancheIntentAt',''),
-		       COALESCE(funding_paid_usdt, 0), last_funding_reconcile_at
+		       COALESCE(funding_paid_usdt, 0), last_funding_reconcile_at,
+		       COALESCE(NULLIF(model_state->>'shiftFloatingOffset','')::NUMERIC, 0),
+		       COALESCE(NULLIF(model_state->>'shiftPosition','')::NUMERIC, 0)
 		FROM grid_bots
 		WHERE autogrid_settings_id = $1 AND bu_order_id IS NOT NULL
 		  AND status IN ('RUNNING', 'STOP_REQUESTED', 'STOPPING')
@@ -3005,6 +3011,8 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 		trancheIntentAt                                         *string
 		fundingPaid                                             decimal.Decimal
 		lastFundingReconcileAt                                  *time.Time
+		shiftFloatingOffset                                     decimal.Decimal
+		shiftPosition                                           decimal.Decimal
 	}
 	bots := make([]managedBot, 0)
 	for rows.Next() {
@@ -3019,6 +3027,7 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 			&item.trancheDeployed, &item.trancheBase, &item.trancheEntry,
 			&item.atrEntry, &item.trancheFailAt, &item.trancheIntentAt,
 			&item.fundingPaid, &item.lastFundingReconcileAt,
+			&item.shiftFloatingOffset, &item.shiftPosition,
 		); err != nil {
 			rows.Close()
 			return clampInterval(settings.ManageIntervalSeconds), err
@@ -3198,6 +3207,36 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 				position = position.Neg()
 			}
 			unrealized = position.Mul(price.Sub(remote.BUOrderData.PositionOpenPrice))
+
+			// v2.0.107: Range shifts with keepInvestment carry inventory across
+			// grid re-basings. The exchange API re-bases positionOpenPrice to the
+			// shift price, discarding the historical cost basis of the open position.
+			// The carried floating PnL is preserved in model_state.shiftFloatingOffset
+			// and scales with the remaining position.
+			if !bot.shiftFloatingOffset.IsZero() {
+				if !bot.shiftPosition.IsZero() {
+					ratio := position.Div(bot.shiftPosition)
+					if ratio.IsPositive() {
+						if ratio.GreaterThan(decimal.NewFromInt(1)) {
+							ratio = decimal.NewFromInt(1)
+						}
+						unrealized = unrealized.Add(bot.shiftFloatingOffset.Mul(ratio))
+					}
+				} else {
+					unrealized = unrealized.Add(bot.shiftFloatingOffset)
+				}
+			}
+		} else if remote.BUOrderData.Position.IsZero() && !bot.shiftFloatingOffset.IsZero() {
+			// Position is flat — all inventory was closed into realized grid profit.
+			// Cleanly remove the offset from model_state.
+			_, _ = worker.db.Exec(ctx, `
+				UPDATE grid_bots
+				SET model_state = model_state - 'shiftFloatingOffset' - 'shiftPosition',
+				    updated_at = NOW()
+				WHERE id = $1
+			`, bot.id)
+			bot.shiftFloatingOffset = decimal.Zero
+			bot.shiftPosition = decimal.Zero
 		}
 
 		// REAL funding reconciliation: prefer the exchange's per-bot
@@ -3911,10 +3950,24 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 				// still fires on exchange success regardless: it is what arms
 				// the durable radar cooldown, and the exchange has already
 				// moved the range.
+				setShift := ""
+				if shiftMode == shiftModeKeepInvestment {
+					shiftPos := remote.BUOrderData.Position
+					if bot.direction == "SHORT" && shiftPos.IsPositive() {
+						shiftPos = shiftPos.Neg()
+					}
+					setShift = fmt.Sprintf(`, model_state = jsonb_set(
+						jsonb_set(
+							COALESCE(model_state, '{}'::jsonb),
+							'{shiftFloatingOffset}', to_jsonb($%d::NUMERIC)),
+						'{shiftPosition}', to_jsonb($%d::NUMERIC))`,
+						4+len(stopArg), 5+len(stopArg))
+					stopArg = append(stopArg, unrealized, shiftPos)
+				}
 				if tag, persistErr := worker.db.Exec(ctx, `
 					UPDATE grid_bots
 					SET lower_price = $2, upper_price = $3,
-					    adjustments_count = adjustments_count + 1`+setStop+`, updated_at = NOW()
+					    adjustments_count = adjustments_count + 1`+setStop+setShift+`, updated_at = NOW()
 					WHERE id = $1
 				`, append([]any{bot.id, decision.NewLower, decision.NewUpper}, stopArg...)...); persistErr != nil || tag.RowsAffected() != 1 {
 					worker.logger.Error("adjusted native grid range, but local range persist failed — next reconcile resyncs from remote truth",
