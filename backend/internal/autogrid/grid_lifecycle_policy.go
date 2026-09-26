@@ -839,6 +839,14 @@ func (worker *Worker) dgtRedeployReal(ctx context.Context, settings Settings, sp
 		data.LossStopType = "price"
 		data.LossStop = &antiHuntStop
 	}
+	// v2.0.111: the break-flip's replacement grid carries the same native
+	// loss bound as a fresh deploy (agent_3217d33f: without this mirror the
+	// ORDI-scenario re-deploy ran unbounded if the process died).
+	if botMaxLoss != nil && botMaxLoss.IsPositive() && data.LossStopType == "" {
+		neg := botMaxLoss.Neg().Round(2)
+		data.LossStopType = "profit_amount"
+		data.LossStop = &neg
+	}
 	if botTarget != nil && botTarget.GreaterThan(decimal.Zero) {
 		targetVal := botTarget.Round(2)
 		data.ProfitStopType = "profit_amount"

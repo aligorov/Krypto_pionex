@@ -5,13 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"sync"
 	"log/slog"
 	"math"
 	"net/http"
 	"runtime/debug"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aligorov/pionex-bot/backend/internal/accounts"
@@ -121,6 +121,14 @@ type Worker struct {
 	// terminalRawLogged dedups the v2.0.100 raw-payload witness to one line
 	// per pending row (single manage goroutine → plain map).
 	terminalRawLogged map[string]bool
+	// v2.0.111 storm mode: ≥3 fleet symbols tripping the realtime trigger
+	// within 5 minutes defer rotations/deploys for a rolling 30 minutes.
+	// Written from the WS callback goroutine, read from the manage loop —
+	// guarded by stormMu.
+	stormMu       sync.RWMutex
+	stormTriggers map[string]time.Time
+	stormUntil    time.Time
+	stormLoggedAt time.Time
 	// runningRawLogged dedups the v2.0.101 raw-payload witness for RUNNING
 	// grids to one line per (bot, adjustments) pair.
 	runningRawLogged map[string]bool
@@ -1739,6 +1747,14 @@ func (worker *Worker) deployReal(
 	if err := worker.realExecutionAllowed(ctx, settings); err != nil {
 		return err
 	}
+	// v2.0.111 storm deferral: opening fresh grids into a fleet-wide
+	// acceleration buys the worst entries of the day; the scan retries in
+	// four minutes and the storm window is rolling.
+	if worker.stormActive() {
+		worker.logger.Info("deploy deferred by storm mode",
+			"component", "autogrid_worker", "scan_id", scanID)
+		return nil
+	}
 	if settings.AccountID == nil {
 		resolved, err := worker.service.resolveAccount(ctx)
 		if err != nil {
@@ -2357,6 +2373,21 @@ func (worker *Worker) deployReal(
 		if !strings.HasSuffix(futuresBase, ".PERP") && !strings.HasSuffix(futuresBase, "_PERP") {
 			futuresBase = fmt.Sprintf("%s.PERP", base)
 		}
+		// v2.0.111 native loss-stop: the exchange's own executor bounds the
+		// position even if our whole process dies (SUI/ORDI overshoots were
+		// 12-31% over cap on our-side reactive stops). Two reviewer-forced
+		// decisions (agent_3217d33f): (a) arm at candidateFullStop — the
+		// post-tranche envelope — because invest_in cannot widen an
+		// exchange stop, and the pre-pour manage stop (halved cap) fires
+		// first in the normal path, leaving this as the process-dead bound;
+		// (b) ADAPTIVE_ATR's price stop keeps priority when set — the
+		// anti-hunt machinery owns that stop positionally, and a silent
+		// displacement would change the guarantee's shape.
+		if candidateFullStop.IsPositive() && data.LossStopType == "" {
+			neg := candidateFullStop.Neg().Round(2)
+			data.LossStopType = "profit_amount"
+			data.LossStop = &neg
+		}
 		params := pionex.NativeFuturesGridCreateParams{
 			Base: futuresBase, Quote: quote, BUOrderData: data,
 		}
@@ -2946,6 +2977,8 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 	// v2.0.98: keep the real-time lane's INDEX subscriptions aligned with the
 	// RUNNING fleet before the pass samples prices.
 	worker.syncWSSubscriptions(ctx, *settings)
+	// v2.0.111: surface storm arm/extend transitions once per arm.
+	worker.maybeLogStormState(ctx)
 	// v2.0.99: overwrite estimate-class terminal finals with the exchange's
 	// netted total once the finished record surfaces (throttled internally).
 	worker.recheckPendingExchangeFinals(ctx, *settings)
@@ -3425,7 +3458,16 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 		{
 			botAge := time.Since(bot.createdAt)
 			ageVerdict := gridAgeVerdictFor(worker.ouReadingForSymbol(ctx, bot.symbol, *settings), botAge)
-			if ageVerdict.rotate {
+			if ageVerdict.rotate && worker.stormActive() {
+				// v2.0.111 storm deferral: rotating INTO a fleet-wide
+				// acceleration crystallizes the bottom tick (ICP #1381
+				// −$4.34). The verdict re-arms next pass; the deferral is
+				// bounded by the storm window itself.
+				worker.logger.Info("half-life rotation deferred by storm mode",
+					"component", "autogrid_worker", "bot_number", bot.botNumber,
+					"symbol", bot.symbol, "age_hours", botAge.Hours(),
+					"max_age_hours", ageVerdict.maxAgeHours)
+			} else if ageVerdict.rotate {
 				totalPnL := realized.Add(unrealized)
 				_, _ = worker.db.Exec(ctx, `
 					UPDATE grid_bots
@@ -3631,7 +3673,8 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 		// (HOLD) tick. The resync/self-heal reconciliation above stays BEFORE
 		// the decision — a doubled position must be judged against doubled
 		// stops, which is exactly what the refreshed locals provide.
-		if decision.Action == ActionHold && !trancheBackoff && bot.trancheDeployed == 1 && bot.trancheBase != nil && bot.localStatus == "RUNNING" && price.IsPositive() {
+		if decision.Action == ActionHold && !trancheBackoff && bot.trancheDeployed == 1 && bot.trancheBase != nil && bot.localStatus == "RUNNING" && price.IsPositive() &&
+			worker.trancheStressAllowed(ctx, bot.id) {
 			if base, bErr := decimal.NewFromString(*bot.trancheBase); bErr == nil && base.GreaterThan(bot.investment) {
 				entry := price
 				if bot.trancheEntry != nil {

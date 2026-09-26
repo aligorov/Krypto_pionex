@@ -68,6 +68,9 @@ func (worker *Worker) onRealtimeMark(update pionex.MarkUpdate) {
 	if !shouldTriggerRealtimePass(baseline.price, update.MarkPrice, baseline.atrPct) {
 		return
 	}
+	// v2.0.111: every sharp move also feeds the fleet storm detector.
+	worker.noteStormTrigger(update.Symbol)
+
 	select {
 	case worker.realtimeSignal <- update.Symbol:
 	default: // a signal is already queued — the pass will re-read marks anyway

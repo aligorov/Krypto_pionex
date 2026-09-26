@@ -426,6 +426,13 @@ func (worker *Worker) radarMaybeRecenter(ctx context.Context, settings Settings,
 	// band, durable cooldown, dwell) already ran; the arm differs only in
 	// execution — native adjust_params instead of a simulated range UPDATE.
 	if b.botSource == "REAL" {
+		// v2.0.111 break-flip first: a band≥3 escape with real adverse
+		// momentum closes the grid for a DGT re-deploy instead of dragging
+		// the toxic inventory through a keep-investment re-center (ORDI
+		// #1396: −$10.45, the bag rode a +6% break to the stop).
+		if worker.radarBreakFlip(ctx, settings, b, rs, velocitySpeed) {
+			return
+		}
 		worker.radarRecenterReal(ctx, settings, b, rs, early, velocity, velocitySpeed)
 		return
 	}
@@ -517,13 +524,13 @@ func (worker *Worker) radarMaybeRecenter(ctx context.Context, settings Settings,
 			"lower", newLower.String(), "upper", newUpper.String())
 		if err := LogBotEvent(ctx, worker.db, b.botID, b.botNumber, "PAPER", b.symbol, "ADJUST_RANGE", &b.price, &total, map[string]any{
 			"reason": reason, "action": "RADAR_RECENTER",
-			"mode":    shiftModeKeepInvestment,
-			"score":   decimal.NewFromFloat(rs.Score).Round(4).String(),
-			"band":    rs.Band,
-			"s1":      decimal.NewFromFloat(rs.S1).Round(3).String(),
-			"s2":      decimal.NewFromFloat(rs.S2).Round(3).String(),
-			"s3":      decimal.NewFromFloat(rs.S3).Round(3).String(),
-			"s4":      decimal.NewFromFloat(rs.S4).Round(3).String(),
+			"mode":      shiftModeKeepInvestment,
+			"score":     decimal.NewFromFloat(rs.Score).Round(4).String(),
+			"band":      rs.Band,
+			"s1":        decimal.NewFromFloat(rs.S1).Round(3).String(),
+			"s2":        decimal.NewFromFloat(rs.S2).Round(3).String(),
+			"s3":        decimal.NewFromFloat(rs.S3).Round(3).String(),
+			"s4":        decimal.NewFromFloat(rs.S4).Round(3).String(),
 			"new_lower": newLower.String(), "new_upper": newUpper.String(),
 			"floating_pnl": bot.unrealized.StringFixed(4),
 		}); err != nil {
@@ -595,13 +602,13 @@ func (worker *Worker) radarMaybeRecenter(ctx context.Context, settings Settings,
 	// here would leave the next re-center un-gated on the following pass.
 	if err := LogBotEvent(ctx, worker.db, b.botID, b.botNumber, "PAPER", b.symbol, "ADJUST_RANGE", &b.price, &total, map[string]any{
 		"reason": reason, "action": "RADAR_RECENTER",
-		"mode":    shiftModeNormal,
-		"score":   decimal.NewFromFloat(rs.Score).Round(4).String(),
-		"band":    rs.Band,
-		"s1":      decimal.NewFromFloat(rs.S1).Round(3).String(),
-		"s2":      decimal.NewFromFloat(rs.S2).Round(3).String(),
-		"s3":      decimal.NewFromFloat(rs.S3).Round(3).String(),
-		"s4":      decimal.NewFromFloat(rs.S4).Round(3).String(),
+		"mode":      shiftModeNormal,
+		"score":     decimal.NewFromFloat(rs.Score).Round(4).String(),
+		"band":      rs.Band,
+		"s1":        decimal.NewFromFloat(rs.S1).Round(3).String(),
+		"s2":        decimal.NewFromFloat(rs.S2).Round(3).String(),
+		"s3":        decimal.NewFromFloat(rs.S3).Round(3).String(),
+		"s4":        decimal.NewFromFloat(rs.S4).Round(3).String(),
 		"new_lower": newLower.String(), "new_upper": newUpper.String(),
 	}); err != nil {
 		worker.logger.Warn("stop-radar: recenter event insert failed — durable cooldown not armed",
@@ -824,13 +831,13 @@ func (worker *Worker) radarRecenterReal(ctx context.Context, settings Settings, 
 	// base (nothing re-based), while the bounds and the anti-hunt moved.
 	if err := LogBotEvent(ctx, worker.db, b.botID, b.botNumber, "REAL", b.symbol, "ADJUST_RANGE", &b.price, &bot.total, map[string]any{
 		"reason": reason, "action": "RADAR_RECENTER",
-		"mode":    mode,
-		"score":   decimal.NewFromFloat(rs.Score).Round(4).String(),
-		"band":    rs.Band,
-		"s1":      decimal.NewFromFloat(rs.S1).Round(3).String(),
-		"s2":      decimal.NewFromFloat(rs.S2).Round(3).String(),
-		"s3":      decimal.NewFromFloat(rs.S3).Round(3).String(),
-		"s4":      decimal.NewFromFloat(rs.S4).Round(3).String(),
+		"mode":      mode,
+		"score":     decimal.NewFromFloat(rs.Score).Round(4).String(),
+		"band":      rs.Band,
+		"s1":        decimal.NewFromFloat(rs.S1).Round(3).String(),
+		"s2":        decimal.NewFromFloat(rs.S2).Round(3).String(),
+		"s3":        decimal.NewFromFloat(rs.S3).Round(3).String(),
+		"s4":        decimal.NewFromFloat(rs.S4).Round(3).String(),
 		"new_lower": newLower.String(), "new_upper": newUpper.String(),
 		"floating_pnl": bot.floating.StringFixed(4),
 	}); err != nil {
