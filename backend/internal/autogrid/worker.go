@@ -122,6 +122,9 @@ type Worker struct {
 	realtimeMu     sync.RWMutex
 	realtimeWatch  map[string]realtimePoint
 	lastEventPass  time.Time
+	// orphanSweepAt throttles the v2.0.104 exchange→DB orphan adoption
+	// sweep (single manage goroutine → plain field).
+	orphanSweepAt time.Time
 }
 
 type trancheTBTrend struct {
@@ -2938,6 +2941,9 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 	// v2.0.99: overwrite estimate-class terminal finals with the exchange's
 	// netted total once the finished record surfaces (throttled internally).
 	worker.recheckPendingExchangeFinals(ctx, *settings)
+	// v2.0.104: adopt exchange-side running grids our DB doesn't actively
+	// track (throttled internally).
+	worker.reconcileOrphanExchangeBots(ctx, *settings)
 	var count int
 	if err := worker.db.QueryRow(ctx, `
 		SELECT COUNT(*) FROM grid_bots
