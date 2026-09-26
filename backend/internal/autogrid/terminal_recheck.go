@@ -59,40 +59,7 @@ func (worker *Worker) recheckPendingExchangeFinals(ctx context.Context, settings
 	// telemetry estimates under REMOTE_TERMINAL_CONFIRMED reopen as pending,
 	// so the sweep can still fetch their exchange truth inside the window
 	// (the ARB #1286 class that already shipped before this fix).
-	// v2.0.105 heal (once EVER per row): every unlock_identity final written
-	// by v2.0.100-104 paired unlockUsdtAmount with the exchange's STALE
-	// usdtInvestment (prod: +$50 phantom per tranche-2 bot, 11 rows). NULL
-	// the final and reopen as pending — the fixed sweep below re-derives it
-	// against OUR final investment within minutes. The buggy figure stays
-	// in model_state.v103UnlockBug for the audit trail, and that key is also
-	// the durable guard: the re-derived row carries marker unlock_identity
-	// again, so WITHOUT the ? 'v103UnlockBug' guard a later restart would
-	// re-heal the CORRECT rows — >48h ones freezing at NULL forever
-	// (adversarial review, agent_a46cd7de).
-	if !worker.terminalIdentityHealDone {
-		worker.terminalIdentityHealDone = true
-		tag, err := worker.db.Exec(ctx, `
-			UPDATE grid_bots
-			SET realized_pnl_usdt = NULL,
-			    unrealized_pnl_usdt = 0,
-			    reconciliation_state = $2,
-			    model_state = (COALESCE(model_state, '{}'::jsonb)
-			        || jsonb_build_object(
-		               'finalProfitSource', 'none',
-		               'v103UnlockBug', COALESCE(model_state->>'finalUsdtExchange', '')))
-		              - 'finalUsdtExchange',
-			    updated_at = NOW()
-			WHERE COALESCE(model_state->>'finalProfitSource','') = 'unlock_identity'
-			  AND status IN ('STOPPED', 'COMPLETED', 'CANCELLED', 'LIQUIDATED')
-			  AND NOT (COALESCE(model_state, '{}'::jsonb) ? 'v103UnlockBug')
-		`, TerminalFinalPendingExchange)
-		if err != nil {
-			worker.logger.Warn("v2.0.105 identity heal failed", "component", "autogrid_worker", "error", err)
-		} else if tag.RowsAffected() > 0 {
-			worker.logger.Warn("v2.0.105 identity heal: reopened buggy unlock_identity finals",
-				"component", "autogrid_worker", "rows", tag.RowsAffected())
-		}
-	}
+	worker.healV103UnlockIdentity(ctx)
 
 	if !worker.terminalReopenDone {
 		worker.terminalReopenDone = true
@@ -294,4 +261,45 @@ func truncateForLog(s string) string {
 		return s[:900]
 	}
 	return s
+}
+
+// healV103UnlockIdentity is the v2.0.105 once-ever-per-row heal: every
+// unlock_identity final written by v2.0.100-104 paired unlockUsdtAmount with
+// the exchange's STALE usdtInvestment (prod: +$50 phantom per tranche-2
+// bot, 11 rows). NULLs the final and reopens the row as pending — the fixed
+// sweep re-derives it against OUR final investment within minutes. The
+// buggy figure is archived under model_state.v103UnlockBug, and that key is
+// the durable guard: a re-derived row carries marker unlock_identity again,
+// so WITHOUT the key guard a later restart would re-heal CORRECT rows —
+// >48h ones freezing at NULL forever (adversarial review, agent_a46cd7de).
+// v2.0.106: placeholder contiguity fixed ($1, was a lone $2 — the pgx
+// parameter-class bug, fifth prod strike).
+func (worker *Worker) healV103UnlockIdentity(ctx context.Context) {
+	if worker.terminalIdentityHealDone {
+		return
+	}
+	worker.terminalIdentityHealDone = true
+	tag, err := worker.db.Exec(ctx, `
+		UPDATE grid_bots
+		SET realized_pnl_usdt = NULL,
+		    unrealized_pnl_usdt = 0,
+		    reconciliation_state = $1,
+		    model_state = (COALESCE(model_state, '{}'::jsonb)
+		        || jsonb_build_object(
+		           'finalProfitSource', 'none',
+		           'v103UnlockBug', COALESCE(model_state->>'finalUsdtExchange', '')))
+		          - 'finalUsdtExchange',
+		    updated_at = NOW()
+		WHERE COALESCE(model_state->>'finalProfitSource','') = 'unlock_identity'
+		  AND status IN ('STOPPED', 'COMPLETED', 'CANCELLED', 'LIQUIDATED')
+		  AND NOT (COALESCE(model_state, '{}'::jsonb) ? 'v103UnlockBug')
+	`, TerminalFinalPendingExchange)
+	if err != nil {
+		worker.logger.Warn("v2.0.105 identity heal failed", "component", "autogrid_worker", "error", err)
+		return
+	}
+	if tag.RowsAffected() > 0 {
+		worker.logger.Warn("v2.0.105 identity heal: reopened buggy unlock_identity finals",
+			"component", "autogrid_worker", "rows", tag.RowsAffected())
+	}
 }
