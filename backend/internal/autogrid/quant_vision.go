@@ -50,6 +50,22 @@ func (worker *Worker) evaluateWickShield(
 			}
 		}
 
+		// Check if a 5m candle has already closed beyond the extreme level (confirmed structural close)
+		if worker.publicClient != nil {
+			if candles, err := worker.publicClient.GetKlines(ctx, symbol, "5M", 2); err == nil && len(candles) >= 2 {
+				closedCandle := candles[len(candles)-2]
+				if strings.ToUpper(direction) == "SHORT" {
+					if closedCandle.Close.GreaterThan(*extreme) {
+						return false, nil, nil, fmt.Sprintf("wick shield invalidated: 5M candle closed body (%s) above extreme (%s)", closedCandle.Close.String(), extreme.String())
+					}
+				} else {
+					if closedCandle.Close.LessThan(*extreme) {
+						return false, nil, nil, fmt.Sprintf("wick shield invalidated: 5M candle closed body (%s) below extreme (%s)", closedCandle.Close.String(), extreme.String())
+					}
+				}
+			}
+		}
+
 		elapsed := time.Since(stamped)
 		if elapsed < time.Duration(graceSec)*time.Second {
 			remaining := graceSec - int(elapsed.Seconds())
@@ -136,22 +152,24 @@ func (worker *Worker) directionalConfirmedByPriceAction(ctx context.Context, sym
 // calculateFleetNetDelta sums the total directional delta (USDT notional) across
 // all active running grid bots to prevent over-concentrated directional exposure.
 func (worker *Worker) calculateFleetNetDelta(ctx context.Context, settingsID string, paper bool) (decimal.Decimal, error) {
-	tableName := "grid_bots"
-	colSettings := "autogrid_settings_id"
-	extraFilter := "AND bu_order_id IS NOT NULL"
+	var query string
 	if paper {
-		tableName = "paper_grid_bots"
-		colSettings = "settings_id"
-		extraFilter = ""
+		query = `
+			SELECT direction, quote_investment, leverage,
+			       COALESCE(NULLIF(model_state->>'shiftPosition','')::NUMERIC, 0),
+			       COALESCE(mark_price, entry_price, (lower_price + upper_price)/2, 0)
+			FROM paper_grid_bots
+			WHERE settings_id = $1 AND status = 'RUNNING'
+		`
+	} else {
+		query = `
+			SELECT direction, quote_investment, leverage,
+			       COALESCE(NULLIF(model_state->>'shiftPosition','')::NUMERIC, 0),
+			       COALESCE(NULLIF(struct_context->>'entryPrice','')::NUMERIC, (lower_price + upper_price)/2, 0)
+			FROM grid_bots
+			WHERE autogrid_settings_id = $1 AND status = 'RUNNING' AND bu_order_id IS NOT NULL
+		`
 	}
-
-	query := fmt.Sprintf(`
-		SELECT direction, quote_investment, leverage,
-		       COALESCE(NULLIF(model_state->>'shiftPosition','')::NUMERIC, 0),
-		       COALESCE(mark_price, entry_price, 0)
-		FROM %s
-		WHERE %s = $1 AND status = 'RUNNING' %s
-	`, tableName, colSettings, extraFilter)
 
 	rows, err := worker.db.Query(ctx, query, settingsID)
 	if err != nil {

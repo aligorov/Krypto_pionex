@@ -2366,17 +2366,23 @@ func (worker *Worker) deployReal(
 			candidateDelta = settings.BudgetUSDT.Mul(decimal.NewFromInt(int64(botLev)))
 		} else if trend == "short" {
 			candidateDelta = settings.BudgetUSDT.Mul(decimal.NewFromInt(int64(botLev))).Neg()
+		} else {
+			// NEUTRAL bot adverse inventory load: at boundary, it holds ~50% notional long exposure
+			candidateDelta = settings.BudgetUSDT.Mul(decimal.NewFromInt(int64(botLev))).Div(decimal.NewFromInt(2))
 		}
 		if settings.FleetMaxNetDeltaUSDT.IsPositive() && !candidateDelta.IsZero() {
 			fleetDelta, err := worker.calculateFleetNetDelta(ctx, settings.ID, false)
-			if err == nil {
-				projectedDelta := fleetDelta.Add(candidateDelta).Abs()
-				if projectedDelta.GreaterThan(settings.FleetMaxNetDeltaUSDT) {
-					worker.rejectCandidate(ctx, candidate,
-						fmt.Sprintf("Fleet net delta cap: текущая дельта $%s + кандидат $%s превысит лимит $%s — пауза направленного входа для защиты портфеля",
-							fleetDelta.StringFixed(2), candidateDelta.StringFixed(2), settings.FleetMaxNetDeltaUSDT.StringFixed(2)), nil)
-					continue
-				}
+			if err != nil {
+				worker.rejectCandidate(ctx, candidate,
+					fmt.Sprintf("Fleet net delta error: %v — деплой отложен для защиты портфеля (fail-closed)", err), nil)
+				continue
+			}
+			projectedDelta := fleetDelta.Add(candidateDelta).Abs()
+			if projectedDelta.GreaterThan(settings.FleetMaxNetDeltaUSDT) {
+				worker.rejectCandidate(ctx, candidate,
+					fmt.Sprintf("Fleet net delta cap: текущая дельта $%s + кандидат $%s превысит лимит $%s — пауза входа для защиты портфеля",
+						fleetDelta.StringFixed(2), candidateDelta.StringFixed(2), settings.FleetMaxNetDeltaUSDT.StringFixed(2)), nil)
+				continue
 			}
 		}
 
@@ -5622,26 +5628,43 @@ func trancheAdversePct(direction string, price, entry decimal.Decimal) float64 {
 }
 
 // trancheTimeBoxTrending reports whether the tape is strongly trending for
-// the tranche-2 time-box, fetching the regime at most once per 5 minutes per
-// symbol (the check would otherwise run every manage tick for every 24h+
+// the tranche-2 time-box and adverse-turn gates, fetching the regime at most once
+// per 5 minutes per symbol (the check would otherwise run every manage tick for every 24h+
 // pending bot).
 func (worker *Worker) trancheTimeBoxTrending(ctx context.Context, symbol string) bool {
 	if cached, ok := worker.trancheTBRegime[symbol]; ok && time.Since(cached.checkedAt) < 5*time.Minute {
 		return cached.trending
 	}
-	regime := worker.regimeForSymbol(ctx, symbol)
-	trending := regime == "TREND_UP" || regime == "TREND_DOWN"
+	res, ok := worker.regimeResultForSymbol(ctx, symbol)
+	trending := false
+	if ok {
+		// Guard: regime TREND_UP/TREND_DOWN or ADX > 25.0
+		// Pouring tranche 2 into an active trend (ADX > 25) averages down into
+		// a runaway breakout, turning normal stops into doubled stop losses.
+		trending = res.Regime == "TREND_UP" || res.Regime == "TREND_DOWN" || res.ADX > 25.0
+	}
 	worker.trancheTBRegime[symbol] = trancheTBTrend{checkedAt: time.Now(), trending: trending}
 	return trending
 }
 
-// regimeForSymbol lazily recomputes the market regime for a managed symbol.
-func (worker *Worker) regimeForSymbol(ctx context.Context, symbol string) string {
+func (worker *Worker) regimeResultForSymbol(ctx context.Context, symbol string) (marketdata.RegimeResult, bool) {
+	if worker.publicClient == nil {
+		return marketdata.RegimeResult{}, false
+	}
 	candles, err := worker.publicClient.GetKlines(ctx, symbol, "60M", 60)
 	if err != nil || len(candles) < 30 {
+		return marketdata.RegimeResult{}, false
+	}
+	return marketdata.DetectRegime(candles), true
+}
+
+// regimeForSymbol lazily recomputes the market regime for a managed symbol.
+func (worker *Worker) regimeForSymbol(ctx context.Context, symbol string) string {
+	res, ok := worker.regimeResultForSymbol(ctx, symbol)
+	if !ok {
 		return ""
 	}
-	return marketdata.DetectRegime(candles).Regime
+	return res.Regime
 }
 
 // betaGateTrend is the pure policy core of the v2.0.21 global beta gate:

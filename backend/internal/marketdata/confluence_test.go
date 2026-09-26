@@ -162,14 +162,14 @@ func TestConfluenceRangeOnCompression(t *testing.T) {
 }
 
 func TestHurstHardVetoNeutral(t *testing.T) {
-	if !HurstHardVetoNeutral(IndicatorBundle{Hurst: 0.62, HurstOK: true}) {
-		t.Fatalf("H=0.62 must veto neutral entries")
+	if !HurstHardVetoNeutral(IndicatorBundle{Hurst: 0.50, HurstOK: true}) {
+		t.Fatalf("H=0.50 must veto neutral entries")
 	}
 	if HurstHardVetoNeutral(IndicatorBundle{Hurst: 0.70, HurstOK: false}) {
 		t.Fatalf("unreliable estimate must not veto")
 	}
-	if HurstHardVetoNeutral(IndicatorBundle{Hurst: 0.50, HurstOK: true}) {
-		t.Fatalf("H=0.50 must not veto")
+	if HurstHardVetoNeutral(IndicatorBundle{Hurst: 0.40, HurstOK: true}) {
+		t.Fatalf("H=0.40 must not veto")
 	}
 }
 

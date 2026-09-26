@@ -26,7 +26,7 @@ import (
 )
 
 var (
-	Version   = "1.3.10"
+	Version   = "2.0.118"
 	GitCommit = "dev"
 	BuildTime = "unknown"
 )
@@ -61,6 +61,7 @@ func main() {
 		autoService    *autogrid.Service
 		llmService     *llm.Service
 		dataService    *marketdata.Service
+		logStore       *observability.Store
 	)
 
 	dbPool, err := pgxpool.New(ctx, dbURL)
@@ -80,6 +81,12 @@ func main() {
 			os.Exit(1)
 		}
 		slog.Info("PostgreSQL connection pool established")
+
+		// Persistent structured logging into PostgreSQL application_logs table (v2.0.118)
+		logStore = observability.NewStore(dbPool)
+		dbHandler := observability.NewDBHandler(logger.Handler(), logStore)
+		logger = slog.New(dbHandler)
+		slog.SetDefault(logger)
 
 		// Initialize services & worker. One shared AutoGrid service keeps the
 		// worker, HTTP API and MCP inside a single Pionex rate budget (M1).
@@ -136,7 +143,9 @@ func main() {
 	if dbPool != nil {
 		authService := auth.NewService(dbPool)
 		auditStore := audit.NewStore(dbPool)
-		logStore := observability.NewStore(dbPool)
+		if logStore == nil {
+			logStore = observability.NewStore(dbPool)
+		}
 
 		controlService := controlplane.NewService(dbPool, riskEngine, auditStore, logStore, Version, GitCommit, BuildTime)
 		telegramService := telegram.NewService(dbPool, logger)

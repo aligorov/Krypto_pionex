@@ -476,9 +476,6 @@ func scoreCandidate(
 		reasons = append(reasons, "volatility above risk threshold")
 	}
 	minEV := config.MinExpectedValuePct
-	if majorMomentum && minEV > 0.0 {
-		minEV = 0.0
-	}
 	if evPct < minEV {
 		reasons = append(reasons, "model EV below limit")
 	}
@@ -645,13 +642,12 @@ func scoreCandidate(
 			confluence.ShortScore, confluence.LongScore))
 		recommendedTrend = "no_trend"
 	}
-	// Hard regime veto: a persistently trending memory (Hurst > 0.55,
-	// lowered from 0.60 in v2.0.39 — the 0.55-0.60 band already bled)
+	// Hard regime veto: a persistently trending memory (Hurst > 0.45)
 	// loads one-sided inventory into a fresh neutral grid — the exact
 	// failure the daily-loss breaker only sees after the damage.
 	if recommendedTrend == "no_trend" && HurstHardVetoNeutral(bundle) {
 		reasons = append(reasons, fmt.Sprintf(
-			"confluence veto: Hurst %.2f > 0.55 — persistent trend regime, neutral grid would load one-sided inventory",
+			"confluence veto: Hurst %.2f > 0.45 — persistent trend regime, neutral grid would load one-sided inventory",
 			bundle.Hurst))
 	}
 	// Kaufman Efficiency Ratio gate (v2.0.89-A, P2): ER = |p_N − p_0| /
@@ -938,11 +934,14 @@ func ratio(values []float64, downsideOnly bool, annualPeriods float64) float64 {
 	deviation := sampleStdDev(sample)
 	if deviation == 0 {
 		if average > 0 {
-			return 99
+			return 4.0
 		}
 		return 0
 	}
-	return clamp(average/deviation*math.Sqrt(annualPeriods), -99, 99)
+	// Scale by daily equivalent factor rather than 35,040 intraday periods
+	// to prevent synthetic zero-drawdown toy paths from saturating at 99.
+	scale := math.Sqrt(math.Min(annualPeriods, 365.0))
+	return clamp(average/deviation*scale, -10, 10)
 }
 
 func maxDrawdown(returns []float64) float64 {
