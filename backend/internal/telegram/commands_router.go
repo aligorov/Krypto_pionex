@@ -164,7 +164,12 @@ func (d *OutboxDispatcher) reportFleet(ctx context.Context, token, chatID string
 		d.sendMessage(ctx, token, chatID, "❌ боты: "+escapeErr(err))
 		return
 	}
-	d.sendMessage(ctx, token, chatID, "🤖 <b>АКТИВНЫЕ БОТЫ</b>\n\n"+buildFleetTable(fleet))
+	nums := make([]int, 0, len(fleet))
+	for _, r := range fleet {
+		nums = append(nums, r.BotNumber)
+	}
+	sparks, _ := loadSparks(ctx, d.db, nums)
+	d.sendMessage(ctx, token, chatID, "🤖 <b>АКТИВНЫЕ БОТЫ</b>\n\n"+buildFleetTable(fleet, sparks))
 }
 
 func (d *OutboxDispatcher) reportClosed(ctx context.Context, token, chatID, arg string) {
@@ -181,7 +186,7 @@ func (d *OutboxDispatcher) reportClosed(ctx context.Context, token, chatID, arg 
 	for _, r := range rows {
 		net = net.Add(r.Final)
 	}
-	text := fmt.Sprintf("🏁 <b>ПОСЛЕДНИЕ ЗАКРЫТИЯ</b> (×%d)\n\n%s\nΣ выборка: <b>%s</b>", limit, buildClosedTable(rows, false), moneySigned(net))
+	text := fmt.Sprintf("🏁 <b>ПОСЛЕДНИЕ ЗАКРЫТИЯ</b> (×%d)\n\n%s\nΣ выборка: <b>%s</b>", limit, buildClosedTable(rows), moneySigned(net))
 	d.sendMessage(ctx, token, chatID, text)
 }
 
@@ -210,7 +215,7 @@ func (d *OutboxDispatcher) reportDay(ctx context.Context, token, chatID string) 
 		floating = floating.Add(r.Floating)
 	}
 	text := fmt.Sprintf("📅 <b>СЕГОДНЯ · %s</b>\n\n%s\n\nРаботают сейчас: %d ботов, нетто открытых <b>%s</b>",
-		today, buildClosedTable(todays, true), len(fleet), moneySigned(realized.Add(floating)))
+		today, buildClosedTable(todays), len(fleet), moneySigned(realized.Add(floating)))
 	d.sendMessage(ctx, token, chatID, text)
 }
 

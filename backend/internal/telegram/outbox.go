@@ -32,7 +32,27 @@ type OutboxDispatcher struct {
 	logger          *slog.Logger
 	lastUpdateID    int64
 	lastCredsWarnAt time.Time
+	lastPollWarnAt  time.Time
+	webhookDropped  bool
 	service         *Service
+}
+
+// dropWebhook clears a webhook pinned on the bot so long-poll getUpdates
+// works again (Telegram refuses getUpdates while a webhook is set).
+func (d *OutboxDispatcher) dropWebhook(ctx context.Context, token string) {
+	url := fmt.Sprintf("https://api.telegram.org/bot%s/deleteWebhook", token)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader([]byte(`{}`)))
+	if err != nil {
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := d.httpClient.Do(req)
+	if err != nil {
+		d.logger.Warn("tg console: deleteWebhook failed", "component", "telegram_console", "error", err)
+		return
+	}
+	defer resp.Body.Close()
+	d.logger.Info("tg console: webhook dropped", "component", "telegram_console", "status", resp.StatusCode)
 }
 
 func NewOutboxDispatcher(db *pgxpool.Pool, defaultToken, defaultChat string) *OutboxDispatcher {
@@ -185,11 +205,38 @@ func (d *OutboxDispatcher) pollUpdates(ctx context.Context) {
 
 	resp, err := d.httpClient.Do(req)
 	if err != nil {
+		if time.Since(d.lastPollWarnAt) > 10*time.Minute {
+			d.lastPollWarnAt = time.Now()
+			d.logger.Warn("tg console: getUpdates transport failed",
+				"component", "telegram_console", "error", err)
+		}
 		return
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
+		// v2.0.112: a silent non-200 return is how the console died
+		// invisibly for hours (prod 09-26: "полная хуйта" with zero trace).
+		// 409 = a webhook is pinned on the bot (getUpdates is then refused
+		// forever) — self-heal by dropping it once per boot, we own the bot.
+		// 401 = the stored token is dead. Both are loud and throttled.
+		var tgErr struct {
+			Description string `json:"description"`
+		}
+		_ = json.NewDecoder(resp.Body).Decode(&tgErr)
+		if resp.StatusCode == http.StatusConflict && !d.webhookDropped {
+			d.webhookDropped = true
+			d.logger.Warn("tg console: getUpdates 409 — dropping pinned webhook and retrying",
+				"component", "telegram_console", "description", tgErr.Description)
+			d.dropWebhook(ctx, token)
+			return
+		}
+		if time.Since(d.lastPollWarnAt) > 10*time.Minute {
+			d.lastPollWarnAt = time.Now()
+			d.logger.Warn("tg console: getUpdates refused",
+				"component", "telegram_console", "status", resp.StatusCode,
+				"description", tgErr.Description)
+		}
 		return
 	}
 

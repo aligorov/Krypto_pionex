@@ -64,6 +64,22 @@ func moneySigned(d decimal.Decimal) string {
 	return d.Round(2).StringFixed(2)
 }
 
+// reasonGlyph is the one-character close-class mark for the narrow tables.
+func reasonGlyph(r string) string {
+	switch {
+	case strings.HasPrefix(r, "STOP_LOSS"), r == "LOSS_STOP":
+		return "✖стоп"
+	case strings.HasPrefix(r, "RADAR_AUTOCLOSE"):
+		return "⚠радар"
+	case r == "TAKE_PROFIT":
+		return "✔тейк"
+	case r == "GRID_AGED_HALF_LIFE":
+		return "↻рот"
+	default:
+		return strings.ToLower(strings.ReplaceAll(r, "_", " "))
+	}
+}
+
 func shortReason(r string) string {
 	switch {
 	case strings.HasPrefix(r, "STOP_LOSS"):
@@ -164,49 +180,137 @@ func dayStatsFrom(rows []closedRow) []dayStat {
 
 // ── report builders (pure — unit-tested) ─────────────────────────────────
 
-func buildFleetTable(fleet []fleetRow) string {
+// sparkline renders a price series as 8 unicode blocks (narrow-screen
+// friendly). Series shorter than 2 points yields an em-dash.
+func sparkline(prices []float64) string {
+	if len(prices) < 2 {
+		return "—"
+	}
+	blocks := []rune("▁▂▃▄▅▆▇█")
+	const cells = 8
+	lo, hi := prices[0], prices[0]
+	for _, p := range prices {
+		if p < lo {
+			lo = p
+		}
+		if p > hi {
+			hi = p
+		}
+	}
+	if hi <= lo {
+		return strings.Repeat(string(blocks[len(blocks)-1]), cells)
+	}
+	// Bucket the series by time order so the shape reads left→right.
+	out := make([]byte, 0, cells*3)
+	bucket := make([]float64, cells)
+	counts := make([]int, cells)
+	for i, p := range prices {
+		idx := i * cells / len(prices)
+		bucket[idx] += p
+		counts[idx]++
+	}
+	for i := 0; i < cells; i++ {
+		if counts[i] == 0 {
+			out = append(out, []byte("·")...)
+			continue
+		}
+		v := (bucket[i]/float64(counts[i]) - lo) / (hi - lo)
+		lvl := int(v * float64(len(blocks)-1))
+		out = append(out, []byte(string(blocks[lvl]))...)
+	}
+	return string(out)
+}
+
+// capBar renders cap usage as ▓▓▓░░░░░ (8 cells), sign-aware.
+func capBar(total, maxLoss decimal.Decimal) string {
+	if !maxLoss.IsPositive() {
+		return "········"
+	}
+	use := total.Abs().Div(maxLoss)
+	pct, _ := use.Mul(decimal.NewFromInt(100)).Float64()
+	cells := int(pct / 100 * 8)
+	if cells < 0 {
+		cells = 0
+	}
+	if cells > 8 {
+		cells = 8
+	}
+	return strings.Repeat("▓", cells) + strings.Repeat("░", 8-cells)
+}
+
+// buildFleetTable renders the compact mobile-first fleet view: one line per
+// bot ≈30 chars wide — #sym lever+cap, total, cap bar+%, 24h spark.
+func buildFleetTable(fleet []fleetRow, sparks map[int]string) string {
 	if len(fleet) == 0 {
 		return "флот пуст"
 	}
 	var b strings.Builder
-	b.WriteString("<pre>  #  символ    гир  кап   итог    к капе  возр  сдв\n")
+	b.WriteString("<pre>#    симв   гир  итог   капа   24ч\n")
 	var realized, floating, capital decimal.Decimal
 	for _, r := range fleet {
 		total := r.Realized.Add(r.Floating)
 		realized = realized.Add(r.Realized)
 		floating = floating.Add(r.Floating)
 		capital = capital.Add(r.Investment)
-		useOfCap := "—"
+		pct := "   —"
 		if r.MaxLoss.IsPositive() {
-			pct := total.Div(r.MaxLoss).Mul(decimal.NewFromInt(100)).Round(0)
-			useOfCap = fmt.Sprintf("%s%%", pct.String())
+			p := total.Div(r.MaxLoss).Mul(decimal.NewFromInt(100)).Round(0)
+			pct = fmt.Sprintf("%4s%%", p.String())
 		}
-		age := time.Since(r.CreatedAt).Hours()
-		fmt.Fprintf(&b, "%4d %-9s %dx $%-4d %8s %7s %4.1fh %d\n",
-			r.BotNumber, sym(r.Symbol), r.Leverage, r.Investment.Round(0).IntPart(),
-			moneySigned(total), useOfCap, age, r.Shifts)
+		sp := sparks[r.BotNumber]
+		if sp == "" {
+			sp = "—"
+		}
+		fmt.Fprintf(&b, "%-4d %-6s %d%-3d %6s %s %s\n",
+			r.BotNumber%10000, sym(r.Symbol), r.Leverage, r.Investment.Round(0).IntPart(),
+			moneySigned(total), pct, sp)
 	}
 	b.WriteString("</pre>")
-	b.WriteString(fmt.Sprintf("\nΣ капитал <b>$%s</b> · realized <b>%s</b> · плавающий <b>%s</b> · нетто <b>%s</b>",
+	b.WriteString(fmt.Sprintf("Σ $%s · realized %s · плав. %s · нетто <b>%s</b>",
 		capital.Round(0).String(), moneySigned(realized), moneySigned(floating), moneySigned(realized.Add(floating))))
 	return b.String()
 }
 
-func buildClosedTable(rows []closedRow, withHeld bool) string {
+// loadSparks pulls 24h price series per RUNNING bot and renders sparklines.
+func loadSparks(ctx context.Context, db *pgxpool.Pool, botNumbers []int) (map[int]string, error) {
+	if len(botNumbers) == 0 {
+		return map[int]string{}, nil
+	}
+	rows, err := db.Query(ctx, `
+		SELECT bot_number, price::FLOAT8, captured_at
+		FROM bot_telemetry
+		WHERE bot_number = ANY($1::INT[]) AND captured_at > NOW() - INTERVAL '24 hours'
+		ORDER BY captured_at
+	`, botNumbers)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	series := map[int][]float64{}
+	for rows.Next() {
+		var n int
+		var p float64
+		var at time.Time
+		if err := rows.Scan(&n, &p, &at); err != nil {
+			return nil, err
+		}
+		series[n] = append(series[n], p)
+	}
+	out := make(map[int]string, len(series))
+	for n, ps := range series {
+		out[n] = sparkline(ps)
+	}
+	return out, rows.Err()
+}
+
+func buildClosedTable(rows []closedRow) string {
 	if len(rows) == 0 {
 		return "закрытий нет"
 	}
 	var b strings.Builder
-	if withHeld {
-		b.WriteString("<pre>  #  символ     финал   держал\n")
-		for _, r := range rows {
-			fmt.Fprintf(&b, "%4d %-10s %8s %5.1fh\n", r.BotNumber, sym(r.Symbol), moneySigned(r.Final), r.HeldHours)
-		}
-	} else {
-		b.WriteString("<pre>  #  символ     финал   причина\n")
-		for _, r := range rows {
-			fmt.Fprintf(&b, "%4d %-10s %8s %s\n", r.BotNumber, sym(r.Symbol), moneySigned(r.Final), shortReason(r.Reason))
-		}
+	b.WriteString("<pre>#    симв    финал держал прич\n")
+	for _, r := range rows {
+		fmt.Fprintf(&b, "%-4d %-7s %7s %5.1fh %s\n", r.BotNumber%10000, sym(r.Symbol), moneySigned(r.Final), r.HeldHours, reasonGlyph(r.Reason))
 	}
 	b.WriteString("</pre>")
 	return b.String()
