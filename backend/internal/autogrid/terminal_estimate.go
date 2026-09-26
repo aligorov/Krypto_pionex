@@ -55,8 +55,13 @@ func gateSettledProfit(
 	source pionex.FinalProfitSource,
 	storedReason, exchangeReason string,
 ) *decimal.Decimal {
+	// v2.0.103: unlock_identity joins the gate's jurisdiction. Without it
+	// every caller's «gated != nil means accepted» contract inverted for
+	// the identity leg — the re-check sweep computed the exchange truth and
+	// then confirmed the estimate instead of applying it (prod 09-25 night:
+	// every reopened row froze back at telemetry_net_close).
 	switch source {
-	case pionex.FinalProfitExited, pionex.FinalProfitTotalAlias:
+	case pionex.FinalProfitExited, pionex.FinalProfitTotalAlias, pionex.FinalProfitUnlockIdentity:
 	default:
 		return nil
 	}
