@@ -231,16 +231,10 @@ func (d *OutboxDispatcher) pollUpdates(ctx context.Context) {
 	}
 }
 
+// v2.0.109: command handling moved to the full router (commands_router.go);
+// this shim keeps the poll loop's call site stable.
 func (d *OutboxDispatcher) handleCommand(ctx context.Context, token, chatID, text string) {
-	text = strings.TrimSpace(text)
-	switch {
-	case strings.HasPrefix(text, "/status") || text == "Статус":
-		d.sendStatusReport(ctx, token, chatID)
-	case strings.HasPrefix(text, "/kill") || text == "🚨 EMERGENCY KILL SWITCH":
-		d.triggerKillSwitch(ctx, token, chatID)
-	case strings.HasPrefix(text, "/start"):
-		d.sendMessage(ctx, token, chatID, "🤖 <b>Pionex Grid Bot Controller</b>\n\nКоманды:\n/status — Текущее состояние ботов и PnL\n/kill — Экстренная остановка (Kill Switch)")
-	}
+	d.routeCommand(ctx, token, chatID, text)
 }
 
 func (d *OutboxDispatcher) handleCallback(ctx context.Context, token, chatID, queryID, action string) {
@@ -251,25 +245,24 @@ func (d *OutboxDispatcher) handleCallback(ctx context.Context, token, chatID, qu
 
 	switch action {
 	case "cmd_status":
-		d.sendStatusReport(ctx, token, chatID)
+		d.reportStatus(ctx, token, chatID)
+	case "cmd_bots":
+		d.reportFleet(ctx, token, chatID)
+	case "cmd_closed":
+		d.reportClosed(ctx, token, chatID, "")
+	case "cmd_day":
+		d.reportDay(ctx, token, chatID)
+	case "cmd_stats":
+		d.reportStats(ctx, token, chatID)
+	case "cmd_pnl":
+		d.reportPnL(ctx, token, chatID)
+	case "cmd_risk":
+		d.reportRisk(ctx, token, chatID)
+	case "cmd_health":
+		d.reportHealth(ctx, token, chatID)
 	case "cmd_kill_switch":
 		d.triggerKillSwitch(ctx, token, chatID)
 	}
-}
-
-func (d *OutboxDispatcher) sendStatusReport(ctx context.Context, token, chatID string) {
-	var paperCount, realCount int
-	_ = d.db.QueryRow(ctx, "SELECT COUNT(*) FROM paper_grid_bots WHERE status = 'RUNNING'").Scan(&paperCount)
-	_ = d.db.QueryRow(ctx, "SELECT COUNT(*) FROM grid_bots WHERE status = 'RUNNING'").Scan(&realCount)
-
-	var totalPnL float64
-	_ = d.db.QueryRow(ctx, "SELECT COALESCE(SUM(realized_pnl_usdt), 0) FROM paper_grid_bots WHERE status IN ('STOPPED', 'COMPLETED')").Scan(&totalPnL)
-
-	msg := fmt.Sprintf(
-		"📊 <b>Pionex Bot Status</b>\n\n🟢 Активных симуляций: <b>%d</b>\n🟢 Реальных ботов: <b>%d</b>\n💰 Зафиксированный PnL: <b>%+.4f USDT</b>\n⏱ Время: %s",
-		paperCount, realCount, totalPnL, time.Now().Format("15:04:05 MSK"),
-	)
-	d.sendMessage(ctx, token, chatID, msg)
 }
 
 func (d *OutboxDispatcher) triggerKillSwitch(ctx context.Context, token, chatID string) {
@@ -288,11 +281,27 @@ func (d *OutboxDispatcher) sendMessage(ctx context.Context, token, chatID, text 
 		"text":       text,
 		"parse_mode": "HTML",
 	}
-	jsonBytes, _ := json.Marshal(bodyData)
-	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(jsonBytes))
+	jsonBytes, err := json.Marshal(bodyData)
+	if err != nil {
+		d.logger.Warn("tg console: marshal failed", "component", "telegram_console", "error", err)
+		return
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(jsonBytes))
+	if err != nil {
+		// A malformed token in settings must never panic the real-money
+		// supervisor (adversarial review, agent_0350f97a).
+		d.logger.Warn("tg console: build request failed", "component", "telegram_console", "error", err)
+		return
+	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := d.httpClient.Do(req)
-	if err == nil {
-		resp.Body.Close()
+	if err != nil {
+		d.logger.Warn("tg console: send failed", "component", "telegram_console", "error", err)
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		d.logger.Warn("tg console: telegram rejected message",
+			"component", "telegram_console", "status", resp.StatusCode)
 	}
 }

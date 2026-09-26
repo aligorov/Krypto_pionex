@@ -120,6 +120,10 @@ func main() {
 				}
 			}
 		}()
+		// v2.0.109: the two-way command console. Long-polls getUpdates and
+		// answers ONLY the chat_id pinned in telegram_settings — the loop
+		// no-ops silently while credentials are unset or disabled.
+		go dispatcher.StartInboundListener(ctx)
 	}
 
 	// Locate frontend dist directory
