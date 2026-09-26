@@ -108,6 +108,7 @@ export default function Bots({ canOperate }: Props) {
               antiHuntStop={selectedBotForChart.antiHuntStop ? Number(selectedBotForChart.antiHuntStop) : undefined}
               direction={selectedBotForChart.direction}
               gridCount={selectedBotForChart.gridNum}
+              gridType={selectedBotForChart.gridType}
               onClose={() => setSelectedBotForChart(null)}
             />
           </div>

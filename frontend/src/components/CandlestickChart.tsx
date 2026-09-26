@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { createChart, CandlestickSeries, IChartApi, ISeriesApi, CandlestickData, Time, LineStyle } from 'lightweight-charts';
+import { createChart, CandlestickSeries, IChartApi, ISeriesApi, CandlestickData, Time, LineStyle, IPriceLine } from 'lightweight-charts';
 
 export interface GridLevel {
   price: number;
@@ -16,6 +16,7 @@ export interface CandlestickChartProps {
   antiHuntStop?: number;
   gridLevels?: GridLevel[];
   gridCount?: number;
+  gridType?: string;
   direction?: string;
   onClose?: () => void;
 }
@@ -30,12 +31,15 @@ export const CandlestickChart: React.FC<CandlestickChartProps> = ({
   antiHuntStop,
   gridLevels,
   gridCount,
+  gridType,
   direction = 'NEUTRAL',
   onClose,
 }) => {
   const chartContainerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const candleSeriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null);
+  const gridPriceLinesRef = useRef<IPriceLine[]>([]);
+  const currentPriceLineRef = useRef<IPriceLine | null>(null);
   const [interval, setInterval] = useState<string>('15M');
   const [loading, setLoading] = useState<boolean>(true);
   const [error, setError] = useState<string | null>(null);
@@ -47,9 +51,79 @@ export const CandlestickChart: React.FC<CandlestickChartProps> = ({
   gridLevelsRef.current = gridLevels;
   const levelsKey = (gridLevels ?? []).map(l => `${l.price}@${l.side}`).join(',');
 
+  const refVal = (lowerPrice && lowerPrice > 0) ? lowerPrice : (currentPrice || 1);
+  let precision = 2;
+  if (refVal < 0.0001) precision = 8;
+  else if (refVal < 0.01) precision = 6;
+  else if (refVal < 1) precision = 4;
+  else if (refVal < 50) precision = 3;
+  const minMove = 1 / Math.pow(10, precision);
+
   useEffect(() => {
     let isMounted = true;
     const controller = new AbortController();
+
+    const updateGridAndCurrentPrice = (series: ISeriesApi<'Candlestick'>, activePrice: number) => {
+      // 1. Очистить старые промежуточные линии сетки
+      gridPriceLinesRef.current.forEach((pl) => {
+        try { series.removePriceLine(pl); } catch {}
+      });
+      gridPriceLinesRef.current = [];
+
+      // 2. Очистить старую линию текущей цены
+      if (currentPriceLineRef.current) {
+        try { series.removePriceLine(currentPriceLineRef.current); } catch {}
+        currentPriceLineRef.current = null;
+      }
+
+      // 3. Нарисовать линию текущей рыночной цены
+      if (activePrice > 0) {
+        currentPriceLineRef.current = series.createPriceLine({
+          price: activePrice,
+          color: '#38bdf8',
+          lineWidth: 1,
+          lineStyle: LineStyle.Solid,
+          axisLabelVisible: true,
+          title: `ТЕКУЩАЯ [${activePrice.toFixed(precision)}]`,
+        });
+      }
+
+      // 4. Построить уровни сетки
+      const effectiveGridCount = gridCount && gridCount >= 2 ? gridCount : 20;
+      const computedLevels: GridLevel[] = [];
+
+      if (gridLevelsRef.current && gridLevelsRef.current.length > 0) {
+        computedLevels.push(...gridLevelsRef.current);
+      } else if (lowerPrice && upperPrice && upperPrice > lowerPrice) {
+        const isGeometric = !gridType || gridType.toLowerCase() === 'geometric';
+        const ratio = Math.pow(upperPrice / lowerPrice, 1 / effectiveGridCount);
+        const step = (upperPrice - lowerPrice) / effectiveGridCount;
+
+        for (let i = 1; i < effectiveGridCount; i++) {
+          const lvlPrice = isGeometric
+            ? lowerPrice * Math.pow(ratio, i)
+            : lowerPrice + step * i;
+          computedLevels.push({
+            price: lvlPrice,
+            side: lvlPrice < activePrice ? 'buy' : 'sell',
+          });
+        }
+      }
+
+      // 5. Нарисовать уровни сетки с точным BUY / SELL и ценой
+      computedLevels.forEach((lvl) => {
+        const isBuy = lvl.side === 'buy';
+        const line = series.createPriceLine({
+          price: lvl.price,
+          color: isBuy ? 'rgba(34, 197, 94, 0.75)' : 'rgba(244, 63, 94, 0.75)',
+          lineWidth: 1,
+          lineStyle: LineStyle.Dotted,
+          axisLabelVisible: true,
+          title: isBuy ? `BUY ${lvl.price.toFixed(precision)}` : `SELL ${lvl.price.toFixed(precision)}`,
+        });
+        gridPriceLinesRef.current.push(line);
+      });
+    };
 
     async function loadCandles(attempt = 0): Promise<void> {
       setLoading(true);
@@ -60,7 +134,6 @@ export const CandlestickChart: React.FC<CandlestickChartProps> = ({
           signal: controller.signal,
         });
         if (!resp.ok) {
-          // Один повтор: 502/503 чаще всего окно перезапуска бэкенда, проходит само.
           if (attempt < 1 && (resp.status >= 500 || resp.status === 429)) {
             await new Promise(res => setTimeout(res, 1200));
             if (!isMounted) return;
@@ -87,15 +160,15 @@ export const CandlestickChart: React.FC<CandlestickChartProps> = ({
             chartRef.current?.timeScale().fitContent();
             const last = chartData[chartData.length - 1];
             setLastCandle({ open: last.open, high: last.high, low: last.low, close: last.close });
+            const refPrice = currentPrice && currentPrice > 0 ? currentPrice : last.close;
+            updateGridAndCurrentPrice(candleSeriesRef.current, refPrice);
           }
         } else {
-          // Пустые свечи без ошибки — тоже ошибка, а не молчаливый пустой график.
           setError(data.error || `Нет данных по паре ${symbol} (${interval})`);
         }
       } catch (err: any) {
-        if (err?.name === 'AbortError') return; // эффект перезапущен, запрос заменён
+        if (err?.name === 'AbortError') return;
         if (isMounted) {
-          // Сетевой сбой тоже заслуживает один повтор.
           if (attempt < 1) {
             await new Promise(res => setTimeout(res, 1200));
             if (isMounted) return loadCandles(attempt + 1);
@@ -143,6 +216,11 @@ export const CandlestickChart: React.FC<CandlestickChartProps> = ({
       borderVisible: false,
       wickUpColor: '#10b981',
       wickDownColor: '#ef4444',
+      priceFormat: {
+        type: 'price',
+        precision: precision,
+        minMove: minMove,
+      },
     });
     candleSeriesRef.current = candleSeries;
 
@@ -154,7 +232,7 @@ export const CandlestickChart: React.FC<CandlestickChartProps> = ({
         lineWidth: 2,
         lineStyle: LineStyle.Dashed,
         axisLabelVisible: true,
-        title: `ВЕРХ [${upperPrice}]`,
+        title: `ВЕРХ [${upperPrice.toFixed(precision)}]`,
       });
     }
 
@@ -166,7 +244,7 @@ export const CandlestickChart: React.FC<CandlestickChartProps> = ({
         lineWidth: 2,
         lineStyle: LineStyle.Dashed,
         axisLabelVisible: true,
-        title: `НИЗ [${lowerPrice}]`,
+        title: `НИЗ [${lowerPrice.toFixed(precision)}]`,
       });
     }
 
@@ -178,7 +256,7 @@ export const CandlestickChart: React.FC<CandlestickChartProps> = ({
         lineWidth: 2,
         lineStyle: LineStyle.Solid,
         axisLabelVisible: true,
-        title: `СТОП-ЛОСС [${stopLoss}]`,
+        title: `СТОП-ЛОСС [${stopLoss.toFixed(precision)}]`,
       });
     }
 
@@ -190,7 +268,7 @@ export const CandlestickChart: React.FC<CandlestickChartProps> = ({
         lineWidth: 2,
         lineStyle: LineStyle.Dotted,
         axisLabelVisible: true,
-        title: `ВХОД [${entryPrice.toFixed(6)}]`,
+        title: `ВХОД [${entryPrice.toFixed(precision)}]`,
       });
     }
 
@@ -202,52 +280,14 @@ export const CandlestickChart: React.FC<CandlestickChartProps> = ({
         lineWidth: 2,
         lineStyle: LineStyle.Solid,
         axisLabelVisible: true,
-        title: `ANTI-HUNT [${antiHuntStop.toFixed(6)}]`,
+        title: `ANTI-HUNT [${antiHuntStop.toFixed(precision)}]`,
       });
     }
 
-    // Draw Current Price Line
-    if (currentPrice && currentPrice > 0) {
-      candleSeries.createPriceLine({
-        price: currentPrice,
-        color: '#38bdf8',
-        lineWidth: 1,
-        lineStyle: LineStyle.Solid,
-        axisLabelVisible: true,
-        title: `ТЕКУЩАЯ [${currentPrice}]`,
-      });
+    const initPrice = currentPrice && currentPrice > 0 ? currentPrice : ((lowerPrice && upperPrice) ? (lowerPrice + upperPrice) / 2 : 0);
+    if (initPrice > 0) {
+      updateGridAndCurrentPrice(candleSeries, initPrice);
     }
-
-    // Generate and Draw Full Grid Levels Ladder
-    const effectiveGridCount = gridCount && gridCount >= 2 ? gridCount : 20;
-    const computedLevels: GridLevel[] = [];
-
-    if (gridLevelsRef.current && gridLevelsRef.current.length > 0) {
-      computedLevels.push(...gridLevelsRef.current);
-    } else if (lowerPrice && upperPrice && upperPrice > lowerPrice) {
-      const ratio = Math.pow(upperPrice / lowerPrice, 1 / effectiveGridCount);
-      const mid = currentPrice && currentPrice > 0 ? currentPrice : (lowerPrice + upperPrice) / 2;
-
-      for (let i = 1; i < effectiveGridCount; i++) {
-        const lvlPrice = lowerPrice * Math.pow(ratio, i);
-        computedLevels.push({
-          price: lvlPrice,
-          side: lvlPrice <= mid ? 'buy' : 'sell',
-        });
-      }
-    }
-
-    // Draw all intermediate grid levels
-    computedLevels.forEach((lvl) => {
-      candleSeries.createPriceLine({
-        price: lvl.price,
-        color: lvl.side === 'buy' ? 'rgba(34, 197, 94, 0.7)' : 'rgba(244, 63, 94, 0.7)',
-        lineWidth: 1,
-        lineStyle: LineStyle.Dotted,
-        axisLabelVisible: true,
-        title: lvl.side === 'buy' ? 'BUY' : 'SELL',
-      });
-    });
 
     const handleResize = () => {
       if (chartContainerRef.current && chartRef.current) {
@@ -267,7 +307,7 @@ export const CandlestickChart: React.FC<CandlestickChartProps> = ({
       window.removeEventListener('resize', handleResize);
       chart.remove();
     };
-  }, [symbol, interval, lowerPrice, upperPrice, stopLoss, currentPrice, entryPrice, antiHuntStop, gridCount, levelsKey]);
+  }, [symbol, interval, lowerPrice, upperPrice, stopLoss, currentPrice, entryPrice, antiHuntStop, gridCount, gridType, levelsKey]);
 
   return (
     <div style={{
