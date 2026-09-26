@@ -1,6 +1,10 @@
 package marketdata
 
-import "math"
+import (
+	"math"
+
+	"github.com/shopspring/decimal"
+)
 
 // GridGeometry is the translation of a HAR volatility forecast into futures
 // grid parameters. Higher forecast volatility widens the range and de-gears
@@ -110,4 +114,49 @@ func ComputeGridGeometry(forecastVolPct float64, harR2 float64, feeBps float64, 
 		StopPct:    stopPct,
 		Confidence: harR2,
 	}
+}
+
+// ComputeGaussianGridLevels computes grid levels clustered according to a Gaussian/volatility-adaptive
+// density distribution around the center price. Orders are denser near center where ~68% of price oscillations
+// take place, and expand toward the boundary tails to reduce idle capital and maximize round-trip frequency.
+func ComputeGaussianGridLevels(lower, upper, center decimal.Decimal, gridNum int, precision int32) []decimal.Decimal {
+	if gridNum < 2 {
+		return []decimal.Decimal{lower.Round(precision), upper.Round(precision)}
+	}
+	if center.LessThanOrEqual(lower) || center.GreaterThanOrEqual(upper) {
+		center = lower.Add(upper).Div(decimal.NewFromInt(2))
+	}
+
+	levels := make([]decimal.Decimal, gridNum)
+	centerF, _ := center.Float64()
+	lowerF, _ := lower.Float64()
+	upperF, _ := upper.Float64()
+
+	// Power exponent: gamma > 1 compresses levels near center.
+	// gamma = 1.4 provides optimal balance of central density without starving outer wings.
+	gamma := 1.4
+
+	for i := 0; i < gridNum; i++ {
+		// Normalized position u from -1 (at i=0) to +1 (at i=gridNum-1)
+		u := -1.0 + 2.0*float64(i)/float64(gridNum-1)
+		sign := 1.0
+		if u < 0 {
+			sign = -1.0
+		}
+		warped := sign * math.Pow(math.Abs(u), gamma)
+
+		var priceF float64
+		if warped < 0 {
+			priceF = centerF + warped*(centerF-lowerF)
+		} else {
+			priceF = centerF + warped*(upperF-centerF)
+		}
+
+		levels[i] = decimal.NewFromFloat(priceF).Round(precision)
+	}
+
+	// Guarantee exact boundary anchoring
+	levels[0] = lower.Round(precision)
+	levels[gridNum-1] = upper.Round(precision)
+	return levels
 }

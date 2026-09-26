@@ -79,6 +79,10 @@ type ScanConfig struct {
 	// Grid density scales with it (GridLevelsForRange): 0 = unknown, the
 	// level count then follows the bare 0.25% step floor.
 	NotionalPerBot float64
+	// Quant & Vision Engine v3.0 controls
+	UniverseScanCap int
+	MaxSpreadPct    float64
+	GaussianDensity bool
 }
 
 type MarketClient interface {
@@ -140,6 +144,11 @@ func (s *Scanner) ScanMarkets(
 			amount = ticker.Volume.Mul(ticker.Close)
 		}
 
+		// Quant & Vision v3.0: Filter out illiquid pairs at L1 to save API budget
+		if config.MinVolume24h.IsPositive() && amount.LessThan(config.MinVolume24h) {
+			continue
+		}
+
 		// Filter out pairs with extreme anomalous 24h pump/dumps (> 50% change)
 		if ticker.Open.GreaterThan(decimal.Zero) {
 			changeRatio, _ := ticker.Close.Sub(ticker.Open).Div(ticker.Open).Abs().Float64()
@@ -163,13 +172,17 @@ func (s *Scanner) ScanMarkets(
 	// — illiquid tail symbols were rejected downstream anyway.
 	scanCap := 10000 // FULL mode: effectively no cap
 	if config.ScanMode != "FULL" {
-		scanCap = config.MaxSymbols * 3
+		if config.UniverseScanCap > 0 {
+			scanCap = config.UniverseScanCap
+		} else {
+			scanCap = config.MaxSymbols * 3
+		}
 	}
 	if scanCap < 30 {
 		scanCap = 30
 	}
-	if scanCap > 150 {
-		scanCap = 150
+	if scanCap > 350 {
+		scanCap = 350
 	}
 	activeRanked := ranked
 	if len(activeRanked) > scanCap {

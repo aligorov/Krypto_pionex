@@ -317,6 +317,16 @@ export interface AutoGridSettings {
   aiAutotuneIntervalSeconds: number;
   lastAutotuneAt: string | null;
   lastAutotuneNotes: string | null;
+  // Quant & Vision Engine v3.0
+  wickShieldEnabled?: boolean;
+  wickGraceSec?: number;
+  fleetMaxNetDeltaUsdt?: string;
+  universeScanCap?: number;
+  maxSpreadPct?: string;
+  gaussianDensityEnabled?: boolean;
+  orderbookProfilerEnabled?: boolean;
+  knifePauseEnabled?: boolean;
+  minDepthCushionRatio?: string;
   lastError: string | null;
   lastStartedAt: string | null;
   lastStoppedAt: string | null;

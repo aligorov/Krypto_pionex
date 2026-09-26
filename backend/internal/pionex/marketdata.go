@@ -178,3 +178,29 @@ func (c *Client) GetDepth(ctx context.Context, symbol string, limit int) ([]Dept
 	}
 	return toLevels(data.Bids), toLevels(data.Asks), nil
 }
+
+// Trade represents an executed market trade from /api/v1/market/trades.
+type Trade struct {
+	Symbol  string          `json:"symbol"`
+	TradeID int64           `json:"tradeId"`
+	Price   decimal.Decimal `json:"price"`
+	Size    decimal.Decimal `json:"size"`
+	Side    string          `json:"side"` // BUY or SELL
+	Time    int64           `json:"time"`
+}
+
+// GetTrades fetches recent public trades via /api/v1/market/trades.
+func (c *Client) GetTrades(ctx context.Context, symbol string, limit int) ([]Trade, error) {
+	query := url.Values{"symbol": []string{symbol}}
+	if limit > 0 {
+		query.Set("limit", strconv.Itoa(limit))
+	}
+	var data struct {
+		Trades []Trade `json:"trades"`
+	}
+	if err := c.do(ctx, http.MethodGet, "/api/v1/market/trades", query, nil, false, 5, &data); err != nil {
+		return nil, err
+	}
+	return data.Trades, nil
+}
+

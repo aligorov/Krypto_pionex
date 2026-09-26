@@ -77,8 +77,18 @@ type Settings struct {
 	LastError          *string    `json:"lastError"`
 	LastStartedAt      *time.Time `json:"lastStartedAt"`
 	LastStoppedAt      *time.Time `json:"lastStoppedAt"`
-	CreatedAt          time.Time  `json:"createdAt"`
-	UpdatedAt          time.Time  `json:"updatedAt"`
+	// Quant & Vision Engine v3.0 controls
+	WickShieldEnabled        bool            `json:"wickShieldEnabled"`
+	WickGraceSec             int             `json:"wickGraceSec"`
+	FleetMaxNetDeltaUSDT     decimal.Decimal `json:"fleetMaxNetDeltaUsdt"`
+	UniverseScanCap          int             `json:"universeScanCap"`
+	MaxSpreadPct             decimal.Decimal `json:"maxSpreadPct"`
+	GaussianDensityEnabled   bool            `json:"gaussianDensityEnabled"`
+	OrderbookProfilerEnabled bool            `json:"orderbookProfilerEnabled"`
+	KnifePauseEnabled        bool            `json:"knifePauseEnabled"`
+	MinDepthCushionRatio     decimal.Decimal `json:"minDepthCushionRatio"`
+	CreatedAt                time.Time       `json:"createdAt"`
+	UpdatedAt                time.Time       `json:"updatedAt"`
 }
 
 type UpdateSettingsInput struct {
@@ -124,6 +134,15 @@ type UpdateSettingsInput struct {
 	AIKitEnabled         bool  `json:"aiKitEnabled"`
 	AIAutotuneEnabled    bool  `json:"aiAutotuneEnabled"`
 	AIAutotuneInterval   int   `json:"aiAutotuneIntervalSeconds"`
+	WickShieldEnabled        *bool            `json:"wickShieldEnabled"`
+	WickGraceSec             *int             `json:"wickGraceSec"`
+	FleetMaxNetDeltaUSDT     *decimal.Decimal `json:"fleetMaxNetDeltaUsdt"`
+	UniverseScanCap          *int             `json:"universeScanCap"`
+	MaxSpreadPct             *decimal.Decimal `json:"maxSpreadPct"`
+	GaussianDensityEnabled   *bool            `json:"gaussianDensityEnabled"`
+	OrderbookProfilerEnabled *bool            `json:"orderbookProfilerEnabled"`
+	KnifePauseEnabled        *bool            `json:"knifePauseEnabled"`
+	MinDepthCushionRatio     *decimal.Decimal `json:"minDepthCushionRatio"`
 }
 
 type ScanRun struct {
@@ -352,7 +371,16 @@ func (s *Service) GetSettings(ctx context.Context) (*Settings, error) {
 		       ai_autotune_enabled, ai_autotune_interval_seconds,
 		       last_autotune_at, last_autotune_notes,
 		       last_error,
-		       last_started_at, last_stopped_at, created_at, updated_at
+		       last_started_at, last_stopped_at, created_at, updated_at,
+		       COALESCE(wick_shield_enabled, true),
+		       COALESCE(wick_grace_sec, 90),
+		       COALESCE(fleet_max_net_delta_usdt, 1200.00),
+		       COALESCE(universe_scan_cap, 250),
+		       COALESCE(max_spread_pct, 0.0020),
+		       COALESCE(gaussian_density_enabled, true),
+		       COALESCE(orderbook_profiler_enabled, true),
+		       COALESCE(knife_pause_enabled, true),
+		       COALESCE(min_depth_cushion_ratio, 50.00)
 		FROM autogrid_settings WHERE scope_key = $1
 	`, DefaultScope).Scan(settingsScanTargets(&item)...)
 	if err != nil {
@@ -444,6 +472,42 @@ func (s *Service) UpdateSettings(
 	if input.TrancheDeployEnabled != nil {
 		trancheDeploy = *input.TrancheDeployEnabled
 	}
+	wickShield := current.WickShieldEnabled
+	if input.WickShieldEnabled != nil {
+		wickShield = *input.WickShieldEnabled
+	}
+	wickGrace := current.WickGraceSec
+	if input.WickGraceSec != nil && *input.WickGraceSec > 0 {
+		wickGrace = *input.WickGraceSec
+	}
+	fleetMaxDelta := current.FleetMaxNetDeltaUSDT
+	if input.FleetMaxNetDeltaUSDT != nil && input.FleetMaxNetDeltaUSDT.IsPositive() {
+		fleetMaxDelta = *input.FleetMaxNetDeltaUSDT
+	}
+	universeCap := current.UniverseScanCap
+	if input.UniverseScanCap != nil && *input.UniverseScanCap > 0 {
+		universeCap = *input.UniverseScanCap
+	}
+	maxSpread := current.MaxSpreadPct
+	if input.MaxSpreadPct != nil && input.MaxSpreadPct.IsPositive() {
+		maxSpread = *input.MaxSpreadPct
+	}
+	gaussDensity := current.GaussianDensityEnabled
+	if input.GaussianDensityEnabled != nil {
+		gaussDensity = *input.GaussianDensityEnabled
+	}
+	obProfiler := current.OrderbookProfilerEnabled
+	if input.OrderbookProfilerEnabled != nil {
+		obProfiler = *input.OrderbookProfilerEnabled
+	}
+	knifePause := current.KnifePauseEnabled
+	if input.KnifePauseEnabled != nil {
+		knifePause = *input.KnifePauseEnabled
+	}
+	minDepthCushion := current.MinDepthCushionRatio
+	if input.MinDepthCushionRatio != nil && input.MinDepthCushionRatio.IsPositive() {
+		minDepthCushion = *input.MinDepthCushionRatio
+	}
 	accountID := input.AccountID
 	if accountID != nil && strings.TrimSpace(*accountID) == "" {
 		accountID = nil
@@ -465,6 +529,11 @@ func (s *Service) UpdateSettings(
 		    ai_autotune_enabled = $31, ai_autotune_interval_seconds = $32,
 		    tranche_deploy_enabled = $34, stop_forecast_mode = $35,
 		    radar_autoclose_mode = $36, dgt_redeploy_enabled = $37,
+		    wick_shield_enabled = $38, wick_grace_sec = $39,
+		    fleet_max_net_delta_usdt = $40, universe_scan_cap = $41,
+		    max_spread_pct = $42, gaussian_density_enabled = $43,
+		    orderbook_profiler_enabled = $44, knife_pause_enabled = $45,
+		    min_depth_cushion_ratio = $46,
 		    last_error = NULL, updated_at = NOW()
 		WHERE scope_key = $1
 	`, DefaultScope, accountID, input.ExecutionMode, input.BudgetUSDT,
@@ -479,7 +548,8 @@ func (s *Service) UpdateSettings(
 		input.RangeBreakBufferPct, input.MaxAdjustmentsPerBot, input.AIKitEnabled,
 		input.AIAutotuneEnabled, input.AIAutotuneInterval, input.ScanMode,
 		trancheDeploy, input.StopForecastMode, input.RadarAutoCloseMode,
-		dgtRedeploy)
+		dgtRedeploy, wickShield, wickGrace, fleetMaxDelta, universeCap,
+		maxSpread, gaussDensity, obProfiler, knifePause, minDepthCushion)
 	if err != nil {
 		return nil, fmt.Errorf("update AutoGrid settings: %w", err)
 	}
@@ -1216,7 +1286,10 @@ func (s *Service) scannerConfig(settings Settings) marketdata.ScanConfig {
 		GridType:            mapGridType(settings.DensityGridEnabled),
 		// v2.0.75 margin-density doctrine: the scanner sizes the level count
 		// against the notional a slot actually commits.
-		NotionalPerBot: settings.BudgetUSDT.Mul(decimal.NewFromInt(int64(settings.Leverage))).InexactFloat64(),
+		NotionalPerBot:  settings.BudgetUSDT.Mul(decimal.NewFromInt(int64(settings.Leverage))).InexactFloat64(),
+		UniverseScanCap: settings.UniverseScanCap,
+		MaxSpreadPct:    decimalFloat(settings.MaxSpreadPct),
+		GaussianDensity: settings.GaussianDensityEnabled,
 	}
 }
 
@@ -1508,6 +1581,9 @@ func settingsScanTargets(item *Settings) []any {
 		&item.LastAutotuneAt, &item.LastAutotuneNotes,
 		&item.LastError, &item.LastStartedAt,
 		&item.LastStoppedAt, &item.CreatedAt, &item.UpdatedAt,
+		&item.WickShieldEnabled, &item.WickGraceSec, &item.FleetMaxNetDeltaUSDT,
+		&item.UniverseScanCap, &item.MaxSpreadPct, &item.GaussianDensityEnabled,
+		&item.OrderbookProfilerEnabled, &item.KnifePauseEnabled, &item.MinDepthCushionRatio,
 	}
 }
 

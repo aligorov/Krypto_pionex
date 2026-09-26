@@ -1445,20 +1445,23 @@ func (worker *Worker) deployPaper(
 
 		// v2.0.56 (F9): block directional flip-entries on a symbol that ran
 		// another direction <12h ago. The cascade-short window is the
-		// designed escape valve and stays exempt.
+		// designed escape valve and stays exempt. Quant Vision v3.0 allows
+		// flip entry if a fresh confirmed price action pattern is formed.
 		if (trend == "long" || trend == "short") && !(cascadeShort && trend == "short") &&
 			worker.directionalFlipBlocked(ctx, candidate.Symbol, strings.ToUpper(trend), true) {
-			worker.rejectCandidate(ctx, candidate,
-				"флип направления: символ закрыл бота другого направления ≤12ч назад — направленный вход отложен", nil)
-			continue
+			paConfirmed, paReason := worker.directionalConfirmedByPriceAction(ctx, candidate.Symbol, trend)
+			if !paConfirmed {
+				worker.rejectCandidate(ctx, candidate,
+					fmt.Sprintf("флип направления: символ закрыл бота другого направления ≤12ч назад и нет свечного паттерна (%s)", paReason), nil)
+				continue
+			}
+			worker.logger.Info("paper directional flip lock bypassed by confirmed price action",
+				"component", "autogrid_worker", "symbol", candidate.Symbol, "trend", trend, "pattern", paReason)
 		}
 
-		// v2.0.62 (R1): a DIRECTIONAL entry needs directional confirmation.
-		// The 14d ledger: every big directional stop (SPX/SNXXX SHORT, WLD
-		// LONG, JUP SHORT) carried confluence verdict=NEUTRAL — the engine
-		// went directional while its own confluence stayed agnostic.
-		// 1W/4L for directional entries, 69% of all losses. Cascade-shorts
-		// remain the designed exemption.
+		// v2.0.62 (R1) + Quant Vision v3.0: directional entry requires
+		// either the matching confluence verdict OR confirmed candlestick price action
+		// (Pin Bar, Engulfing, or SFP liquidity sweep). Cascade-shorts exempt.
 		if (trend == "long" || trend == "short") && !(cascadeShort && trend == "short") {
 			verdict := candidateConfluenceVerdict(candidate.ModelAssumptions)
 			want := "SUPPORT_SHORT"
@@ -1466,10 +1469,63 @@ func (worker *Worker) deployPaper(
 				want = "SUPPORT_LONG"
 			}
 			if verdict != want {
+				paConfirmed, paReason := worker.directionalConfirmedByPriceAction(ctx, candidate.Symbol, trend)
+				if !paConfirmed {
+					worker.rejectCandidate(ctx, candidate,
+						fmt.Sprintf("R1 + Vision: направленный вход (%s) без подтверждения — confluence %s (нужно %s) и нет свечного паттерна (%s)",
+							strings.ToUpper(trend), verdict, want, paReason), nil)
+					continue
+				}
+				worker.logger.Info("paper directional entry approved via Price Action",
+					"component", "autogrid_worker", "symbol", candidate.Symbol, "trend", trend, "pattern", paReason)
+			}
+		}
+
+		// Fleet Net Delta Cap (Quant & Vision v3.0)
+		candidateDelta := decimal.Zero
+		if trend == "long" {
+			candidateDelta = settings.BudgetUSDT.Mul(decimal.NewFromInt(int64(botLev)))
+		} else if trend == "short" {
+			candidateDelta = settings.BudgetUSDT.Mul(decimal.NewFromInt(int64(botLev))).Neg()
+		}
+		if settings.FleetMaxNetDeltaUSDT.IsPositive() && !candidateDelta.IsZero() {
+			fleetDelta, err := worker.calculateFleetNetDelta(ctx, settings.ID, true)
+			if err == nil {
+				projectedDelta := fleetDelta.Add(candidateDelta).Abs()
+				if projectedDelta.GreaterThan(settings.FleetMaxNetDeltaUSDT) {
+					worker.rejectCandidate(ctx, candidate,
+						fmt.Sprintf("Fleet net delta cap: текущая дельта $%s + кандидат $%s превысит лимит $%s — пауза направленного входа для защиты портфеля",
+							fleetDelta.StringFixed(2), candidateDelta.StringFixed(2), settings.FleetMaxNetDeltaUSDT.StringFixed(2)), nil)
+					continue
+				}
+			}
+		}
+
+		// Knife Pause Check (Quant & Vision v3.0)
+		if settings.KnifePauseEnabled {
+			paused, _, knifeReason := worker.checkKnifePause(ctx, candidate.Symbol, trend)
+			if paused {
 				worker.rejectCandidate(ctx, candidate,
-					fmt.Sprintf("R1: направленный вход (%s) без направленного подтверждения — confluence verdict %s, требуется %s",
-						strings.ToUpper(trend), verdict, want), nil)
+					fmt.Sprintf("Knife Pause: %s — деплой отложен для защиты от падающего ножа", knifeReason), nil)
 				continue
+			}
+		}
+
+		// Order Book Cushion Check (Quant & Vision v3.0)
+		if settings.OrderbookProfilerEnabled {
+			botNotional := settings.BudgetUSDT.Mul(decimal.NewFromInt(int64(botLev))).InexactFloat64()
+			minCushion := settings.MinDepthCushionRatio.InexactFloat64()
+			ok, profile, depthReason := worker.checkOrderBookCushion(ctx, candidate.Symbol, candidate.CurrentPrice, botNotional, minCushion)
+			if !ok {
+				worker.rejectCandidate(ctx, candidate,
+					fmt.Sprintf("Стакан: %s — отказ по фильтру тонкой ликвидности", depthReason), nil)
+				continue
+			}
+			if trend != "short" && profile.HasBidWall && profile.BidWallPrice.GreaterThan(mesh.LowerPrice) && profile.BidWallPrice.LessThan(candidate.CurrentPrice) {
+				worker.logger.Info("paper anchoring grid lowerPrice above order book bid wall",
+					"component", "autogrid_worker", "symbol", candidate.Symbol,
+					"old_lower", mesh.LowerPrice.String(), "bid_wall", profile.BidWallPrice.String())
+				mesh.LowerPrice = profile.BidWallPrice
 			}
 		}
 
@@ -2191,15 +2247,22 @@ func (worker *Worker) deployReal(
 		}
 		// v2.0.56 (F9, REAL mirror): block directional flip-entries on a
 		// symbol that ran another direction <12h ago; cascade-shorts exempt.
+		// Quant Vision v3.0 allows flip entry if a fresh confirmed price action pattern is formed.
 		if (trend == "long" || trend == "short") && !(cascadeShort && trend == "short") &&
 			worker.directionalFlipBlocked(ctx, candidate.Symbol, strings.ToUpper(trend), false) {
-			worker.rejectCandidate(ctx, candidate,
-				"флип направления: символ закрыл бота другого направления ≤12ч назад — направленный вход отложен", nil)
-			continue
+			paConfirmed, paReason := worker.directionalConfirmedByPriceAction(ctx, candidate.Symbol, trend)
+			if !paConfirmed {
+				worker.rejectCandidate(ctx, candidate,
+					fmt.Sprintf("флип направления: символ закрыл бота другого направления ≤12ч назад и нет свечного паттерна (%s)", paReason), nil)
+				continue
+			}
+			worker.logger.Info("real directional flip lock bypassed by confirmed price action",
+				"component", "autogrid_worker", "symbol", candidate.Symbol, "trend", trend, "pattern", paReason)
 		}
 
-		// v2.0.62 (R1, REAL mirror): directional entry requires the matching
-		// confluence verdict; cascade-shorts exempt.
+		// v2.0.62 (R1, REAL mirror) + Quant Vision v3.0: directional entry requires
+		// either the matching confluence verdict OR confirmed candlestick price action
+		// (Pin Bar, Engulfing, or SFP liquidity sweep). Cascade-shorts exempt.
 		if (trend == "long" || trend == "short") && !(cascadeShort && trend == "short") {
 			verdict := candidateConfluenceVerdict(candidate.ModelAssumptions)
 			want := "SUPPORT_SHORT"
@@ -2207,10 +2270,15 @@ func (worker *Worker) deployReal(
 				want = "SUPPORT_LONG"
 			}
 			if verdict != want {
-				worker.rejectCandidate(ctx, candidate,
-					fmt.Sprintf("R1: направленный вход (%s) без направленного подтверждения — confluence verdict %s, требуется %s",
-						strings.ToUpper(trend), verdict, want), nil)
-				continue
+				paConfirmed, paReason := worker.directionalConfirmedByPriceAction(ctx, candidate.Symbol, trend)
+				if !paConfirmed {
+					worker.rejectCandidate(ctx, candidate,
+						fmt.Sprintf("R1 + Vision: направленный вход (%s) без подтверждения — confluence %s (нужно %s) и нет свечного паттерна (%s)",
+							strings.ToUpper(trend), verdict, want, paReason), nil)
+					continue
+				}
+				worker.logger.Info("real directional entry approved via Price Action",
+					"component", "autogrid_worker", "symbol", candidate.Symbol, "trend", trend, "pattern", paReason)
 			}
 		}
 		// v2.0.21 beta gate (REAL mirror).
@@ -2290,6 +2358,54 @@ func (worker *Worker) deployReal(
 			botLev = smartLev
 		} else if harGeo != nil && harGeo.geo.Leverage < botLev {
 			botLev = harGeo.geo.Leverage
+		}
+
+		// Fleet Net Delta Cap (Quant & Vision v3.0)
+		candidateDelta := decimal.Zero
+		if trend == "long" {
+			candidateDelta = settings.BudgetUSDT.Mul(decimal.NewFromInt(int64(botLev)))
+		} else if trend == "short" {
+			candidateDelta = settings.BudgetUSDT.Mul(decimal.NewFromInt(int64(botLev))).Neg()
+		}
+		if settings.FleetMaxNetDeltaUSDT.IsPositive() && !candidateDelta.IsZero() {
+			fleetDelta, err := worker.calculateFleetNetDelta(ctx, settings.ID, false)
+			if err == nil {
+				projectedDelta := fleetDelta.Add(candidateDelta).Abs()
+				if projectedDelta.GreaterThan(settings.FleetMaxNetDeltaUSDT) {
+					worker.rejectCandidate(ctx, candidate,
+						fmt.Sprintf("Fleet net delta cap: текущая дельта $%s + кандидат $%s превысит лимит $%s — пауза направленного входа для защиты портфеля",
+							fleetDelta.StringFixed(2), candidateDelta.StringFixed(2), settings.FleetMaxNetDeltaUSDT.StringFixed(2)), nil)
+					continue
+				}
+			}
+		}
+
+		// Knife Pause Check (Quant & Vision v3.0)
+		if settings.KnifePauseEnabled {
+			paused, _, knifeReason := worker.checkKnifePause(ctx, candidate.Symbol, trend)
+			if paused {
+				worker.rejectCandidate(ctx, candidate,
+					fmt.Sprintf("Knife Pause: %s — деплой отложен для защиты от падающего ножа", knifeReason), nil)
+				continue
+			}
+		}
+
+		// Order Book Cushion Check (Quant & Vision v3.0)
+		if settings.OrderbookProfilerEnabled {
+			botNotional := settings.BudgetUSDT.Mul(decimal.NewFromInt(int64(botLev))).InexactFloat64()
+			minCushion := settings.MinDepthCushionRatio.InexactFloat64()
+			ok, profile, depthReason := worker.checkOrderBookCushion(ctx, candidate.Symbol, candidate.CurrentPrice, botNotional, minCushion)
+			if !ok {
+				worker.rejectCandidate(ctx, candidate,
+					fmt.Sprintf("Стакан: %s — отказ по фильтру тонкой ликвидности", depthReason), nil)
+				continue
+			}
+			if trend != "short" && profile.HasBidWall && profile.BidWallPrice.GreaterThan(lowerPrice) && profile.BidWallPrice.LessThan(candidate.CurrentPrice) {
+				worker.logger.Info("real anchoring grid lowerPrice above order book bid wall",
+					"component", "autogrid_worker", "symbol", candidate.Symbol,
+					"old_lower", lowerPrice.String(), "bid_wall", profile.BidWallPrice.String())
+				lowerPrice = profile.BidWallPrice.Round(int32(pricePrecision))
+			}
 		}
 
 		if err := worker.risk.ValidateNewGrid(
@@ -3023,7 +3139,9 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 		       COALESCE(supervision_floor_pnl_usdt, unrealized_pnl_usdt, 0),
 		       COALESCE(NULLIF(model_state->>'rebasePool','')::NUMERIC, 0),
 		       NULLIF(model_state->>'payloadEntryMark','')::NUMERIC,
-		       NULLIF(model_state->>'payloadSignedPos','')::NUMERIC
+		       NULLIF(model_state->>'payloadSignedPos','')::NUMERIC,
+		       NULLIF(model_state->>'wickShieldTriggeredAt',''),
+		       NULLIF(model_state->>'wickShieldExtreme','')::NUMERIC
 		FROM grid_bots
 		WHERE autogrid_settings_id = $1 AND bu_order_id IS NOT NULL
 		  AND status IN ('RUNNING', 'STOP_REQUESTED', 'STOPPING')
@@ -3057,6 +3175,8 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 		rebasePool                                              decimal.Decimal
 		lastEntryMark                                           *decimal.Decimal
 		lastSignedPos                                           *decimal.Decimal
+		wickShieldTriggeredAt                                   *string
+		wickShieldExtreme                                       *decimal.Decimal
 	}
 	bots := make([]managedBot, 0)
 	for rows.Next() {
@@ -3073,6 +3193,7 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 			&item.fundingPaid, &item.lastFundingReconcileAt,
 			&item.shiftFloatingOffset, &item.shiftPosition,
 			&item.supervisionFloor, &item.rebasePool, &item.lastEntryMark, &item.lastSignedPos,
+			&item.wickShieldTriggeredAt, &item.wickShieldExtreme,
 		); err != nil {
 			rows.Close()
 			return clampInterval(settings.ManageIntervalSeconds), err
@@ -3969,8 +4090,60 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 			}
 		}
 
+		if decision.Action == ActionHold || decision.Action == ActionAdjustUp || decision.Action == ActionAdjustDown {
+			if bot.wickShieldTriggeredAt != nil {
+				worker.logger.Info("wick shield saved bot from stop loss - price recovered",
+					"component", "autogrid_worker", "symbol", bot.symbol, "bot_id", bot.id, "price", price.String())
+				_, _ = worker.db.Exec(ctx, `
+					UPDATE grid_bots
+					SET model_state = COALESCE(model_state, '{}'::jsonb) - 'wickShieldTriggeredAt' - 'wickShieldExtreme',
+					    updated_at = NOW()
+					WHERE id = $1
+				`, bot.id)
+				_ = QueueTelegramEvent(ctx, worker.db, "WICK_SHIELD_SAVED", map[string]any{
+					"bot_number": bot.botNumber, "symbol": bot.symbol, "price": price.StringFixed(6),
+				})
+			}
+		}
+
 		switch decision.Action {
-		case ActionCloseTakeProfit, ActionCloseStopLoss, ActionCloseRangeBreak, ActionCloseStructInvalid:
+		case ActionCloseStopLoss, ActionCloseStructInvalid, ActionCloseRangeBreak:
+			if settings.WickShieldEnabled {
+				shouldHold, newTriggeredAt, newExtreme, shieldReason := worker.evaluateWickShield(
+					ctx, bot.symbol, bot.direction, price, bot.wickShieldTriggeredAt, bot.wickShieldExtreme, settings.WickGraceSec,
+				)
+				if shouldHold {
+					if bot.wickShieldTriggeredAt == nil && newTriggeredAt != nil && newExtreme != nil {
+						_, _ = worker.db.Exec(ctx, `
+							UPDATE grid_bots
+							SET model_state = (COALESCE(model_state, '{}'::jsonb) - 'wickShieldTriggeredAt' - 'wickShieldExtreme')
+							    || jsonb_build_object('wickShieldTriggeredAt', $2::TEXT, 'wickShieldExtreme', $3::NUMERIC),
+							    updated_at = NOW()
+							WHERE id = $1
+						`, bot.id, *newTriggeredAt, newExtreme.String())
+						worker.logger.Info("wick shield armed: deferring stop loss",
+							"component", "autogrid_worker", "symbol", bot.symbol, "reason", decision.Reason, "shield_reason", shieldReason)
+						_ = QueueTelegramEvent(ctx, worker.db, "WICK_SHIELD_ARMED", map[string]any{
+							"bot_number": bot.botNumber, "symbol": bot.symbol, "reason": decision.Reason,
+							"wick_extreme": newExtreme.StringFixed(6), "grace_sec": settings.WickGraceSec,
+						})
+					} else {
+						worker.logger.Debug("wick shield holding: stop loss deferred",
+							"component", "autogrid_worker", "symbol", bot.symbol, "shield_reason", shieldReason)
+					}
+					continue
+				}
+				if bot.wickShieldTriggeredAt != nil {
+					_, _ = worker.db.Exec(ctx, `
+						UPDATE grid_bots
+						SET model_state = COALESCE(model_state, '{}'::jsonb) - 'wickShieldTriggeredAt' - 'wickShieldExtreme',
+						    updated_at = NOW()
+						WHERE id = $1
+					`, bot.id)
+				}
+			}
+			fallthrough
+		case ActionCloseTakeProfit:
 			totalPnL := realized.Add(unrealized)
 			_, _ = worker.db.Exec(ctx, `
 				UPDATE grid_bots
@@ -4691,7 +4864,9 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 		       COALESCE(NULLIF(model_state->>'trancheDeployed','')::INT, 0),
 		       NULLIF(model_state->>'trancheBase',''),
 		       COALESCE(NULLIF(model_state->>'atrPctEntry','')::FLOAT8, 0),
-		       candidate_id, COALESCE(pairs_completed, 0), COALESCE(funding_paid_usdt, 0)
+		       candidate_id, COALESCE(pairs_completed, 0), COALESCE(funding_paid_usdt, 0),
+		       NULLIF(model_state->>'wickShieldTriggeredAt',''),
+		       NULLIF(model_state->>'wickShieldExtreme','')::NUMERIC
 		FROM paper_grid_bots
 		WHERE settings_id = $1 AND status = 'RUNNING'
 	`, settings.ID)
@@ -4720,6 +4895,8 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 		candidateID              *string
 		pairsCompleted           int
 		fundingPaid              decimal.Decimal
+		wickShieldTriggeredAt    *string
+		wickShieldExtreme        *decimal.Decimal
 	}
 	bots := make([]paperBot, 0)
 	for rows.Next() {
@@ -4732,6 +4909,7 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 			&item.openedAt, &item.lastFundingAt,
 			&item.peak, &item.trancheDeployed, &item.trancheBase, &item.atrEntry,
 			&item.candidateID, &item.pairsCompleted, &item.fundingPaid,
+			&item.wickShieldTriggeredAt, &item.wickShieldExtreme,
 		); err != nil {
 			rows.Close()
 			return err
@@ -5011,6 +5189,59 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 			Regime:           regime,
 			AntiHuntStop:     bot.antiHuntStop,
 		})
+
+		if decision.Action == ActionHold || decision.Action == ActionAdjustUp || decision.Action == ActionAdjustDown {
+			if bot.wickShieldTriggeredAt != nil {
+				worker.logger.Info("paper wick shield saved bot from stop loss - price recovered",
+					"component", "autogrid_worker", "symbol", bot.symbol, "bot_id", bot.id, "price", price.String())
+				_, _ = worker.db.Exec(ctx, `
+					UPDATE paper_grid_bots
+					SET model_state = COALESCE(model_state, '{}'::jsonb) - 'wickShieldTriggeredAt' - 'wickShieldExtreme',
+					    updated_at = NOW()
+					WHERE id = $1
+				`, bot.id)
+				_ = QueueTelegramEvent(ctx, worker.db, "WICK_SHIELD_SAVED", map[string]any{
+					"bot_number": bot.botNumber, "symbol": bot.symbol, "price": price.StringFixed(6), "mode": "PAPER",
+				})
+			}
+		}
+
+		if decision.Action == ActionCloseStopLoss || decision.Action == ActionCloseStructInvalid || decision.Action == ActionCloseRangeBreak {
+			if settings.WickShieldEnabled {
+				shouldHold, newTriggeredAt, newExtreme, shieldReason := worker.evaluateWickShield(
+					ctx, bot.symbol, bot.direction, price, bot.wickShieldTriggeredAt, bot.wickShieldExtreme, settings.WickGraceSec,
+				)
+				if shouldHold {
+					if bot.wickShieldTriggeredAt == nil && newTriggeredAt != nil && newExtreme != nil {
+						_, _ = worker.db.Exec(ctx, `
+							UPDATE paper_grid_bots
+							SET model_state = (COALESCE(model_state, '{}'::jsonb) - 'wickShieldTriggeredAt' - 'wickShieldExtreme')
+							    || jsonb_build_object('wickShieldTriggeredAt', $2::TEXT, 'wickShieldExtreme', $3::NUMERIC),
+							    updated_at = NOW()
+							WHERE id = $1
+						`, bot.id, *newTriggeredAt, newExtreme.String())
+						worker.logger.Info("paper wick shield armed: deferring stop loss",
+							"component", "autogrid_worker", "symbol", bot.symbol, "reason", decision.Reason, "shield_reason", shieldReason)
+						_ = QueueTelegramEvent(ctx, worker.db, "WICK_SHIELD_ARMED", map[string]any{
+							"bot_number": bot.botNumber, "symbol": bot.symbol, "reason": decision.Reason,
+							"wick_extreme": newExtreme.StringFixed(6), "grace_sec": settings.WickGraceSec, "mode": "PAPER",
+						})
+					} else {
+						worker.logger.Debug("paper wick shield holding: stop loss deferred",
+							"component", "autogrid_worker", "symbol", bot.symbol, "shield_reason", shieldReason)
+					}
+					continue
+				}
+				if bot.wickShieldTriggeredAt != nil {
+					_, _ = worker.db.Exec(ctx, `
+						UPDATE paper_grid_bots
+						SET model_state = COALESCE(model_state, '{}'::jsonb) - 'wickShieldTriggeredAt' - 'wickShieldExtreme',
+						    updated_at = NOW()
+						WHERE id = $1
+					`, bot.id)
+				}
+			}
+		}
 
 		if decision.Action == ActionCloseTakeProfit || decision.Action == ActionCloseStopLoss ||
 			decision.Action == ActionCloseRangeBreak || decision.Action == ActionCloseStructInvalid {

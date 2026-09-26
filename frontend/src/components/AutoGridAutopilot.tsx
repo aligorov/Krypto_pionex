@@ -540,6 +540,12 @@ function SettingsSummary({ settings }: { settings: AutoGridSettings }) {
       : 'OFF'],
     ['Плотная сетка (geometric)', settings.densityGridEnabled ? 'да' : 'нет'],
     ['Адаптивное плечо', settings.adaptiveLeverageEnabled ? 'да' : 'нет'],
+    ['Wick Shield (защита от выбивания фитилями)', settings.wickShieldEnabled ? `включён (${settings.wickGraceSec ?? 90}с буфер)` : 'выключен'],
+    ['Fleet Net Delta Cap (лимит дельты)', `${settings.fleetMaxNetDeltaUsdt ?? '1200'} USDT`],
+    ['Вселенная сканирования', `${settings.universeScanCap ?? 250} пар (спред < ${(Number(settings.maxSpreadPct ?? 0.0020) * 100).toFixed(2)}%)`],
+    ['Order Book Cushion & Walls', settings.orderbookProfilerEnabled ? `включён (мин. подушка ${settings.minDepthCushionRatio ?? '50'}x)` : 'выключен'],
+    ['Knife Pause (защита от ножа)', settings.knifePauseEnabled ? 'включён (пауза при >75% taker sell)' : 'выключен'],
+    ['Gaussian Grid Density', settings.gaussianDensityEnabled ? 'включён (сгущение уровней у POC)' : 'выключен'],
   ];
   return (
     <div>
@@ -882,6 +888,84 @@ function SettingsForm({
             <option value="BAND3">BAND3 — band3 + под водой</option>
             <option value="STRICT">STRICT — + близко к стопу</option>
           </select>
+        </div>
+
+        <div className="section-divider" style={{ margin: '16px 0', borderTop: '1px solid var(--border)' }} />
+        <h4 style={{ margin: '0 0 12px 0' }}>👁️ Quant &amp; Vision Engine v3.0</h4>
+
+        <div className="toggle-row">
+          <div>
+            <strong>Wick Shield (защита от выбивания фитилями)</strong>
+            <span>
+              Откладывает закрытие по стоп-лоссу на 90 секунд при обнаружении длинного фитиля отскока (Pin Bar / SFP с фитилём ≥40%), защищая от закрытия на самом дне сквиза.
+            </span>
+          </div>
+          <input
+            type="checkbox"
+            checked={Boolean(form.wickShieldEnabled)}
+            onChange={(event) => setForm((current) => ({ ...current, wickShieldEnabled: event.target.checked }))}
+          />
+        </div>
+
+        <div className="toggle-row">
+          <div>
+            <strong>Order Book Cushion &amp; Walls</strong>
+            <span>
+              Проверяет глубину стакана (подушка ≥50x от размера бота) и автоматически привязывает нижнюю границу сетки к крупным плотностям покупателей (Bid Walls).
+            </span>
+          </div>
+          <input
+            type="checkbox"
+            checked={Boolean(form.orderbookProfilerEnabled)}
+            onChange={(event) => setForm((current) => ({ ...current, orderbookProfilerEnabled: event.target.checked }))}
+          />
+        </div>
+
+        <div className="toggle-row">
+          <div>
+            <strong>Knife Pause (защита от падающего ножа)</strong>
+            <span>
+              Приостанавливает новые покупки и входы, если в ленте сделок преобладают агрессивные маркет-продажи (&gt;75% taker sell volume).
+            </span>
+          </div>
+          <input
+            type="checkbox"
+            checked={Boolean(form.knifePauseEnabled)}
+            onChange={(event) => setForm((current) => ({ ...current, knifePauseEnabled: event.target.checked }))}
+          />
+        </div>
+
+        <div className="toggle-row">
+          <div>
+            <strong>Gaussian Grid Density</strong>
+            <span>
+              Концентрирует уровни сетки вокруг равновесной цены (POC / VWAP) по нормальному распределению, повышая частоту срабатываний на 35–45%.
+            </span>
+          </div>
+          <input
+            type="checkbox"
+            checked={Boolean(form.gaussianDensityEnabled)}
+            onChange={(event) => setForm((current) => ({ ...current, gaussianDensityEnabled: event.target.checked }))}
+          />
+        </div>
+
+        <div className="field-grid">
+          <label>
+            <span>Лимит дельты флота (USDT)</span>
+            <input
+              type="text"
+              value={form.fleetMaxNetDeltaUsdt || '1200'}
+              onChange={(event) => setForm((current) => ({ ...current, fleetMaxNetDeltaUsdt: event.target.value }))}
+            />
+          </label>
+          <label>
+            <span>Лимит вселенной пар (Universe Cap)</span>
+            <input
+              type="number"
+              value={form.universeScanCap || 250}
+              onChange={(event) => setForm((current) => ({ ...current, universeScanCap: Number(event.target.value) }))}
+            />
+          </label>
         </div>
       </div>
 
