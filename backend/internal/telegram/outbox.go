@@ -25,13 +25,14 @@ type InlineKeyboardMarkup struct {
 }
 
 type OutboxDispatcher struct {
-	db           *pgxpool.Pool
-	defaultToken string
-	defaultChat  string
-	httpClient   *http.Client
-	logger       *slog.Logger
-	lastUpdateID int64
-	service      *Service
+	db              *pgxpool.Pool
+	defaultToken    string
+	defaultChat     string
+	httpClient      *http.Client
+	logger          *slog.Logger
+	lastUpdateID    int64
+	lastCredsWarnAt time.Time
+	service         *Service
 }
 
 func NewOutboxDispatcher(db *pgxpool.Pool, defaultToken, defaultChat string) *OutboxDispatcher {
@@ -146,6 +147,10 @@ func (d *OutboxDispatcher) DispatchPending(ctx context.Context) error {
 
 // StartInboundListener starts the long-polling loop for 2-way Telegram commands
 func (d *OutboxDispatcher) StartInboundListener(ctx context.Context) {
+	// One banner per boot: the console's liveness is greppable in
+	// docker logs without waiting for a command.
+	d.logger.Info("tg console: inbound listener starting (getUpdates long-poll)",
+		"component", "telegram_console")
 	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
 
@@ -162,6 +167,13 @@ func (d *OutboxDispatcher) StartInboundListener(ctx context.Context) {
 func (d *OutboxDispatcher) pollUpdates(ctx context.Context) {
 	token, chatID, _, enabled := d.getActiveCredentials(ctx)
 	if !enabled || token == "" || chatID == "" {
+		// Throttled visibility: a disabled console must announce itself once
+		// an hour, not every 3s tick, but never stay silent forever.
+		if time.Since(d.lastCredsWarnAt) > time.Hour {
+			d.lastCredsWarnAt = time.Now()
+			d.logger.Warn("tg console: credentials disabled or unset in telegram_settings — commands ignored",
+				"component", "telegram_console")
+		}
 		return
 	}
 

@@ -22,6 +22,8 @@ import (
 // keep the pinned chat a private dialog (the /help footer states it).
 
 // routeCommand dispatches one inbound message. Unknown input gets the menu.
+// iOS clients send commands with an @botname suffix and any case; Russian
+// aliases arrive as plain words — both normalized here.
 func (d *OutboxDispatcher) routeCommand(ctx context.Context, token, chatID, text string) {
 	text = strings.TrimSpace(text)
 	cmd := text
@@ -29,25 +31,35 @@ func (d *OutboxDispatcher) routeCommand(ctx context.Context, token, chatID, text
 	if idx := strings.IndexAny(text, " \n"); idx > 0 {
 		cmd, arg = text[:idx], strings.TrimSpace(text[idx+1:])
 	}
+	if idx := strings.IndexByte(cmd, '@'); idx > 0 {
+		cmd = cmd[:idx]
+	}
+	cmd = strings.ToLower(cmd)
+	if mapped, ok := ruCommandAliases[cmd]; ok {
+		cmd = mapped
+	}
+
+	d.logger.Info("tg console: command received",
+		"component", "telegram_console", "cmd", cmd)
 
 	switch cmd {
-	case "/start", "/help", "меню":
+	case "/start", "/help":
 		d.sendMenu(ctx, token, chatID)
-	case "/status", "статус":
+	case "/status":
 		d.reportStatus(ctx, token, chatID)
-	case "/bots", "боты":
+	case "/bots":
 		d.reportFleet(ctx, token, chatID)
-	case "/closed", "закрытые":
+	case "/closed":
 		d.reportClosed(ctx, token, chatID, arg)
-	case "/day", "день":
+	case "/day":
 		d.reportDay(ctx, token, chatID)
-	case "/stats", "статистика":
+	case "/stats":
 		d.reportStats(ctx, token, chatID)
-	case "/pnl", "прибыль":
+	case "/pnl":
 		d.reportPnL(ctx, token, chatID)
-	case "/risk", "риск":
+	case "/risk":
 		d.reportRisk(ctx, token, chatID)
-	case "/health", "здоровье":
+	case "/health":
 		d.reportHealth(ctx, token, chatID)
 	case "/kill":
 		d.triggerKillSwitch(ctx, token, chatID)
@@ -332,4 +344,11 @@ func (d *OutboxDispatcher) sendMessageWithKeyboard(ctx context.Context, token, c
 		d.logger.Warn("tg console: telegram rejected message",
 			"component", "telegram_console", "status", resp.StatusCode)
 	}
+}
+
+// ruCommandAliases maps the operator's Russian words to commands.
+var ruCommandAliases = map[string]string{
+	"меню": "/start", "статус": "/status", "боты": "/bots",
+	"закрытые": "/closed", "день": "/day", "статистика": "/stats",
+	"прибыль": "/pnl", "риск": "/risk", "здоровье": "/health",
 }
