@@ -4629,7 +4629,11 @@ func (worker *Worker) reconcileUnknownSubmissions(ctx context.Context, client *p
 	listsComplete := true
 	for _, listStatus := range []string{"running", "finished"} {
 		token := ""
-		for page := 0; page < 10; page++ {
+		maxPages := 10
+		if listStatus == "finished" {
+			maxPages = 3 // Recent finished grids are on the first pages; older history is irrelevant for adoption
+		}
+		for page := 0; page < maxPages; page++ {
 			orders, next, listErr := client.ListBotOrders(ctx, listStatus, token)
 			if listErr != nil {
 				worker.logger.Warn("list bot orders for unknown-submission reconciliation",
@@ -4642,9 +4646,8 @@ func (worker *Worker) reconcileUnknownSubmissions(ctx context.Context, client *p
 				break
 			}
 			token = next
-			if page == 9 {
-				// Page budget exhausted with a continuation token: the listing
-				// is NOT complete — a live bot may sit on the next page.
+			if page == maxPages-1 && listStatus == "running" {
+				// Page budget exhausted on RUNNING: the listing is NOT complete — a live bot may sit on the next page.
 				listsComplete = false
 			}
 		}
