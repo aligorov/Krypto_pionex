@@ -243,7 +243,78 @@ func TestMarkFreshness(t *testing.T) {
 	}
 }
 
+func TestPublicStreamOrderbookAndTrades(t *testing.T) {
+	stream := NewPublicStream("ws://unused", testLogger(t))
+
+	var receivedOB OrderbookUpdate
+	var obCalled bool
+	stream.SetOrderbookListener(func(ob OrderbookUpdate) {
+		obCalled = true
+		receivedOB = ob
+	})
+
+	var receivedTrade Trade
+	var tradeCalled bool
+	stream.SetTradeListener(func(tr Trade) {
+		tradeCalled = true
+		receivedTrade = tr
+	})
+
+	// Test ORDERBOOK push
+	obJSON := []byte(`{
+		"topic": "ORDERBOOK",
+		"symbol": "BTC_USDT_PERP",
+		"timestamp": 1700000000000,
+		"data": {
+			"base": "BTC",
+			"quote": "USDT",
+			"bids": [["50000.0", "1.5"], ["49990.0", "2.0"]],
+			"asks": [["50010.0", "1.0"], ["50020.0", "3.0"]],
+			"number": 1001,
+			"prevNumber": 1000,
+			"full": true
+		}
+	}`)
+	stream.handleFrame(obJSON)
+
+	if !obCalled {
+		t.Fatalf("expected orderbook listener to be called")
+	}
+	if receivedOB.Symbol != "BTC_USDT_PERP" || receivedOB.Number != 1001 || receivedOB.PrevNumber != 1000 || !receivedOB.IsSnapshot {
+		t.Fatalf("unexpected orderbook update: %+v", receivedOB)
+	}
+	if len(receivedOB.Bids) != 2 || len(receivedOB.Asks) != 2 {
+		t.Fatalf("expected 2 bids and 2 asks, got %d bids and %d asks", len(receivedOB.Bids), len(receivedOB.Asks))
+	}
+
+	// Test TRADE push
+	tradeJSON := []byte(`{
+		"topic": "TRADE",
+		"symbol": "BTC_USDT_PERP",
+		"timestamp": 1700000001000,
+		"data": [
+			{
+				"symbol": "BTC_USDT_PERP",
+				"tradeId": 999888,
+				"price": "50010.0",
+				"size": "0.5",
+				"side": "BUY",
+				"time": 1700000001000
+			}
+		]
+	}`)
+	stream.handleFrame(tradeJSON)
+
+	if !tradeCalled {
+		t.Fatalf("expected trade listener to be called")
+	}
+	if receivedTrade.Symbol != "BTC_USDT_PERP" || receivedTrade.TradeID != 999888 || receivedTrade.Side != "BUY" {
+		t.Fatalf("unexpected trade update: %+v", receivedTrade)
+	}
+}
+
 func testLogger(t *testing.T) *slog.Logger {
 	t.Helper()
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
+

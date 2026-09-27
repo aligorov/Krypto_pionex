@@ -104,6 +104,7 @@ type Worker struct {
 	// nil until startWSLane, all consumers nil-check.
 	ouReadings map[string]ouSymbolReading
 	wsLane     *pionex.PublicStream
+	ofiEngine  *marketdata.OFIEngine
 	// terminalRecheckAt throttles the v2.0.99 finished-record re-check sweep
 	// (single manage goroutine → plain field).
 	terminalRecheckAt time.Time
@@ -183,6 +184,7 @@ func NewWorker(
 		ouReadings:      make(map[string]ouSymbolReading),
 		realtimeSignal:  make(chan string, 1),
 		realtimeWatch:   make(map[string]realtimePoint),
+		ofiEngine:       marketdata.NewOFIEngine(marketdata.DefaultOFIEngineConfig()),
 	}
 }
 

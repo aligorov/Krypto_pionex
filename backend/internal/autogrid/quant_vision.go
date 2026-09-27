@@ -285,6 +285,9 @@ func (worker *Worker) checkOrderBookCushion(
 		}
 		return true, marketdata.DepthProfile{}, "depth unavailable (fail-open)"
 	}
+	if worker.ofiEngine != nil && len(bids) > 0 && len(asks) > 0 {
+		worker.ofiEngine.IngestL2(symbol, bids, asks, time.Now())
+	}
 	profile = marketdata.ProfileOrderBook(bids, asks, currentPrice, botNotional, minCushionRatio)
 	if maxSpreadPct.IsPositive() && len(bids) > 0 && len(asks) > 0 {
 		bestBid, bestAsk := bids[0].Price, asks[0].Price
@@ -323,6 +326,19 @@ func (worker *Worker) checkKnifePause(
 		return false, marketdata.TakerFlowMetrics{}, "trades fetch failed (fail-open)"
 	}
 	metrics = marketdata.AnalyzeTakerFlow(trades)
+
+	// v2.0.123 dynamic microstructure: feed trades into OFI engine and
+	// enforce multi-window persistence, spoof rejection, and directional vetoes.
+	if worker.ofiEngine != nil {
+		for _, tr := range trades {
+			worker.ofiEngine.IngestTrade(symbol, tr)
+		}
+		analysis := worker.ofiEngine.Analyze(symbol)
+		if allowed, ofiReason := analysis.CanEnter(trend); !allowed {
+			return true, metrics, ofiReason
+		}
+	}
+
 	t := strings.ToLower(trend)
 	if (t == "long" || t == "neutral" || t == "no_trend") && metrics.IsAggressiveDumping {
 		return true, metrics, fmt.Sprintf("агрессивный сброс маркет-ордерами: %.0f%% taker sell volume ($%.0f) — нож падает",

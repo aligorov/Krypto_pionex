@@ -36,6 +36,16 @@ func (worker *Worker) startWSLane(ctx context.Context) {
 	// callback ships only a buffered-channel signal, all decisions stay on
 	// the manage goroutine.
 	worker.wsLane.SetMarkListener(worker.onRealtimeMark)
+	worker.wsLane.SetOrderbookListener(func(ob pionex.OrderbookUpdate) {
+		if worker.ofiEngine != nil {
+			worker.ofiEngine.IngestL2(ob.Symbol, ob.Bids, ob.Asks, ob.ReceivedAt)
+		}
+	})
+	worker.wsLane.SetTradeListener(func(tr pionex.Trade) {
+		if worker.ofiEngine != nil {
+			worker.ofiEngine.IngestTrade(tr.Symbol, tr)
+		}
+	})
 	go worker.wsLane.Run(ctx)
 }
 

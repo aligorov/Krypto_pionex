@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aligorov/pionex-bot/backend/internal/marketdata"
 	"github.com/aligorov/pionex-bot/backend/internal/pionex"
 	"github.com/shopspring/decimal"
 )
@@ -231,3 +232,60 @@ func TestCheckOrderBookCushion_FailClosedAndSpread(t *testing.T) {
 		t.Fatalf("deep two-sided book within spread limit must pass, got %q", reason)
 	}
 }
+
+func TestCheckKnifePause_DynamicOFI_Integration(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v1/market/trades", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		// Moderate balanced trades so static AnalyzeTakerFlow won't dump/pump on its own
+		json.NewEncoder(w).Encode(map[string]any{
+			"result": true,
+			"data": map[string]any{
+				"trades": []map[string]any{
+					{"symbol": "SOL_USDT_PERP", "tradeId": 1, "price": "100.0", "size": "10.0", "side": "BUY", "time": time.Now().UnixMilli()},
+					{"symbol": "SOL_USDT_PERP", "tradeId": 2, "price": "100.0", "size": "8.0", "side": "SELL", "time": time.Now().UnixMilli()},
+				},
+			},
+		})
+	})
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	worker := &Worker{
+		publicClient: pionex.NewClient(server.URL, "", ""),
+		ofiEngine:    marketdata.NewOFIEngine(marketdata.DefaultOFIEngineConfig()),
+	}
+
+	sym := "SOL_USDT_PERP"
+	now := time.Now()
+
+	// Feed 3 consecutive bullish windows into worker's ofiEngine
+	for i := 0; i < 3; i++ {
+		ts := now.Add(time.Duration(i*5) * time.Second)
+		worker.ofiEngine.IngestL2(sym,
+			[]pionex.DepthLevel{{Price: decimal.NewFromInt(100), Amount: decimal.NewFromInt(500)}},
+			[]pionex.DepthLevel{{Price: decimal.RequireFromString("100.02"), Amount: decimal.NewFromInt(100)}},
+			ts,
+		)
+		worker.ofiEngine.IngestTrade(sym, pionex.Trade{
+			Symbol: sym, Side: "BUY", Price: decimal.RequireFromString("100.02"), Size: decimal.NewFromInt(200), Time: ts.UnixMilli(),
+		})
+		worker.ofiEngine.FinalizeWindow(sym, ts.Add(5*time.Second))
+	}
+
+	// 1. Under pump pressure, SHORT entry must be paused / vetoed!
+	pausedShort, _, reasonShort := worker.checkKnifePause(context.Background(), sym, "SHORT")
+	if !pausedShort {
+		t.Fatalf("expected checkKnifePause to return paused=true for SHORT under pump pressure")
+	}
+	if !strings.Contains(reasonShort, "pump pressure veto") {
+		t.Fatalf("expected pump pressure veto reason, got %q", reasonShort)
+	}
+
+	// 2. Under pump pressure, LONG entry should not be paused by pump pressure
+	pausedLong, _, _ := worker.checkKnifePause(context.Background(), sym, "LONG")
+	if pausedLong {
+		t.Fatalf("expected checkKnifePause to allow LONG under pump pressure")
+	}
+}
+

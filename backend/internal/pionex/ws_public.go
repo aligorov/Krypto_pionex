@@ -62,6 +62,17 @@ func (m MarkUpdate) Fresh(maxAge time.Duration) bool {
 	return !m.ReceivedAt.IsZero() && time.Since(m.ReceivedAt) <= maxAge
 }
 
+// OrderbookUpdate is one ORDERBOOK snapshot or incremental delta push.
+type OrderbookUpdate struct {
+	Symbol     string
+	Bids       []DepthLevel
+	Asks       []DepthLevel
+	Number     int64
+	PrevNumber int64
+	IsSnapshot bool
+	ReceivedAt time.Time
+}
+
 type PublicStream struct {
 	url    string
 	logger *slog.Logger
@@ -87,7 +98,9 @@ type PublicStream struct {
 	firstPayloadLogged map[string]struct{}
 	// onMark (v2.0.102) is the realtime consumer hook: invoked once per
 	// ingested INDEX push, outside stateMu. nil = no consumer.
-	onMark func(MarkUpdate)
+	onMark      func(MarkUpdate)
+	onOrderbook func(OrderbookUpdate)
+	onTrade     func(Trade)
 }
 
 // NewPublicStream builds a lane client for the public futures stream.
@@ -158,6 +171,20 @@ func (s *PublicStream) SetSymbols(symbols []string) {
 func (s *PublicStream) SetMarkListener(fn func(MarkUpdate)) {
 	s.stateMu.Lock()
 	s.onMark = fn
+	s.stateMu.Unlock()
+}
+
+// SetOrderbookListener registers the realtime consumer invoked on every ORDERBOOK push.
+func (s *PublicStream) SetOrderbookListener(fn func(OrderbookUpdate)) {
+	s.stateMu.Lock()
+	s.onOrderbook = fn
+	s.stateMu.Unlock()
+}
+
+// SetTradeListener registers the realtime consumer invoked on every TRADE push.
+func (s *PublicStream) SetTradeListener(fn func(Trade)) {
+	s.stateMu.Lock()
+	s.onTrade = fn
 	s.stateMu.Unlock()
 }
 
@@ -275,13 +302,17 @@ func (s *PublicStream) markDisconnected() {
 }
 
 func (s *PublicStream) sendStreamOp(op, symbol string) error {
+	return s.sendTopicOp(op, "INDEX", symbol)
+}
+
+func (s *PublicStream) sendTopicOp(op, topic, symbol string) error {
 	s.connMu.Lock()
 	conn := s.conn
 	s.connMu.Unlock()
 	if conn == nil {
 		return fmt.Errorf("websocket not connected")
 	}
-	frame, err := json.Marshal(map[string]string{"op": op, "topic": "INDEX", "symbol": symbol})
+	frame, err := json.Marshal(map[string]string{"op": op, "topic": topic, "symbol": symbol})
 	if err != nil {
 		return err
 	}
@@ -371,8 +402,14 @@ func (s *PublicStream) handleFrame(raw []byte) {
 	default:
 		s.logger.Debug("ws lane unhandled op", "component", "pionex_ws", "op", env.Op)
 	}
-	if strings.EqualFold(env.Topic, "INDEX") && strings.ToUpper(env.Op) != "PING" {
-		s.ingestIndex(env)
+	if strings.ToUpper(env.Op) != "PING" {
+		if strings.EqualFold(env.Topic, "INDEX") {
+			s.ingestIndex(env)
+		} else if strings.EqualFold(env.Topic, "ORDERBOOK") {
+			s.ingestOrderbook(env)
+		} else if strings.EqualFold(env.Topic, "TRADE") {
+			s.ingestTrades(env)
+		}
 	}
 }
 
@@ -436,6 +473,107 @@ func (s *PublicStream) ingestIndex(env wsEnvelope) {
 				"next_funding_rate", update.NextFundingRate.String(),
 				"next_funding_time", update.NextFundingTime,
 				"raw", truncateForLog(string(env.Data)))
+		}
+	}
+	s.resetBackoff()
+}
+
+type wsOrderbookData struct {
+	Base       string               `json:"base"`
+	Quote      string               `json:"quote"`
+	Bids       [][2]decimal.Decimal `json:"bids"`
+	Asks       [][2]decimal.Decimal `json:"asks"`
+	Number     int64                `json:"number"`
+	PrevNumber int64                `json:"prevNumber"`
+	Full       bool                 `json:"full"`
+}
+
+type wsTradeData struct {
+	Symbol  string          `json:"symbol"`
+	TradeID int64           `json:"tradeId"`
+	Price   decimal.Decimal `json:"price"`
+	Size    decimal.Decimal `json:"size"`
+	Side    string          `json:"side"`
+	Time    int64           `json:"time"`
+}
+
+func (s *PublicStream) ingestOrderbook(env wsEnvelope) {
+	var data wsOrderbookData
+	if err := json.Unmarshal(env.Data, &data); err != nil {
+		s.logger.Debug("ws lane ORDERBOOK payload undecodable", "component", "pionex_ws",
+			"payload", truncateForLog(string(env.Data)))
+		return
+	}
+	sym := normalizeStreamSymbol(env.Symbol)
+	if sym == "" && data.Base != "" && data.Quote != "" {
+		sym = fmt.Sprintf("%s_%s_PERP", strings.ToUpper(data.Base), strings.ToUpper(data.Quote))
+	}
+	if sym == "" {
+		return
+	}
+
+	toLevels := func(rows [][2]decimal.Decimal) []DepthLevel {
+		levels := make([]DepthLevel, 0, len(rows))
+		for _, row := range rows {
+			levels = append(levels, DepthLevel{Price: row[0], Amount: row[1]})
+		}
+		return levels
+	}
+
+	update := OrderbookUpdate{
+		Symbol:     sym,
+		Bids:       toLevels(data.Bids),
+		Asks:       toLevels(data.Asks),
+		Number:     data.Number,
+		PrevNumber: data.PrevNumber,
+		IsSnapshot: data.Full || data.PrevNumber == 0,
+		ReceivedAt: time.Now(),
+	}
+
+	s.stateMu.RLock()
+	listener := s.onOrderbook
+	s.stateMu.RUnlock()
+	if listener != nil {
+		listener(update)
+	}
+	s.resetBackoff()
+}
+
+func (s *PublicStream) ingestTrades(env wsEnvelope) {
+	var entries []wsTradeData
+	if err := json.Unmarshal(env.Data, &entries); err != nil {
+		var single wsTradeData
+		if err2 := json.Unmarshal(env.Data, &single); err2 != nil {
+			s.logger.Debug("ws lane TRADE payload undecodable", "component", "pionex_ws",
+				"payload", truncateForLog(string(env.Data)))
+			return
+		}
+		entries = []wsTradeData{single}
+	}
+
+	s.stateMu.RLock()
+	listener := s.onTrade
+	s.stateMu.RUnlock()
+
+	for _, e := range entries {
+		sym := normalizeStreamSymbol(e.Symbol)
+		if sym == "" {
+			sym = normalizeStreamSymbol(env.Symbol)
+		}
+		tTime := e.Time
+		if tTime == 0 && env.Timestamp > 0 {
+			tTime = env.Timestamp
+		}
+		trade := Trade{
+			Symbol:  sym,
+			TradeID: e.TradeID,
+			Price:   e.Price,
+			Size:    e.Size,
+			Side:    strings.ToUpper(e.Side),
+			Time:    tTime,
+		}
+		if listener != nil {
+			listener(trade)
 		}
 	}
 	s.resetBackoff()
