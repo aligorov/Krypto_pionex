@@ -78,11 +78,12 @@ func TestPaperEngineFrictionOscillatingDay(t *testing.T) {
 	var botID string
 	// Deployed exactly like the v2.0.89 deploy path books it: the entry fee
 	// on the initial inventory at the deploy price (95.5 sits 4.5 levels
-	// below mid → inventory 4.5 × $10 = $45 → taker 0.05% = $0.0225).
+	// below mid → inventory 4.5 × $10 = $45 → NEUTRAL enters passively at
+	// the MAKER rate, 2 bps since v2.0.114 = $0.009).
 	deployFee := paperEntryFee("NEUTRAL", decimal.NewFromInt(90), decimal.NewFromInt(110),
 		20, decimal.NewFromInt(100), 2, decimal.RequireFromString("95.5"))
-	if !deployFee.Equal(decimal.NewFromFloat(0.0225)) {
-		t.Fatalf("expected deploy fee 0.0225 (0.0005 × 45), got %s", deployFee)
+	if !deployFee.Equal(decimal.NewFromFloat(0.009)) {
+		t.Fatalf("expected deploy fee 0.009 (0.0002 × 45), got %s", deployFee)
 	}
 	err = pool.QueryRow(ctx, `
 		INSERT INTO paper_grid_bots (
@@ -218,13 +219,14 @@ func TestPaperInvestInBooksEntryFee(t *testing.T) {
 	`, botID).Scan(&realized, &feesPaid); err != nil {
 		t.Fatalf("load poured bot: %v", err)
 	}
-	// Neutral pour at mid convention: half the leveraged pour —
-	// 0.0005 × (100 × 4 / 2) = $0.10.
-	wantFee := decimal.NewFromFloat(0.10)
+	// Neutral pour at mid convention: half the leveraged pour at the MAKER
+	// entry rate (v2.0.114+ passive-ladder pricing: 2 bps) —
+	// 0.0002 × (100 × 4 / 2) = $0.04.
+	wantFee := decimal.NewFromFloat(0.04)
 	if fees := decimal.RequireFromString(feesPaid); !fees.Equal(wantFee) {
-		t.Fatalf("pour fee = 0.0005 × 200 = 0.1, got %s", fees)
+		t.Fatalf("pour fee = 0.0002 × 200 = 0.04, got %s", fees)
 	}
 	if real := decimal.RequireFromString(realized); !real.Equal(wantFee.Neg()) {
-		t.Fatalf("pour fee must debit realized to −0.1, got %s", real)
+		t.Fatalf("pour fee must debit realized to −0.04, got %s", real)
 	}
 }

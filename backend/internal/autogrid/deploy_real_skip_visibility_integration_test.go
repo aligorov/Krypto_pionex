@@ -68,6 +68,19 @@ func newRealDeployExchangeMock(t *testing.T, symbols ...string) *realDeployExcha
 			},
 		})
 	})
+	// v2.0.119: the REAL deploy path is fail-closed on depth — the harness
+	// book is tight (0.03% spread) and deep on both sides (hundreds of x the
+	// test notional) so the liquidity gate passes and the per-test exchange
+	// behaviours (maintenance 403s etc.) are what the assertions see.
+	mux.HandleFunc("GET /api/v1/market/depth", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, map[string]any{
+			"result": true, "timestamp": time.Now().UnixMilli(),
+			"data": map[string]any{
+				"bids": [][2]string{{"99.985", "500"}},
+				"asks": [][2]string{{"100.015", "500"}},
+			},
+		})
+	})
 	// 60 candles oscillating around 100: the fresh-trend revalidation reads
 	// RANGE/no_trend, the fresh price equals the scan price, and both the
 	// HAR fit and the 24h vol-expansion baseline stay deterministic.

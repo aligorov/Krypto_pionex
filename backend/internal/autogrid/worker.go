@@ -118,9 +118,6 @@ type Worker struct {
 	// inventory cost-basis offset for bots that shifted range under earlier
 	// versions (AAVE #1288).
 	shiftOffsetHealDone bool
-	// virtualHealDone gates the one-time v2.0.113 heal that clears the
-	// phantom shiftFloatingOffset on VIRTUAL #1394 (where Pionex itself net-rebased entry).
-	virtualHealDone bool
 	// terminalRawLogged dedups the v2.0.100 raw-payload witness to one line
 	// per pending row (single manage goroutine → plain map).
 	terminalRawLogged map[string]bool
@@ -974,6 +971,21 @@ func (worker *Worker) deployPaper(
 	// side='long' (v2.0.14). The per-candidate cut happens after the final
 	// direction (smart override included) is known below.
 	cascadeLong, cascadeUSD := worker.CheckLiquidationCascade(ctx, 50_000_000)
+	// v2.0.119 fail-closed cascade: a silent liquidation feed must not read
+	// as "no cascade". The gate's table is fed by one external WebSocket —
+	// when it dies quietly the LONG-freeze disarms exactly for the crash it
+	// exists for. An unhealthy source freezes LONG/NEUTRAL deploys the same
+	// way a detected cascade does (SHORT participation stays live).
+	if !cascadeLong {
+		if healthy, lastEvent := worker.LiquidationSourceHealthy(ctx); !healthy {
+			cascadeLong = true
+			cascadeUSD = 0
+			worker.logger.Warn("liquidation feed stale: treating as cascade — LONG/NEUTRAL deploys paused until the source recovers",
+				"component", "autogrid_worker",
+				"last_event", lastEvent.Format(time.RFC3339), "staleness_limit", "15m")
+			worker.noteDeployBlock(ctx, "источник ликвидаций нестабилен (тишина >15м) — LONG/NEUTRAL деплои на паузе до восстановления")
+		}
+	}
 	if cascadeLong {
 		worker.logger.Warn("liquidation cascade: LONG/NEUTRAL paper deploys paused, SHORT stay live",
 			"component", "autogrid_worker", "usd_1h", cascadeUSD)
@@ -1515,7 +1527,7 @@ func (worker *Worker) deployPaper(
 		if settings.OrderbookProfilerEnabled {
 			botNotional := settings.BudgetUSDT.Mul(decimal.NewFromInt(int64(botLev))).InexactFloat64()
 			minCushion := settings.MinDepthCushionRatio.InexactFloat64()
-			ok, profile, depthReason := worker.checkOrderBookCushion(ctx, candidate.Symbol, candidate.CurrentPrice, botNotional, minCushion)
+			ok, profile, depthReason := worker.checkOrderBookCushion(ctx, candidate.Symbol, candidate.CurrentPrice, botNotional, minCushion, false, settings.MaxSpreadPct)
 			if !ok {
 				worker.rejectCandidate(ctx, candidate,
 					fmt.Sprintf("Стакан: %s — отказ по фильтру тонкой ликвидности", depthReason), nil)
@@ -1882,6 +1894,18 @@ func (worker *Worker) deployReal(
 		return nil
 	}
 	cascadeLong, cascadeUSD := worker.CheckLiquidationCascade(ctx, 50_000_000)
+	// v2.0.119 fail-closed cascade (REAL arm): a stale liquidation feed
+	// freezes LONG/NEUTRAL REAL deploys like a detected cascade would.
+	if !cascadeLong {
+		if healthy, lastEvent := worker.LiquidationSourceHealthy(ctx); !healthy {
+			cascadeLong = true
+			cascadeUSD = 0
+			worker.logger.Warn("liquidation feed stale (REAL): treating as cascade — LONG/NEUTRAL deploys paused until the source recovers",
+				"component", "autogrid_worker",
+				"last_event", lastEvent.Format(time.RFC3339), "staleness_limit", "15m")
+			worker.noteDeployBlock(ctx, "REAL: источник ликвидаций нестабилен (тишина >15м) — LONG/NEUTRAL деплои на паузе до восстановления")
+		}
+	}
 	if cascadeLong {
 		worker.logger.Warn("liquidation cascade: LONG/NEUTRAL real deploys paused, SHORT stay live",
 			"component", "autogrid_worker", "usd_1h", cascadeUSD)
@@ -2400,7 +2424,7 @@ func (worker *Worker) deployReal(
 		if settings.OrderbookProfilerEnabled {
 			botNotional := settings.BudgetUSDT.Mul(decimal.NewFromInt(int64(botLev))).InexactFloat64()
 			minCushion := settings.MinDepthCushionRatio.InexactFloat64()
-			ok, profile, depthReason := worker.checkOrderBookCushion(ctx, candidate.Symbol, candidate.CurrentPrice, botNotional, minCushion)
+			ok, profile, depthReason := worker.checkOrderBookCushion(ctx, candidate.Symbol, candidate.CurrentPrice, botNotional, minCushion, true, settings.MaxSpreadPct)
 			if !ok {
 				worker.rejectCandidate(ctx, candidate,
 					fmt.Sprintf("Стакан: %s — отказ по фильтру тонкой ликвидности", depthReason), nil)
@@ -3147,7 +3171,10 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 		       NULLIF(model_state->>'payloadEntryMark','')::NUMERIC,
 		       NULLIF(model_state->>'payloadSignedPos','')::NUMERIC,
 		       NULLIF(model_state->>'wickShieldTriggeredAt',''),
-		       NULLIF(model_state->>'wickShieldExtreme','')::NUMERIC
+		       NULLIF(model_state->>'wickShieldExtreme','')::NUMERIC,
+		       NULLIF(model_state->>'wickShieldLastClearedAt',''),
+		       COALESCE(NULLIF(model_state->>'rebasePos','')::NUMERIC, 0),
+		       NULLIF(model_state->>'peakFloorUsdt','')::NUMERIC
 		FROM grid_bots
 		WHERE autogrid_settings_id = $1 AND bu_order_id IS NOT NULL
 		  AND status IN ('RUNNING', 'STOP_REQUESTED', 'STOPPING')
@@ -3183,6 +3210,9 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 		lastSignedPos                                           *decimal.Decimal
 		wickShieldTriggeredAt                                   *string
 		wickShieldExtreme                                       *decimal.Decimal
+		wickShieldLastClearedAt                                 *string
+		rebasePos                                               decimal.Decimal
+		peakFloor                                               *decimal.Decimal
 	}
 	bots := make([]managedBot, 0)
 	for rows.Next() {
@@ -3200,6 +3230,7 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 			&item.shiftFloatingOffset, &item.shiftPosition,
 			&item.supervisionFloor, &item.rebasePool, &item.lastEntryMark, &item.lastSignedPos,
 			&item.wickShieldTriggeredAt, &item.wickShieldExtreme,
+			&item.wickShieldLastClearedAt, &item.rebasePos, &item.peakFloor,
 		); err != nil {
 			rows.Close()
 			return clampInterval(settings.ManageIntervalSeconds), err
@@ -3409,6 +3440,7 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 			bot.shiftFloatingOffset = decimal.Zero
 			bot.shiftPosition = decimal.Zero
 			bot.rebasePool = decimal.Zero
+			bot.rebasePos = decimal.Zero
 			bot.lastEntryMark = nil
 			bot.lastSignedPos = nil
 		}
@@ -3427,11 +3459,18 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 					rebaseDelta := signedPos.Mul(currentEntry.Sub(*bot.lastEntryMark))
 					if rebaseDelta.IsNegative() {
 						bot.rebasePool = bot.rebasePool.Add(rebaseDelta)
+						// v2.0.119 decay anchor: the discard belongs to the
+						// inventory alive at absorb time. As the grid sells
+						// that inventory down, the exchange realizes the
+						// discarded loss into its books — an unscaled pool
+						// would double-count it (the v2.0.113 review's P1).
+						bot.rebasePos = signedPos
 						worker.logger.Info("absorbed positionOpenPrice rebase into supervision pool",
 							"component", "autogrid_worker",
 							"bot_number", bot.botNumber, "symbol", bot.symbol,
 							"old_entry", bot.lastEntryMark.String(), "new_entry", currentEntry.String(),
-							"rebase_delta", rebaseDelta.StringFixed(4), "rebase_pool", bot.rebasePool.StringFixed(4))
+							"rebase_delta", rebaseDelta.StringFixed(4), "rebase_pool", bot.rebasePool.StringFixed(4),
+							"rebase_pos", signedPos.String())
 					}
 				}
 			}
@@ -3452,8 +3491,21 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 				}
 			}
 
-			// Point Б: Conservative floor = min(raw, raw + rebasePool + legacyShiftOffset)
-			floorCandidate := unrealized.Add(bot.rebasePool).Add(legacyShiftOffset)
+			// v2.0.119: the rebasePool decays with the anchored inventory —
+			// pos/anchor clamped to [0,1] — exactly like the legacy shift
+			// offset, so realized-away loss is never double-counted while
+			// the grid heals. Growth beyond the anchor keeps the full pool
+			// (clamp at 1): the added inventory carried its own honest entry.
+			poolEff := bot.rebasePool
+			if !bot.rebasePool.IsZero() && !bot.rebasePos.IsZero() {
+				poolRatio := signedPos.Div(bot.rebasePos)
+				if poolRatio.IsPositive() && poolRatio.LessThan(decimal.NewFromInt(1)) {
+					poolEff = bot.rebasePool.Mul(poolRatio)
+				}
+			}
+
+			// Point Б: Conservative floor = min(raw, raw + decayed rebasePool + legacyShiftOffset)
+			floorCandidate := unrealized.Add(poolEff).Add(legacyShiftOffset)
 			if floorCandidate.LessThan(unrealized) {
 				supervisionFloor = floorCandidate
 			} else {
@@ -3605,9 +3657,17 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 		if !bot.rebasePool.IsZero() {
 			rebasePoolParam = &bot.rebasePool
 		}
+		var rebasePosParam *decimal.Decimal
+		if !bot.rebasePos.IsZero() {
+			rebasePosParam = &bot.rebasePos
+		}
 		var signedPosParam *decimal.Decimal
 		if bot.lastSignedPos != nil && !bot.lastSignedPos.IsZero() {
 			signedPosParam = bot.lastSignedPos
+		}
+		var peakFloorParam *decimal.Decimal
+		if bot.peakFloor != nil && bot.peakFloor.IsPositive() {
+			peakFloorParam = bot.peakFloor
 		}
 		clearKeys := isZeroPos || isFlip
 
@@ -3628,19 +3688,21 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 			    trough_pnl_usdt = LEAST(COALESCE(trough_pnl_usdt, 0), $5::NUMERIC + $6::NUMERIC),
 			    model_state = CASE
 					WHEN $8::BOOLEAN THEN
-						COALESCE(model_state, '{}'::jsonb) - 'shiftFloatingOffset' - 'shiftPosition' - 'rebasePool' - 'payloadEntryMark' - 'payloadSignedPos'
+						COALESCE(model_state, '{}'::jsonb) - 'shiftFloatingOffset' - 'shiftPosition' - 'rebasePool' - 'rebasePos' - 'payloadEntryMark' - 'payloadSignedPos'
 					ELSE
-						(COALESCE(model_state, '{}'::jsonb) - 'rebasePool' - 'payloadEntryMark' - 'payloadSignedPos')
+						(COALESCE(model_state, '{}'::jsonb) - 'rebasePool' - 'rebasePos' - 'payloadEntryMark' - 'payloadSignedPos' - 'peakFloorUsdt')
 						|| jsonb_strip_nulls(jsonb_build_object(
 							'payloadEntryMark', $9::NUMERIC,
 							'rebasePool', $10::NUMERIC,
-							'payloadSignedPos', $11::NUMERIC
+							'payloadSignedPos', $11::NUMERIC,
+							'rebasePos', $12::NUMERIC,
+							'peakFloorUsdt', $13::NUMERIC
 						))
 				END,
 			    last_reconciled_at = NOW(),
 			    last_error = NULL, updated_at = NOW()
 			WHERE id = $1
-		`, bot.id, bot.localStatus, persistedReconciliation, remoteStatus, realized, unrealized, supervisionFloor, clearKeys, entryMarkParam, rebasePoolParam, signedPosParam); err != nil {
+		`, bot.id, bot.localStatus, persistedReconciliation, remoteStatus, realized, unrealized, supervisionFloor, clearKeys, entryMarkParam, rebasePoolParam, signedPosParam, rebasePosParam, peakFloorParam); err != nil {
 			// The PnL persist must never fail silently: v2.0.45 lost every
 			// REAL mark for weeks exactly because this error was swallowed.
 			worker.logger.Error("persist remote grid truth and PnL",
@@ -3864,6 +3926,18 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 		if current := realized.Add(unrealized); current.GreaterThan(peakNow) {
 			peakNow = current
 		}
+		// v2.0.119: the trailing/breakeven engine must compare like with
+		// like. decideBotAction reads the total on the supervisionFloor
+		// basis, so its peak must be floored on the same basis — a raw-basis
+		// peak above the floor-basis total armed BREAKEVEN_LOCK on the very
+		// first floor dip (the v2.0.113 review's mixed-basis P2). The raw
+		// peak_pnl_usdt column stays untouched for display continuity.
+		peakFloorNow := realized.Add(supervisionFloor)
+		if bot.peakFloor != nil && bot.peakFloor.GreaterThan(peakFloorNow) {
+			peakFloorNow = *bot.peakFloor
+		}
+		bot.peakFloor = &peakFloorNow
+		closeDecidedAt := time.Now()
 		decision := decideBotAction(botActionInput{
 			Direction:        bot.direction,
 			Lower:            bot.lower,
@@ -3871,7 +3945,7 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 			CurrentPrice:     price,
 			RealizedPNL:      realized,
 			UnrealizedPNL:    supervisionFloor,
-			PeakPNL:          peakNow,
+			PeakPNL:          peakFloorNow,
 			Budget:           bot.investment,
 			PnLTarget:        botTarget,
 			MaxLoss:          botMaxLoss,
@@ -4098,11 +4172,12 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 
 		if decision.Action == ActionHold || decision.Action == ActionAdjustUp || decision.Action == ActionAdjustDown {
 			if bot.wickShieldTriggeredAt != nil {
-				worker.logger.Info("wick shield saved bot from stop loss - price recovered",
+				worker.logger.Info("wick shield saved bot from close - price recovered",
 					"component", "autogrid_worker", "symbol", bot.symbol, "bot_id", bot.id, "price", price.String())
 				_, _ = worker.db.Exec(ctx, `
 					UPDATE grid_bots
-					SET model_state = COALESCE(model_state, '{}'::jsonb) - 'wickShieldTriggeredAt' - 'wickShieldExtreme',
+					SET model_state = (COALESCE(model_state, '{}'::jsonb) - 'wickShieldTriggeredAt' - 'wickShieldExtreme')
+					    || jsonb_build_object('wickShieldLastClearedAt', to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')),
 					    updated_at = NOW()
 					WHERE id = $1
 				`, bot.id)
@@ -4112,11 +4187,30 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 			}
 		}
 
+		// v2.0.119: ActionCloseStopLoss is OUT of the wick shield's reach.
+		// NEAR #1401 (2026-09-27): a breached dollar cap is not a wick
+		// question — the shield deferred the max-loss stop twice (05:46:54
+		// and 05:49:47, both past the $8 cap, judged by a LOWER wick while
+		// the short inventory died on the upper move) and the bot settled
+		// −$14.90. The shield may still defer structural/range-break closes
+		// when explicitly enabled, with the wick side taken from the SIGNED
+		// position and one grace per signal episode.
+		wickShieldClear := func() {
+			if bot.wickShieldTriggeredAt != nil {
+				_, _ = worker.db.Exec(ctx, `
+					UPDATE grid_bots
+					SET model_state = (COALESCE(model_state, '{}'::jsonb) - 'wickShieldTriggeredAt' - 'wickShieldExtreme')
+					    || jsonb_build_object('wickShieldLastClearedAt', to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')),
+					    updated_at = NOW()
+					WHERE id = $1
+				`, bot.id)
+			}
+		}
 		switch decision.Action {
-		case ActionCloseStopLoss, ActionCloseStructInvalid, ActionCloseRangeBreak:
+		case ActionCloseStructInvalid, ActionCloseRangeBreak:
 			if settings.WickShieldEnabled {
 				shouldHold, newTriggeredAt, newExtreme, shieldReason := worker.evaluateWickShield(
-					ctx, bot.symbol, bot.direction, price, bot.wickShieldTriggeredAt, bot.wickShieldExtreme, settings.WickGraceSec,
+					ctx, bot.symbol, signedPos, price, bot.wickShieldTriggeredAt, bot.wickShieldExtreme, bot.wickShieldLastClearedAt, settings.WickGraceSec,
 				)
 				if shouldHold {
 					if bot.wickShieldTriggeredAt == nil && newTriggeredAt != nil && newExtreme != nil {
@@ -4127,35 +4221,31 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 							    updated_at = NOW()
 							WHERE id = $1
 						`, bot.id, *newTriggeredAt, newExtreme.String())
-						worker.logger.Info("wick shield armed: deferring stop loss",
+						worker.logger.Info("wick shield armed: deferring structural close",
 							"component", "autogrid_worker", "symbol", bot.symbol, "reason", decision.Reason, "shield_reason", shieldReason)
 						_ = QueueTelegramEvent(ctx, worker.db, "WICK_SHIELD_ARMED", map[string]any{
 							"bot_number": bot.botNumber, "symbol": bot.symbol, "reason": decision.Reason,
 							"wick_extreme": newExtreme.StringFixed(6), "grace_sec": settings.WickGraceSec,
 						})
 					} else {
-						worker.logger.Debug("wick shield holding: stop loss deferred",
+						worker.logger.Debug("wick shield holding: close deferred",
 							"component", "autogrid_worker", "symbol", bot.symbol, "shield_reason", shieldReason)
 					}
 					continue
 				}
-				if bot.wickShieldTriggeredAt != nil {
-					_, _ = worker.db.Exec(ctx, `
-						UPDATE grid_bots
-						SET model_state = COALESCE(model_state, '{}'::jsonb) - 'wickShieldTriggeredAt' - 'wickShieldExtreme',
-						    updated_at = NOW()
-						WHERE id = $1
-					`, bot.id)
-				}
+				wickShieldClear()
 			}
 			fallthrough
-		case ActionCloseTakeProfit:
+		case ActionCloseStopLoss, ActionCloseTakeProfit:
 			totalPnL := realized.Add(unrealized)
+			intentAt := time.Now()
 			_, _ = worker.db.Exec(ctx, `
 				UPDATE grid_bots
-				SET status = 'STOP_REQUESTED', closed_reason = $2, updated_at = NOW()
+				SET status = 'STOP_REQUESTED', closed_reason = $2, updated_at = NOW(),
+				    model_state = jsonb_set(COALESCE(model_state, '{}'::jsonb),
+				        '{stopIntentTotal}', to_jsonb($3::NUMERIC))
 				WHERE id = $1 AND status = 'RUNNING'
-			`, bot.id, decision.Reason)
+			`, bot.id, decision.Reason, totalPnL)
 			if err := worker.cancelRealBot(ctx, client, bot.id, bot.remoteID, "autogrid "+decision.Reason); err != nil {
 				worker.logger.Error("close bot by management decision",
 					"component", "autogrid_worker", "bot_id", bot.id,
@@ -4175,6 +4265,12 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 				}
 				_ = LogBotEvent(ctx, worker.db, bot.id, bot.botNumber, "REAL", bot.symbol, eventType, &price, &totalPnL, map[string]any{
 					"reason": decision.Reason, "pnlPct": pnlPct,
+					// v2.0.119 SLA telemetry stage 1: detect→intent latency.
+					// decideBotAction ran this same pass; the delta is the
+					// intent-persist cost the risk engine controls.
+					"intent_latency_ms": time.Since(closeDecidedAt).Milliseconds(),
+					"intent_to_send_ms": time.Since(intentAt).Milliseconds(),
+					"stop_intent_total": totalPnL.StringFixed(4),
 				})
 				_ = QueueTelegramEvent(ctx, worker.db, eventType, map[string]any{
 					"bot_number": bot.botNumber, "symbol": bot.symbol,
@@ -4872,7 +4968,8 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 		       COALESCE(NULLIF(model_state->>'atrPctEntry','')::FLOAT8, 0),
 		       candidate_id, COALESCE(pairs_completed, 0), COALESCE(funding_paid_usdt, 0),
 		       NULLIF(model_state->>'wickShieldTriggeredAt',''),
-		       NULLIF(model_state->>'wickShieldExtreme','')::NUMERIC
+		       NULLIF(model_state->>'wickShieldExtreme','')::NUMERIC,
+		       NULLIF(model_state->>'wickShieldLastClearedAt','')
 		FROM paper_grid_bots
 		WHERE settings_id = $1 AND status = 'RUNNING'
 	`, settings.ID)
@@ -4903,6 +5000,7 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 		fundingPaid              decimal.Decimal
 		wickShieldTriggeredAt    *string
 		wickShieldExtreme        *decimal.Decimal
+		wickShieldLastClearedAt  *string
 	}
 	bots := make([]paperBot, 0)
 	for rows.Next() {
@@ -4915,7 +5013,7 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 			&item.openedAt, &item.lastFundingAt,
 			&item.peak, &item.trancheDeployed, &item.trancheBase, &item.atrEntry,
 			&item.candidateID, &item.pairsCompleted, &item.fundingPaid,
-			&item.wickShieldTriggeredAt, &item.wickShieldExtreme,
+			&item.wickShieldTriggeredAt, &item.wickShieldExtreme, &item.wickShieldLastClearedAt,
 		); err != nil {
 			rows.Close()
 			return err
@@ -5198,11 +5296,12 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 
 		if decision.Action == ActionHold || decision.Action == ActionAdjustUp || decision.Action == ActionAdjustDown {
 			if bot.wickShieldTriggeredAt != nil {
-				worker.logger.Info("paper wick shield saved bot from stop loss - price recovered",
+				worker.logger.Info("paper wick shield saved bot from close - price recovered",
 					"component", "autogrid_worker", "symbol", bot.symbol, "bot_id", bot.id, "price", price.String())
 				_, _ = worker.db.Exec(ctx, `
 					UPDATE paper_grid_bots
-					SET model_state = COALESCE(model_state, '{}'::jsonb) - 'wickShieldTriggeredAt' - 'wickShieldExtreme',
+					SET model_state = (COALESCE(model_state, '{}'::jsonb) - 'wickShieldTriggeredAt' - 'wickShieldExtreme')
+					    || jsonb_build_object('wickShieldLastClearedAt', to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')),
 					    updated_at = NOW()
 					WHERE id = $1
 				`, bot.id)
@@ -5212,10 +5311,22 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 			}
 		}
 
-		if decision.Action == ActionCloseStopLoss || decision.Action == ActionCloseStructInvalid || decision.Action == ActionCloseRangeBreak {
+		// v2.0.119 paper arm mirrors the REAL rules: ActionCloseStopLoss is
+		// never deferred, the wick side follows the signed position. Paper
+		// tracks no per-level inventory for NEUTRAL grids, so the side is
+		// synthesized from the declared direction and a NEUTRAL paper bot —
+		// whose inventory side is unknowable here — gets no shield at all.
+		if decision.Action == ActionCloseStructInvalid || decision.Action == ActionCloseRangeBreak {
 			if settings.WickShieldEnabled {
+				paperSignedPos := decimal.Zero
+				switch strings.ToUpper(bot.direction) {
+				case "LONG":
+					paperSignedPos = decimal.NewFromInt(1)
+				case "SHORT":
+					paperSignedPos = decimal.NewFromInt(-1)
+				}
 				shouldHold, newTriggeredAt, newExtreme, shieldReason := worker.evaluateWickShield(
-					ctx, bot.symbol, bot.direction, price, bot.wickShieldTriggeredAt, bot.wickShieldExtreme, settings.WickGraceSec,
+					ctx, bot.symbol, paperSignedPos, price, bot.wickShieldTriggeredAt, bot.wickShieldExtreme, bot.wickShieldLastClearedAt, settings.WickGraceSec,
 				)
 				if shouldHold {
 					if bot.wickShieldTriggeredAt == nil && newTriggeredAt != nil && newExtreme != nil {
@@ -5226,14 +5337,14 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 							    updated_at = NOW()
 							WHERE id = $1
 						`, bot.id, *newTriggeredAt, newExtreme.String())
-						worker.logger.Info("paper wick shield armed: deferring stop loss",
+						worker.logger.Info("paper wick shield armed: deferring structural close",
 							"component", "autogrid_worker", "symbol", bot.symbol, "reason", decision.Reason, "shield_reason", shieldReason)
 						_ = QueueTelegramEvent(ctx, worker.db, "WICK_SHIELD_ARMED", map[string]any{
 							"bot_number": bot.botNumber, "symbol": bot.symbol, "reason": decision.Reason,
 							"wick_extreme": newExtreme.StringFixed(6), "grace_sec": settings.WickGraceSec, "mode": "PAPER",
 						})
 					} else {
-						worker.logger.Debug("paper wick shield holding: stop loss deferred",
+						worker.logger.Debug("paper wick shield holding: close deferred",
 							"component", "autogrid_worker", "symbol", bot.symbol, "shield_reason", shieldReason)
 					}
 					continue
@@ -5241,7 +5352,8 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 				if bot.wickShieldTriggeredAt != nil {
 					_, _ = worker.db.Exec(ctx, `
 						UPDATE paper_grid_bots
-						SET model_state = COALESCE(model_state, '{}'::jsonb) - 'wickShieldTriggeredAt' - 'wickShieldExtreme',
+						SET model_state = (COALESCE(model_state, '{}'::jsonb) - 'wickShieldTriggeredAt' - 'wickShieldExtreme')
+						    || jsonb_build_object('wickShieldLastClearedAt', to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')),
 						    updated_at = NOW()
 						WHERE id = $1
 					`, bot.id)

@@ -44,7 +44,12 @@ docker compose down
 
 echo ">> Building backend, web UI and quant worker..."
 RELEASE_VERSION=$(tr -d '[:space:]' < VERSION 2>/dev/null || echo dev)
-docker compose build --build-arg VERSION="$RELEASE_VERSION" backend
+# v2.0.119: stamp the real commit and build time — prod reported gitCommit
+# "dev" / buildTime "unknown" because only VERSION was passed, leaving the
+# running binary unidentifiable during the 2026-09-26/27 incident forensics.
+RELEASE_COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)
+RELEASE_BUILD_TIME=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+docker compose build --build-arg VERSION="$RELEASE_VERSION" --build-arg GIT_COMMIT="$RELEASE_COMMIT" --build-arg BUILD_TIME="$RELEASE_BUILD_TIME" backend
 # The quant worker must rebuild with the backend: it polls the backtest_jobs
 # queue, and a stale image silently leaves every job QUEUED forever.
 docker compose build quant-worker

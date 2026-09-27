@@ -9,18 +9,18 @@ import (
 
 // DepthProfile encapsulates the liquidity structure and wall density of the order book.
 type DepthProfile struct {
-	BidVolumeUSDT    float64         `json:"bidVolumeUsdt"`
-	AskVolumeUSDT    float64         `json:"askVolumeUsdt"`
-	ImbalanceRatio   float64         `json:"imbalanceRatio"`   // Bids / (Bids + Asks), > 0.5 means bid heavy
-	BidCushionRatio  float64         `json:"bidCushionRatio"`  // Bid volume in 2% / bot notional
-	AskCushionRatio  float64         `json:"askCushionRatio"`  // Ask volume in 2% / bot notional
-	BidWallPrice     decimal.Decimal `json:"bidWallPrice"`     // Nearest significant bid wall
-	BidWallNotional  float64         `json:"bidWallNotional"`
-	AskWallPrice     decimal.Decimal `json:"askWallPrice"`     // Nearest significant ask wall
-	AskWallNotional  float64         `json:"askWallNotional"`
-	IsThinBook       bool            `json:"isThinBook"`       // True if cushion is below threshold
-	HasBidWall       bool            `json:"hasBidWall"`
-	HasAskWall       bool            `json:"hasAskWall"`
+	BidVolumeUSDT   float64         `json:"bidVolumeUsdt"`
+	AskVolumeUSDT   float64         `json:"askVolumeUsdt"`
+	ImbalanceRatio  float64         `json:"imbalanceRatio"`  // Bids / (Bids + Asks), > 0.5 means bid heavy
+	BidCushionRatio float64         `json:"bidCushionRatio"` // Bid volume in 2% / bot notional
+	AskCushionRatio float64         `json:"askCushionRatio"` // Ask volume in 2% / bot notional
+	BidWallPrice    decimal.Decimal `json:"bidWallPrice"`    // Nearest significant bid wall
+	BidWallNotional float64         `json:"bidWallNotional"`
+	AskWallPrice    decimal.Decimal `json:"askWallPrice"` // Nearest significant ask wall
+	AskWallNotional float64         `json:"askWallNotional"`
+	IsThinBook      bool            `json:"isThinBook"` // True if cushion is below threshold
+	HasBidWall      bool            `json:"hasBidWall"`
+	HasAskWall      bool            `json:"hasAskWall"`
 }
 
 // ProfileOrderBook analyzes the L2 aggregated depth levels around current price.
@@ -78,8 +78,13 @@ func ProfileOrderBook(
 	bidWallPrice, bidWallNotional, hasBidWall := FindMajorWall(bids, currentPrice, true, 0.05)
 	askWallPrice, askWallNotional, hasAskWall := FindMajorWall(asks, currentPrice, false, 0.05)
 
+	// v2.0.119: the thin-book verdict is SYMMETRIC. The old check read only
+	// bidCushion, so a book with deep bids and an empty ask side passed —
+	// and a NEUTRAL/SHORT close buys straight into that empty side. A grid
+	// bot exits in either direction depending on where price breaks, so
+	// BOTH the 2% bid depth and the 2% ask depth must cushion the notional.
 	isThin := false
-	if botNotional > 0 && bidCushion < minCushionRatio {
+	if botNotional > 0 && (bidCushion < minCushionRatio || askCushion < minCushionRatio) {
 		isThin = true
 	}
 

@@ -130,10 +130,10 @@ type UpdateSettingsInput struct {
 	// TrancheDeployEnabled is optional in updates (v2.0.93 FIX-B): nil
 	// preserves the stored value — a partial MCP/UI form must not silently
 	// arm or disarm the tranche-1/tranche-2 capital contract.
-	TrancheDeployEnabled *bool `json:"trancheDeployEnabled"`
-	AIKitEnabled         bool  `json:"aiKitEnabled"`
-	AIAutotuneEnabled    bool  `json:"aiAutotuneEnabled"`
-	AIAutotuneInterval   int   `json:"aiAutotuneIntervalSeconds"`
+	TrancheDeployEnabled     *bool            `json:"trancheDeployEnabled"`
+	AIKitEnabled             bool             `json:"aiKitEnabled"`
+	AIAutotuneEnabled        bool             `json:"aiAutotuneEnabled"`
+	AIAutotuneInterval       int              `json:"aiAutotuneIntervalSeconds"`
 	WickShieldEnabled        *bool            `json:"wickShieldEnabled"`
 	WickGraceSec             *int             `json:"wickGraceSec"`
 	FleetMaxNetDeltaUSDT     *decimal.Decimal `json:"fleetMaxNetDeltaUsdt"`
@@ -181,33 +181,33 @@ type Candidate struct {
 }
 
 type ActiveBot struct {
-	ID                  string           `json:"id"`
-	BotNumber           int              `json:"botNumber"`
-	Source              string           `json:"source"`
-	AccountID           *string          `json:"accountId"`
-	BUOrderID           *string          `json:"buOrderId"`
-	Symbol              string           `json:"symbol"`
-	Status              string           `json:"status"`
-	Direction           string           `json:"direction"`
-	GridType            string           `json:"gridType"`
-	LowerPrice          decimal.Decimal  `json:"lowerPrice"`
-	UpperPrice          decimal.Decimal  `json:"upperPrice"`
-	GridNum             int              `json:"gridNum"`
-	Leverage            int              `json:"leverage"`
-	QuoteInvestment     decimal.Decimal  `json:"quoteInvestment"`
-	RealizedPNLUSDT     *decimal.Decimal `json:"realizedPnlUsdt"`
-	UnrealizedPNLUSDT   *decimal.Decimal `json:"unrealizedPnlUsdt"`
+	ID                   string           `json:"id"`
+	BotNumber            int              `json:"botNumber"`
+	Source               string           `json:"source"`
+	AccountID            *string          `json:"accountId"`
+	BUOrderID            *string          `json:"buOrderId"`
+	Symbol               string           `json:"symbol"`
+	Status               string           `json:"status"`
+	Direction            string           `json:"direction"`
+	GridType             string           `json:"gridType"`
+	LowerPrice           decimal.Decimal  `json:"lowerPrice"`
+	UpperPrice           decimal.Decimal  `json:"upperPrice"`
+	GridNum              int              `json:"gridNum"`
+	Leverage             int              `json:"leverage"`
+	QuoteInvestment      decimal.Decimal  `json:"quoteInvestment"`
+	RealizedPNLUSDT      *decimal.Decimal `json:"realizedPnlUsdt"`
+	UnrealizedPNLUSDT    *decimal.Decimal `json:"unrealizedPnlUsdt"`
 	SupervisionFloorUSDT *decimal.Decimal `json:"supervisionFloorUsdt,omitempty"`
-	ReconciliationState string           `json:"reconciliationState"`
-	AdjustmentsCount    int              `json:"adjustmentsCount"`
-	PnLTargetUSDT       *decimal.Decimal `json:"pnlTargetUsdt"`
-	MaxLossUSDT         *decimal.Decimal `json:"maxLossUsdt"`
-	EntryPrice          *decimal.Decimal `json:"entryPrice,omitempty"`
-	AntiHuntStop        *decimal.Decimal `json:"antiHuntStop,omitempty"`
-	LeverageReason      string           `json:"leverageReason,omitempty"`
-	LeverageMode        string           `json:"leverageMode,omitempty"`
-	BaseLeverage        int              `json:"baseLeverage,omitempty"`
-	UpdatedAt           time.Time        `json:"updatedAt"`
+	ReconciliationState  string           `json:"reconciliationState"`
+	AdjustmentsCount     int              `json:"adjustmentsCount"`
+	PnLTargetUSDT        *decimal.Decimal `json:"pnlTargetUsdt"`
+	MaxLossUSDT          *decimal.Decimal `json:"maxLossUsdt"`
+	EntryPrice           *decimal.Decimal `json:"entryPrice,omitempty"`
+	AntiHuntStop         *decimal.Decimal `json:"antiHuntStop,omitempty"`
+	LeverageReason       string           `json:"leverageReason,omitempty"`
+	LeverageMode         string           `json:"leverageMode,omitempty"`
+	BaseLeverage         int              `json:"baseLeverage,omitempty"`
+	UpdatedAt            time.Time        `json:"updatedAt"`
 }
 
 type ClosedBot struct {
@@ -2383,6 +2383,22 @@ func (s *Service) DeployManualBot(
 	if row < 2 || row > 500 {
 		return nil, "", errors.New("grid row must be between 2 and 500")
 	}
+	// v2.0.119: the durable kill switch moves ABOVE every geometry gate. A
+	// fee-gate refusal ran first and MASKED the armed kill switch (the
+	// v2.0.93 FIX-D test caught it once the suite-level hang stopped
+	// swallowing the v-file): a system-wide stop must never be reported as
+	// "grid too dense" — the operator would tune geometry while the real
+	// blocker is the switch. The full PAPER exam (kill switch, MaxLeverage,
+	// exposure caps) rides the same hoist; REAL re-validates through
+	// ValidateNewGrid below with the resolved account.
+	if mode == "PAPER" {
+		if err := s.risk.ValidateNewPaperGrid(ctx, input.Symbol, leverage, investment); err != nil {
+			return nil, "", err
+		}
+	} else if riskSettings, ksErr := s.risk.LoadSettings(ctx); ksErr == nil && riskSettings.KillSwitchEnabled {
+		return nil, "", errors.New("kill switch is enabled: bot creation is blocked")
+	}
+
 	// v2.0.89-A fee-gate (P1; floor 2.5× round-trip since v2.0.94): the
 	// invariant «level step ≥ StepFloorRoundTripMultiple × round-trip
 	// costs» on the FINAL geometry — lower/upper over the row AFTER every
@@ -2420,12 +2436,10 @@ func (s *Service) DeployManualBot(
 		// every durable risk gate the scan path and manual REAL run — no kill
 		// switch, no MaxLeverage, no exposure caps, no fleet stop envelope —
 		// a hand deploy could bypass the kill switch in paper exactly when
-		// the operator uses a manual deploy to test under stress. ValidateNewPaperGrid
-		// carries the kill-switch gate (paper exam, investment = the amount
-		// this deploy actually commits); the envelope reserves the FULL stop.
-		if err := s.risk.ValidateNewPaperGrid(ctx, input.Symbol, leverage, investment); err != nil {
-			return nil, "", err
-		}
+		// the operator uses a manual deploy to test under stress. The
+		// ValidateNewPaperGrid exam itself moved ABOVE the geometry gates in
+		// v2.0.119 (a fee-gate refusal was masking the armed kill switch);
+		// the envelope stays here — it needs the derived stop.
 		if botMaxLoss != nil {
 			if reason := deployStopEnvelopeGate(ctx, s.db, s.risk, s.logger, settings.ID, *botMaxLoss); reason != "" {
 				return nil, "", errors.New(reason)

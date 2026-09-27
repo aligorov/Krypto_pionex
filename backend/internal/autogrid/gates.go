@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"time"
 )
 
 // CheckEconomicEvents queries the economic_events table for high-impact
@@ -54,6 +55,14 @@ func (worker *Worker) CheckEconomicEvents(ctx context.Context, hoursAhead int) (
 // long unwinding is the falling-knife signature this gate exists for. A
 // short-squeeze cascade (side='short') marks a violent UP move — precisely
 // when participation finally makes sense — and must not freeze entries.
+//
+// v2.0.119 staleness contract: a SILENT source must read as a BLOCKED
+// cascade, not as "no cascade". The table is fed by a single external
+// WebSocket (liquidations.go); when that socket dies quietly the 1-hour
+// window drains to zero, this gate returns false forever, and the direction
+// engine happily opens LONG at the start of the next real crash. Callers
+// that gate fresh LONG exposure must also consult LiquidationSourceHealthy
+// and fail closed when it reports false.
 func (worker *Worker) CheckLiquidationCascade(ctx context.Context, thresholdUSD float64) (bool, float64) {
 	var totalUSD float64
 	err := worker.db.QueryRow(ctx, `
@@ -65,6 +74,30 @@ func (worker *Worker) CheckLiquidationCascade(ctx context.Context, thresholdUSD 
 		return false, 0
 	}
 	return totalUSD > thresholdUSD, totalUSD
+}
+
+// liquidationSourceStaleness is the age beyond which the liquidation feed is
+// considered dead. Bybit/Binance perp liquidation streams emit at least a
+// trickle every few minutes on any liquid universe; total silence for 15
+// minutes means the collector is down, not that nobody is being liquidated.
+const liquidationSourceStaleness = 15 * time.Minute
+
+// LiquidationSourceHealthy reports whether the liquidation feed has produced
+// an event recently enough to trust the cascade gate's "no cascade" answer.
+// An EMPTY table (source never delivered anything — fresh install, test
+// database, collector intentionally off) reads healthy: staleness detection
+// needs evidence of a once-alive feed, and freezing a never-configured
+// system would block every deploy forever. The protected case is the
+// populated table whose stream died quietly — history exists, but nothing
+// arrived within the window.
+func (worker *Worker) LiquidationSourceHealthy(ctx context.Context) (healthy bool, lastEvent time.Time) {
+	var last *time.Time
+	if err := worker.db.QueryRow(ctx, `
+        SELECT MAX(captured_at) FROM liquidation_events
+    `).Scan(&last); err != nil || last == nil {
+		return true, time.Time{}
+	}
+	return time.Since(*last) <= liquidationSourceStaleness, *last
 }
 
 // GetFundingForSymbol gets the latest cross-exchange funding rate.

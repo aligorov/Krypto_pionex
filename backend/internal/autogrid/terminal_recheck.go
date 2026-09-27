@@ -61,7 +61,6 @@ func (worker *Worker) recheckPendingExchangeFinals(ctx context.Context, settings
 	// (the ARB #1286 class that already shipped before this fix).
 	worker.healV103UnlockIdentity(ctx)
 	worker.healV107ShiftOffset(ctx)
-	worker.healV113VirtualShiftOffset(ctx)
 
 	if !worker.terminalReopenDone {
 		worker.terminalReopenDone = true
@@ -238,6 +237,30 @@ func (worker *Worker) applyExchangeFinal(ctx context.Context, item pendingTermin
 		"bot_number": item.botNumber, "symbol": item.symbol,
 		"estimate_was": item.currentRealized, "exchange_final": settled.StringFixed(4),
 	})
+	// v2.0.119 exit-slippage telemetry (stage 2): when the row carries the
+	// total our engine intended at close time, the gap between intent and
+	// the exchange's settled figure prices the execution itself — NEAR #1401
+	// settled −$14.90 against a −$10.41 intent, and that −$4.49 was invisible
+	// until a human diffed the numbers. Decomposition (latency move vs book
+	// slippage vs fees) needs the 5-stage timestamps; the aggregate is the
+	// instrument to calibrate first.
+	var stopIntentRaw *string
+	_ = worker.db.QueryRow(ctx,
+		`SELECT model_state->>'stopIntentTotal' FROM grid_bots WHERE id = $1`, item.id).Scan(&stopIntentRaw)
+	if stopIntentRaw != nil {
+		if stopIntent, dErr := decimal.NewFromString(strings.TrimSpace(*stopIntentRaw)); dErr == nil && !stopIntent.IsZero() {
+			delta := settled.Sub(stopIntent)
+			_ = LogBotEvent(ctx, worker.db, item.id, item.botNumber, "REAL", item.symbol,
+				"EXIT_SLIPPAGE", nil, &delta, map[string]any{
+					"stop_intent_total": stopIntent.StringFixed(4),
+					"exchange_final":    settled.StringFixed(4),
+					"delta_usdt":        delta.StringFixed(4),
+				})
+			worker.logger.Warn("exit slippage: exchange settle vs stop intent",
+				"component", "autogrid_worker", "bot_number", item.botNumber, "symbol", item.symbol,
+				"intent", stopIntent.StringFixed(4), "settled", settled.StringFixed(4), "delta", delta.StringFixed(4))
+		}
+	}
 }
 
 // confirmTerminalFinal freezes a pending row whose finished record offers no
@@ -342,54 +365,12 @@ func (worker *Worker) healV107ShiftOffset(ctx context.Context) {
 	}
 }
 
-// healV113VirtualShiftOffset clears the phantom shiftFloatingOffset on VIRTUAL #1394
-// (where Pionex itself net-rebased entry on adjust) and seeds the rebasePool for
-// PENGU #1386 (where tranche-2 invest_in rebased positionOpenPrice, hiding loss from risk engine).
-// Durable once-ever keys: v113VirtualHealedAt, v113PenguHealedAt.
-func (worker *Worker) healV113VirtualShiftOffset(ctx context.Context) {
-	if worker.virtualHealDone {
-		return
-	}
-	tagVirtual, err := worker.db.Exec(ctx, `
-		UPDATE grid_bots
-		SET model_state = (COALESCE(model_state, '{}'::jsonb)
-		        || jsonb_build_object(
-		           'v113VirtualHealedAt', NOW()
-		        ))
-		        - 'shiftFloatingOffset' - 'shiftPosition',
-		    updated_at = NOW()
-		WHERE bot_number = 1394
-		  AND status = 'RUNNING'
-		  AND NOT (COALESCE(model_state, '{}'::jsonb) ? 'v113VirtualHealedAt')
-	`)
-	if err != nil {
-		worker.logger.Warn("v2.0.113 virtual shift offset heal failed — will retry next pass", "component", "autogrid_worker", "error", err)
-		return
-	}
-	tagPengu, err := worker.db.Exec(ctx, `
-		UPDATE grid_bots
-		SET model_state = (COALESCE(model_state, '{}'::jsonb)
-		        || jsonb_build_object(
-		           'rebasePool', -0.4280,
-		           'v113PenguHealedAt', NOW()
-		        )),
-		    updated_at = NOW()
-		WHERE bot_number = 1386
-		  AND status = 'RUNNING'
-		  AND NOT (COALESCE(model_state, '{}'::jsonb) ? 'v113PenguHealedAt')
-	`)
-	if err != nil {
-		worker.logger.Warn("v2.0.113 pengu rebase pool heal failed — will retry next pass", "component", "autogrid_worker", "error", err)
-		return
-	}
-	worker.virtualHealDone = true
-	if tagVirtual.RowsAffected() > 0 {
-		worker.logger.Warn("v2.0.113 heal: cleared phantom shiftFloatingOffset for VIRTUAL #1394",
-			"component", "autogrid_worker", "rows", tagVirtual.RowsAffected())
-	}
-	if tagPengu.RowsAffected() > 0 {
-		worker.logger.Warn("v2.0.113 heal: seeded rebasePool for PENGU #1386",
-			"component", "autogrid_worker", "rows", tagPengu.RowsAffected())
-	}
-}
-
+// healV113VirtualShiftOffset was retired in v2.0.119. Its two surgical
+// targets are long closed (VIRTUAL #1394 settled 2026-09-27T01:17Z +2.126,
+// PENGU #1386 21:30Z −1.163) and both rows carry their durable
+// v113*HealedAt guards, so the heal had degenerated into a permanent no-op.
+// The seed constant it wrote (rebasePool −0.4280) also contradicted the
+// detection formula's own derivation (3733 × (0.010053−0.010229) ≈ −0.657)
+// — the v2.0.113 NO-GO review's P1. Future rebases are absorbed dynamically
+// by the reconcile loop's jump detector with a decay anchor; no per-bot
+// hand-pin constants remain in this file.

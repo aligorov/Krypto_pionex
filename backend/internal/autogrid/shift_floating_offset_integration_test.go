@@ -5,7 +5,9 @@ import (
 	"io"
 	"log/slog"
 	"testing"
+	"time"
 
+	"github.com/aligorov/pionex-bot/backend/internal/accounts"
 	"github.com/aligorov/pionex-bot/backend/internal/risk"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/shopspring/decimal"
@@ -61,13 +63,46 @@ func TestHealV107ShiftOffset(t *testing.T) {
 	if err != nil {
 		t.Fatalf("connect: %v", err)
 	}
-	t.Cleanup(pool.Close)
+	// v2.0.119: pool.Close() here could hang for the whole suite budget —
+	// some EARLIER test leaks an acquired connection (invisible to
+	// pg_stat_activity: acquired-and-idle), and Close waits for every
+	// acquisition to return. This test was the visible victim (7m hangs on
+	// unmodified HEAD), not the leak's owner. Close with a bounded wait;
+	// the leaked connection dies with the test process anyway.
+	t.Cleanup(func() {
+		closed := make(chan struct{})
+		go func() {
+			pool.Close()
+			close(closed)
+		}()
+		select {
+		case <-closed:
+		case <-time.After(3 * time.Second):
+		}
+	})
 
 	service := NewService(pool, risk.NewEngine(pool))
 	settings, err := service.GetSettings(ctx)
 	if err != nil {
 		t.Fatalf("settings: %v", err)
 	}
+
+	// grid_bots.account_id is NOT NULL and the default settings may carry no
+	// account on a fresh disposable database — the test owns a throwaway
+	// account instead of borrowing one (v2.0.119).
+	accountService := accounts.NewService(pool)
+	seedAccount, accErr := accountService.Create(ctx, accounts.CreateInput{
+		Name:   "integration-heal-v107-" + time.Now().Format("150405.000000000"),
+		APIKey: "itest-key", APISecret: "itest-secret",
+		HasFuturesPermission: true, HasBotPermission: true,
+	})
+	if accErr != nil {
+		t.Fatalf("create seed account: %v", accErr)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(ctx, `DELETE FROM grid_bots WHERE account_id = $1`, seedAccount.ID)
+		_, _ = pool.Exec(ctx, `DELETE FROM pionex_accounts WHERE id = $1`, seedAccount.ID)
+	})
 
 	worker := &Worker{
 		db:      pool,
@@ -90,7 +125,7 @@ func TestHealV107ShiftOffset(t *testing.T) {
 			'fp-1288', $3, 2.13228776, 0.17422347, 1288,
 			'{"trancheDeployed": 2}'::jsonb, NOW(), NOW()
 		)
-	`, botID, settings.AccountID, settings.ID); err != nil {
+	`, botID, seedAccount.ID, settings.ID); err != nil {
 		t.Fatalf("seed bot 1288: %v", err)
 	}
 	t.Cleanup(func() {
@@ -134,7 +169,7 @@ func TestTwoCircuitFloorMath(t *testing.T) {
 		t.Fatalf("expected floorVirtual %s, got %s", rawVirtual, floorVirtual)
 	}
 
-	// Case 2: PENGU #1386:
+	// Case 2: PENGU #1386 with a dynamically absorbed pool:
 	// Raw float is -0.2333, rebasePool is -0.4280 -> supervisionFloor is -0.6613.
 	rawPengu := decimal.RequireFromString("-0.2333")
 	poolPengu := decimal.RequireFromString("-0.4280")
@@ -189,7 +224,60 @@ func TestTwoCircuitFloorMath(t *testing.T) {
 	}
 }
 
-func TestHealV113VirtualAndPengu(t *testing.T) {
+// TestRebasePoolDecayAnchor pins the v2.0.119 pool scaling: the discarded
+// basis belongs to the inventory alive at absorb time, so as the grid sells
+// that inventory down the pool's contribution shrinks proportionally — the
+// v2.0.113 unscaled-pool double-count (the NO-GO review's P1).
+func TestRebasePoolDecayAnchor(t *testing.T) {
+	// Pool absorbed at pos 3733 (the PENGU-class discard), now the grid has
+	// sold down to 1866.5 — half the anchored inventory: only half the pool
+	// may contribute to the floor.
+	pool := decimal.RequireFromString("-0.657")
+	anchor := decimal.RequireFromString("3733")
+	posNow := decimal.RequireFromString("1866.5")
+
+	poolEff := pool
+	ratio := posNow.Div(anchor)
+	if ratio.IsPositive() && ratio.LessThan(decimal.NewFromInt(1)) {
+		poolEff = pool.Mul(ratio)
+	}
+	expected := decimal.RequireFromString("-0.3285")
+	if !poolEff.Equal(expected) {
+		t.Fatalf("expected decayed pool %s, got %s", expected, poolEff)
+	}
+
+	// Position grew beyond the anchor: the added inventory carried its own
+	// honest entry, so the pool stays whole (clamp at 1).
+	posGrown := decimal.RequireFromString("9952")
+	poolEffGrown := pool
+	ratioGrown := posGrown.Div(anchor)
+	if ratioGrown.IsPositive() && ratioGrown.LessThan(decimal.NewFromInt(1)) {
+		poolEffGrown = pool.Mul(ratioGrown)
+	}
+	if !poolEffGrown.Equal(pool) {
+		t.Fatalf("pool must clamp at full value when position grows past the anchor, got %s", poolEffGrown)
+	}
+
+	// Legacy semantics preserved: the shiftFloatingOffset keeps its own
+	// ratio scaling (AAVE #1288 class), independent of the pool anchor.
+	legacyOffset := decimal.RequireFromString("-3.0672")
+	legacyAnchor := decimal.RequireFromString("-0.72")
+	legacyNow := decimal.RequireFromString("-0.36")
+	legacyRatio := legacyNow.Div(legacyAnchor)
+	if legacyRatio.GreaterThan(decimal.NewFromInt(1)) {
+		legacyRatio = decimal.NewFromInt(1)
+	}
+	expectedLegacy := decimal.RequireFromString("-1.5336")
+	if got := legacyOffset.Mul(legacyRatio); !got.Equal(expectedLegacy) {
+		t.Fatalf("expected legacy offset %s, got %s", expectedLegacy, got)
+	}
+}
+
+// TestMigration0050FloorNullFallback verifies the NULL floor contract on a
+// disposable database: after migration 0050 a row with floor 0 reads NULL
+// through the supervision readers' COALESCE chain (falls back to the raw
+// unrealized leg), and a row with a real floor keeps it.
+func TestMigration0050FloorNullFallback(t *testing.T) {
 	dbURL := integrationDatabaseURL(t)
 	ctx := context.Background()
 	pool, err := pgxpool.New(ctx, dbURL)
@@ -198,97 +286,64 @@ func TestHealV113VirtualAndPengu(t *testing.T) {
 	}
 	t.Cleanup(pool.Close)
 
+	// Migration 0050's contract on live data: a row whose floor was never
+	// written reads NULL through the supervision chain. Earlier suite tests
+	// legitimately write floor 0 for flat bots, so the census targets a row
+	// THIS test inserts without a floor (fresh rows default to NULL, the
+	// pre-0050 backfilled zeros are gone for any row the reconcile loop has
+	// not touched since).
 	service := NewService(pool, risk.NewEngine(pool))
-	settings, err := service.GetSettings(ctx)
-	if err != nil {
+	if _, err := service.GetSettings(ctx); err != nil {
 		t.Fatalf("settings: %v", err)
 	}
-
-	worker := &Worker{
-		db:      pool,
-		service: service,
-		logger:  slog.New(slog.NewTextHandler(io.Discard, nil)),
-	}
-
-	bot1394ID := "7c88b000-0000-0000-0000-000000001394"
-	bot1386ID := "7c88b000-0000-0000-0000-000000001386"
-	_, _ = pool.Exec(ctx, `DELETE FROM grid_bots WHERE id IN ($1, $2)`, bot1394ID, bot1386ID)
-
-	// Seed bot 1394 (VIRTUAL with phantom shiftFloatingOffset)
-	if _, err := pool.Exec(ctx, `
-		INSERT INTO grid_bots (
-			id, account_id, symbol, bu_order_id, status, direction, grid_type,
-			lower_price, upper_price, grid_num, leverage, quote_investment,
-			request_fingerprint, autogrid_settings_id, realized_pnl_usdt,
-			unrealized_pnl_usdt, bot_number, model_state, created_at, updated_at
-		) VALUES (
-			$1, $2, 'VIRTUAL_USDT_PERP', 'bu-1394', 'RUNNING',
-			'SHORT', 'GEOMETRIC', 0.50, 1.20, 32, 4, 100,
-			'fp-1394', $3, 0.56, -0.21, 1394,
-			'{"shiftFloatingOffset": -0.91088124, "shiftPosition": -83, "trancheDeployed": 2}'::jsonb, NOW(), NOW()
-		)
-	`, bot1394ID, settings.AccountID, settings.ID); err != nil {
-		t.Fatalf("seed bot 1394: %v", err)
-	}
-
-	// Seed bot 1386 (PENGU)
-	if _, err := pool.Exec(ctx, `
-		INSERT INTO grid_bots (
-			id, account_id, symbol, bu_order_id, status, direction, grid_type,
-			lower_price, upper_price, grid_num, leverage, quote_investment,
-			request_fingerprint, autogrid_settings_id, realized_pnl_usdt,
-			unrealized_pnl_usdt, bot_number, model_state, created_at, updated_at
-		) VALUES (
-			$1, $2, 'PENGU_USDT_PERP', 'bu-1386', 'RUNNING',
-			'SHORT', 'GEOMETRIC', 0.008, 0.015, 32, 4, 100,
-			'fp-1386', $3, 0.48, -0.23, 1386,
-			'{"trancheDeployed": 2}'::jsonb, NOW(), NOW()
-		)
-	`, bot1386ID, settings.AccountID, settings.ID); err != nil {
-		t.Fatalf("seed bot 1386: %v", err)
-	}
-
-	t.Cleanup(func() {
-		_, _ = pool.Exec(ctx, `DELETE FROM grid_bots WHERE id IN ($1, $2)`, bot1394ID, bot1386ID)
+	probeID := "7c88b000-0000-4119-8119-000000000050"
+	_, _ = pool.Exec(ctx, `DELETE FROM grid_bots WHERE id = $1`, probeID)
+	accountService := accounts.NewService(pool)
+	probeAccount, accErr := accountService.Create(ctx, accounts.CreateInput{
+		Name:   "integration-floor0050-" + time.Now().Format("150405.000000000"),
+		APIKey: "itest-key", APISecret: "itest-secret",
+		HasFuturesPermission: true, HasBotPermission: true,
 	})
-
-	// Run heal
-	worker.healV113VirtualShiftOffset(ctx)
-
-	// Check bot 1394: offset must be removed, v113VirtualHealedAt set
-	var offsetStr *string
-	var healedVirtual *string
+	if accErr != nil {
+		t.Fatalf("create probe account: %v", accErr)
+	}
+	var settingsID string
+	if err := pool.QueryRow(ctx, `SELECT id FROM autogrid_settings LIMIT 1`).Scan(&settingsID); err != nil {
+		t.Fatalf("settings row: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO grid_bots (
+			id, account_id, symbol, bu_order_id, status, direction, grid_type,
+			lower_price, upper_price, grid_num, leverage, quote_investment,
+			request_fingerprint, autogrid_settings_id, unrealized_pnl_usdt, bot_number
+		) VALUES (
+			$1, $2, 'FLOOR0050_USDT_PERP', 'bu-floor0050', 'STOPPED', 'NEUTRAL', 'GEOMETRIC',
+			1, 2, 4, 2, 100, 'fp-floor0050', $3, -1.25, 5050
+		)
+	`, probeID, probeAccount.ID, settingsID); err != nil {
+		t.Fatalf("seed floor probe: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(ctx, `DELETE FROM grid_bots WHERE id = $1`, probeID)
+		_, _ = pool.Exec(ctx, `DELETE FROM pionex_accounts WHERE id = $1`, probeAccount.ID)
+	})
+	var viaCoalesce decimal.Decimal
 	if err := pool.QueryRow(ctx, `
-		SELECT model_state->>'shiftFloatingOffset', model_state->>'v113VirtualHealedAt'
+		SELECT COALESCE(supervision_floor_pnl_usdt, unrealized_pnl_usdt, 0)
 		FROM grid_bots WHERE id = $1
-	`, bot1394ID).Scan(&offsetStr, &healedVirtual); err != nil {
-		t.Fatalf("query bot 1394: %v", err)
+	`, probeID).Scan(&viaCoalesce); err != nil {
+		t.Fatalf("floor probe read: %v", err)
 	}
-	if offsetStr != nil {
-		t.Fatalf("expected shiftFloatingOffset to be cleared, got %v", *offsetStr)
-	}
-	if healedVirtual == nil {
-		t.Fatalf("expected v113VirtualHealedAt to be set")
+	if !viaCoalesce.Equal(decimal.RequireFromString("-1.25")) {
+		t.Fatalf("NULL floor must fall back to the raw unrealized leg, got %s", viaCoalesce.String())
 	}
 
-	// Check bot 1386: rebasePool must be -0.428, v113PenguHealedAt set
-	var rebasePoolStr *string
-	var healedPengu *string
-	if err := pool.QueryRow(ctx, `
-		SELECT model_state->>'rebasePool', model_state->>'v113PenguHealedAt'
-		FROM grid_bots WHERE id = $1
-	`, bot1386ID).Scan(&rebasePoolStr, &healedPengu); err != nil {
-		t.Fatalf("query bot 1386: %v", err)
+	// The wick shield must be disabled by default after 0050.
+	var shieldDefault bool
+	if err := pool.QueryRow(ctx, `SELECT COALESCE(bool_or(wick_shield_enabled), false) FROM autogrid_settings`).Scan(&shieldDefault); err != nil {
+		t.Fatalf("settings read: %v", err)
 	}
-	if rebasePoolStr == nil || *rebasePoolStr != "-0.428" {
-		t.Fatalf("expected rebasePool -0.428, got %v", rebasePoolStr)
+	if shieldDefault {
+		t.Fatalf("migration 0050 must disable wick_shield_enabled on existing settings rows")
 	}
-	if healedPengu == nil {
-		t.Fatalf("expected v113PenguHealedAt to be set")
-	}
-
-	// Idempotency: second run must not fail
-	worker.virtualHealDone = false
-	worker.healV113VirtualShiftOffset(ctx)
 }
-

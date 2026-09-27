@@ -5,7 +5,9 @@ import (
 	"io"
 	"log/slog"
 	"testing"
+	"time"
 
+	"github.com/aligorov/pionex-bot/backend/internal/accounts"
 	"github.com/aligorov/pionex-bot/backend/internal/risk"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -31,6 +33,24 @@ func TestHealV103UnlockIdentity(t *testing.T) {
 		t.Fatalf("settings: %v", err)
 	}
 
+	// grid_bots.account_id is NOT NULL: on a fresh disposable database the
+	// default settings carry no account and no bot rows exist to borrow one
+	// from, so the test owns a throwaway account (same shape the real-deploy
+	// harnesses create) and detaches it on cleanup.
+	accountService := accounts.NewService(pool)
+	seedAccount, accErr := accountService.Create(ctx, accounts.CreateInput{
+		Name:   "integration-heal-v103-" + time.Now().Format("150405.000000000"),
+		APIKey: "itest-key", APISecret: "itest-secret",
+		HasFuturesPermission: true, HasBotPermission: true,
+	})
+	if accErr != nil {
+		t.Fatalf("create seed account: %v", accErr)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(ctx, `DELETE FROM grid_bots WHERE account_id = $1`, seedAccount.ID)
+		_, _ = pool.Exec(ctx, `DELETE FROM pionex_accounts WHERE id = $1`, seedAccount.ID)
+	})
+
 	worker := &Worker{
 		db:      pool,
 		service: service,
@@ -48,19 +68,19 @@ func TestHealV103UnlockIdentity(t *testing.T) {
 				id, account_id, symbol, bu_order_id, status, direction, grid_type,
 				lower_price, upper_price, grid_num, leverage, quote_investment,
 				request_fingerprint, autogrid_settings_id, realized_pnl_usdt,
-				model_state, closed_reason, closed_at
+				model_state, closed_reason, closed_at, reconciliation_state
 			) VALUES (
-				$1, (SELECT account_id FROM grid_bots LIMIT 1), 'HEALV103_USDT_PERP',
-				$1, 'STOPPED', 'NEUTRAL', 'ARITHMETIC',
+				$1::UUID, $3::UUID, 'HEALV103_USDT_PERP',
+				$1::TEXT, 'STOPPED', 'NEUTRAL', 'ARITHMETIC',
 				1, 2, 4, 2, 100, md5(random()::text), $2, 52.279854292,
-				`+state+`, 'GRID_AGED_HALF_LIFE', NOW()
+				`+state+`, 'GRID_AGED_HALF_LIFE', NOW(), 'REMOTE_TERMINAL_CONFIRMED'
 			)
 			ON CONFLICT (id) DO UPDATE
 			SET model_state = EXCLUDED.model_state,
 			    realized_pnl_usdt = EXCLUDED.realized_pnl_usdt,
 			    status = 'STOPPED',
 			    reconciliation_state = 'REMOTE_TERMINAL_CONFIRMED'
-		`, id, settings.ID); err != nil {
+		`, id, settings.ID, seedAccount.ID); err != nil {
 			t.Fatalf("seed %s: %v", id, err)
 		}
 	}
@@ -95,16 +115,18 @@ func TestHealV103UnlockIdentity(t *testing.T) {
 		t.Fatalf("buggy figure must be archived under v103UnlockBug, got %q", bugFig)
 	}
 
-	var guardRealized float64
+	var guardExact bool
 	var guardRecon string
 	if err := pool.QueryRow(ctx, `
-		SELECT realized_pnl_usdt::FLOAT8, reconciliation_state
+		SELECT realized_pnl_usdt = 52.27985429, reconciliation_state
 		FROM grid_bots WHERE id = $1
-	`, healedID).Scan(&guardRealized, &guardRecon); err != nil {
+	`, healedID).Scan(&guardExact, &guardRecon); err != nil {
 		t.Fatalf("guarded row read: %v", err)
 	}
-	if guardRealized != 52.279854292 || guardRecon != "REMOTE_TERMINAL_CONFIRMED" {
-		t.Fatalf("guarded row must stay untouched, got %v/%s", guardRealized, guardRecon)
+	// Numeric equality in SQL: casting to FLOAT8 rounds the 9th digit and
+	// made the untouched row compare unequal to itself.
+	if !guardExact || guardRecon != "REMOTE_TERMINAL_CONFIRMED" {
+		t.Fatalf("guarded row must stay untouched, got exact=%v/%s", guardExact, guardRecon)
 	}
 
 	// A fresh process (flag reset) must be a no-op for BOTH rows.

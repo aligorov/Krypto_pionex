@@ -10,21 +10,48 @@ import (
 	"github.com/shopspring/decimal"
 )
 
-// evaluateWickShield checks whether a stop-loss, structural invalidation, or range-break close
-// was triggered by an intraday liquidity sweep wick (SFP / long lower wick for LONG/NEUTRAL,
-// or long upper wick for SHORT). If a rejection wick is detected, the stop is deferred
-// for up to graceSec seconds to prevent getting stopped out at the exact bottom/top of the wick.
+// wickShieldReArmCooldown blocks a second arming for five minutes after any
+// shield cleared. NEAR #1401 (2026-09-27): the shield armed at 05:46:54,
+// cleared on a one-minute bounce ("price recovered"), re-armed at 05:49:47 on
+// the same unclosed-wick pattern and deferred the max-loss stop a second
+// 90s window — 4m25s total under a breached cap, −$14.90 settled on an $8
+// cap. One grace per signal episode is the contractual maximum.
+const wickShieldReArmCooldown = 5 * time.Minute
+
+// evaluateWickShield checks whether a structural-invalidation or range-break
+// close was triggered by an intraday liquidity sweep wick. v2.0.119 rules,
+// each born from the NEAR #1401 post-mortem:
+//
+//   - ActionCloseStopLoss is OUT OF SCOPE entirely (enforced by the caller):
+//     a breached dollar cap is not a wick question, and any relative
+//     threshold loses to a 2%/30s spike between passes.
+//   - The wick side follows the SIGNED POSITION, not bot.direction — a
+//     NEUTRAL grid holding short inventory dies on the UPPER move, so the
+//     lower-wick branch must never arm for it (the exact NEAR inversion).
+//   - Arming inspects only CLOSED candles: the last closed bar is
+//     candles[len-2], the same bar the invalidation check reads. Arming on
+//     the unclosed candles[len-1] saw intrabar wicks that close away.
+//   - A flat position gets no shield: with zero inventory there is nothing
+//     a wick can damage, and the close itself is already risk-free.
+//
+// If a rejection wick is detected, the close is deferred for up to graceSec
+// seconds, at most once per signal episode.
 func (worker *Worker) evaluateWickShield(
 	ctx context.Context,
 	symbol string,
-	direction string,
+	signedPos decimal.Decimal,
 	currentPrice decimal.Decimal,
 	triggeredAt *string,
 	extreme *decimal.Decimal,
+	lastClearedAt *string,
 	graceSec int,
 ) (shouldHold bool, newTriggeredAt *string, newExtreme *decimal.Decimal, reason string) {
 	if graceSec <= 0 {
 		graceSec = 90
+	}
+	shortSide := signedPos.IsNegative()
+	if signedPos.IsZero() {
+		return false, nil, nil, "flat position — wick shield not applicable"
 	}
 
 	// Case 1: Wick shield is already armed on this bot
@@ -38,13 +65,13 @@ func (worker *Worker) evaluateWickShield(
 		}
 
 		// Check if extreme was violated
-		if strings.ToUpper(direction) == "SHORT" {
-			// For SHORT, breach means price punched HIGHER than the wick high
+		if shortSide {
+			// For a short inventory, breach means price punched HIGHER than the wick high
 			if currentPrice.GreaterThan(*extreme) {
 				return false, nil, nil, fmt.Sprintf("wick shield breached: price %s > wick high %s", currentPrice.String(), extreme.String())
 			}
 		} else {
-			// For LONG and NEUTRAL, breach means price punched LOWER than the wick low
+			// For a long inventory, breach means price punched LOWER than the wick low
 			if currentPrice.LessThan(*extreme) {
 				return false, nil, nil, fmt.Sprintf("wick shield breached: price %s < wick low %s", currentPrice.String(), extreme.String())
 			}
@@ -54,7 +81,7 @@ func (worker *Worker) evaluateWickShield(
 		if worker.publicClient != nil {
 			if candles, err := worker.publicClient.GetKlines(ctx, symbol, "5M", 2); err == nil && len(candles) >= 2 {
 				closedCandle := candles[len(candles)-2]
-				if strings.ToUpper(direction) == "SHORT" {
+				if shortSide {
 					if closedCandle.Close.GreaterThan(*extreme) {
 						return false, nil, nil, fmt.Sprintf("wick shield invalidated: 5M candle closed body (%s) above extreme (%s)", closedCandle.Close.String(), extreme.String())
 					}
@@ -76,36 +103,46 @@ func (worker *Worker) evaluateWickShield(
 		return false, nil, nil, fmt.Sprintf("wick shield grace window expired (%ds passed)", int(elapsed.Seconds()))
 	}
 
-	// Case 2: Shield not yet armed. Inspect latest 5M candle for a rejection wick.
+	// Case 2: Shield not yet armed. One grace per signal episode: a shield
+	// cleared less than wickShieldReArmCooldown ago may not re-arm — the
+	// NEAR double-deferral class.
+	if lastClearedAt != nil && strings.TrimSpace(*lastClearedAt) != "" {
+		if cleared, err := time.Parse(time.RFC3339, strings.TrimSpace(*lastClearedAt)); err == nil &&
+			time.Since(cleared) < wickShieldReArmCooldown {
+			return false, nil, nil, fmt.Sprintf("wick shield re-arm cooldown (%ds of %ds passed)",
+				int(time.Since(cleared).Seconds()), int(wickShieldReArmCooldown.Seconds()))
+		}
+	}
+
 	if worker.publicClient == nil {
 		return false, nil, nil, "public client not initialized"
 	}
 
-	// Fetch 2 candles of 5M interval
-	candles, err := worker.publicClient.GetKlines(ctx, symbol, "5M", 2)
-	if err != nil || len(candles) == 0 {
-		return false, nil, nil, "failed to fetch 5M candles for wick analysis"
+	// Fetch 3 candles of 5M interval: len-1 is the live (unclosed) bar,
+	// len-2 is the last CLOSED bar — the only bar allowed to arm the shield.
+	candles, err := worker.publicClient.GetKlines(ctx, symbol, "5M", 3)
+	if err != nil || len(candles) < 2 {
+		return false, nil, nil, "failed to fetch closed 5M candles for wick analysis"
 	}
 
-	latestCandle := candles[len(candles)-1]
-	analysis := marketdata.AnalyzeCandle(latestCandle)
+	closedCandle := candles[len(candles)-2]
+	analysis := marketdata.AnalyzeCandle(closedCandle)
 
-	dir := strings.ToUpper(direction)
-	if dir == "SHORT" {
-		// Bearish wick: Upper wick is long, price is bouncing downward
+	if shortSide {
+		// Bearish wick against a short inventory: long UPPER wick, price bouncing down
 		if (analysis.UpperWickRatio >= 0.40 || analysis.IsPinBarBear) &&
-			currentPrice.LessThan(latestCandle.High) {
+			currentPrice.LessThan(closedCandle.High) {
 			nowStr := time.Now().UTC().Format(time.RFC3339)
-			high := latestCandle.High
-			return true, &nowStr, &high, fmt.Sprintf("armed wick shield: 5m upper wick ratio %.2f (high %s)", analysis.UpperWickRatio, high.String())
+			high := closedCandle.High
+			return true, &nowStr, &high, fmt.Sprintf("armed wick shield: closed 5m upper wick ratio %.2f (high %s)", analysis.UpperWickRatio, high.String())
 		}
 	} else {
-		// Bullish wick: Lower wick is long, price is bouncing upward
+		// Bullish wick against a long inventory: long LOWER wick, price bouncing up
 		if (analysis.LowerWickRatio >= 0.40 || analysis.IsPinBarBull) &&
-			currentPrice.GreaterThan(latestCandle.Low) {
+			currentPrice.GreaterThan(closedCandle.Low) {
 			nowStr := time.Now().UTC().Format(time.RFC3339)
-			low := latestCandle.Low
-			return true, &nowStr, &low, fmt.Sprintf("armed wick shield: 5m lower wick ratio %.2f (low %s)", analysis.LowerWickRatio, low.String())
+			low := closedCandle.Low
+			return true, &nowStr, &low, fmt.Sprintf("armed wick shield: closed 5m lower wick ratio %.2f (low %s)", analysis.LowerWickRatio, low.String())
 		}
 	}
 
@@ -209,24 +246,64 @@ func (worker *Worker) calculateFleetNetDelta(ctx context.Context, settingsID str
 
 // checkOrderBookCushion queries the L2 depth and evaluates whether the order book
 // provides adequate liquidity cushion to absorb orders without slippage cliffs.
+//
+// v2.0.119: REAL deploys pass failClosed=true — an unavailable book (429,
+// transport error, missing client) REJECTS the candidate instead of waving it
+// through. The old fail-open opened REAL bots blind exactly during scan
+// bursts, when Pionex answers 429 and a 60s limiter cooldown blanks every
+// depth call left in the pass. The paper arm keeps fail-open: it is a
+// decision-parity sandbox, not a capital path. The same call now enforces the
+// configured MaxSpreadPct (dead end-to-end since migration 0049 shipped the
+// column with zero consumers): a book whose best bid/ask gap exceeds the
+// limit cannot absorb a round trip without paying the gap twice.
 func (worker *Worker) checkOrderBookCushion(
 	ctx context.Context,
 	symbol string,
 	currentPrice decimal.Decimal,
 	botNotional float64,
 	minCushionRatio float64,
+	failClosed bool,
+	maxSpreadPct decimal.Decimal,
 ) (ok bool, profile marketdata.DepthProfile, reason string) {
 	if worker.publicClient == nil {
+		if failClosed {
+			return false, marketdata.DepthProfile{}, "no public client (fail-closed)"
+		}
 		return true, marketdata.DepthProfile{}, "no public client"
 	}
 	bids, asks, err := worker.publicClient.GetDepth(ctx, symbol, 50)
-	if err != nil {
-		return true, marketdata.DepthProfile{}, "depth fetch failed (fail-open)"
+	if err != nil || len(bids) == 0 || len(asks) == 0 {
+		// An empty book is missing data, not a thin book: a live Pionex
+		// symbol always carries levels on both sides, and the deploy-path
+		// mocks of older tests returned a non-depth JSON that decoded to
+		// zero levels — graded "thin" and wrongly rejecting candidates.
+		if failClosed && err != nil {
+			return false, marketdata.DepthProfile{}, "depth fetch failed (fail-closed): " + err.Error()
+		}
+		if failClosed {
+			return false, marketdata.DepthProfile{}, "пустой стакан (нет уровней) — fail-closed"
+		}
+		return true, marketdata.DepthProfile{}, "depth unavailable (fail-open)"
 	}
 	profile = marketdata.ProfileOrderBook(bids, asks, currentPrice, botNotional, minCushionRatio)
+	if maxSpreadPct.IsPositive() && len(bids) > 0 && len(asks) > 0 {
+		bestBid, bestAsk := bids[0].Price, asks[0].Price
+		if bestAsk.GreaterThan(bestBid) && bestBid.GreaterThan(decimal.Zero) {
+			mid := bestAsk.Add(bestBid).Div(decimal.NewFromInt(2))
+			// maxSpreadPct is stored as a FRACTION (migration 0049: 0.0020
+			// = 0.20%) — compare fraction to fraction, print percent.
+			spreadFrac := bestAsk.Sub(bestBid).Div(mid)
+			if spreadFrac.GreaterThan(maxSpreadPct) {
+				return false, profile, fmt.Sprintf("спред %.3f%% > лимита %.3f%% (bid %s / ask %s)",
+					spreadFrac.Mul(decimal.NewFromInt(100)).InexactFloat64(),
+					maxSpreadPct.Mul(decimal.NewFromInt(100)).InexactFloat64(),
+					bestBid.StringFixed(6), bestAsk.StringFixed(6))
+			}
+		}
+	}
 	if profile.IsThinBook {
-		return false, profile, fmt.Sprintf("глубина 2%% стакана $%.0f составляет %.1fx от размера бота (нужно ≥%.0fx)",
-			profile.BidVolumeUSDT, profile.BidCushionRatio, minCushionRatio)
+		return false, profile, fmt.Sprintf("глубина 2%% стакана: bid %.1fx / ask %.1fx от размера бота (нужно ≥%.0fx с обеих сторон)",
+			profile.BidCushionRatio, profile.AskCushionRatio, minCushionRatio)
 	}
 	return true, profile, ""
 }
