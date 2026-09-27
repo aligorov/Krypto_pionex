@@ -976,20 +976,29 @@ func (worker *Worker) deployPaper(
 	// when it dies quietly the LONG-freeze disarms exactly for the crash it
 	// exists for. An unhealthy source freezes LONG/NEUTRAL deploys the same
 	// way a detected cascade does (SHORT participation stays live).
+	// v2.0.120 (review agent): a stale feed and a detected cascade are
+	// DIFFERENT durable traces. The first version let the generic cascade
+	// note overwrite the actionable "feed is dead" message with a
+	// meaningless "каскад $0M/час" — exactly the no-durable-trace class
+	// noteDeployBlock exists to prevent.
+	staleLiquidationFeed := false
 	if !cascadeLong {
 		if healthy, lastEvent := worker.LiquidationSourceHealthy(ctx); !healthy {
 			cascadeLong = true
-			cascadeUSD = 0
+			staleLiquidationFeed = true
 			worker.logger.Warn("liquidation feed stale: treating as cascade — LONG/NEUTRAL deploys paused until the source recovers",
 				"component", "autogrid_worker",
 				"last_event", lastEvent.Format(time.RFC3339), "staleness_limit", "15m")
-			worker.noteDeployBlock(ctx, "источник ликвидаций нестабилен (тишина >15м) — LONG/NEUTRAL деплои на паузе до восстановления")
 		}
 	}
 	if cascadeLong {
-		worker.logger.Warn("liquidation cascade: LONG/NEUTRAL paper deploys paused, SHORT stay live",
-			"component", "autogrid_worker", "usd_1h", cascadeUSD)
-		worker.noteDeployBlock(ctx, fmt.Sprintf("каскад ликвидаций лонгов $%.0fM/час — LONG/NEUTRAL деплои на паузе, SHORT доступны", cascadeUSD/1_000_000))
+		worker.logger.Warn("liquidation gate: LONG/NEUTRAL paper deploys paused, SHORT stay live",
+			"component", "autogrid_worker", "usd_1h", cascadeUSD, "stale_feed", staleLiquidationFeed)
+		if staleLiquidationFeed {
+			worker.noteDeployBlock(ctx, "источник ликвидаций нестабилен (тишина >15м) — LONG/NEUTRAL деплои на паузе до восстановления")
+		} else {
+			worker.noteDeployBlock(ctx, fmt.Sprintf("каскад ликвидаций лонгов $%.0fM/час — LONG/NEUTRAL деплои на паузе, SHORT доступны", cascadeUSD/1_000_000))
+		}
 	}
 	fng, _ := worker.GetFearGreed(ctx)
 	// v2.0.21 global beta gate: BTC's tape gates altcoin NEUTRAL/LONG
@@ -1352,9 +1361,15 @@ func (worker *Worker) deployPaper(
 			trend = smartTrend
 		}
 		if cascadeLong && trend != "short" {
-			worker.rejectCandidate(ctx, candidate, fmt.Sprintf(
+			// v2.0.120: a stale feed must name itself in the per-candidate
+			// trace too — "$0M/час" hid the actionable cause.
+			reason := fmt.Sprintf(
 				"каскад ликвидаций лонгов $%.0fM/час — входы LONG/NEUTRAL на паузе (SHORT доступны)",
-				cascadeUSD/1_000_000), nil)
+				cascadeUSD/1_000_000)
+			if staleLiquidationFeed {
+				reason = "источник ликвидаций нестабилен (тишина >15м) — входы LONG/NEUTRAL на паузе до восстановления"
+			}
+			worker.rejectCandidate(ctx, candidate, reason, nil)
 			continue
 		}
 		// v2.0.21 cascade-short window: this out-of-turn scan exists to
@@ -1896,20 +1911,26 @@ func (worker *Worker) deployReal(
 	cascadeLong, cascadeUSD := worker.CheckLiquidationCascade(ctx, 50_000_000)
 	// v2.0.119 fail-closed cascade (REAL arm): a stale liquidation feed
 	// freezes LONG/NEUTRAL REAL deploys like a detected cascade would.
+	// v2.0.120 (review agent): distinct durable traces — the generic
+	// cascade note must not overwrite the actionable feed-dead message.
+	staleLiquidationFeed := false
 	if !cascadeLong {
 		if healthy, lastEvent := worker.LiquidationSourceHealthy(ctx); !healthy {
 			cascadeLong = true
-			cascadeUSD = 0
+			staleLiquidationFeed = true
 			worker.logger.Warn("liquidation feed stale (REAL): treating as cascade — LONG/NEUTRAL deploys paused until the source recovers",
 				"component", "autogrid_worker",
 				"last_event", lastEvent.Format(time.RFC3339), "staleness_limit", "15m")
-			worker.noteDeployBlock(ctx, "REAL: источник ликвидаций нестабилен (тишина >15м) — LONG/NEUTRAL деплои на паузе до восстановления")
 		}
 	}
 	if cascadeLong {
-		worker.logger.Warn("liquidation cascade: LONG/NEUTRAL real deploys paused, SHORT stay live",
-			"component", "autogrid_worker", "usd_1h", cascadeUSD)
-		worker.noteDeployBlock(ctx, fmt.Sprintf("REAL: каскад ликвидаций лонгов $%.0fM/час — LONG/NEUTRAL деплои на паузе, SHORT доступны", cascadeUSD/1_000_000))
+		worker.logger.Warn("liquidation gate: LONG/NEUTRAL real deploys paused, SHORT stay live",
+			"component", "autogrid_worker", "usd_1h", cascadeUSD, "stale_feed", staleLiquidationFeed)
+		if staleLiquidationFeed {
+			worker.noteDeployBlock(ctx, "REAL: источник ликвидаций нестабилен (тишина >15м) — LONG/NEUTRAL деплои на паузе до восстановления")
+		} else {
+			worker.noteDeployBlock(ctx, fmt.Sprintf("REAL: каскад ликвидаций лонгов $%.0fM/час — LONG/NEUTRAL деплои на паузе, SHORT доступны", cascadeUSD/1_000_000))
+		}
 	}
 	// When the LLM brain is enabled, an UNAUDITED candidate is not
 	// deployable — regardless of why the audit is missing (beyond the
@@ -2258,9 +2279,15 @@ func (worker *Worker) deployReal(
 			trend = smartParam
 		}
 		if cascadeLong && trend != "short" {
-			worker.rejectCandidate(ctx, candidate, fmt.Sprintf(
+			// v2.0.120: a stale feed must name itself in the per-candidate
+			// trace too — "$0M/час" hid the actionable cause.
+			reason := fmt.Sprintf(
 				"каскад ликвидаций лонгов $%.0fM/час — входы LONG/NEUTRAL на паузе (SHORT доступны)",
-				cascadeUSD/1_000_000), nil)
+				cascadeUSD/1_000_000)
+			if staleLiquidationFeed {
+				reason = "источник ликвидаций нестабилен (тишина >15м) — входы LONG/NEUTRAL на паузе до восстановления"
+			}
+			worker.rejectCandidate(ctx, candidate, reason, nil)
 			continue
 		}
 		// v2.0.21 cascade-short window (REAL mirror).
@@ -4237,15 +4264,33 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 			}
 			fallthrough
 		case ActionCloseStopLoss, ActionCloseTakeProfit:
-			totalPnL := realized.Add(unrealized)
+			// v2.0.120 (review agent): the stop DECISION runs on the floor
+			// basis (UnrealizedPNL = supervisionFloor), so the intent marker
+			// must carry the same basis — a raw-basis marker on a pooled bot
+			// systematically books the known discard into "execution
+			// slippage" and poisons the EXIT_SLIPPAGE calibration.
+			totalPnL := realized.Add(supervisionFloor)
 			intentAt := time.Now()
-			_, _ = worker.db.Exec(ctx, `
+			intentTag, intentErr := worker.db.Exec(ctx, `
 				UPDATE grid_bots
 				SET status = 'STOP_REQUESTED', closed_reason = $2, updated_at = NOW(),
 				    model_state = jsonb_set(COALESCE(model_state, '{}'::jsonb),
 				        '{stopIntentTotal}', to_jsonb($3::NUMERIC))
 				WHERE id = $1 AND status = 'RUNNING'
 			`, bot.id, decision.Reason, totalPnL)
+			// The status guard races external stop writers (manual close,
+			// close-all, radar break-flip). Losing that race must not lose
+			// the telemetry marker — our engine still made THIS decision at
+			// THIS total, so stamp it unconditionally on the row.
+			if intentErr != nil || intentTag.RowsAffected() == 0 {
+				_, _ = worker.db.Exec(ctx, `
+					UPDATE grid_bots
+					SET model_state = jsonb_set(COALESCE(model_state, '{}'::jsonb),
+					    '{stopIntentTotal}', to_jsonb($2::NUMERIC)),
+					    updated_at = NOW()
+					WHERE id = $1
+				`, bot.id, totalPnL)
+			}
 			if err := worker.cancelRealBot(ctx, client, bot.id, bot.remoteID, "autogrid "+decision.Reason); err != nil {
 				worker.logger.Error("close bot by management decision",
 					"component", "autogrid_worker", "bot_id", bot.id,

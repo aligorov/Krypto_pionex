@@ -29,7 +29,7 @@ func TestProfileOrderBook_NormalBook(t *testing.T) {
 	profile := ProfileOrderBook(bids, asks, currentPrice, botNotional, minCushion)
 
 	if profile.IsThinBook {
-		t.Fatalf("expected IsThinBook=false (bid $69.3k / ask $70.8k > $50k), got true")
+		t.Fatalf("expected IsThinBook=false (bid $69.3k / ask $67.7k > $50k), got true")
 	}
 	if profile.BidCushionRatio < 60.0 {
 		t.Errorf("expected BidCushionRatio >= 60, got %.2f", profile.BidCushionRatio)

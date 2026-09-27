@@ -286,6 +286,19 @@ func (worker *Worker) dgtSharedGateBlockers(ctx context.Context, settings Settin
 	if cascadeLong, cascadeUSD := worker.CheckLiquidationCascade(ctx, 50_000_000); cascadeLong && trend != "short" {
 		return fmt.Sprintf("каскад ликвидаций лонгов $%.0fM/час — LONG/NEUTRAL редеплой на паузе", cascadeUSD/1_000_000)
 	}
+	// v2.0.120 (review agent): the v2.0.119 staleness contract — "callers
+	// that gate fresh LONG exposure must also consult
+	// LiquidationSourceHealthy and fail closed" (gates.go) — reaches its
+	// third LONG-gating call site. A re-deploy IS a fresh entry: a silently
+	// dead liquidation feed must freeze LONG/NEUTRAL re-entries here exactly
+	// like it freezes the scan deploys, or the break-flip pipeline becomes
+	// the one lane the crash gate cannot cover.
+	if trend != "short" {
+		if healthy, lastEvent := worker.LiquidationSourceHealthy(ctx); !healthy {
+			return fmt.Sprintf("источник ликвидаций нестабилен (тишина >15м, последнее %s) — LONG/NEUTRAL редеплой на паузе до восстановления",
+				lastEvent.Format(time.RFC3339))
+		}
+	}
 	// Macro gate (CoinGecko beta-drift / alt-drain), same exemption shape.
 	if veto, reason, _ := macroVeto(trend, false, worker.loadMacroContext(ctx)); veto {
 		return reason

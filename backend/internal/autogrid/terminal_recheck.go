@@ -319,7 +319,15 @@ func (worker *Worker) healV103UnlockIdentity(ctx context.Context) {
 		WHERE COALESCE(model_state->>'finalProfitSource','') = 'unlock_identity'
 		  AND status IN ('STOPPED', 'COMPLETED', 'CANCELLED', 'LIQUIDATED')
 		  AND NOT (COALESCE(model_state, '{}'::jsonb) ? 'v103UnlockBug')
+		  AND COALESCE(closed_at, updated_at) > NOW() - INTERVAL '48 hours'
 	`, TerminalFinalPendingExchange)
+	// v2.0.120 (review agent): the 48h window. The identity-settled rows the
+	// sweep writes (applyExchangeFinal) never carried the v103UnlockBug
+	// guard, so on every restart this heal reopened them again — an endless
+	// heal→pending→re-correct loop re-logging TERMINAL_FINAL_CORRECTED (and,
+	// new in v2.0.119, EXIT_SLIPPAGE), and for rows older than the re-check
+	// window it froze the final at NULL forever. The 2026-09-26 bug
+	// population is long healed; only fresh closes can still be pending.
 	if err != nil {
 		// Flag stays false: a transient DB error retries on the next manage
 		// pass instead of skipping the heal for the whole process lifetime

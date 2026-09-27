@@ -372,7 +372,10 @@ func (s *Service) GetSettings(ctx context.Context) (*Settings, error) {
 		       last_autotune_at, last_autotune_notes,
 		       last_error,
 		       last_started_at, last_stopped_at, created_at, updated_at,
-		       COALESCE(wick_shield_enabled, true),
+		       -- v2.0.120: NULL must read as OFF - the v2.0.119 migration
+		       -- disables the shield by default, and a nullable column must
+		       -- never silently re-arm it (review agent's latent mine).
+		       COALESCE(wick_shield_enabled, false),
 		       COALESCE(wick_grace_sec, 90),
 		       COALESCE(fleet_max_net_delta_usdt, 1200.00),
 		       COALESCE(universe_scan_cap, 250),
@@ -2395,8 +2398,12 @@ func (s *Service) DeployManualBot(
 		if err := s.risk.ValidateNewPaperGrid(ctx, input.Symbol, leverage, investment); err != nil {
 			return nil, "", err
 		}
-	} else if riskSettings, ksErr := s.risk.LoadSettings(ctx); ksErr == nil && riskSettings.KillSwitchEnabled {
-		return nil, "", errors.New("kill switch is enabled: bot creation is blocked")
+	} else if riskSettings, ksErr := s.risk.LoadSettings(ctx); ksErr != nil {
+		// Fail-closed, same as the PAPER exam one line above: a kill-switch
+		// read error must surface here, not fall through to geometry gates.
+		return nil, "", fmt.Errorf("kill switch check: %w", ksErr)
+	} else if riskSettings.KillSwitchEnabled {
+		return nil, "", errors.New("kill switch is enabled: real bot creation is blocked")
 	}
 
 	// v2.0.89-A fee-gate (P1; floor 2.5× round-trip since v2.0.94): the

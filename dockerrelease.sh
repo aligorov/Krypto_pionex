@@ -28,22 +28,44 @@ echo "[1/5] Running Backend Test Suite in Docker (unit + DB integration)..."
 # because migration 0016 (security hardening) revokes its LOGIN mid-stream
 # and would brick the run from migration 0017 onward. Migrations are piped
 # in a single session for the same reason. Any failure blocks the release.
+#
+# v2.0.119 review hardening (agent pass): (a) the go-test container ALSO
+# mounts the repo's migrations/ — the ledger_fees migration-consistency test
+# resolves ../../migrations and silently skipped without it, the exact
+# pathology this gate exists to kill; (b) the disposable postgres lives on a
+# PRIVATE docker network with NO published port — a trust-auth DB on
+# 0.0.0.0:55499 for minutes was an open window on any public build host;
+# (c) an existing tag pointing elsewhere than HEAD fails the release instead
+# of silently no-op'ing the deploy; (d) a dirty working tree fails the
+# release — update.sh deploys the TAGGED commit, so the suite must test
+# exactly that tree.
+if ! git diff --quiet || ! git diff --cached --quiet; then
+    echo "Working tree is dirty — the suite would test a tree the tag will not carry. Commit first."
+    exit 1
+fi
+if git rev-parse -q --verify "refs/tags/v$VERSION" >/dev/null 2>&1; then
+    if [[ "$(git rev-parse "refs/tags/v$VERSION^{commit}")" != "$(git rev-parse HEAD)" ]]; then
+        echo "Tag v$VERSION already exists on a DIFFERENT commit — bump VERSION or move the tag on purpose; a silent no-deploy is not an option."
+        exit 1
+    fi
+fi
+
 TEST_PG_NAME="pionex-release-test-pg"
-TEST_PG_PORT="55499"
-# The go-test container reaches the host-published port via
-# host.docker.internal (mapped to the host gateway below); the disposable
-# psql calls run inside the postgres container itself.
-TEST_DB_URL="postgres://pionex@host.docker.internal:${TEST_PG_PORT}/pionex?sslmode=disable"
+TEST_PG_NET="pionex-release-test-net"
+TEST_DB_URL="postgres://pionex@${TEST_PG_NAME}:5432/pionex?sslmode=disable"
 
 docker rm -f "$TEST_PG_NAME" >/dev/null 2>&1 || true
+docker network rm "$TEST_PG_NET" >/dev/null 2>&1 || true
+docker network create "$TEST_PG_NET" >/dev/null
 docker run -d --name "$TEST_PG_NAME" \
+    --network "$TEST_PG_NET" \
     -e POSTGRES_USER=pionex \
     -e POSTGRES_HOST_AUTH_METHOD=trust \
-    -p "${TEST_PG_PORT}:5432" \
     postgres:16-alpine >/dev/null
 
 RELEASE_TEST_CLEANUP() {
     docker rm -f "$TEST_PG_NAME" >/dev/null 2>&1 || true
+    docker network rm "$TEST_PG_NET" >/dev/null 2>&1 || true
 }
 trap RELEASE_TEST_CLEANUP EXIT
 
@@ -66,9 +88,10 @@ if ! cat "$ROOT_DIR"/migrations/*.sql | docker exec -i "$TEST_PG_NAME" psql -U p
 fi
 
 if ! docker run --rm \
+    --network "$TEST_PG_NET" \
     -v "$ROOT_DIR/backend":/app -w /app \
+    -v "$ROOT_DIR/migrations":/app/migrations \
     -e PIONEX_TEST_DATABASE_URL="$TEST_DB_URL" \
-    --add-host=host.docker.internal:host-gateway \
     golang:1.25-alpine go test ./...; then
     echo "Backend test suite FAILED (unit or integration) — release blocked."
     exit 1

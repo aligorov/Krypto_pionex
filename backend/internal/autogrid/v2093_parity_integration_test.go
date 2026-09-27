@@ -73,11 +73,11 @@ func TestV2093ManualPaperDeployRiskGates(t *testing.T) {
 		t.Helper()
 		_, _, deployErr := service.DeployManualBot(ctx, nil, ManualDeployInput{
 			Symbol: symbol, Mode: "PAPER", Direction: "NEUTRAL", Leverage: leverage,
-			// Row 11 keeps the level step (4% span / 10 gaps = 0.40%) above
-			// the v2.0.94 fee-gate floor (2.5× the 0.14% round trip = 0.35%)
-			// so the CLEAN-deploy case reaches the risk exam it tests; the
-			// refused cases fail on risk before geometry anyway (v2.0.119
-			// hoisted the durable exam above the fee-gate).
+			// Row 11 keeps the level step (4% span / 11 levels = 0.364%)
+			// above the v2.0.94 fee-gate floor (2.5× the 0.14% round trip
+			// = 0.35%) so the CLEAN-deploy case reaches the risk exam it
+			// tests; the refused cases fail on risk before geometry anyway
+			// (v2.0.119 hoisted the durable exam above the fee-gate).
 			Lower: decimal.NewFromInt(98), Upper: decimal.NewFromInt(102), Row: 11,
 		})
 		return deployErr
