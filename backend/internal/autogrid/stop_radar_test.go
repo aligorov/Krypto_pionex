@@ -190,6 +190,7 @@ func TestScoreBotOFIAdverseAmplification(t *testing.T) {
 
 	inDumpPressure := inBaseline
 	inDumpPressure.ofiRegime = "DUMP_PRESSURE"
+	inDumpPressure.ofiActionable = true
 	rsPressure := scoreBot(inDumpPressure, 10, 10, 0.50, radarFleet{}, 0, 0)
 
 	if rsPressure.M5 <= rsBase.M5 {
@@ -198,10 +199,19 @@ func TestScoreBotOFIAdverseAmplification(t *testing.T) {
 
 	inConfirmedDump := inBaseline
 	inConfirmedDump.ofiRegime = "CONFIRMED_DUMP"
+	inConfirmedDump.ofiActionable = true
 	rsConfirmed := scoreBot(inConfirmedDump, 10, 10, 0.50, radarFleet{}, 0, 0)
 
 	if rsConfirmed.M5 <= rsPressure.M5 {
 		t.Fatalf("CONFIRMED_DUMP must increase M5 higher than pressure: got %f vs %f", rsConfirmed.M5, rsPressure.M5)
+	}
+
+	// Non-actionable state (e.g. stale or desynced stream) must not increase M5
+	inStale := inConfirmedDump
+	inStale.ofiActionable = false
+	rsStale := scoreBot(inStale, 10, 10, 0.50, radarFleet{}, 0, 0)
+	if rsStale.M5 != rsBase.M5 {
+		t.Fatalf("non-actionable ofi state must not increase M5: got %f vs base %f", rsStale.M5, rsBase.M5)
 	}
 }
 

@@ -2,9 +2,12 @@ package pionex
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 
 	"github.com/shopspring/decimal"
 )
@@ -179,14 +182,74 @@ func (c *Client) GetDepth(ctx context.Context, symbol string, limit int) ([]Dept
 	return toLevels(data.Bids), toLevels(data.Asks), nil
 }
 
-// Trade represents an executed market trade from /api/v1/market/trades.
+// Trade represents an executed market trade from /api/v1/market/trades or WebSocket TRADE.
 type Trade struct {
-	Symbol  string          `json:"symbol"`
-	TradeID int64           `json:"tradeId"`
-	Price   decimal.Decimal `json:"price"`
-	Size    decimal.Decimal `json:"size"`
-	Side    string          `json:"side"` // BUY or SELL
-	Time    int64           `json:"time"`
+	Symbol    string          `json:"symbol"`
+	TradeID   string          `json:"tradeId"`
+	Price     decimal.Decimal `json:"price"`
+	Size      decimal.Decimal `json:"size"`
+	Side      string          `json:"side"` // BUY or SELL
+	Timestamp int64           `json:"timestamp"`
+	Time      int64           `json:"time,omitempty"`
+}
+
+// UnmarshalJSON handles flexible decoding of Trade records from both REST API and WebSocket streams.
+// TradeID can be a string (e.g. "200000001384538101") or numeric (e.g. 123456).
+// Timestamp can be named "timestamp" or "time", in string or numeric millisecond format.
+func (t *Trade) UnmarshalJSON(data []byte) error {
+	type Alias Trade
+	aux := struct {
+		TradeID interface{} `json:"tradeId"`
+		Time    interface{} `json:"time"`
+		TS      interface{} `json:"timestamp"`
+		*Alias
+	}{
+		Alias: (*Alias)(t),
+	}
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	if aux.TradeID != nil {
+		switch v := aux.TradeID.(type) {
+		case string:
+			t.TradeID = strings.TrimSpace(v)
+		case float64:
+			t.TradeID = strconv.FormatInt(int64(v), 10)
+		case json.Number:
+			t.TradeID = v.String()
+		default:
+			t.TradeID = fmt.Sprintf("%v", v)
+		}
+	}
+	var ts int64
+	if aux.TS != nil {
+		ts = parseTimestampValue(aux.TS)
+	}
+	if ts == 0 && aux.Time != nil {
+		ts = parseTimestampValue(aux.Time)
+	}
+	t.Timestamp = ts
+	t.Time = ts
+	t.Side = strings.ToUpper(strings.TrimSpace(t.Side))
+	return nil
+}
+
+func parseTimestampValue(v interface{}) int64 {
+	switch val := v.(type) {
+	case float64:
+		return int64(val)
+	case int64:
+		return val
+	case string:
+		if n, err := strconv.ParseInt(strings.TrimSpace(val), 10, 64); err == nil {
+			return n
+		}
+	case json.Number:
+		if n, err := val.Int64(); err == nil {
+			return n
+		}
+	}
+	return 0
 }
 
 // GetTrades fetches recent public trades via /api/v1/market/trades.

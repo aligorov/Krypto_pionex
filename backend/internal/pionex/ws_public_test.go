@@ -308,8 +308,29 @@ func TestPublicStreamOrderbookAndTrades(t *testing.T) {
 	if !tradeCalled {
 		t.Fatalf("expected trade listener to be called")
 	}
-	if receivedTrade.Symbol != "BTC_USDT_PERP" || receivedTrade.TradeID != 999888 || receivedTrade.Side != "BUY" {
+	if receivedTrade.Symbol != "BTC_USDT_PERP" || receivedTrade.TradeID != "999888" || receivedTrade.Side != "BUY" {
 		t.Fatalf("unexpected trade update: %+v", receivedTrade)
+	}
+
+	// Test real Pionex Futures TRADE push with string tradeId and timestamp
+	pionexRealTradeJSON := []byte(`{
+		"topic": "TRADE",
+		"symbol": "BTC_USDT_PERP",
+		"timestamp": 1700000002000,
+		"data": [
+			{
+				"symbol": "BTC_USDT_PERP",
+				"tradeId": "200000001384538101",
+				"price": "50020.0",
+				"size": "1.25",
+				"side": "SELL",
+				"timestamp": 1700000002000
+			}
+		]
+	}`)
+	stream.handleFrame(pionexRealTradeJSON)
+	if receivedTrade.TradeID != "200000001384538101" || receivedTrade.Side != "SELL" || receivedTrade.Time != 1700000002000 {
+		t.Fatalf("unexpected real pionex trade update: %+v", receivedTrade)
 	}
 }
 

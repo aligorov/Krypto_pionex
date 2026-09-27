@@ -794,6 +794,16 @@ function ofiBadge(regime?: string | null, biasBps?: number | null) {
           ℹ️ PUMP-P
         </span>
       );
+    case 'SPOOF_WARNING':
+      return (
+        <span
+          className="badge warning"
+          style={{ fontSize: '0.68rem', padding: '1px 5px', fontWeight: 700, color: '#f59e0b', border: '1px solid #78350f' }}
+          title={`Фиктивная стенка в стакане без подтверждения тейкерами (spoof risk)${biasStr}`}
+        >
+          🛡️ SPOOF{biasStr}
+        </span>
+      );
     case 'NEUTRAL':
       return (
         <span
@@ -802,6 +812,56 @@ function ofiBadge(regime?: string | null, biasBps?: number | null) {
           title={`Микроструктура стакана сбалансирована${biasStr} — нормальный режим сетки`}
         >
           ⚖️ OFI{biasStr || ' 0.0'}
+        </span>
+      );
+    case 'WARMING_UP':
+      return (
+        <span
+          className="badge neutral"
+          style={{ fontSize: '0.68rem', padding: '1px 5px', fontWeight: 500, color: '#a1a1aa', border: '1px dashed #52525b' }}
+          title={`Сбор микроструктурной истории стакана (прогрев окон)`}
+        >
+          ⏳ WARM
+        </span>
+      );
+    case 'STALE':
+      return (
+        <span
+          className="badge neutral"
+          style={{ fontSize: '0.68rem', padding: '1px 5px', fontWeight: 500, color: '#e2e8f0', background: '#334155' }}
+          title={`Поток стакана устарел (>15с без обновлений) — защита активна, сигналы заморожены`}
+        >
+          ⏸️ STALE
+        </span>
+      );
+    case 'DESYNC':
+      return (
+        <span
+          className="badge warning"
+          style={{ fontSize: '0.68rem', padding: '1px 5px', fontWeight: 600, color: '#fb923c' }}
+          title={`Рассинхронизация очереди книги заявок — ожидание полного снепшота`}
+        >
+          🔄 DESYNC
+        </span>
+      );
+    case 'THIN_BOOK':
+      return (
+        <span
+          className="badge neutral"
+          style={{ fontSize: '0.68rem', padding: '1px 5px', fontWeight: 500, color: '#facc15' }}
+          title={`Тонкая ликвидность в 2% диапазоне стакана`}
+        >
+          ⚠️ THIN
+        </span>
+      );
+    case 'SPREAD_BLOWN':
+      return (
+        <span
+          className="badge warning"
+          style={{ fontSize: '0.68rem', padding: '1px 5px', fontWeight: 600, color: '#f87171' }}
+          title={`Спред стакана превысил допустимый лимит`}
+        >
+          ⚠️ SPREAD
         </span>
       );
     default:

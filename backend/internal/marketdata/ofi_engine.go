@@ -16,6 +16,11 @@ import (
 type MicrostructureRegime string
 
 const (
+	RegimeWarmingUp     MicrostructureRegime = "WARMING_UP"
+	RegimeDesync        MicrostructureRegime = "DESYNC"
+	RegimeStale         MicrostructureRegime = "STALE"
+	RegimeThinBook      MicrostructureRegime = "THIN_BOOK"
+	RegimeSpreadBlown   MicrostructureRegime = "SPREAD_BLOWN"
 	RegimeNeutral       MicrostructureRegime = "NEUTRAL"
 	RegimePumpPressure  MicrostructureRegime = "PUMP_PRESSURE"
 	RegimeDumpPressure  MicrostructureRegime = "DUMP_PRESSURE"
@@ -33,6 +38,7 @@ type OFIEngineConfig struct {
 	BreakoutDisplacementPct float64       // Price displacement threshold for triple confluence (default 0.15%)
 	MinDepthNotionalUSDT    float64       // Minimum notional on bid & ask within 2% to not be thin (default $500)
 	MaxHistoryWindows       int           // Retained window history count (default 10)
+	MaxStaleness            time.Duration // Maximum age of updates before being declared STALE (default 15s)
 }
 
 func DefaultOFIEngineConfig() OFIEngineConfig {
@@ -44,6 +50,7 @@ func DefaultOFIEngineConfig() OFIEngineConfig {
 		BreakoutDisplacementPct: 0.15,
 		MinDepthNotionalUSDT:    500.0,
 		MaxHistoryWindows:       10,
+		MaxStaleness:            15 * time.Second,
 	}
 }
 
@@ -63,10 +70,6 @@ type OFIWindow struct {
 	BidVolume2Pct   float64
 	AskVolume2Pct   float64
 	QueueImbalance  float64 // (BidVol - AskVol) / (BidVol + AskVol)
-	AskDepleted     float64
-	AskReplenished  float64
-	BidDepleted     float64
-	BidReplenished  float64
 	TradeCount      int
 	L2Count         int
 	IsThin          bool
@@ -88,13 +91,34 @@ type MicrostructureAnalysis struct {
 	IsSpoofRisk            bool                 `json:"isSpoofRisk"`
 	IsThinBook             bool                 `json:"isThinBook"`
 	IsSpreadIntact         bool                 `json:"isSpreadIntact"`
+	IsFresh                bool                 `json:"isFresh"`
 	Reason                 string               `json:"reason"`
 	UpdatedAt              time.Time            `json:"updatedAt"`
+}
+
+// IsActionable returns true only if the signal is fresh, continuous, synchronized, and actionable.
+// Stale, desynced, warming-up, thin-book, and spread-blown states are non-actionable fail-safes.
+func (a MicrostructureAnalysis) IsActionable() bool {
+	if !a.IsFresh {
+		return false
+	}
+	switch a.Regime {
+	case RegimePumpPressure, RegimeConfirmedPump, RegimeDumpPressure, RegimeConfirmedDump, RegimeSpoofWarning:
+		return true
+	default:
+		return false
+	}
 }
 
 // CanEnter checks whether a bot entry (LONG, SHORT, or NEUTRAL) is allowed
 // given the current microstructure regime.
 func (a MicrostructureAnalysis) CanEnter(trend string) (allowed bool, reason string) {
+	if !a.IsActionable() {
+		// Non-actionable regimes (WARMING_UP, DESYNC, STALE, NEUTRAL, THIN_BOOK, SPREAD_BLOWN)
+		// do not veto entry here (thin book and spread checks are governed by their dedicated risk filters).
+		return true, ""
+	}
+
 	t := strings.ToUpper(strings.TrimSpace(trend))
 	if t == "SHORT" {
 		if a.Regime == RegimePumpPressure || a.Regime == RegimeConfirmedPump {
@@ -158,7 +182,7 @@ func CalculateMicroPrice(bids, asks []pionex.DepthLevel) decimal.Decimal {
 	return term1.Add(term2).Div(totalQ)
 }
 
-// CalculateLevel1OFI calculates the discrete event Order Flow Imbalance (Cont, Kukanov & Stoikov 2014)
+// CalculateLevel1OFI calculates discrete event Order Flow Imbalance (Cont, Kukanov & Stoikov 2014)
 // between two consecutive snapshots of the best bid and best ask.
 func CalculateLevel1OFI(prevBids, prevAsks, nextBids, nextAsks []pionex.DepthLevel) float64 {
 	if len(prevBids) == 0 || len(prevAsks) == 0 || len(nextBids) == 0 || len(nextAsks) == 0 {
@@ -199,26 +223,33 @@ func CalculateLevel1OFI(prevBids, prevAsks, nextBids, nextAsks []pionex.DepthLev
 	return deltaBid - deltaAsk
 }
 
-// SymbolMicrostate stores the rolling microstructure and OFI history for a single symbol.
+// SymbolMicrostate stores the rolling microstructure, local order book, and OFI history for a single symbol.
 type SymbolMicrostate struct {
-	symbol          string
-	config          OFIEngineConfig
-	mu              sync.RWMutex
-	prevBids        []pionex.DepthLevel
-	prevAsks        []pionex.DepthLevel
-	currentWindow   OFIWindow
-	history         []OFIWindow
-	latestAnalysis  MicrostructureAnalysis
+	symbol         string
+	config         OFIEngineConfig
+	mu             sync.RWMutex
+	book           *LocalOrderBook
+	prevBestBid    pionex.DepthLevel
+	prevBestAsk    pionex.DepthLevel
+	hasPrevL1      bool
+	currentWindow  OFIWindow
+	history        []OFIWindow
+	latestAnalysis MicrostructureAnalysis
+	recentTrades   map[string]time.Time // tradeId -> seenAt for deduplication
 }
 
 func newSymbolMicrostate(symbol string, cfg OFIEngineConfig) *SymbolMicrostate {
 	return &SymbolMicrostate{
-		symbol:  symbol,
-		config:  cfg,
-		history: make([]OFIWindow, 0, cfg.MaxHistoryWindows),
+		symbol:       symbol,
+		config:       cfg,
+		book:         NewLocalOrderBook(symbol),
+		history:      make([]OFIWindow, 0, cfg.MaxHistoryWindows),
+		recentTrades: make(map[string]time.Time, 1024),
 		latestAnalysis: MicrostructureAnalysis{
-			Symbol: symbol,
-			Regime: RegimeNeutral,
+			Symbol:  symbol,
+			Regime:  RegimeWarmingUp,
+			Reason:  "initializing market data stream",
+			IsFresh: false,
 		},
 	}
 }
@@ -253,6 +284,9 @@ func NewOFIEngine(cfg OFIEngineConfig) *OFIEngine {
 	if cfg.MaxHistoryWindows <= 0 {
 		cfg.MaxHistoryWindows = 10
 	}
+	if cfg.MaxStaleness <= 0 {
+		cfg.MaxStaleness = 15 * time.Second
+	}
 
 	return &OFIEngine{
 		config:  cfg,
@@ -272,12 +306,15 @@ func (e *OFIEngine) getOrCreate(symbol string) *SymbolMicrostate {
 	return st
 }
 
-// IngestL2 processes an L2 order book update.
-func (e *OFIEngine) IngestL2(symbol string, bids, asks []pionex.DepthLevel, ts time.Time) {
-	st := e.getOrCreate(symbol)
+// IngestOrderbookUpdate handles official Pionex WebSocket ORDERBOOK frames.
+// It synchronizes the local 100-level L2 book (SNAPSHOT vs UPDATE), enforces sequence continuity,
+// updates mid/micro prices, computes L1 OFI, and maintains 2% depth profiles.
+func (e *OFIEngine) IngestOrderbookUpdate(update pionex.OrderbookUpdate) {
+	st := e.getOrCreate(update.Symbol)
 	st.mu.Lock()
 	defer st.mu.Unlock()
 
+	ts := update.ReceivedAt
 	if ts.IsZero() {
 		ts = time.Now()
 	}
@@ -289,13 +326,33 @@ func (e *OFIEngine) IngestL2(symbol string, bids, asks []pionex.DepthLevel, ts t
 		st.currentWindow.StartTime = ts
 	}
 
-	if len(bids) == 0 || len(asks) == 0 {
+	// 1. Synchronize local order book
+	if update.IsSnapshot {
+		st.book.ApplySnapshot(update.Bids, update.Asks, update.Number, ts)
+	} else {
+		if err := st.book.ApplyDelta(update.Bids, update.Asks, update.Number, update.PrevNumber, ts); err != nil {
+			st.latestAnalysis.Regime = RegimeDesync
+			st.latestAnalysis.IsFresh = false
+			st.latestAnalysis.Reason = fmt.Sprintf("order book desync: %v", err)
+			st.latestAnalysis.UpdatedAt = ts
+			return
+		}
+	}
+
+	if !st.book.IsSynced() {
+		st.latestAnalysis.Regime = RegimeDesync
+		st.latestAnalysis.IsFresh = false
+		st.latestAnalysis.Reason = "order book waiting for snapshot"
+		st.latestAnalysis.UpdatedAt = ts
 		return
 	}
 
-	bestBid, bestAsk := bids[0], asks[0]
-	mid := bestBid.Price.Add(bestAsk.Price).Div(decimal.NewFromInt(2))
-	micro := CalculateMicroPrice(bids, asks)
+	bestBid, bestAsk, ok := st.book.BestBidAsk()
+	if !ok {
+		return
+	}
+
+	mid, micro, _ := st.book.MidAndMicroPrice()
 
 	if st.currentWindow.FirstMidPrice.IsZero() {
 		st.currentWindow.FirstMidPrice = mid
@@ -310,65 +367,78 @@ func (e *OFIEngine) IngestL2(symbol string, bids, asks []pionex.DepthLevel, ts t
 		st.latestAnalysis.CurrentMicroPrice = micro
 		st.latestAnalysis.MicroPriceBiasBps = biasBps
 		st.latestAnalysis.UpdatedAt = ts
-		if st.latestAnalysis.Regime == "" {
-			st.latestAnalysis.Regime = RegimeNeutral
-		}
 	}
 
-	// Calculate L1 OFI
-	if len(st.prevBids) > 0 && len(st.prevAsks) > 0 {
-		ofiStep := CalculateLevel1OFI(st.prevBids, st.prevAsks, bids, asks)
+	// 2. Calculate discrete Level 1 OFI against true previous top of book
+	if st.hasPrevL1 {
+		ofiStep := CalculateLevel1OFI(
+			[]pionex.DepthLevel{st.prevBestBid}, []pionex.DepthLevel{st.prevBestAsk},
+			[]pionex.DepthLevel{bestBid}, []pionex.DepthLevel{bestAsk},
+		)
 		st.currentWindow.OFI += ofiStep
 	}
+	st.prevBestBid = bestBid
+	st.prevBestAsk = bestAsk
+	st.hasPrevL1 = true
 
-	// Calculate 2% Depth and Spread
-	midF, _ := mid.Float64()
-	if midF > 0 {
-		bidLow := midF * 0.98
-		askHigh := midF * 1.02
+	// 3. Calculate 2% Depth and Spread from full synchronized book
+	spreadBps, _ := st.book.SpreadBps()
+	bidVol, askVol := st.book.DepthVolume2Pct(mid)
 
-		var bidVol, askVol float64
-		for _, b := range bids {
-			pF, _ := b.Price.Float64()
-			aF, _ := b.Amount.Float64()
-			if pF >= bidLow && pF <= midF {
-				bidVol += pF * aF
-			}
-		}
-		for _, a := range asks {
-			pF, _ := a.Price.Float64()
-			aF, _ := a.Amount.Float64()
-			if pF <= askHigh && pF >= midF {
-				askVol += pF * aF
-			}
-		}
-
-		st.currentWindow.BidVolume2Pct = bidVol
-		st.currentWindow.AskVolume2Pct = askVol
-		totalVol := bidVol + askVol
-		if totalVol > 0 {
-			st.currentWindow.QueueImbalance = (bidVol - askVol) / totalVol
-		}
-
-		pAskF, _ := bestAsk.Price.Float64()
-		pBidF, _ := bestBid.Price.Float64()
-		st.currentWindow.LastSpreadBps = ((pAskF - pBidF) / midF) * 10000.0
-		st.currentWindow.IsThin = bidVol < st.config.MinDepthNotionalUSDT || askVol < st.config.MinDepthNotionalUSDT
+	st.currentWindow.BidVolume2Pct = bidVol
+	st.currentWindow.AskVolume2Pct = askVol
+	totalVol := bidVol + askVol
+	if totalVol > 0 {
+		st.currentWindow.QueueImbalance = (bidVol - askVol) / totalVol
 	}
+	st.currentWindow.LastSpreadBps = spreadBps
+	st.currentWindow.IsThin = bidVol < st.config.MinDepthNotionalUSDT || askVol < st.config.MinDepthNotionalUSDT
+}
 
-	st.prevBids = bids
-	st.prevAsks = asks
+// IngestL2 processes an L2 order book snapshot (e.g. from REST GetDepth).
+// Treats incoming bids/asks as a full snapshot.
+func (e *OFIEngine) IngestL2(symbol string, bids, asks []pionex.DepthLevel, ts time.Time) {
+	e.IngestOrderbookUpdate(pionex.OrderbookUpdate{
+		Symbol:     symbol,
+		Action:     "SNAPSHOT",
+		Bids:       bids,
+		Asks:       asks,
+		IsSnapshot: true,
+		ReceivedAt: ts,
+	})
 }
 
 // IngestTrade processes an aggressive taker trade event.
+// Enforces tradeId deduplication and time-window isolation.
 func (e *OFIEngine) IngestTrade(symbol string, trade pionex.Trade) {
 	st := e.getOrCreate(symbol)
 	st.mu.Lock()
 	defer st.mu.Unlock()
 
+	// Trade deduplication
+	if trade.TradeID != "" {
+		if _, seen := st.recentTrades[trade.TradeID]; seen {
+			return
+		}
+		st.recentTrades[trade.TradeID] = time.Now()
+		if len(st.recentTrades) > 5000 {
+			cutoff := time.Now().Add(-2 * time.Minute)
+			for tid, tSeen := range st.recentTrades {
+				if tSeen.Before(cutoff) {
+					delete(st.recentTrades, tid)
+				}
+			}
+		}
+	}
+
 	ts := time.UnixMilli(trade.Time)
 	if trade.Time <= 0 {
 		ts = time.Now()
+	}
+
+	// Ignore trades older than 2 minutes to prevent backfill/replay pollution
+	if time.Since(ts) > 2*time.Minute {
+		return
 	}
 
 	if st.currentWindow.StartTime.IsZero() {
@@ -396,9 +466,10 @@ func (e *OFIEngine) IngestTrade(symbol string, trade pionex.Trade) {
 		st.currentWindow.TakerBuyRatio = st.currentWindow.TakerBuyUSDT / tot
 	}
 	st.currentWindow.TradeCount++
+	st.latestAnalysis.UpdatedAt = ts
 }
 
-// IngestTradeBatch sorts trades chronologically and ingests each trade, rolling 5s windows.
+// IngestTradeBatch sorts trades chronologically and ingests each trade, rolling micro-windows.
 func (e *OFIEngine) IngestTradeBatch(symbol string, trades []pionex.Trade) {
 	if len(trades) == 0 {
 		return
@@ -475,6 +546,9 @@ func (st *SymbolMicrostate) evaluateLocked(now time.Time) {
 	}
 
 	if len(st.history) == 0 {
+		analysis.Regime = RegimeWarmingUp
+		analysis.IsFresh = false
+		analysis.Reason = "warming up (no completed history windows)"
 		st.latestAnalysis = analysis
 		return
 	}
@@ -495,33 +569,55 @@ func (st *SymbolMicrostate) evaluateLocked(now time.Time) {
 		analysis.MicroPriceBiasBps = ((microF - midF) / midF) * 10000.0
 	}
 
-	// 1. Spoofing Detection: Severe queue imbalance (> 4:1) with zero or contrary taker volume
+	// 1. Order book synchronization check
+	if !st.book.IsSynced() {
+		analysis.Regime = RegimeDesync
+		analysis.IsFresh = false
+		analysis.Reason = "order book sequence desynchronized"
+		st.latestAnalysis = analysis
+		return
+	}
+
+	// 2. Spoofing Detection: Severe queue imbalance (> 4:1) with zero or contrary taker volume
 	hasHugeWall := math.Abs(lastW.QueueImbalance) >= 0.60
 	totalTaker := lastW.TakerBuyUSDT + lastW.TakerSellUSDT
 	if hasHugeWall && totalTaker < 1000.0 {
 		analysis.IsSpoofRisk = true
 		analysis.Regime = RegimeSpoofWarning
+		analysis.IsFresh = true
 		analysis.Reason = "unconfirmed book wall with zero taker flow confirmation (spoof risk)"
 		st.latestAnalysis = analysis
 		return
 	}
 
-	// If spread is blown out or book is thin, reject directional signal
+	// 3. Spread degraded check
 	if !analysis.IsSpreadIntact {
-		analysis.Regime = RegimeNeutral
+		analysis.Regime = RegimeSpreadBlown
+		analysis.IsFresh = false
 		analysis.Reason = fmt.Sprintf("spread degraded: %.1f bps > limit %.1f bps", lastW.LastSpreadBps, st.config.MaxSpreadBps)
 		st.latestAnalysis = analysis
 		return
 	}
+
+	// 4. Thin book liquidity check
 	if analysis.IsThinBook {
-		analysis.Regime = RegimeNeutral
+		analysis.Regime = RegimeThinBook
+		analysis.IsFresh = false
 		analysis.Reason = "thin book liquidity in 2% range"
 		st.latestAnalysis = analysis
 		return
 	}
 
-	// 2. Count consecutive windows meeting Bullish / Bearish persistence
-	// Check from newest window backwards
+	// 5. Warmup check: require at least MinWindows completed windows
+	if len(st.history) < st.config.MinWindows {
+		analysis.Regime = RegimeWarmingUp
+		analysis.IsFresh = false
+		analysis.Reason = fmt.Sprintf("warming up (%d/%d windows)", len(st.history), st.config.MinWindows)
+		st.latestAnalysis = analysis
+		return
+	}
+
+	// 6. Count consecutive windows meeting Bullish / Bearish persistence
 	bullStreak := 0
 	bearStreak := 0
 
@@ -555,12 +651,8 @@ func (st *SymbolMicrostate) evaluateLocked(now time.Time) {
 	analysis.ConsecutiveBullWindows = bullStreak
 	analysis.ConsecutiveBearWindows = bearStreak
 
-	// 3. Evaluate Regime
+	// 7. Evaluate Regime
 	if bullStreak >= st.config.MinWindows {
-		// Check Triple Confluence:
-		// 1) Persistent OFI (confirmed by bullStreak >= MinWindows)
-		// 2) Taker Flow Dominance (Total taker buy >= $15,000 across window span and ratio >= 75%)
-		// 3) Price displacement (FirstMidPrice of span vs LastMidPrice >= BreakoutDisplacementPct)
 		firstIdx := len(st.history) - bullStreak
 		spanFirstMid := st.history[firstIdx].FirstMidPrice
 		spanLastMid := st.history[len(st.history)-1].LastMidPrice
@@ -593,6 +685,7 @@ func (st *SymbolMicrostate) evaluateLocked(now time.Time) {
 			analysis.Reason = fmt.Sprintf("pump pressure: %d consecutive bullish windows (OFI +$%.0f, micro bias +%.1f bps)",
 				bullStreak, analysis.CurrentOFI, analysis.MicroPriceBiasBps)
 		}
+		analysis.IsFresh = true
 	} else if bearStreak >= st.config.MinWindows {
 		firstIdx := len(st.history) - bearStreak
 		spanFirstMid := st.history[firstIdx].FirstMidPrice
@@ -626,18 +719,45 @@ func (st *SymbolMicrostate) evaluateLocked(now time.Time) {
 			analysis.Reason = fmt.Sprintf("dump pressure: %d consecutive bearish windows (OFI -$%.0f, micro bias %.1f bps) — knife guard",
 				bearStreak, math.Abs(analysis.CurrentOFI), analysis.MicroPriceBiasBps)
 		}
+		analysis.IsFresh = true
 	} else {
 		analysis.Regime = RegimeNeutral
 		analysis.Reason = "order book and taker flow in balanced/neutral regime"
+		analysis.IsFresh = true
 	}
 
 	st.latestAnalysis = analysis
 }
 
 // Analyze returns the current microstructure analysis for a symbol.
+// Enforces strict staleness checking: if last update is older than MaxStaleness,
+// returns RegimeStale with IsFresh: false to prevent outdated signals acting on live bots.
 func (e *OFIEngine) Analyze(symbol string) MicrostructureAnalysis {
-	st := e.getOrCreate(symbol)
+	sym := strings.ToUpper(strings.TrimSpace(symbol))
+	e.mu.RLock()
+	st, ok := e.symbols[sym]
+	e.mu.RUnlock()
+
+	if !ok {
+		return MicrostructureAnalysis{
+			Symbol:  sym,
+			Regime:  RegimeWarmingUp,
+			Reason:  "no market data stream",
+			IsFresh: false,
+		}
+	}
+
 	st.mu.RLock()
 	defer st.mu.RUnlock()
-	return st.latestAnalysis
+
+	analysis := st.latestAnalysis
+	if analysis.UpdatedAt.IsZero() || time.Since(analysis.UpdatedAt) > st.config.MaxStaleness {
+		analysis.Regime = RegimeStale
+		analysis.IsFresh = false
+		analysis.Reason = fmt.Sprintf("market data stale: last update was %s ago (>%s)",
+			time.Since(analysis.UpdatedAt).Round(time.Second), st.config.MaxStaleness)
+		return analysis
+	}
+
+	return analysis
 }

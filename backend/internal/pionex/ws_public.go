@@ -65,6 +65,7 @@ func (m MarkUpdate) Fresh(maxAge time.Duration) bool {
 // OrderbookUpdate is one ORDERBOOK snapshot or incremental delta push.
 type OrderbookUpdate struct {
 	Symbol     string
+	Action     string // "SNAPSHOT" or "UPDATE"
 	Bids       []DepthLevel
 	Asks       []DepthLevel
 	Number     int64
@@ -519,22 +520,15 @@ func (s *PublicStream) ingestIndex(env wsEnvelope) {
 }
 
 type wsOrderbookData struct {
+	Action     string               `json:"action"` // "SNAPSHOT" or "UPDATE"
 	Base       string               `json:"base"`
 	Quote      string               `json:"quote"`
 	Bids       [][2]decimal.Decimal `json:"bids"`
 	Asks       [][2]decimal.Decimal `json:"asks"`
 	Number     int64                `json:"number"`
 	PrevNumber int64                `json:"prevNumber"`
+	TimeStamp  int64                `json:"timeStamp"`
 	Full       bool                 `json:"full"`
-}
-
-type wsTradeData struct {
-	Symbol  string          `json:"symbol"`
-	TradeID int64           `json:"tradeId"`
-	Price   decimal.Decimal `json:"price"`
-	Size    decimal.Decimal `json:"size"`
-	Side    string          `json:"side"`
-	Time    int64           `json:"time"`
 }
 
 func (s *PublicStream) ingestOrderbook(env wsEnvelope) {
@@ -560,13 +554,24 @@ func (s *PublicStream) ingestOrderbook(env wsEnvelope) {
 		return levels
 	}
 
+	isSnapshot := strings.EqualFold(data.Action, "SNAPSHOT") || data.Full || data.PrevNumber == 0
+	action := strings.ToUpper(strings.TrimSpace(data.Action))
+	if action == "" {
+		if isSnapshot {
+			action = "SNAPSHOT"
+		} else {
+			action = "UPDATE"
+		}
+	}
+
 	update := OrderbookUpdate{
 		Symbol:     sym,
+		Action:     action,
 		Bids:       toLevels(data.Bids),
 		Asks:       toLevels(data.Asks),
 		Number:     data.Number,
 		PrevNumber: data.PrevNumber,
-		IsSnapshot: data.Full || data.PrevNumber == 0,
+		IsSnapshot: isSnapshot,
 		ReceivedAt: time.Now(),
 	}
 
@@ -580,37 +585,30 @@ func (s *PublicStream) ingestOrderbook(env wsEnvelope) {
 }
 
 func (s *PublicStream) ingestTrades(env wsEnvelope) {
-	var entries []wsTradeData
+	var entries []Trade
 	if err := json.Unmarshal(env.Data, &entries); err != nil {
-		var single wsTradeData
+		var single Trade
 		if err2 := json.Unmarshal(env.Data, &single); err2 != nil {
 			s.logger.Debug("ws lane TRADE payload undecodable", "component", "pionex_ws",
 				"payload", truncateForLog(string(env.Data)))
 			return
 		}
-		entries = []wsTradeData{single}
+		entries = []Trade{single}
 	}
 
 	s.stateMu.RLock()
 	listener := s.onTrade
 	s.stateMu.RUnlock()
 
-	for _, e := range entries {
-		sym := normalizeStreamSymbol(e.Symbol)
-		if sym == "" {
-			sym = normalizeStreamSymbol(env.Symbol)
+	for _, trade := range entries {
+		if trade.Symbol == "" {
+			trade.Symbol = normalizeStreamSymbol(env.Symbol)
+		} else {
+			trade.Symbol = normalizeStreamSymbol(trade.Symbol)
 		}
-		tTime := e.Time
-		if tTime == 0 && env.Timestamp > 0 {
-			tTime = env.Timestamp
-		}
-		trade := Trade{
-			Symbol:  sym,
-			TradeID: e.TradeID,
-			Price:   e.Price,
-			Size:    e.Size,
-			Side:    strings.ToUpper(e.Side),
-			Time:    tTime,
+		if trade.Time == 0 && env.Timestamp > 0 {
+			trade.Time = env.Timestamp
+			trade.Timestamp = env.Timestamp
 		}
 		if listener != nil {
 			listener(trade)

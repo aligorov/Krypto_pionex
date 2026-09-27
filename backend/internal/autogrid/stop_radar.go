@@ -73,8 +73,9 @@ type radarInput struct {
 	inventorySide float64
 
 	// v2.0.128: Live order flow & microstructure state
-	ofiRegime    string
-	microBiasBps float64
+	ofiRegime     string
+	microBiasBps  float64
+	ofiActionable bool
 }
 
 // radarPriceFor resolves a bot's live price from the pass-wide ticker map,
@@ -259,17 +260,19 @@ func scoreBot(in radarInput, parkNow, parkMedian24h, latestHurst float64, fleet 
 		rs.M5 = 1.0 + 0.5*clamp01((latestHurst-0.55)/0.20)*math.Abs(in.inventorySide)
 	}
 	// v2.0.128: Order flow imbalance & microstructure risk amplification
-	if in.inventorySide > 0 {
-		if in.ofiRegime == "DUMP_PRESSURE" {
-			rs.M5 += 0.25
-		} else if in.ofiRegime == "CONFIRMED_DUMP" {
-			rs.M5 += 0.50
-		}
-	} else if in.inventorySide < 0 {
-		if in.ofiRegime == "PUMP_PRESSURE" {
-			rs.M5 += 0.25
-		} else if in.ofiRegime == "CONFIRMED_PUMP" {
-			rs.M5 += 0.50
+	if in.ofiActionable {
+		if in.inventorySide > 0 {
+			if in.ofiRegime == "DUMP_PRESSURE" {
+				rs.M5 += 0.25
+			} else if in.ofiRegime == "CONFIRMED_DUMP" {
+				rs.M5 += 0.50
+			}
+		} else if in.inventorySide < 0 {
+			if in.ofiRegime == "PUMP_PRESSURE" {
+				rs.M5 += 0.25
+			} else if in.ofiRegime == "CONFIRMED_PUMP" {
+				rs.M5 += 0.50
+			}
 		}
 	}
 
@@ -345,6 +348,7 @@ func (worker *Worker) radarPass(ctx context.Context, settings Settings, bots []r
 			analysis := worker.ofiEngine.Analyze(b.symbol)
 			b.ofiRegime = string(analysis.Regime)
 			b.microBiasBps = analysis.MicroPriceBiasBps
+			b.ofiActionable = analysis.IsActionable()
 		}
 		parkNow, parkMed, hurst := worker.symbolScanStats(ctx, b.symbol)
 		rs := scoreBot(b, parkNow, parkMed, hurst, fleet, legs, maxLeg)

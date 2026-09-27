@@ -38,7 +38,7 @@ func (worker *Worker) startWSLane(ctx context.Context) {
 	worker.wsLane.SetMarkListener(worker.onRealtimeMark)
 	worker.wsLane.SetOrderbookListener(func(ob pionex.OrderbookUpdate) {
 		if worker.ofiEngine != nil {
-			worker.ofiEngine.IngestL2(ob.Symbol, ob.Bids, ob.Asks, ob.ReceivedAt)
+			worker.ofiEngine.IngestOrderbookUpdate(ob)
 		}
 	})
 	worker.wsLane.SetTradeListener(func(tr pionex.Trade) {

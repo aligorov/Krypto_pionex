@@ -62,8 +62,8 @@ func (worker *Worker) radarBreakFlip(ctx context.Context, settings Settings, b r
 		return false // not underwater enough to pay the escape cost
 	}
 	progress := radarB2EarlyEdgeProgress(b.price, b.lower, b.upper, b.inventorySide)
-	isOFIConfirmed := (b.inventorySide > 0 && b.ofiRegime == "CONFIRMED_DUMP") ||
-		(b.inventorySide < 0 && b.ofiRegime == "CONFIRMED_PUMP")
+	isOFIConfirmed := b.ofiActionable && ((b.inventorySide > 0 && b.ofiRegime == "CONFIRMED_DUMP") ||
+		(b.inventorySide < 0 && b.ofiRegime == "CONFIRMED_PUMP"))
 
 	// Standard trigger: progress >= 0.85 and velocity >= breakFlipSpeedATR15.
 	// OFI accelerated escape: if institutional flow is confirmed adverse, trigger earlier at progress >= 0.60

@@ -1,6 +1,7 @@
 package marketdata
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
@@ -135,10 +136,10 @@ func TestOFIEngine_PumpPressure_Persistence(t *testing.T) {
 	})
 	engine.FinalizeWindow(sym, t1.Add(5*time.Second))
 
-	// After 1 window: should still be NEUTRAL (needs 3 consecutive windows)
+	// After 1 window: should not be pump pressure yet (needs 3 consecutive windows)
 	a1 := engine.Analyze(sym)
-	if a1.Regime != RegimeNeutral {
-		t.Fatalf("expected RegimeNeutral after only 1 window, got %s", a1.Regime)
+	if a1.Regime == RegimePumpPressure || a1.Regime == RegimeConfirmedPump || a1.IsActionable() {
+		t.Fatalf("expected non-actionable warmup after only 1 window, got regime %s (actionable=%v)", a1.Regime, a1.IsActionable())
 	}
 
 	// Window 2: Bullish flow continues
@@ -153,10 +154,10 @@ func TestOFIEngine_PumpPressure_Persistence(t *testing.T) {
 	})
 	engine.FinalizeWindow(sym, t2.Add(5*time.Second))
 
-	// After 2 windows: should still be NEUTRAL
+	// After 2 windows: should still not be actionable pump pressure
 	a2 := engine.Analyze(sym)
-	if a2.Regime != RegimeNeutral {
-		t.Fatalf("expected RegimeNeutral after only 2 windows, got %s", a2.Regime)
+	if a2.Regime == RegimePumpPressure || a2.Regime == RegimeConfirmedPump || a2.IsActionable() {
+		t.Fatalf("expected non-actionable warmup after only 2 windows, got regime %s (actionable=%v)", a2.Regime, a2.IsActionable())
 	}
 
 	// Window 3: Bullish flow continues for 3rd window
@@ -311,7 +312,7 @@ func TestOFIEngine_IngestTradeBatch(t *testing.T) {
 		}
 		trades = append(trades, pionex.Trade{
 			Symbol:  sym,
-			TradeID: int64(i + 1),
+			TradeID: fmt.Sprintf("%d", i+1),
 			Price:   d("50.0"),
 			Size:    d("40.0"), // $2,000 per trade
 			Side:    side,
@@ -329,6 +330,119 @@ func TestOFIEngine_IngestTradeBatch(t *testing.T) {
 	allowedLong, reason := analysis.CanEnter("LONG")
 	if allowedLong && analysis.Regime == RegimeDumpPressure {
 		t.Fatalf("expected LONG entry to be vetoed under dump pressure, got allowed with reason: %s", reason)
+	}
+}
+
+func TestOFIEngine_Staleness(t *testing.T) {
+	engine := NewOFIEngine(OFIEngineConfig{
+		WindowDuration: 5 * time.Second,
+		MinWindows:     3,
+		MaxStaleness:   15 * time.Second,
+	})
+
+	sym := "STALE_USDT_PERP"
+	oldTime := time.Now().Add(-30 * time.Second)
+
+	engine.IngestL2(sym,
+		[]pionex.DepthLevel{{Price: d("100"), Amount: d("10")}},
+		[]pionex.DepthLevel{{Price: d("100.1"), Amount: d("10")}},
+		oldTime,
+	)
+	engine.FinalizeWindow(sym, oldTime.Add(5*time.Second))
+
+	analysis := engine.Analyze(sym)
+	if analysis.Regime != RegimeStale {
+		t.Fatalf("expected RegimeStale for 30s old data, got %s", analysis.Regime)
+	}
+	if analysis.IsActionable() {
+		t.Fatalf("stale analysis must NOT be actionable")
+	}
+	if allowed, _ := analysis.CanEnter("LONG"); !allowed {
+		t.Fatalf("stale data must fail-safe to allowed (not freeze or veto entries spuriously)")
+	}
+}
+
+func TestOFIEngine_TradeDeduplication(t *testing.T) {
+	engine := NewOFIEngine(DefaultOFIEngineConfig())
+	sym := "DEDUP_USDT_PERP"
+	now := time.Now()
+
+	tr := pionex.Trade{
+		Symbol:  sym,
+		TradeID: "dup_trade_001",
+		Price:   d("100"),
+		Size:    d("10"), // $1,000
+		Side:    "BUY",
+		Time:    now.UnixMilli(),
+	}
+
+	// Ingest same trade twice
+	engine.IngestTrade(sym, tr)
+	engine.IngestTrade(sym, tr)
+
+	st := engine.getOrCreate(sym)
+	st.mu.RLock()
+	takerBuy := st.currentWindow.TakerBuyUSDT
+	tradeCount := st.currentWindow.TradeCount
+	st.mu.RUnlock()
+
+	if takerBuy != 1000.0 {
+		t.Fatalf("expected taker volume 1000.0 (deduplicated), got %.2f", takerBuy)
+	}
+	if tradeCount != 1 {
+		t.Fatalf("expected tradeCount=1, got %d", tradeCount)
+	}
+}
+
+func TestOFIEngine_DesyncRecovery(t *testing.T) {
+	engine := NewOFIEngine(DefaultOFIEngineConfig())
+	sym := "SYNC_USDT_PERP"
+	now := time.Now()
+
+	// 1. Initial snapshot
+	engine.IngestOrderbookUpdate(pionex.OrderbookUpdate{
+		Symbol:     sym,
+		Action:     "SNAPSHOT",
+		Bids:       []pionex.DepthLevel{{Price: d("100"), Amount: d("10")}},
+		Asks:       []pionex.DepthLevel{{Price: d("100.1"), Amount: d("10")}},
+		Number:     1,
+		IsSnapshot: true,
+		ReceivedAt: now,
+	})
+
+	// 2. Incremental delta with gap (prevNumber 5 instead of 1)
+	engine.IngestOrderbookUpdate(pionex.OrderbookUpdate{
+		Symbol:     sym,
+		Action:     "UPDATE",
+		Bids:       []pionex.DepthLevel{{Price: d("100"), Amount: d("15")}},
+		Number:     6,
+		PrevNumber: 5,
+		IsSnapshot: false,
+		ReceivedAt: now.Add(50 * time.Millisecond),
+	})
+
+	analysis := engine.Analyze(sym)
+	if analysis.Regime != RegimeDesync {
+		t.Fatalf("expected RegimeDesync on sequence gap, got %s", analysis.Regime)
+	}
+	if analysis.IsActionable() {
+		t.Fatalf("desynced book must not be actionable")
+	}
+
+	// 3. New snapshot recovers sync
+	engine.IngestOrderbookUpdate(pionex.OrderbookUpdate{
+		Symbol:     sym,
+		Action:     "SNAPSHOT",
+		Bids:       []pionex.DepthLevel{{Price: d("100"), Amount: d("20")}},
+		Asks:       []pionex.DepthLevel{{Price: d("100.1"), Amount: d("20")}},
+		Number:     10,
+		IsSnapshot: true,
+		ReceivedAt: now.Add(100 * time.Millisecond),
+	})
+
+	st := engine.getOrCreate(sym)
+	if !st.book.IsSynced() {
+		t.Fatalf("expected book to be synced after fresh snapshot")
 	}
 }
 
