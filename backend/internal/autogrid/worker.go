@@ -6241,11 +6241,14 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 
 	// Telemetry retention, batched like the radar snapshots.
 	_, _ = worker.db.Exec(ctx, `DELETE FROM bot_telemetry WHERE captured_at < NOW() - INTERVAL '14 days' AND id % 1000 = 0`)
-	// v2.0.138 decision journals ride the same retention (batched deletes;
-	// radar rows are throttle-gated, but a sustained storm of actionable
-	// flows across a large fleet still accumulates).
-	_, _ = worker.db.Exec(ctx, `DELETE FROM ofi_decision_snapshots WHERE created_at < NOW() - INTERVAL '14 days' AND id % 1000 = 0`)
-	_, _ = worker.db.Exec(ctx, `DELETE FROM entry_decisions WHERE created_at < NOW() - INTERVAL '14 days' AND id % 1000 = 0`)
+	// v2.0.141 (audit P1): the journal tables' ids are UUIDs — Postgres has
+	// no uuid % integer, so the v2.0.138 modulo batching failed on EVERY
+	// pass and the discarded error made retention dead code (unbounded
+	// growth). The tables are small (<100k rows steady state): a plain
+	// created_at delete needs no batching.
+	_, _ = worker.db.Exec(ctx, `DELETE FROM ofi_decision_snapshots WHERE created_at < NOW() - INTERVAL '14 days'`)
+	_, _ = worker.db.Exec(ctx, `DELETE FROM entry_decisions WHERE created_at < NOW() - INTERVAL '14 days'`)
+	_, _ = worker.db.Exec(ctx, `DELETE FROM gate_value_snapshots WHERE created_at < NOW() - INTERVAL '90 days'`)
 	return nil
 }
 
