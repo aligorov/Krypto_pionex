@@ -274,7 +274,8 @@ func TestRadarMicrostructureEmergencyExit_Gates(t *testing.T) {
 
 func TestRadarMicrostructureEmergencyExit_ShadowSafety(t *testing.T) {
 	worker := &Worker{
-		emergencyExits: make(map[string]time.Time),
+		emergencyExits:          make(map[string]time.Time),
+		emergencyShadowDebounce: make(map[string]time.Time),
 	}
 	settings := Settings{
 		StopForecastMode: "SHADOW", // SHADOW mode MUST NOT execute trade exits!
@@ -293,8 +294,13 @@ func TestRadarMicrostructureEmergencyExit_ShadowSafety(t *testing.T) {
 	}
 
 	// Shadow debounce should be armed
-	if !worker.isEmergencyExitDebounced("real_shadow_bot") {
+	if !worker.isEmergencyShadowDebounced("real_shadow_bot") {
 		t.Fatalf("expected shadow debounce to be armed after observation")
+	}
+
+	// ACTIVE execution debounce MUST NOT be armed by SHADOW mode observation!
+	if worker.isEmergencyExitDebounced("real_shadow_bot") {
+		t.Fatalf("SHADOW observation must never lock out ACTIVE execution debounce")
 	}
 
 	// Paper bot in SHADOW mode must also never close
@@ -303,6 +309,50 @@ func TestRadarMicrostructureEmergencyExit_ShadowSafety(t *testing.T) {
 	bPaper.botSource = "PAPER"
 	if worker.radarMicrostructureEmergencyExit(context.Background(), settings, bPaper) {
 		t.Fatalf("SHADOW mode must never close PAPER bots")
+	}
+}
+
+func TestRadarMicrostructureEmergencyExit_ShadowToActiveTransition(t *testing.T) {
+	worker := &Worker{
+		emergencyExits:          make(map[string]time.Time),
+		emergencyShadowDebounce: make(map[string]time.Time),
+	}
+	shadowSettings := Settings{
+		StopForecastMode: "SHADOW",
+	}
+
+	b := radarInput{
+		botID: "transition_bot", botNumber: 103, botSource: "REAL", direction: "LONG",
+		total: d("-10.0"), price: d("96.0"), lower: d("95.0"), upper: d("105.0"),
+		inventorySide: 1, ofiRegime: "CONFIRMED_DUMP", ofiActionable: true,
+	}
+
+	// 1. First run in SHADOW mode: records observation, returns false
+	if worker.radarMicrostructureEmergencyExit(context.Background(), shadowSettings, b) {
+		t.Fatalf("SHADOW mode must not execute")
+	}
+	if !worker.isEmergencyShadowDebounced("transition_bot") {
+		t.Fatalf("expected shadow debounce to be armed")
+	}
+	if worker.isEmergencyExitDebounced("transition_bot") {
+		t.Fatalf("execution debounce must remain clean during shadow mode")
+	}
+
+	// 2. Operator switches mode from SHADOW to ACTIVE immediately
+	activeSettings := Settings{
+		StopForecastMode: "ACTIVE",
+	}
+
+	// When evaluating under ACTIVE, worker should NOT be debounced by the shadow debounce!
+	// With worker.db == nil, it proceeds past execution debounce check and reaches DB step,
+	// which arms 2s retry backoff.
+	if worker.isEmergencyExitDebounced("transition_bot") {
+		t.Fatalf("active execution debounce must NOT be locked by shadow debounce")
+	}
+	_ = worker.radarMicrostructureEmergencyExit(context.Background(), activeSettings, b)
+	until := worker.emergencyExits["transition_bot"]
+	if until.IsZero() {
+		t.Fatalf("ACTIVE pass must have reached execution branch and armed execution backoff")
 	}
 }
 
@@ -340,4 +390,35 @@ func TestRadarMicrostructureEmergencyExit_DBFailureRetry(t *testing.T) {
 		t.Fatalf("bot should be eligible for immediate retry after 2s backoff expires")
 	}
 }
+
+func TestRadarMicrostructureEmergencyExit_NeutralDecoupledGate(t *testing.T) {
+	worker := &Worker{
+		emergencyExits:          make(map[string]time.Time),
+		emergencyShadowDebounce: make(map[string]time.Time),
+		db:                      nil, // tests the path before DB execution
+	}
+	settings := Settings{
+		StopForecastMode:   "ACTIVE",
+		DgtRedeployEnabled: true,
+	}
+
+	// NEUTRAL bot with total = -$0.50 (in v2.0.133 this was rejected by radarBreakFlip <= -$1.00 gate)
+	b := radarInput{
+		botID: "neutral_dgt_bot", botNumber: 104, botSource: "REAL", direction: "NEUTRAL",
+		total: d("-0.50"), price: d("96.0"), lower: d("95.0"), upper: d("105.0"),
+		inventorySide: 1, ofiRegime: "CONFIRMED_DUMP", ofiActionable: true,
+	}
+
+	// In v2.0.133, this returned false WITHOUT arming any debounce because radarBreakFlip was false.
+	// In v2.0.134, it proceeds past all gates, reaches the DB execution step (db == nil),
+	// and arms 2s transient backoff!
+	fired := worker.radarMicrostructureEmergencyExit(context.Background(), settings, b)
+	if fired {
+		t.Fatalf("expected false with nil db")
+	}
+	if !worker.isEmergencyExitDebounced("neutral_dgt_bot") {
+		t.Fatalf("expected NEUTRAL bot with -$0.50 to proceed to execution and arm retry debounce")
+	}
+}
+
 

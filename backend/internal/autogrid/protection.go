@@ -181,10 +181,6 @@ func (worker *Worker) radarMicrostructureEmergencyExit(ctx context.Context, sett
 		return false
 	}
 
-	if worker.isEmergencyExitDebounced(b.botID) {
-		return false
-	}
-
 	adverseReason := "EMERGENCY_OFI_DUMP"
 	if isAdversePump {
 		adverseReason = "EMERGENCY_OFI_PUMP"
@@ -192,8 +188,12 @@ func (worker *Worker) radarMicrostructureEmergencyExit(ctx context.Context, sett
 
 	// 1. SHADOW mode safety gate: strictly observational!
 	// Never mutate bot status, never stop real positions, never close paper bots.
+	// Uses dedicated emergencyShadowDebounce so switching to ACTIVE immediately executes without delay!
 	if settings.StopForecastMode != "ACTIVE" {
-		worker.armEmergencyExitDebounce(b.botID, 2*time.Minute)
+		if worker.isEmergencyShadowDebounced(b.botID) {
+			return false
+		}
+		worker.armEmergencyShadowDebounce(b.botID, 2*time.Minute)
 		if worker.logger != nil {
 			worker.logger.Info("microstructure emergency protective exit (SHADOW observation)",
 				"component", "autogrid_worker", "bot_number", b.botNumber, "symbol", b.symbol,
@@ -224,22 +224,17 @@ func (worker *Worker) radarMicrostructureEmergencyExit(ctx context.Context, sett
 		return false
 	}
 
+	// 2. ACTIVE mode: Check execution debounce
+	if worker.isEmergencyExitDebounced(b.botID) {
+		return false
+	}
+
 	if worker.db == nil {
 		worker.armEmergencyExitDebounce(b.botID, 2*time.Second)
 		return false
 	}
 
-	// 2. ACTIVE: REAL NEUTRAL with DGT redeploy -> break-flip route
-	if b.botSource == "REAL" && b.direction == "NEUTRAL" && settings.DgtRedeployEnabled {
-		if worker.radarBreakFlip(ctx, settings, b, radarScores{Band: 3}, 0) {
-			worker.armEmergencyExitDebounce(b.botID, 30*time.Second)
-			return true
-		}
-		worker.armEmergencyExitDebounce(b.botID, 2*time.Second)
-		return false
-	}
-
-	// 3. ACTIVE: Direct emergency stop for Directional bots (LONG/SHORT) or REAL without DGT
+	// 3. ACTIVE: Emergency stop for REAL bots (NEUTRAL, LONG, SHORT)
 	if b.botSource == "REAL" {
 		now := time.Now().UTC()
 		nowStr := now.Format(time.RFC3339)
@@ -283,6 +278,29 @@ func (worker *Worker) radarMicrostructureEmergencyExit(ctx context.Context, sett
 			"requested_at":  nowStr,
 			"message":       fmt.Sprintf("🚨 запрошена экстренная защитная остановка (STOP_REQUESTED, %s): институциональный поток против позиции, прогресс к краю %.0f%% — ордера отменяются, позиция закрывается", b.ofiRegime, progress*100),
 		})
+
+		// DGT re-deploy intent for NEUTRAL bots (if enabled):
+		// Decoupled from the emergency exit decision! The risk is ALREADY stopped above.
+		if b.direction == "NEUTRAL" && settings.DgtRedeployEnabled {
+			var accountID string
+			var investment decimal.Decimal
+			if err := worker.db.QueryRow(ctx, `
+				SELECT COALESCE(account_id, ''), quote_investment
+				FROM grid_bots WHERE id = $1
+			`, b.botID).Scan(&accountID, &investment); err == nil && accountID != "" {
+				worker.dgtQueueRealRedeploy(ctx, settings, dgtRedeploySpec{
+					symbol:       b.symbol,
+					direction:    b.direction,
+					slotBudget:   investment,
+					oldBotID:     b.botID,
+					oldBotNumber: b.botNumber,
+					atrFallback:  b.atrEntryPct,
+					accountID:    accountID,
+					breakPrice:   b.price,
+				})
+			}
+		}
+
 		return true
 	}
 

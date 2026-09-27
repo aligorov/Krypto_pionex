@@ -145,8 +145,9 @@ type Worker struct {
 	// sweep (single manage goroutine → plain field).
 	orphanSweepAt time.Time
 
-	emergencyExitMu sync.Mutex
-	emergencyExits  map[string]time.Time
+	emergencyExitMu         sync.Mutex
+	emergencyExits          map[string]time.Time
+	emergencyShadowDebounce map[string]time.Time
 }
 
 type trancheTBTrend struct {
@@ -190,8 +191,9 @@ func NewWorker(
 		ouReadings:      make(map[string]ouSymbolReading),
 		realtimeSignal:  make(chan string, 1),
 		realtimeWatch:   make(map[string]realtimePoint),
-		ofiEngine:       marketdata.NewOFIEngine(marketdata.DefaultOFIEngineConfig()),
-		emergencyExits:  make(map[string]time.Time),
+		ofiEngine:               marketdata.NewOFIEngine(marketdata.DefaultOFIEngineConfig()),
+		emergencyExits:          make(map[string]time.Time),
+		emergencyShadowDebounce: make(map[string]time.Time),
 	}
 	service.SetLivePriceResolver(w.LiveMarkPrice)
 	return w
@@ -221,6 +223,32 @@ func (worker *Worker) armEmergencyExitDebounce(botID string, duration time.Durat
 		worker.emergencyExits = make(map[string]time.Time)
 	}
 	worker.emergencyExits[botID] = time.Now().Add(duration)
+}
+
+func (worker *Worker) isEmergencyShadowDebounced(botID string) bool {
+	worker.emergencyExitMu.Lock()
+	defer worker.emergencyExitMu.Unlock()
+	if worker.emergencyShadowDebounce == nil {
+		return false
+	}
+	until, ok := worker.emergencyShadowDebounce[botID]
+	if !ok {
+		return false
+	}
+	if time.Now().Before(until) {
+		return true
+	}
+	delete(worker.emergencyShadowDebounce, botID)
+	return false
+}
+
+func (worker *Worker) armEmergencyShadowDebounce(botID string, duration time.Duration) {
+	worker.emergencyExitMu.Lock()
+	defer worker.emergencyExitMu.Unlock()
+	if worker.emergencyShadowDebounce == nil {
+		worker.emergencyShadowDebounce = make(map[string]time.Time)
+	}
+	worker.emergencyShadowDebounce[botID] = time.Now().Add(duration)
 }
 
 // LiveMarkPrice returns the freshest known WebSocket mark price for a symbol.

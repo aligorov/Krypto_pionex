@@ -423,6 +423,15 @@ func TestOFIEngine_DesyncRecovery(t *testing.T) {
 		IsSnapshot: false,
 		ReceivedAt: now.Add(50 * time.Millisecond),
 	})
+	// Ingest trade during contaminated period
+	engine.IngestTrade(sym, pionex.Trade{
+		Symbol:  sym,
+		TradeID: "contaminated_trade_1",
+		Side:    "BUY",
+		Price:   d("100.1"),
+		Size:    d("100"),
+		Time:    now.Add(60 * time.Millisecond).UnixMilli(),
+	})
 
 	analysis := engine.Analyze(sym)
 	if analysis.Regime != RegimeDesync {
@@ -432,7 +441,7 @@ func TestOFIEngine_DesyncRecovery(t *testing.T) {
 		t.Fatalf("desynced book must not be actionable")
 	}
 
-	// 3. New snapshot recovers sync
+	// 3. New snapshot recovers sync — must purge BOTH history AND currentWindow!
 	engine.IngestOrderbookUpdate(pionex.OrderbookUpdate{
 		Symbol:     sym,
 		Action:     "SNAPSHOT",
@@ -446,6 +455,17 @@ func TestOFIEngine_DesyncRecovery(t *testing.T) {
 	st := engine.getOrCreate(sym)
 	if !st.book.IsSynced() {
 		t.Fatalf("expected book to be synced after fresh snapshot")
+	}
+	st.mu.RLock()
+	defer st.mu.RUnlock()
+	if len(st.history) != 0 {
+		t.Fatalf("expected history to be purged on desync recovery, got %d windows", len(st.history))
+	}
+	if st.currentWindow.TradeCount != 0 {
+		t.Fatalf("expected currentWindow trade count to be purged on desync recovery, got %d", st.currentWindow.TradeCount)
+	}
+	if st.currentWindow.TakerBuyUSDT != 0 {
+		t.Fatalf("expected currentWindow volume to be purged on desync recovery, got %f", st.currentWindow.TakerBuyUSDT)
 	}
 }
 

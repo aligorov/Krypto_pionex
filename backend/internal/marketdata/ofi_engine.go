@@ -382,6 +382,7 @@ func (e *OFIEngine) IngestOrderbookUpdate(update pionex.OrderbookUpdate) {
 		if wasDesynced {
 			// Sequence breach occurred previously: purge contaminated history and restart clean warmup!
 			st.history = st.history[:0]
+			st.currentWindow = OFIWindow{StartTime: ts}
 			st.recoveringFromDesync = true
 			st.latestAnalysis.Regime = RegimeWarmingUp
 			st.latestAnalysis.IsSynced = false
