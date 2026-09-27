@@ -1720,6 +1720,24 @@ func (s *Service) RequestBotClose(ctx context.Context, settingsID, botID, reason
 		return "REAL", nil
 	}
 
+	// Allow closing a pending real bot whose remote id was never persisted
+	// (e.g. process crashed during creation) once the 90s transport window has passed.
+	// The adoption reconciler will adopt and cancel if it exists on Pionex, or clear to FAILED.
+	tagNull, errNull := s.db.Exec(ctx, `
+		UPDATE grid_bots
+		SET status = 'STOP_REQUESTED', closed_reason = $3, updated_at = NOW()
+		WHERE id = $1 AND autogrid_settings_id = $2
+		  AND bu_order_id IS NULL
+		  AND status IN ('PENDING_SUBMISSION', 'SUBMISSION_UNKNOWN')
+		  AND created_at < NOW() - INTERVAL '90 seconds'
+	`, botID, settingsID, reason)
+	if errNull != nil {
+		return "", fmt.Errorf("request pending real bot close: %w", errNull)
+	}
+	if tagNull.RowsAffected() == 1 {
+		return "REAL", nil
+	}
+
 	var bNum int
 	var sym, direction string
 	var entry, investment, lower, upper, realized, mPrice decimal.Decimal

@@ -4596,7 +4596,7 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 // they are the stop-race zombies; adoption preserves their stop intent.
 func (worker *Worker) reconcileUnknownSubmissions(ctx context.Context, client *pionex.Client) {
 	rows, err := worker.db.Query(ctx, `
-		SELECT id, symbol, quote_investment, EXTRACT(EPOCH FROM created_at) * 1000
+		SELECT id, symbol, status, quote_investment, EXTRACT(EPOCH FROM created_at) * 1000
 		FROM grid_bots
 		WHERE bu_order_id IS NULL
 		  AND status IN ('SUBMISSION_UNKNOWN', 'PENDING_SUBMISSION', 'STOP_REQUESTED')
@@ -4609,14 +4609,14 @@ func (worker *Worker) reconcileUnknownSubmissions(ctx context.Context, client *p
 		return
 	}
 	type unknownBot struct {
-		id, symbol string
-		investment decimal.Decimal
-		createdMS  float64
+		id, symbol, status string
+		investment         decimal.Decimal
+		createdMS          float64
 	}
 	pending := make([]unknownBot, 0, 10)
 	for rows.Next() {
 		var item unknownBot
-		if err := rows.Scan(&item.id, &item.symbol, &item.investment, &item.createdMS); err == nil {
+		if err := rows.Scan(&item.id, &item.symbol, &item.status, &item.investment, &item.createdMS); err == nil {
 			pending = append(pending, item)
 		}
 	}
@@ -4699,10 +4699,13 @@ func (worker *Worker) reconcileUnknownSubmissions(ctx context.Context, client *p
 				"component", "autogrid_worker", "symbol", bot.symbol, "matches", len(matches))
 			continue
 		}
-		// No running or finished order matches. Only clear the row when both
-		// lists paginated to the end without errors, otherwise the bot may
-		// simply live on a page we could not reach.
-		if !listsComplete || time.Since(time.UnixMilli(int64(bot.createdMS))) < 30*time.Minute {
+		// No running or finished order matches. Clear the row when:
+		// 1) Both lists paginated to the end without errors, AND
+		// 2) Either the operator explicitly requested stop (STOP_REQUESTED),
+		//    or the 5-minute grace period has elapsed.
+		graceElapsed := time.Since(time.UnixMilli(int64(bot.createdMS))) >= 5*time.Minute
+		operatorRequestedStop := bot.status == "STOP_REQUESTED"
+		if !listsComplete || (!graceElapsed && !operatorRequestedStop) {
 			continue
 		}
 		tag, err := worker.db.Exec(ctx, `

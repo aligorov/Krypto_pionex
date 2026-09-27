@@ -698,7 +698,18 @@ func (s *Service) executeCommand(
 			  AND status NOT IN ('STOPPED', 'CANCELLED', 'COMPLETED', 'LIQUIDATED')
 		`, resourceID)
 		if executeErr == nil && tag.RowsAffected() == 0 {
-			executeErr = errors.New("grid bot not found, not yet submitted (adoption pending) or already terminal")
+			tagNull, nullErr := s.db.Exec(ctx, `
+				UPDATE grid_bots
+				SET status = 'STOP_REQUESTED', updated_at = NOW()
+				WHERE id = $1 AND bu_order_id IS NULL
+				  AND status IN ('PENDING_SUBMISSION', 'SUBMISSION_UNKNOWN')
+				  AND created_at < NOW() - INTERVAL '90 seconds'
+			`, resourceID)
+			if nullErr == nil && tagNull.RowsAffected() > 0 {
+				tag = tagNull
+			} else {
+				executeErr = errors.New("grid bot not found, not yet submitted (adoption pending) or already terminal")
+			}
 		}
 		status = "QUEUED"
 		result["executor"] = "native_grid_worker"
