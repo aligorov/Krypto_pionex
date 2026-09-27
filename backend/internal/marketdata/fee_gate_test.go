@@ -34,7 +34,7 @@ func TestFeeGateSpanOverLevels(t *testing.T) {
 	if !violated {
 		t.Fatal("4% span over 20 levels (0.20% step) must be rejected by the fee-gate")
 	}
-	for _, fragment := range []string{"0.20%", "0.14%", "fee-gate"} {
+	for _, fragment := range []string{"0.20%", "0.14%", "fee-gate", "целевого буфера"} {
 		if !strings.Contains(reason, fragment) {
 			t.Fatalf("rejection reason must name %q, got %q", fragment, reason)
 		}
@@ -180,10 +180,9 @@ func TestScoreCandidateGridNumFollowsShippingSpan(t *testing.T) {
 	if candidate.GridNum < 1 {
 		t.Fatalf("candidate must carry a level count, got %d", candidate.GridNum)
 	}
-	// The count follows the SHIPPED span (span/lower is the scanner's own
-	// derivation formula), the scan's fees and the scan's notional — one
-	// geometry source, self-consistent by construction.
-	srSpanPct := (upper - lower) / lower * 100
+	// The count follows the SHIPPED midline-normalized span, which is the
+	// canonical geometry used by density, EV and fee-gate.
+	srSpanPct := (upper - lower) / ((upper + lower) / 2) * 100
 	want := GridLevelsForRange(srSpanPct, config.NotionalPerBot, config.FeeBps, config.SlippageBps)
 	if candidate.GridNum != want {
 		t.Fatalf("gridNum must follow the shipping S/R span doctrine count %d (span %.4f%%, %v notional, %v/%v bps), got %d",

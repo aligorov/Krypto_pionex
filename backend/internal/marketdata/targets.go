@@ -224,9 +224,9 @@ const stepFloorEpsilon = 1e-9
 // ValidateMinGridStep checks the v2.0.89 fee-gate invariant (floor raised to
 // 2.5× round-trip in v2.0.94): the per-level step must be at least
 // StepFloorRoundTripMultiple × the round-trip cost (fee + slippage on both
-// legs). A grid whose step is below that bar pays the market more per
-// traverse than it can ever harvest from it — it is guaranteed to bleed on
-// commissions regardless of how often price oscillates.
+// legs). A grid whose step is below that bar has too little cost buffer for
+// realistic execution friction; it is rejected as economically fragile,
+// while the gate itself is not a claim that every such cycle loses money.
 func ValidateMinGridStep(stepPct, feeBps, slippageBps float64) bool {
 	return stepPct >= StepFloorRoundTripMultiple*RoundTripCostPct(feeBps, slippageBps)-stepFloorEpsilon
 }
@@ -244,7 +244,7 @@ func FeeGateRejection(stepPct, feeBps, slippageBps float64) (string, bool) {
 		return "", false
 	}
 	return fmt.Sprintf(
-		"шаг уровня %.2f%% < %.1f× round-trip издержек %.2f%% — сетка гарантированно в минус на комиссиях (fee-gate)",
+		"шаг уровня %.2f%% < %.1f× round-trip издержек %.2f%% — шаг ниже целевого буфера издержек (fee-gate)",
 		stepPct, StepFloorRoundTripMultiple, roundTripPct), true
 }
 

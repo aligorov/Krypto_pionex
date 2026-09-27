@@ -342,12 +342,14 @@ func scoreCandidate(
 	// default). The count is derived from the S/R span that actually ships;
 	// the volatility-blend range is only the degenerate fallback when the S/R
 	// range is unreadable.
-	gridNum := GridLevelsForRange(rangePct, config.NotionalPerBot, config.FeeBps, config.SlippageBps)
+	// One canonical span drives density, EV and the fee gate. Using the lower
+	// bound for density and the midline for the gate made the same persisted
+	// geometry receive two different step estimates.
 	modelSpanPct := rangePct
-	if srSpanPct := (upperFloat - lowerFloat) / lowerFloat * 100; srSpanPct > 0 {
-		gridNum = GridLevelsForRange(srSpanPct, config.NotionalPerBot, config.FeeBps, config.SlippageBps)
+	if srSpanPct := (upperFloat - lowerFloat) / ((upperFloat + lowerFloat) / 2) * 100; srSpanPct > 0 {
 		modelSpanPct = srSpanPct
 	}
+	gridNum := GridLevelsForRange(modelSpanPct, config.NotionalPerBot, config.FeeBps, config.SlippageBps)
 	gridStep := modelSpanPct / 100 / float64(gridNum)
 	friction := 2 * (config.FeeBps + config.SlippageBps) / 10_000
 
@@ -498,15 +500,13 @@ func scoreCandidate(
 	// S/R span ran ~2.5× tighter — a 7d prod audit put 46.5% of ACCEPTED
 	// candidates on sub-0.28% steps, grids that pay the feed more per
 	// traverse than they can harvest.
-	feeGateStepPct := gridStep * 100 // volatility-span fallback (degenerate S/R range)
-	if upperFloat > lowerFloat && lowerFloat > 0 {
-		srSpanPct := (upperFloat - lowerFloat) / ((upperFloat + lowerFloat) / 2) * 100
-		feeGateStepPct = GridStepPctForSpan(srSpanPct, gridNum)
-	}
+	feeGateStepPct := GridStepPctForSpan(modelSpanPct, gridNum)
 	if feeReason, violated := FeeGateRejection(feeGateStepPct, config.FeeBps, config.SlippageBps); violated {
 		reasons = append(reasons, feeReason)
 	}
-	if regime.IsSqueeze && recommendedTrend == "no_trend" {
+	// Compression can be a valid range when the tape is genuinely choppy and
+	// weak. Keep the breakout veto for directional/low-choppiness squeezes.
+	if neutralSqueezeRisk(regime) && recommendedTrend == "no_trend" {
 		reasons = append(reasons, "volatility squeeze: impending explosive breakout")
 	}
 	if recommendedTrend == "no_trend" && (regime.ADX > 32.0 || math.Abs(regime.EMASlopePct) > 3.0 ||
@@ -642,12 +642,12 @@ func scoreCandidate(
 			confluence.ShortScore, confluence.LongScore))
 		recommendedTrend = "no_trend"
 	}
-	// Hard regime veto: a persistently trending memory (Hurst > 0.45)
+	// Hard regime veto: a persistently trending memory (Hurst > 0.58)
 	// loads one-sided inventory into a fresh neutral grid — the exact
 	// failure the daily-loss breaker only sees after the damage.
 	if recommendedTrend == "no_trend" && HurstHardVetoNeutral(bundle) {
 		reasons = append(reasons, fmt.Sprintf(
-			"confluence veto: Hurst %.2f > 0.45 — persistent trend regime, neutral grid would load one-sided inventory",
+			"confluence veto: Hurst %.2f > 0.58 — persistent trend regime, neutral grid would load one-sided inventory",
 			bundle.Hurst))
 	}
 	// Kaufman Efficiency Ratio gate (v2.0.89-A, P2): ER = |p_N − p_0| /
@@ -1034,6 +1034,13 @@ func isMajorSymbol(baseCurrency, _ string) bool {
 // while the classic >32 veto still calls it a range.
 func neutralSemiTrendBlocked(trend string, adx float64) bool {
 	return trend == "no_trend" && adx >= 24.0 && adx <= 32.0
+}
+
+// neutralSqueezeRisk distinguishes a quiet, choppy compression from a
+// compression that is more likely to break. A squeeze remains a score
+// penalty in both cases; only the latter is a hard neutral-grid rejection.
+func neutralSqueezeRisk(regime RegimeResult) bool {
+	return regime.IsSqueeze && !(regime.ADX < 20.0 && regime.Choppiness > 55.0)
 }
 
 // matureTrendLongDemoted drops LONG when the trend is aged (ADX ≥28,

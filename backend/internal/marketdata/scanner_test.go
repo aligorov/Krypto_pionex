@@ -210,3 +210,15 @@ func TestLedgerAuditedEntryZones(t *testing.T) {
 		t.Fatal("demotion is LONG-only")
 	}
 }
+
+func TestNeutralSqueezeRisk(t *testing.T) {
+	if neutralSqueezeRisk(RegimeResult{IsSqueeze: true, ADX: 18, Choppiness: 60}) {
+		t.Fatal("calm, choppy squeeze must not be a hard breakout veto")
+	}
+	if !neutralSqueezeRisk(RegimeResult{IsSqueeze: true, ADX: 24, Choppiness: 60}) {
+		t.Fatal("stronger ADX squeeze must remain a breakout risk")
+	}
+	if !neutralSqueezeRisk(RegimeResult{IsSqueeze: true, ADX: 18, Choppiness: 45}) {
+		t.Fatal("low-choppiness squeeze must remain a breakout risk")
+	}
+}

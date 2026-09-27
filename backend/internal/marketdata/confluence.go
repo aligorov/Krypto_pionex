@@ -24,10 +24,10 @@ const (
 const (
 	hurstGridFriendly = 0.45
 	hurstTrendDanger  = 0.58
-	// hurstHardVeto 0.45 (v3.0 quant audit): NEUTRAL entries require confirmed
-	// mean reversion (Hurst < 0.45). Entries in the 0.45-0.55 random walk / drift zone
-	// accumulate one-sided inventory and account for the majority of stop-losses.
-	hurstHardVeto     = 0.45
+	// The interval between 0.45 and 0.58 is a transition zone, not a confirmed
+	// trend. It receives a soft range-score penalty below; only the documented
+	// TREND_DANGER boundary is a hard neutral-grid veto.
+	hurstHardVeto = hurstTrendDanger
 
 	confluenceSupportThreshold = 0.50
 	confluenceConflictFloor    = 0.45
@@ -189,6 +189,14 @@ func EvaluateConfluence(regime RegimeResult, bundle IndicatorBundle) ConfluenceR
 	if result.HurstGate == HurstGateGridFriendly {
 		vote("hurst_mean_reverting", 0, 0.25, true, "H<0.45")
 		rangeSupport += 0.25
+	} else if bundle.HurstOK && bundle.Hurst <= hurstTrendDanger {
+		penalty := 0.10
+		if bundle.Hurst > 0.55 {
+			penalty = 0.20
+		}
+		vote("hurst_transition_penalty", 0, penalty, true,
+			"0.45<=H<=0.58: range support reduced, hard veto not fired")
+		rangeSupport -= penalty
 	}
 	if regime.BBWPercentile > 0 && regime.BBWPercentile < 25 {
 		vote("bbw_low_percentile", 0, 0.25, true, "bands tighter than 75% of window")

@@ -162,14 +162,36 @@ func TestConfluenceRangeOnCompression(t *testing.T) {
 }
 
 func TestHurstHardVetoNeutral(t *testing.T) {
-	if !HurstHardVetoNeutral(IndicatorBundle{Hurst: 0.50, HurstOK: true}) {
-		t.Fatalf("H=0.50 must veto neutral entries")
+	if HurstHardVetoNeutral(IndicatorBundle{Hurst: 0.50, HurstOK: true}) {
+		t.Fatalf("H=0.50 is a transition zone and must not hard-veto neutral entries")
+	}
+	if !HurstHardVetoNeutral(IndicatorBundle{Hurst: 0.581, HurstOK: true}) {
+		t.Fatalf("H>0.58 must veto neutral entries")
 	}
 	if HurstHardVetoNeutral(IndicatorBundle{Hurst: 0.70, HurstOK: false}) {
 		t.Fatalf("unreliable estimate must not veto")
 	}
 	if HurstHardVetoNeutral(IndicatorBundle{Hurst: 0.40, HurstOK: true}) {
 		t.Fatalf("H=0.40 must not veto")
+	}
+}
+
+func TestHurstTransitionIsSoftPenalty(t *testing.T) {
+	res := EvaluateConfluence(RegimeResult{}, IndicatorBundle{Hurst: 0.50, HurstOK: true})
+	found := false
+	for _, vote := range res.Votes {
+		if vote.Name == "hurst_transition_penalty" && vote.Fired && vote.Weight != 0.10 {
+			t.Fatalf("transition Hurst penalty = %.2f, want 0.10", vote.Weight)
+		}
+		if vote.Name == "hurst_transition_penalty" && vote.Fired {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("transition Hurst must emit a soft penalty vote")
+	}
+	if HurstHardVetoNeutral(IndicatorBundle{Hurst: 0.50, HurstOK: true}) {
+		t.Fatal("transition Hurst must remain below the hard-veto boundary")
 	}
 }
 
@@ -190,11 +212,11 @@ func klinesFromSeries(s *Series) []pionex.KlineCandle {
 
 func TestConfluenceFibonacciAndMACDLong(t *testing.T) {
 	bundle := IndicatorBundle{
-		Hurst:   0.48,
-		HurstOK: true,
-		OBVDiv:  OBVDivergence{Direction: 1, Strength: 0.8},
-		Fib:     FibonacciRetracement{InGoldenPocket: true, TrendDir: 1},
-		MACD:    MACDResult{CrossedUp: true},
+		Hurst:    0.48,
+		HurstOK:  true,
+		OBVDiv:   OBVDivergence{Direction: 1, Strength: 0.8},
+		Fib:      FibonacciRetracement{InGoldenPocket: true, TrendDir: 1},
+		MACD:     MACDResult{CrossedUp: true},
 		StochRSI: StochRSIResult{CrossedUp: true},
 	}
 	regime := RegimeResult{Regime: "TREND_UP"}
@@ -215,12 +237,12 @@ func TestConfluenceDirectionalConflict(t *testing.T) {
 	bundle := IndicatorBundle{
 		Hurst:    0.48,
 		HurstOK:  true,
-		OBVDiv:   OBVDivergence{Direction: 1, Strength: 0.9}, // long
-		IFT:      IFTRSIResult{CrossedUp: true},              // long
+		OBVDiv:   OBVDivergence{Direction: 1, Strength: 0.9},              // long
+		IFT:      IFTRSIResult{CrossedUp: true},                           // long
 		Fib:      FibonacciRetracement{InGoldenPocket: true, TrendDir: 1}, // long
-		MACD:     MACDResult{CrossedDown: true},              // short
-		StochRSI: StochRSIResult{CrossedDown: true},          // short
-		AVWAP:    AVWAPResult{ZScore: 2.0},                   // short
+		MACD:     MACDResult{CrossedDown: true},                           // short
+		StochRSI: StochRSIResult{CrossedDown: true},                       // short
+		AVWAP:    AVWAPResult{ZScore: 2.0},                                // short
 	}
 	regime := RegimeResult{Regime: "RANGE"}
 	res := EvaluateConfluence(regime, bundle)
@@ -232,4 +254,3 @@ func TestConfluenceDirectionalConflict(t *testing.T) {
 		t.Fatalf("long side must outscore, got long=%.2f short=%.2f", res.LongScore, res.ShortScore)
 	}
 }
-
