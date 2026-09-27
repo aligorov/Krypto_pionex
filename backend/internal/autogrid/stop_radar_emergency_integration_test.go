@@ -17,6 +17,9 @@ import (
 // 1. NEUTRAL REAL bot with total = -$0.50 triggers emergency exit (STOP_REQUESTED)
 //    without being blocked by the old -$1.00 DGT threshold.
 // 2. DGT redeploy intent is queued in model_state.
+// 3. When the bot reaches terminal status ('STOPPED'), processDgtRealRedeployIntents
+//    picks up the row using dgtBreakReasonSQL (including EMERGENCY_OFI_DUMP)
+//    and processes the queued intent.
 func TestRadarMicrostructureEmergencyExit_NeutralDgtDecoupled_Integration(t *testing.T) {
 	dbURL := integrationDatabaseURL(t)
 	ctx := context.Background()
@@ -56,20 +59,23 @@ func TestRadarMicrostructureEmergencyExit_NeutralDgtDecoupled_Integration(t *tes
 
 	var botID string
 	buOrderID := fmt.Sprintf("EM-%d", time.Now().UnixNano())
+	fp := fmt.Sprintf("fp-em-%d", time.Now().UnixNano())
 	err = pool.QueryRow(ctx, `
 		INSERT INTO grid_bots (
-			account_id, settings_id, symbol, bu_order_id, status, direction, grid_type,
+			account_id, autogrid_settings_id, symbol, bu_order_id, status, direction, grid_type,
 			lower_price, upper_price, grid_num, leverage, quote_investment,
+			extra_margin, request_fingerprint, execution_mode, reconciliation_state,
 			entry_price, mark_price, realized_pnl_usdt, unrealized_pnl_usdt,
 			bot_number, created_at, updated_at
 		) VALUES (
 			$1, $2, 'BTC_USDT_PERP', $3, 'RUNNING', 'NEUTRAL', 'ARITHMETIC',
 			90, 110, 10, 2, 250,
+			0, $4, 'REAL', 'REST_AUTHORITATIVE_OK',
 			100, 96, 0, -0.50,
 			999, NOW(), NOW()
 		)
 		RETURNING id
-	`, account.ID, settings.ID, buOrderID).Scan(&botID)
+	`, account.ID, settings.ID, buOrderID, fp).Scan(&botID)
 	if err != nil {
 		t.Fatalf("insert real bot: %v", err)
 	}
@@ -119,6 +125,32 @@ func TestRadarMicrostructureEmergencyExit_NeutralDgtDecoupled_Integration(t *tes
 	if modelState["dgtSlotBudget"] != "250" {
 		t.Fatalf("expected dgtSlotBudget 250, got %v", modelState["dgtSlotBudget"])
 	}
+
+	// Simulate bot transition to terminal state (STOPPED on exchange)
+	_, err = pool.Exec(ctx, `
+		UPDATE grid_bots
+		SET status = 'STOPPED', closed_at = NOW(), updated_at = NOW()
+		WHERE id = $1
+	`, botID)
+	if err != nil {
+		t.Fatalf("update to STOPPED: %v", err)
+	}
+
+	// Run processDgtRealRedeployIntents: must pick up the bot with closed_reason EMERGENCY_OFI_DUMP!
+	worker.processDgtRealRedeployIntents(ctx, *settings)
+
+	// Verify intent was processed (dgtRedeployDoneAt is set)
+	var doneAt, outcome *string
+	err = pool.QueryRow(ctx, `
+		SELECT model_state->>'dgtRedeployDoneAt', model_state->>'dgtRedeployOutcome'
+		FROM grid_bots WHERE id = $1
+	`, botID).Scan(&doneAt, &outcome)
+	if err != nil {
+		t.Fatalf("query intent result: %v", err)
+	}
+	if doneAt == nil {
+		t.Fatalf("expected dgtRedeployDoneAt to be recorded after processDgtRealRedeployIntents (intent must be picked up via dgtBreakReasonSQL)")
+	}
 }
 
 // TestRadarMicrostructureEmergencyExit_DBZeroRowsRetry_Integration verifies:
@@ -163,20 +195,23 @@ func TestRadarMicrostructureEmergencyExit_DBZeroRowsRetry_Integration(t *testing
 	// Bot is already STOPPED, so WHERE status = 'RUNNING' will affect 0 rows
 	var botID string
 	buOrderID := fmt.Sprintf("EM-ZERO-%d", time.Now().UnixNano())
+	fp := fmt.Sprintf("fp-em-zero-%d", time.Now().UnixNano())
 	err = pool.QueryRow(ctx, `
 		INSERT INTO grid_bots (
-			account_id, settings_id, symbol, bu_order_id, status, direction, grid_type,
+			account_id, autogrid_settings_id, symbol, bu_order_id, status, direction, grid_type,
 			lower_price, upper_price, grid_num, leverage, quote_investment,
+			extra_margin, request_fingerprint, execution_mode, reconciliation_state,
 			entry_price, mark_price, realized_pnl_usdt, unrealized_pnl_usdt,
 			bot_number, created_at, updated_at
 		) VALUES (
 			$1, $2, 'BTC_USDT_PERP', $3, 'STOPPED', 'LONG', 'ARITHMETIC',
 			90, 110, 10, 2, 250,
+			0, $4, 'REAL', 'REST_AUTHORITATIVE_OK',
 			100, 96, 0, -10.0,
 			998, NOW(), NOW()
 		)
 		RETURNING id
-	`, account.ID, settings.ID, buOrderID).Scan(&botID)
+	`, account.ID, settings.ID, buOrderID, fp).Scan(&botID)
 	if err != nil {
 		t.Fatalf("insert real bot: %v", err)
 	}

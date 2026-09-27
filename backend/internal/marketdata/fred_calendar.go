@@ -140,6 +140,16 @@ func classifyFREDRelease(name string) fredReleaseClass {
 	if lower == "" {
 		return fredReleaseClass{}
 	}
+	// Guard against daily / continuous FRED publications that would arm
+	// false HIGH gate events every day:
+	// - "Federal Funds Effective Rate" is published daily.
+	// - "FOMC Press Release" in FRED is an aggregate feed with daily release dates.
+	//   Actual FOMC rate decision windows are tracked authoritatively in fomc_meetings.
+	if strings.Contains(lower, "federal funds effective rate") ||
+		strings.Contains(lower, "fomc press release") ||
+		lower == "press release" {
+		return fredReleaseClass{}
+	}
 	if containsAnyKeyword(lower, fredFOMCKeywords) {
 		return fredReleaseClass{impact: "High", hourUTC: 18, minuteUTC: 0, classified: true}
 	}

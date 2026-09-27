@@ -3431,7 +3431,7 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 				reconState := pendingOrConfirmedRecon(decision.marker)
 				if _, err := worker.db.Exec(ctx, `
 					UPDATE grid_bots
-					SET status = 'STOPPED', closed_reason = $2,
+					SET status = 'STOPPED', closed_reason = COALESCE(NULLIF(closed_reason, ''), $2),
 					    reconciliation_state = $7,
 					    realized_pnl_usdt = CASE WHEN $4::BOOLEAN THEN NULL ELSE COALESCE($3, realized_pnl_usdt) END,
 					    unrealized_pnl_usdt = 0,

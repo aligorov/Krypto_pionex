@@ -348,6 +348,32 @@ func (worker *Worker) radarMicrostructureEmergencyExit(ctx context.Context, sett
 			"closed_at":     nowStr,
 			"message":       fmt.Sprintf("экстренный защитный выход (PAPER, %s): институциональный поток против позиции — сетка закрыта", b.ofiRegime),
 		})
+
+		// DGT re-deploy for NEUTRAL PAPER bots (if enabled):
+		if b.direction == "NEUTRAL" && settings.DgtRedeployEnabled {
+			var investment decimal.Decimal
+			var trancheBase *string
+			var atrEntry float64
+			var candidateID *string
+			if err := worker.db.QueryRow(ctx, `
+				SELECT quote_investment, NULLIF(model_state->>'trancheBase', ''),
+				       COALESCE(NULLIF(model_state->>'atrPctEntry', '')::FLOAT8, 0),
+				       candidate_id
+				FROM paper_grid_bots WHERE id = $1
+			`, b.botID).Scan(&investment, &trancheBase, &atrEntry, &candidateID); err == nil {
+				worker.dgtRedeployPaper(ctx, settings, dgtRedeploySpec{
+					symbol:       b.symbol,
+					direction:    b.direction,
+					breakPrice:   b.price,
+					slotBudget:   slotCapital(trancheBase, investment),
+					oldBotID:     b.botID,
+					oldBotNumber: b.botNumber,
+					candidateID:  candidateID,
+					atrFallback:  atrEntry,
+				})
+			}
+		}
+
 		return true
 	}
 

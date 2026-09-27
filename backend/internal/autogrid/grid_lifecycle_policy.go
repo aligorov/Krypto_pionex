@@ -95,7 +95,8 @@ const (
 func dgtBreakRedeployReason(reason string) bool {
 	switch reason {
 	case "RANGE_BREAK_DOWN", "RANGE_BREAK_UP", "RANGE_BREAK_UP_TREND_STOP",
-		"RANGE_SHIFT_DOWN_NO_ADJUSTMENTS_LEFT", "RANGE_SHIFT_UP_NO_ADJUSTMENTS_LEFT":
+		"RANGE_SHIFT_DOWN_NO_ADJUSTMENTS_LEFT", "RANGE_SHIFT_UP_NO_ADJUSTMENTS_LEFT",
+		"EMERGENCY_OFI_DUMP", "EMERGENCY_OFI_PUMP":
 		return true
 	}
 	return false
@@ -465,7 +466,8 @@ func queueDgtRedeployTelegram(ctx context.Context, worker *Worker, spec dgtRedep
 // dgtBreakReasonSQL is the SQL twin of dgtBreakRedeployReason — one literal,
 // referenced by every query that filters close reasons by the DGT family.
 const dgtBreakReasonSQL = `'RANGE_BREAK_DOWN', 'RANGE_BREAK_UP', 'RANGE_BREAK_UP_TREND_STOP',
-	'RANGE_SHIFT_DOWN_NO_ADJUSTMENTS_LEFT', 'RANGE_SHIFT_UP_NO_ADJUSTMENTS_LEFT'`
+	'RANGE_SHIFT_DOWN_NO_ADJUSTMENTS_LEFT', 'RANGE_SHIFT_UP_NO_ADJUSTMENTS_LEFT',
+	'EMERGENCY_OFI_DUMP', 'EMERGENCY_OFI_PUMP'`
 
 // dgtRealIntentMaxAge bounds how long a queued REAL re-deploy intent stays
 // executable: the native cancel normally settles within one manage pass

@@ -2,6 +2,7 @@ package autogrid
 
 import (
 	"math"
+	"strings"
 	"testing"
 	"time"
 
@@ -130,10 +131,14 @@ func TestDgtBreakRedeployReasonFamily(t *testing.T) {
 	triggers := []string{
 		"RANGE_BREAK_UP", "RANGE_BREAK_DOWN", "RANGE_BREAK_UP_TREND_STOP",
 		"RANGE_SHIFT_UP_NO_ADJUSTMENTS_LEFT", "RANGE_SHIFT_DOWN_NO_ADJUSTMENTS_LEFT",
+		"EMERGENCY_OFI_DUMP", "EMERGENCY_OFI_PUMP",
 	}
 	for _, reason := range triggers {
 		if !dgtBreakRedeployReason(reason) {
 			t.Fatalf("%s must trigger the DGT re-deploy", reason)
+		}
+		if !strings.Contains(dgtBreakReasonSQL, "'"+reason+"'") {
+			t.Fatalf("%s must be included in dgtBreakReasonSQL", reason)
 		}
 	}
 	nonTriggers := []string{

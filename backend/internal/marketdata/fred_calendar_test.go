@@ -49,7 +49,8 @@ func TestClassifyFREDRelease(t *testing.T) {
 		{"G.17 Industrial Production and Capacity Utilization", "Medium", 13, 30},
 		{"U.S. International Trade in Goods and Services", "Medium", 13, 30}, // trade balance
 		{"Manufacturing and Trade Inventories and Sales", "", 0, 0},          // LOW/ignored
-		{"Federal Funds Effective Rate", "", 0, 0},                           // DAILY — must never map
+		{"Federal Funds Effective Rate", "", 0, 0}, // DAILY — must never map
+		{"FOMC Press Release", "", 0, 0},           // DAILY — must never map (tracked in fomc_meetings)
 		{"Dallas Fed Manufacturing Survey", "", 0, 0},                        // regional noise
 		{"NBER-based Recession Indicators", "", 0, 0},
 		{"H.6 Money Stock Measures", "", 0, 0},
