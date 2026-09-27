@@ -911,3 +911,90 @@ func TestOFIEngine_DesyncPersistsAcrossStalenessAndWarmup(t *testing.T) {
 }
 
 
+
+// v2.0.137: Stats must quantify WHY trades get dropped — dedup, too-old and
+// window-isolation — plus raw ingest volume for both lanes.
+func TestOFIEngine_Stats_CountsDropReasons(t *testing.T) {
+	engine := NewOFIEngine(DefaultOFIEngineConfig())
+	sym := "STATS_USDT_PERP"
+	now := time.Now()
+
+	engine.IngestL2(sym,
+		[]pionex.DepthLevel{{Price: d("50.0"), Amount: d("100.0")}},
+		[]pionex.DepthLevel{{Price: d("50.05"), Amount: d("100.0")}},
+		now,
+	)
+
+	// Too old (3 minutes back) → droppedTooOld.
+	engine.IngestTrade(sym, pionex.Trade{
+		Symbol: sym, TradeID: "old-1", Side: "SELL",
+		Price: d("50.0"), Size: d("10.0"), Time: now.Add(-3 * time.Minute).UnixMilli(),
+	})
+	// Accepted trade (baseline for dedup + isolation).
+	engine.IngestTrade(sym, pionex.Trade{
+		Symbol: sym, TradeID: "ok-1", Side: "BUY",
+		Price: d("50.05"), Size: d("10.0"), Time: now.UnixMilli(),
+	})
+	// Same tradeId again → droppedDedup.
+	engine.IngestTrade(sym, pionex.Trade{
+		Symbol: sym, TradeID: "ok-1", Side: "BUY",
+		Price: d("50.05"), Size: d("10.0"), Time: now.UnixMilli(),
+	})
+	// Trade timestamped before the current window start → droppedIsolation.
+	engine.IngestTrade(sym, pionex.Trade{
+		Symbol: sym, TradeID: "iso-1", Side: "BUY",
+		Price: d("50.05"), Size: d("10.0"), Time: now.Add(-10 * time.Second).UnixMilli(),
+	})
+
+	stats := engine.Stats()
+	if stats.Trades != 1 {
+		t.Fatalf("expected exactly 1 accepted trade, got %d", stats.Trades)
+	}
+	if stats.TradesDroppedDedup != 1 || stats.TradesDroppedTooOld != 1 || stats.TradesDroppedIsolation != 1 {
+		t.Fatalf("expected one drop per reason, got dedup=%d tooOld=%d isolation=%d",
+			stats.TradesDroppedDedup, stats.TradesDroppedTooOld, stats.TradesDroppedIsolation)
+	}
+	if stats.OrderbookFrames == 0 || stats.Symbols != 1 {
+		t.Fatalf("expected 1 symbol with ingested book frames, got %+v", stats)
+	}
+}
+
+// v2.0.137 lock-order regression: UpdateConfig (e.mu → st.mu) used to invert
+// against the desync path (st.mu → e.mu.RLock). Concurrent ingest + config
+// updates must complete without deadlock; run with -race to catch the race
+// detector's view of the shared config writes.
+func TestOFIEngine_UpdateConfig_ConcurrentSafe(t *testing.T) {
+	engine := NewOFIEngine(DefaultOFIEngineConfig())
+	sym := "CFG_USDT_PERP"
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 2000; i++ {
+			ts := time.Now()
+			engine.IngestL2(sym,
+				[]pionex.DepthLevel{{Price: d("50.0"), Amount: d("100.0")}},
+				[]pionex.DepthLevel{{Price: d("50.05"), Amount: d("100.0")}},
+				ts,
+			)
+			// Broken delta (sequence gap) drives the desync path that used to
+			// take e.mu.RLock under st.mu.
+			engine.IngestOrderbookUpdate(pionex.OrderbookUpdate{
+				Symbol: sym, Action: "UPDATE",
+				Bids: []pionex.DepthLevel{{Price: d("50.0"), Amount: d("90.0")}},
+				Asks: []pionex.DepthLevel{{Price: d("50.05"), Amount: d("90.0")}},
+				Number: int64(9000 + i), PrevNumber: int64(1),
+			})
+		}
+	}()
+
+	for i := 0; i < 50; i++ {
+		engine.UpdateConfig(OFIEngineConfig{MinTakerVolumeUSDT: float64(4000 + i)})
+	}
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("concurrent UpdateConfig vs ingest deadlocked (lock-order regression)")
+	}
+}

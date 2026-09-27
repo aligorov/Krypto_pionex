@@ -247,6 +247,10 @@ type dgtRedeploySpec struct {
 	candidateID  *string // lineage: the redeployed bot keeps the closed bot's candidate link
 	atrFallback  float64 // deploy-time atrPctEntry of the closed bot (fresh ATR preferred)
 	accountID    string  // REAL only
+	// emergencyExit marks intents born from an EMERGENCY_OFI_* protective
+	// close (v2.0.137): their re-entry must not treat missing market data
+	// as "danger gone" — only a fresh, synced, warmed-up NEUTRAL clears it.
+	emergencyExit bool
 }
 
 // slotCapital resolves the closed bot's slot budget: the stored tranche base
@@ -286,6 +290,20 @@ func (worker *Worker) dgtSharedGateBlockers(ctx context.Context, settings Settin
 		analysis := worker.ofiEngine.Analyze(spec.symbol)
 		if allowed, ofiReason := analysis.CanEnter(spec.direction); !allowed {
 			return "OFI re-entry veto: " + ofiReason
+		}
+		// v2.0.137 (review follow-up): an EMERGENCY_OFI_* exit fired on LIVE
+		// flow — the re-open must prove the danger is GONE, not merely that
+		// we stopped seeing it. A stale/warming/desynced feed (and anything
+		// short of a fresh synced NEUTRAL) keeps the re-entry blocked; a
+		// silent TRADE lane is equally disqualifying (the exit fired on
+		// taker flow, so normalization must be observed on taker flow too).
+		// The slot stays with the scanner, which re-checks on deploy.
+		if spec.emergencyExit {
+			tradesFresh := !analysis.LastTradeAt.IsZero() && time.Since(analysis.LastTradeAt) <= 30*time.Second
+			if !analysis.IsFresh || !analysis.IsSynced || analysis.Regime != marketdata.RegimeNeutral || !tradesFresh {
+				return fmt.Sprintf("OFI re-entry: нет свежего подтверждения нормализации потока (regime=%s, fresh=%v, synced=%v, taker_last=%v) — защитный выход был по живому потоку, переоткрытие требует прогретого NEUTRAL-сигнала с живой лентой сделок",
+					analysis.Regime, analysis.IsFresh, analysis.IsSynced, analysis.LastTradeAt.Format(time.RFC3339))
+			}
 		}
 	}
 	// Economic-event gate: same window the deploy paths run (T−2h…T+1h).
@@ -542,7 +560,8 @@ func (worker *Worker) processDgtRealRedeployIntents(ctx context.Context, setting
 		       NULLIF(model_state->>'trancheBase', ''),
 		       COALESCE(NULLIF(model_state->>'atrPctEntry', '')::FLOAT8, 0),
 		       NULLIF(model_state->>'dgtBreakPrice', ''),
-		       model_state->>'dgtRedeployPendingAt'
+		       model_state->>'dgtRedeployPendingAt',
+		       COALESCE(closed_reason, '')
 		FROM grid_bots
 		WHERE COALESCE(closed_reason, '') IN (`+dgtBreakReasonSQL+`)
 		  AND model_state->>'dgtRedeployPendingAt' IS NOT NULL
@@ -564,6 +583,7 @@ func (worker *Worker) processDgtRealRedeployIntents(ctx context.Context, setting
 		trancheBase                  *string
 		pendingAt                    *string
 		breakPriceRaw                *string
+		closedReason                 string
 		investment                   decimal.Decimal
 		atrEntry                     float64
 	}
@@ -572,7 +592,7 @@ func (worker *Worker) processDgtRealRedeployIntents(ctx context.Context, setting
 		var item dgtIntent
 		if err := rows.Scan(&item.botID, &item.botNumber, &item.symbol, &item.direction,
 			&item.accountID, &item.investment, &item.trancheBase, &item.atrEntry,
-			&item.breakPriceRaw, &item.pendingAt); err != nil {
+			&item.breakPriceRaw, &item.pendingAt, &item.closedReason); err != nil {
 			continue
 		}
 		intents = append(intents, item)
@@ -581,13 +601,14 @@ func (worker *Worker) processDgtRealRedeployIntents(ctx context.Context, setting
 
 	for _, item := range intents {
 		spec := dgtRedeploySpec{
-			symbol:       item.symbol,
-			direction:    item.direction,
-			slotBudget:   slotCapital(item.trancheBase, item.investment),
-			oldBotID:     item.botID,
-			oldBotNumber: item.botNumber,
-			atrFallback:  item.atrEntry,
-			accountID:    item.accountID,
+			symbol:        item.symbol,
+			direction:     item.direction,
+			slotBudget:    slotCapital(item.trancheBase, item.investment),
+			oldBotID:      item.botID,
+			oldBotNumber:  item.botNumber,
+			atrFallback:   item.atrEntry,
+			accountID:     item.accountID,
+			emergencyExit: item.closedReason == "EMERGENCY_OFI_DUMP" || item.closedReason == "EMERGENCY_OFI_PUMP",
 		}
 		switch {
 		case !settings.DgtRedeployEnabled:

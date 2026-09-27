@@ -40,6 +40,7 @@ func TestRadarMicrostructureEmergencyExit_NeutralDgtDecoupled_Integration(t *tes
 
 	bot1 := insertEmergencyRealBot(t, pool, h.account.ID, settings.ID, 990)
 	bot2 := insertEmergencyRealBot(t, pool, h.account.ID, settings.ID, 991)
+	bot3 := insertEmergencyRealBot(t, pool, h.account.ID, settings.ID, 993)
 
 	runEmergencyExit := func(botID string, botNumber int) {
 		t.Helper()
@@ -70,6 +71,7 @@ func TestRadarMicrostructureEmergencyExit_NeutralDgtDecoupled_Integration(t *tes
 	}
 	runEmergencyExit(bot1, 990)
 	runEmergencyExit(bot2, 991)
+	runEmergencyExit(bot3, 993)
 
 	// ── Part 1: the dump is still confirmed → re-entry must be blocked ──
 	seedConfirmedDump(t, h.worker, "BTC_USDT_PERP")
@@ -109,6 +111,45 @@ func TestRadarMicrostructureEmergencyExit_NeutralDgtDecoupled_Integration(t *tes
 	}
 	if calls := h.mock.createCalls.Load(); calls != 0 {
 		t.Fatalf("bot1: blocked re-deploy must not reach the exchange create, got %d calls", calls)
+	}
+
+	// ── Part 1.5: feed went STALE → an EMERGENCY_OFI_* re-entry must stay
+	// blocked: missing data is not proof the danger is gone (v2.0.137) ──
+	seedStaleBook(t, h.worker, "BTC_USDT_PERP")
+	settleBot(bot3)
+
+	h.worker.processDgtRealRedeployIntents(ctx, settings)
+
+	outcome3 := readDgtOutcome(t, pool, bot3)
+	if outcome3 == nil {
+		t.Fatal("bot3: expected dgtRedeployOutcome after intent processing")
+	}
+	if *outcome3 != "blocked" {
+		t.Fatalf("bot3: expected outcome blocked under a STALE feed, got %q", *outcome3)
+	}
+	var staleReason string
+	if err := pool.QueryRow(ctx, `
+		SELECT details->>'reason' FROM bot_execution_events
+		WHERE bot_id = $1 AND event_type = 'DGT_REDEPLOY_SKIPPED'
+		ORDER BY created_at DESC LIMIT 1
+	`, bot3).Scan(&staleReason); err != nil {
+		t.Fatalf("bot3: DGT_REDEPLOY_SKIPPED event missing: %v", err)
+	}
+	if !strings.Contains(staleReason, "нормализации") {
+		t.Fatalf("bot3: expected the no-fresh-confirmation skip reason, got %q", staleReason)
+	}
+	if calls := h.mock.createCalls.Load(); calls != 0 {
+		t.Fatalf("bot3: stale-blocked re-deploy must not reach the exchange, got %d calls", calls)
+	}
+	// Simulate the hour passing: the consumed emergency closes (bot1, bot3)
+	// age out of the 1h protective-close circuit breaker so the breaker does
+	// not mask the Part-2 deploy-path assertions.
+	if _, err := pool.Exec(ctx, `
+		UPDATE grid_bots
+		SET closed_at = NOW() - INTERVAL '2 hours'
+		WHERE id IN ($1, $2)
+	`, bot1, bot3); err != nil {
+		t.Fatalf("age out processed closes: %v", err)
 	}
 
 	// ── Part 2: the flow cleared → the second intent must deploy ──
@@ -330,6 +371,23 @@ func seedConfirmedDump(t *testing.T, worker *Worker, symbol string) {
 	analysis := worker.ofiEngine.Analyze(symbol)
 	if analysis.Regime != "CONFIRMED_DUMP" || !analysis.IsActionable() {
 		t.Fatalf("seed: expected actionable CONFIRMED_DUMP, got %s (fresh=%v synced=%v reason=%s)",
+			analysis.Regime, analysis.IsFresh, analysis.IsSynced, analysis.Reason)
+	}
+}
+
+// seedStaleBook stamps the symbol's book with an update older than
+// MaxStaleness (15s) so Analyze reports the STALE regime — the "feed died,
+// danger unproven" state an emergency re-entry must fail closed on.
+func seedStaleBook(t *testing.T, worker *Worker, symbol string) {
+	t.Helper()
+	worker.ofiEngine.IngestL2(symbol,
+		[]pionex.DepthLevel{{Price: d("95.98"), Amount: d("300.0")}},
+		[]pionex.DepthLevel{{Price: d("96.00"), Amount: d("300.0")}},
+		time.Now().Add(-60*time.Second),
+	)
+	analysis := worker.ofiEngine.Analyze(symbol)
+	if analysis.Regime != "STALE" {
+		t.Fatalf("seed: expected STALE book, got %s (fresh=%v synced=%v reason=%s)",
 			analysis.Regime, analysis.IsFresh, analysis.IsSynced, analysis.Reason)
 	}
 }

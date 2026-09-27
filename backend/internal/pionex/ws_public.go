@@ -96,8 +96,11 @@ type PublicStream struct {
 	backoff     time.Duration
 	// firstPayloadLogged keys symbols whose first live INDEX push was logged
 	// (observability rule: every new endpoint gets a raw-payload snippet
-	// until trusted against the docs).
+	// until trusted against the docs). The ORDERBOOK and TRADE lanes carry
+	// their own maps since v2.0.137.
 	firstPayloadLogged map[string]struct{}
+	firstOBLogged      map[string]struct{}
+	firstTradeLogged   map[string]struct{}
 	// onMark (v2.0.102) is the realtime consumer hook: invoked once per
 	// ingested INDEX push, outside stateMu. nil = no consumer.
 	onMark      func(MarkUpdate)
@@ -124,6 +127,8 @@ func NewPublicStream(url string, logger *slog.Logger) *PublicStream {
 		subscribed:         make(map[string]struct{}),
 		marks:              make(map[string]MarkUpdate),
 		firstPayloadLogged: make(map[string]struct{}),
+		firstOBLogged:      make(map[string]struct{}),
+		firstTradeLogged:   make(map[string]struct{}),
 		resyncInFlight:     make(map[string]time.Time),
 	}
 }
@@ -609,6 +614,17 @@ func (s *PublicStream) ingestOrderbook(env wsEnvelope) {
 		}
 	}
 
+	// v2.0.137: единый домен времени с TRADE-потоком — серверный timeStamp
+	// с узким клэмпом ±5с (ревью P2-2: ±60с противоречило 15s-бюджету
+	// свежести книги — ске >15с навсегда STALE-ил бы каждый фрейм);
+	// локальные часы — fallback, сохраняющий поведение v2.0.136.
+	received := time.Now()
+	if data.TimeStamp > 0 {
+		if srv := time.UnixMilli(data.TimeStamp); srv.After(received.Add(-5*time.Second)) && srv.Before(received.Add(5*time.Second)) {
+			received = srv
+		}
+	}
+
 	update := OrderbookUpdate{
 		Symbol:     sym,
 		Action:     action,
@@ -617,7 +633,7 @@ func (s *PublicStream) ingestOrderbook(env wsEnvelope) {
 		Number:     data.Number,
 		PrevNumber: data.PrevNumber,
 		IsSnapshot: isSnapshot,
-		ReceivedAt: time.Now(),
+		ReceivedAt: received,
 	}
 
 	if isSnapshot {
@@ -626,9 +642,24 @@ func (s *PublicStream) ingestOrderbook(env wsEnvelope) {
 		s.resyncMu.Unlock()
 	}
 
-	s.stateMu.RLock()
+	// v2.0.137 (review P2-1): check-and-set под write-локом — map не
+	// терпит конкурентных записей под RLock (как в ingestIndex).
+	s.stateMu.Lock()
 	listener := s.onOrderbook
-	s.stateMu.RUnlock()
+	_, obLogged := s.firstOBLogged[sym]
+	if !obLogged {
+		s.firstOBLogged[sym] = struct{}{}
+	}
+	s.stateMu.Unlock()
+	if !obLogged {
+		// Observability rule (v2.0.98): every lane logs its first live
+		// payload per symbol until the field shapes are trusted.
+		s.logger.Info("ws lane first ORDERBOOK payload", "component", "pionex_ws",
+			"symbol", sym, "action", action, "number", data.Number,
+			"prev_number", data.PrevNumber, "bids", len(data.Bids), "asks", len(data.Asks),
+			"raw", truncateForLog(string(env.Data)))
+	}
+
 	if listener != nil {
 		listener(update)
 	}
@@ -647,9 +678,27 @@ func (s *PublicStream) ingestTrades(env wsEnvelope) {
 		entries = []Trade{single}
 	}
 
-	s.stateMu.RLock()
+	// v2.0.137 (review P2-1): check-and-set под write-локом.
+	s.stateMu.Lock()
 	listener := s.onTrade
-	s.stateMu.RUnlock()
+	firstTrade := false
+	if len(entries) > 0 {
+		tsym := entries[0].Symbol
+		if tsym == "" {
+			tsym = normalizeStreamSymbol(env.Symbol)
+		}
+		if tsym != "" {
+			if _, ok := s.firstTradeLogged[tsym]; !ok {
+				s.firstTradeLogged[tsym] = struct{}{}
+				firstTrade = true
+			}
+		}
+	}
+	s.stateMu.Unlock()
+	if firstTrade {
+		s.logger.Info("ws lane first TRADE payload", "component", "pionex_ws",
+			"raw", truncateForLog(string(env.Data)))
+	}
 
 	for _, trade := range entries {
 		if trade.Symbol == "" {

@@ -296,14 +296,15 @@ func (worker *Worker) radarMicrostructureEmergencyExit(ctx context.Context, sett
 				FROM grid_bots WHERE id = $1
 			`, b.botID).Scan(&accountID, &investment); err == nil && accountID != "" {
 				worker.dgtQueueRealRedeploy(ctx, settings, dgtRedeploySpec{
-					symbol:       b.symbol,
-					direction:    b.direction,
-					slotBudget:   investment,
-					oldBotID:     b.botID,
-					oldBotNumber: b.botNumber,
-					atrFallback:  b.atrEntryPct,
-					accountID:    accountID,
-					breakPrice:   b.price,
+					symbol:        b.symbol,
+					direction:     b.direction,
+					slotBudget:    investment,
+					oldBotID:      b.botID,
+					oldBotNumber:  b.botNumber,
+					atrFallback:   b.atrEntryPct,
+					accountID:     accountID,
+					breakPrice:    b.price,
+					emergencyExit: true,
 				})
 			}
 		}
@@ -369,14 +370,15 @@ func (worker *Worker) radarMicrostructureEmergencyExit(ctx context.Context, sett
 				FROM paper_grid_bots WHERE id = $1
 			`, b.botID).Scan(&investment, &trancheBase, &atrEntry, &candidateID); err == nil {
 				worker.dgtRedeployPaper(ctx, settings, dgtRedeploySpec{
-					symbol:       b.symbol,
-					direction:    b.direction,
-					breakPrice:   b.price,
-					slotBudget:   slotCapital(trancheBase, investment),
-					oldBotID:     b.botID,
-					oldBotNumber: b.botNumber,
-					candidateID:  candidateID,
-					atrFallback:  atrEntry,
+					symbol:        b.symbol,
+					direction:     b.direction,
+					breakPrice:    b.price,
+					slotBudget:    slotCapital(trancheBase, investment),
+					oldBotID:      b.botID,
+					oldBotNumber:  b.botNumber,
+					candidateID:   candidateID,
+					atrFallback:   atrEntry,
+					emergencyExit: true,
 				})
 			}
 		}

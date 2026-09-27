@@ -93,6 +93,11 @@ type MicrostructureAnalysis struct {
 	IsSpreadIntact         bool                 `json:"isSpreadIntact"`
 	IsFresh                bool                 `json:"isFresh"`
 	IsSynced               bool                 `json:"isSynced"`
+	// LastTradeAt is the server timestamp of the last ACCEPTED taker trade
+	// (zero when none). v2.0.137: emergency re-entry gates consult it — a
+	// fresh book alone must not pass as "flow normalized" if the TRADE lane
+	// is silent.
+	LastTradeAt time.Time                `json:"lastTradeAt"`
 	Reason                 string               `json:"reason"`
 	UpdatedAt              time.Time            `json:"updatedAt"`
 }
@@ -247,6 +252,14 @@ type SymbolMicrostate struct {
 	resyncAttempts       int
 	isDesynced           bool
 	recoveringFromDesync bool
+
+	// v2.0.137 ingest observability: counters are mutated only under st.mu
+	// (single ingest lane) and read by Stats() under st.mu.RLock.
+	ingestedOB        uint64
+	ingestedTrades    uint64
+	droppedDedup      uint64
+	droppedTooOld     uint64
+	droppedIsolation  uint64
 }
 
 func newSymbolMicrostate(symbol string, cfg OFIEngineConfig) *SymbolMicrostate {
@@ -354,8 +367,16 @@ func (e *OFIEngine) getOrCreate(symbol string) *SymbolMicrostate {
 // updates mid/micro prices, computes L1 OFI, and maintains 2% depth profiles.
 func (e *OFIEngine) IngestOrderbookUpdate(update pionex.OrderbookUpdate) {
 	st := e.getOrCreate(update.Symbol)
+	// v2.0.137: handler читается ДО st.mu. Раньше desync-ветка брала e.mu
+	// под st.mu, а UpdateConfig берёт e.mu и заходит в st.mu — инверсия
+	// порядка локов (дедлок, как только настройка из БД станет живой).
+	e.mu.RLock()
+	desyncHandler := e.onDesync
+	e.mu.RUnlock()
+
 	st.mu.Lock()
 	defer st.mu.Unlock()
+	st.ingestedOB++
 
 	ts := update.ReceivedAt
 	if ts.IsZero() {
@@ -404,11 +425,8 @@ func (e *OFIEngine) IngestOrderbookUpdate(update pionex.OrderbookUpdate) {
 				st.resyncInFlight = true
 				st.lastResyncAt = now
 				st.resyncAttempts++
-				e.mu.RLock()
-				handler := e.onDesync
-				e.mu.RUnlock()
-				if handler != nil {
-					go handler(update.Symbol)
+				if desyncHandler != nil {
+					go desyncHandler(update.Symbol)
 				}
 			}
 			return
@@ -512,6 +530,7 @@ func (e *OFIEngine) IngestTrade(symbol string, trade pionex.Trade) {
 	// Trade deduplication
 	if trade.TradeID != "" {
 		if _, seen := st.recentTrades[trade.TradeID]; seen {
+			st.droppedDedup++
 			return
 		}
 		st.recentTrades[trade.TradeID] = time.Now()
@@ -532,6 +551,7 @@ func (e *OFIEngine) IngestTrade(symbol string, trade pionex.Trade) {
 
 	// 1. Ignore trades older than 2 minutes to prevent backfill/replay pollution
 	if time.Since(ts) > 2*time.Minute {
+		st.droppedTooOld++
 		return
 	}
 
@@ -539,6 +559,7 @@ func (e *OFIEngine) IngestTrade(symbol string, trade pionex.Trade) {
 	// If the trade timestamp is earlier than the current window start time,
 	// do NOT add past volume into the current forward-looking micro-window!
 	if !st.currentWindow.StartTime.IsZero() && ts.UnixMilli() < st.currentWindow.StartTime.UnixMilli() {
+		st.droppedIsolation++
 		return
 	}
 
@@ -567,6 +588,7 @@ func (e *OFIEngine) IngestTrade(symbol string, trade pionex.Trade) {
 		st.currentWindow.TakerBuyRatio = st.currentWindow.TakerBuyUSDT / tot
 	}
 	st.currentWindow.TradeCount++
+	st.ingestedTrades++
 	st.lastTradeUpdate = ts
 	// Only update latestAnalysis.UpdatedAt if order book is active
 	if !st.lastBookUpdate.IsZero() {
@@ -876,7 +898,7 @@ func (e *OFIEngine) Analyze(symbol string) MicrostructureAnalysis {
 	defer st.mu.RUnlock()
 
 	analysis := st.latestAnalysis
-
+	analysis.LastTradeAt = st.lastTradeUpdate
 	// 1. Strict Desync & Recovery check takes precedence over staleness:
 	// A desynchronized order book or one recovering from a desync must NEVER
 	// be converted to RegimeStale and allowed to fail-open into trading!
@@ -960,4 +982,39 @@ func (e *OFIEngine) ResetAll() {
 	for _, sym := range syms {
 		e.ResetSymbol(sym)
 	}
+}
+
+// OFIEngineStats is the aggregated ingest observability snapshot: proves
+// (or disproves) that the ORDERBOOK and TRADE lanes actually deliver, and
+// quantifies why trades get dropped.
+type OFIEngineStats struct {
+	Symbols                    int
+	OrderbookFrames            uint64
+	Trades                     uint64
+	TradesDroppedDedup         uint64
+	TradesDroppedTooOld        uint64
+	TradesDroppedIsolation     uint64
+}
+
+// Stats aggregates per-symbol ingest counters across the engine.
+func (e *OFIEngine) Stats() OFIEngineStats {
+	e.mu.RLock()
+	states := make([]*SymbolMicrostate, 0, len(e.symbols))
+	for _, st := range e.symbols {
+		states = append(states, st)
+	}
+	e.mu.RUnlock()
+
+	var out OFIEngineStats
+	out.Symbols = len(states)
+	for _, st := range states {
+		st.mu.RLock()
+		out.OrderbookFrames += st.ingestedOB
+		out.Trades += st.ingestedTrades
+		out.TradesDroppedDedup += st.droppedDedup
+		out.TradesDroppedTooOld += st.droppedTooOld
+		out.TradesDroppedIsolation += st.droppedIsolation
+		st.mu.RUnlock()
+	}
+	return out
 }

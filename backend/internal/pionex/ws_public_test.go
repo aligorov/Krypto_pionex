@@ -2,6 +2,7 @@ package pionex
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -339,3 +340,53 @@ func testLogger(t *testing.T) *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
+
+// v2.0.137: the ORDERBOOK lane must carry the SERVER timestamp (clamped to
+// ±1min like INDEX) so book windows and trade timestamps live in one time
+// domain; a bogus/far-away server stamp falls back to local receive time.
+func TestPublicStreamOrderbookServerTimestamp(t *testing.T) {
+	stream := NewPublicStream("ws://unused", testLogger(t))
+
+	var got OrderbookUpdate
+	done := make(chan struct{}, 2)
+	stream.SetOrderbookListener(func(ob OrderbookUpdate) {
+		got = ob
+		done <- struct{}{}
+	})
+
+	frame := func(ts int64) []byte {
+		payload := fmt.Sprintf(`{
+			"topic": "ORDERBOOK",
+			"symbol": "BTC_USDT_PERP",
+			"timestamp": 1700000000000,
+			"data": {
+				"base": "BTC",
+				"quote": "USDT",
+				"bids": [["50000.0", "1.5"]],
+				"asks": [["50010.0", "1.0"]],
+				"number": 2001,
+				"prevNumber": 2000,
+				"timeStamp": %d
+			}
+		}`, ts)
+		return []byte(payload)
+	}
+
+	// Valid server stamp (now in ms): ReceivedAt must equal it.
+	validTS := time.Now().Add(2 * time.Second).UnixMilli()
+	stream.handleFrame(frame(validTS))
+	<-done
+	if !got.ReceivedAt.Equal(time.UnixMilli(validTS)) {
+		t.Fatalf("expected server timestamp %v to be used, got %v", time.UnixMilli(validTS), got.ReceivedAt)
+	}
+
+	// Far-away server stamp (10 minutes behind): must clamp to local now.
+	// If it were trusted, OFI windows would shift by the full skew.
+	bogusTS := time.Now().Add(-10 * time.Minute).UnixMilli()
+	before := time.Now()
+	stream.handleFrame(frame(bogusTS))
+	<-done
+	if got.ReceivedAt.Before(before.Add(-2 * time.Second)) {
+		t.Fatalf("bogus server stamp must fall back to local receive time, got %v", got.ReceivedAt)
+	}
+}

@@ -105,6 +105,9 @@ type Worker struct {
 	ouReadings map[string]ouSymbolReading
 	wsLane     *pionex.PublicStream
 	ofiEngine  *marketdata.OFIEngine
+	// ofiStatsAt throttles the periodic OFI ingest-stats log (single manage
+	// goroutine → plain field); v2.0.137 lane observability.
+	ofiStatsAt time.Time
 	// terminalRecheckAt throttles the v2.0.99 finished-record re-check sweep
 	// (single manage goroutine → plain field).
 	terminalRecheckAt time.Time
@@ -3234,6 +3237,21 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 	// v2.0.98: keep the real-time lane's INDEX subscriptions aligned with the
 	// RUNNING fleet before the pass samples prices.
 	worker.syncWSSubscriptions(ctx, *settings)
+	// v2.0.137: lane observability — ORDERBOOK/TRADE delivery volume and
+	// drop reasons, every 5 minutes, so a silently dead or skewed feed is
+	// visible in the logs (not inferred from bot regimes).
+	if worker.ofiEngine != nil && time.Since(worker.ofiStatsAt) > 5*time.Minute {
+		worker.ofiStatsAt = time.Now()
+		stats := worker.ofiEngine.Stats()
+		worker.logger.Info("ofi engine ingest stats",
+			"component", "autogrid_worker",
+			"symbols", stats.Symbols,
+			"orderbook_frames", stats.OrderbookFrames,
+			"trades", stats.Trades,
+			"trades_dropped_dedup", stats.TradesDroppedDedup,
+			"trades_dropped_too_old", stats.TradesDroppedTooOld,
+			"trades_dropped_isolation", stats.TradesDroppedIsolation)
+	}
 	// v2.0.111: surface storm arm/extend transitions once per arm.
 	worker.maybeLogStormState(ctx)
 	// v2.0.99: overwrite estimate-class terminal finals with the exchange's
