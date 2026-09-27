@@ -286,3 +286,49 @@ func TestOFIEngine_TripleConfluence_Breakout(t *testing.T) {
 		t.Fatalf("expected LONG entry to be allowed under confirmed pump")
 	}
 }
+
+func TestOFIEngine_IngestTradeBatch(t *testing.T) {
+	engine := NewOFIEngine(DefaultOFIEngineConfig())
+	sym := "BATCH_DUMP_PERP"
+	baseTime := time.Date(2026, 9, 27, 12, 0, 0, 0, time.UTC)
+
+	// Feed L2 depth initially
+	engine.IngestL2(sym,
+		[]pionex.DepthLevel{{Price: d("50.0"), Amount: d("100.0")}},
+		[]pionex.DepthLevel{{Price: d("50.05"), Amount: d("1000.0")}},
+		baseTime,
+	)
+
+	// Simulate 15 trades arriving out of chronological order over 20 seconds,
+	// with heavy sell pressure (85% sells).
+	trades := make([]pionex.Trade, 0, 15)
+	for i := 0; i < 15; i++ {
+		secOffset := (i * 2) % 20 // mixed times
+		tradeTime := baseTime.Add(time.Duration(secOffset) * time.Second).UnixMilli()
+		side := "SELL"
+		if i == 3 || i == 7 {
+			side = "BUY"
+		}
+		trades = append(trades, pionex.Trade{
+			Symbol:  sym,
+			TradeID: int64(i + 1),
+			Price:   d("50.0"),
+			Size:    d("40.0"), // $2,000 per trade
+			Side:    side,
+			Time:    tradeTime,
+		})
+	}
+
+	engine.IngestTradeBatch(sym, trades)
+	analysis := engine.Analyze(sym)
+
+	// Taker sell ratio should be heavy sell (buy ratio <= 35%)
+	if analysis.TakerBuyRatio > 0.35 {
+		t.Fatalf("expected taker buy ratio <= 0.35 (heavy sell), got %.2f", analysis.TakerBuyRatio)
+	}
+	allowedLong, reason := analysis.CanEnter("LONG")
+	if allowedLong && analysis.Regime == RegimeDumpPressure {
+		t.Fatalf("expected LONG entry to be vetoed under dump pressure, got allowed with reason: %s", reason)
+	}
+}
+

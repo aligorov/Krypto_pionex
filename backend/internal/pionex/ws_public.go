@@ -302,7 +302,18 @@ func (s *PublicStream) markDisconnected() {
 }
 
 func (s *PublicStream) sendStreamOp(op, symbol string) error {
-	return s.sendTopicOp(op, "INDEX", symbol)
+	if err := s.sendTopicOp(op, "INDEX", symbol); err != nil {
+		return err
+	}
+	s.stateMu.RLock()
+	hasTradeListener := s.onTrade != nil
+	s.stateMu.RUnlock()
+	if hasTradeListener {
+		if err := s.sendTopicOp(op, "TRADE", symbol); err != nil {
+			s.logger.Debug("ws lane trade op", "component", "pionex_ws", "op", op, "symbol", symbol, "error", err)
+		}
+	}
+	return nil
 }
 
 func (s *PublicStream) sendTopicOp(op, topic, symbol string) error {

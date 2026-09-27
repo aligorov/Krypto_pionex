@@ -327,12 +327,10 @@ func (worker *Worker) checkKnifePause(
 	}
 	metrics = marketdata.AnalyzeTakerFlow(trades)
 
-	// v2.0.123 dynamic microstructure: feed trades into OFI engine and
-	// enforce multi-window persistence, spoof rejection, and directional vetoes.
+	// v2.0.123 dynamic microstructure: feed trades into OFI engine as a
+	// chronologically sorted batch, roll micro-windows, and finalize for analysis.
 	if worker.ofiEngine != nil {
-		for _, tr := range trades {
-			worker.ofiEngine.IngestTrade(symbol, tr)
-		}
+		worker.ofiEngine.IngestTradeBatch(symbol, trades)
 		analysis := worker.ofiEngine.Analyze(symbol)
 		if allowed, ofiReason := analysis.CanEnter(trend); !allowed {
 			return true, metrics, ofiReason

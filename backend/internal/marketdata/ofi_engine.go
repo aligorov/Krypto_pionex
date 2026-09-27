@@ -3,6 +3,7 @@ package marketdata
 import (
 	"fmt"
 	"math"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -384,6 +385,32 @@ func (e *OFIEngine) IngestTrade(symbol string, trade pionex.Trade) {
 		st.currentWindow.TakerBuyRatio = st.currentWindow.TakerBuyUSDT / tot
 	}
 	st.currentWindow.TradeCount++
+}
+
+// IngestTradeBatch sorts trades chronologically and ingests each trade, rolling 5s windows.
+func (e *OFIEngine) IngestTradeBatch(symbol string, trades []pionex.Trade) {
+	if len(trades) == 0 {
+		return
+	}
+	sorted := make([]pionex.Trade, len(trades))
+	copy(sorted, trades)
+	sort.SliceStable(sorted, func(i, j int) bool {
+		return sorted[i].Time < sorted[j].Time
+	})
+	for _, tr := range sorted {
+		e.IngestTrade(symbol, tr)
+	}
+}
+
+// IngestSnapshot ingests an L2 orderbook snapshot and recent trades together,
+// chronologically rolling windows and finalizing the current state for immediate analysis.
+func (e *OFIEngine) IngestSnapshot(symbol string, bids, asks []pionex.DepthLevel, trades []pionex.Trade, now time.Time) {
+	if now.IsZero() {
+		now = time.Now()
+	}
+	e.IngestL2(symbol, bids, asks, now)
+	e.IngestTradeBatch(symbol, trades)
+	e.FinalizeWindow(symbol, now)
 }
 
 // FinalizeWindow closes the current window explicitly (e.g. at timer tick or test step).

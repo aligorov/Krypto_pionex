@@ -1529,17 +1529,7 @@ func (worker *Worker) deployPaper(
 			}
 		}
 
-		// Knife Pause Check (Quant & Vision v3.0)
-		if settings.KnifePauseEnabled {
-			paused, _, knifeReason := worker.checkKnifePause(ctx, candidate.Symbol, trend)
-			if paused {
-				worker.rejectCandidate(ctx, candidate,
-					fmt.Sprintf("Knife Pause: %s — деплой отложен для защиты от падающего ножа", knifeReason), nil)
-				continue
-			}
-		}
-
-		// Order Book Cushion Check (Quant & Vision v3.0)
+		// Order Book Cushion Check (Quant & Vision v3.0) — feeds L2 depth into OFIEngine
 		if settings.OrderbookProfilerEnabled {
 			botNotional := settings.BudgetUSDT.Mul(decimal.NewFromInt(int64(botLev))).InexactFloat64()
 			minCushion := settings.MinDepthCushionRatio.InexactFloat64()
@@ -1554,6 +1544,16 @@ func (worker *Worker) deployPaper(
 					"component", "autogrid_worker", "symbol", candidate.Symbol,
 					"old_lower", mesh.LowerPrice.String(), "bid_wall", profile.BidWallPrice.String())
 				mesh.LowerPrice = profile.BidWallPrice
+			}
+		}
+
+		// Knife Pause & OFI Check (Quant & Vision v3.0)
+		if settings.KnifePauseEnabled {
+			paused, _, knifeReason := worker.checkKnifePause(ctx, candidate.Symbol, trend)
+			if paused {
+				worker.rejectCandidate(ctx, candidate,
+					fmt.Sprintf("Knife Pause: %s — деплой отложен для защиты от падающего ножа", knifeReason), nil)
+				continue
 			}
 		}
 
@@ -2438,17 +2438,7 @@ func (worker *Worker) deployReal(
 			}
 		}
 
-		// Knife Pause Check (Quant & Vision v3.0)
-		if settings.KnifePauseEnabled {
-			paused, _, knifeReason := worker.checkKnifePause(ctx, candidate.Symbol, trend)
-			if paused {
-				worker.rejectCandidate(ctx, candidate,
-					fmt.Sprintf("Knife Pause: %s — деплой отложен для защиты от падающего ножа", knifeReason), nil)
-				continue
-			}
-		}
-
-		// Order Book Cushion Check (Quant & Vision v3.0)
+		// Order Book Cushion Check (Quant & Vision v3.0) — feeds L2 depth into OFIEngine
 		if settings.OrderbookProfilerEnabled {
 			botNotional := settings.BudgetUSDT.Mul(decimal.NewFromInt(int64(botLev))).InexactFloat64()
 			minCushion := settings.MinDepthCushionRatio.InexactFloat64()
@@ -2463,6 +2453,16 @@ func (worker *Worker) deployReal(
 					"component", "autogrid_worker", "symbol", candidate.Symbol,
 					"old_lower", lowerPrice.String(), "bid_wall", profile.BidWallPrice.String())
 				lowerPrice = profile.BidWallPrice.Round(int32(pricePrecision))
+			}
+		}
+
+		// Knife Pause & OFI Check (Quant & Vision v3.0)
+		if settings.KnifePauseEnabled {
+			paused, _, knifeReason := worker.checkKnifePause(ctx, candidate.Symbol, trend)
+			if paused {
+				worker.rejectCandidate(ctx, candidate,
+					fmt.Sprintf("Knife Pause: %s — деплой отложен для защиты от падающего ножа", knifeReason), nil)
+				continue
 			}
 		}
 
