@@ -682,8 +682,13 @@ func (worker *Worker) nativeFundingRates(ctx context.Context) map[string]decimal
 // logs — the GBP-CPI incident class froze deployments for hours with no
 // durable trace.
 func (worker *Worker) noteDeployBlock(ctx context.Context, reason string) {
+	// v2.0.143 (audit-2): no updated_at bump — last_error is a UI note, not
+	// a settings-semantic change, and ConfigVersion hashes updated_at (a
+	// deploy-block note must not mint a new cv for unchanged parameters).
+	// Matches the deployErrors writers in manageDeployments, which never
+	// bumped it either.
 	_, _ = worker.db.Exec(ctx, `
-		UPDATE autogrid_settings SET last_error = $1, updated_at = NOW()
+		UPDATE autogrid_settings SET last_error = $1
 	`, reason)
 }
 
@@ -1934,8 +1939,11 @@ func (worker *Worker) deployPaper(
 	// in the UI for hours while the fleet is live and farming (prod:
 	// 19:10Z breaker note still displayed at 03:00Z with 10 bots RUNNING).
 	if activeCount > 0 {
+		// v2.0.143 (audit-2): no updated_at bump — clearing the stale note
+		// is bookkeeping, not a settings change; ConfigVersion hashes
+		// updated_at and must not churn on it.
 		_, _ = worker.db.Exec(ctx, `
-			UPDATE autogrid_settings SET last_error = NULL, updated_at = NOW()
+			UPDATE autogrid_settings SET last_error = NULL
 			WHERE id = $1
 		`, settings.ID)
 	}

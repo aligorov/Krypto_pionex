@@ -627,6 +627,9 @@ const EVENT_DETAIL_LABELS: Record<string, string> = {
   pnlPct: 'PnL %', price: 'цена', direction: 'направление',
   target: 'цель', maxLoss: 'макс. убыток', score: 'скор',
   mode: 'режим', trigger: 'триггер', note: 'заметка', pct: '%',
+  // v2.0.143 (audit-2): DIRECTION_FLIP detail keys — the flip used to render
+  // as raw "from: NEUTRAL · to: SHORT" machine noise.
+  from: 'из', to: 'в', ofi_regime: 'режим OFI', cascade_usd: 'каскад',
 };
 const EVENT_REASON_LABELS: Record<string, string> = {
   AUTOGRID_STOP: 'остановка автопилота',
@@ -636,6 +639,11 @@ const EVENT_REASON_LABELS: Record<string, string> = {
   STOP_LOSS: 'стоп-лосс',
   TAKE_PROFIT: 'тейк-профит',
   TRAILING: 'трейлинг',
+  // v2.0.143 (audit-2): the OFI protective exits and the direction break.
+  EMERGENCY_OFI_DUMP: '🚨 экстренный выход (OFI-дамп)',
+  EMERGENCY_OFI_PUMP: '🚨 экстренный выход (OFI-памп)',
+  RANGE_BREAK_DOWN: 'пробой диапазона вниз',
+  RANGE_BREAK_UP: 'пробой диапазона вверх',
 };
 const formatEventDetails = (details: Record<string, any> | null | undefined): string => {
   if (!details) return '';
@@ -654,6 +662,9 @@ const formatEventDetails = (details: Record<string, any> | null | undefined): st
       case 'TAKE_PROFIT': return <span className="badge success">🎯 ТЕЙК-ПРОФИТ</span>;
       case 'STOP_LOSS': return <span className="badge danger">🛡️ СТОП-ЛОСС</span>;
       case 'ADJUST_RANGE': return <span className="badge warning">🔄 СДВИГ</span>;
+      // v2.0.143 (audit-2): the cascade-short flip is a routing decision over
+      // a REAL slot — warning, not success: money changed direction.
+      case 'DIRECTION_FLIP': return <span className="badge warning">🔀 ФЛИП</span>;
       case 'GRID_FILL': return <span className="badge neutral">⚡ ИСПОЛНЕНИЕ</span>;
       case 'MANUAL_STOP': return <span className="badge warning">⏹️ ОСТАНОВКА</span>;
       default: return <span className="badge neutral">{type}</span>;
@@ -760,6 +771,7 @@ function reasonBadge(reason: string | null): string {
     reason.startsWith('STOP_LOSS') ||
     reason.startsWith('STRUCT_INVALID') ||
     reason.startsWith('RANGE_BREAK') ||
+    reason.startsWith('EMERGENCY_OFI') || // v2.0.143 (audit-2): OFI protective exit is a danger-class close
     reason.startsWith('LIQUID')
   ) {
     return 'danger';

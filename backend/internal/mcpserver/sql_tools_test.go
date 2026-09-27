@@ -2,6 +2,52 @@ package mcpserver
 
 import "testing"
 
+// journalWriterTables is the drift guard for the v2.0.142 audit P1 #1 fix.
+// It mirrors, as a hardcoded set, every table the autogrid journal writers
+// INSERT into:
+//
+//	entry_chain.go  insertEntryDecisionRow  -> entry_decisions
+//	ofi_journal.go  logOFIDecision          -> ofi_decision_snapshots
+//	gate_value.go   runGateValueReport      -> gate_value_snapshots
+//
+// The whole point of whitelisting these journals in autogrid_sql is that the
+// analytics surface can read back what the writers record. When the next
+// journal table is added to those INSERT statements it MUST be added here AND
+// to sqlAllowedTables — this test fails until both happen.
+var journalWriterTables = []string{
+	"entry_decisions",
+	"ofi_decision_snapshots",
+	"gate_value_snapshots",
+}
+
+// TestJournalTablesWhitelisted pins that the decision journals added by the
+// v2.0.142 audit (P1 #1) are reachable through validateAnalyticsSQL and that
+// the whitelist stays in sync with the autogrid journal-writing surface.
+func TestJournalTablesWhitelisted(t *testing.T) {
+	for _, table := range journalWriterTables {
+		if !sqlAllowedTables[table] {
+			t.Errorf("journal table %q is missing from sqlAllowedTables — the analytics tool cannot read back what the journal writers record", table)
+		}
+		// The exact query shape an audit session issues first.
+		if _, err := validateAnalyticsSQL("SELECT count(*) FROM " + table); err != nil {
+			t.Errorf("journal table %q must pass validateAnalyticsSQL: %v", table, err)
+		}
+	}
+	// And the reachability is real, not just the map: a table filter with a
+	// WHERE clause and an ORDER BY over the journal's indexed columns must
+	// validate too (rules out a regex accident that only admits the bare
+	// FROM form).
+	for _, q := range []string{
+		"SELECT symbol, outcome, code FROM entry_decisions WHERE symbol = 'BTC_USDT_PERP' ORDER BY created_at DESC LIMIT 10",
+		"SELECT kind, verdict FROM ofi_decision_snapshots WHERE created_at > NOW() - INTERVAL '1 hour'",
+		"SELECT gate, net_value_usdt FROM gate_value_snapshots ORDER BY created_at DESC",
+	} {
+		if _, err := validateAnalyticsSQL(q); err != nil {
+			t.Errorf("journal query rejected: %q -> %v", q, err)
+		}
+	}
+}
+
 func TestValidateAnalyticsSQL(t *testing.T) {
 	ok := []string{
 		"SELECT * FROM paper_grid_bots WHERE status = 'RUNNING'",

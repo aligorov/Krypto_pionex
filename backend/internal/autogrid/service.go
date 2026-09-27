@@ -2954,7 +2954,29 @@ func (s *Service) ApplyAutotune(ctx context.Context, suggested map[string]any) (
 	if notes == "" {
 		notes = "без изменений: рынок в пределах текущих параметров"
 	}
-	if _, err := s.db.Exec(ctx, `
+	// v2.0.143 (audit-2, cv churn): a round that changes NO parameter must
+	// not touch updated_at — ConfigVersion hashes autogrid_settings.updated_at,
+	// so a bookkeeping-only bump would mint a fresh cv for an unchanged
+	// config and stamp a minute of decisions with it. Parameter rounds keep
+	// the full row rewrite (updated_at moves — the config genuinely
+	// changed); no-op rounds refresh ONLY the autotune bookkeeping columns
+	// (last_autotune_at/last_autotune_notes stay honest). The paramDelta
+	// gate compares exactly the four columns the UPDATE writes — it covers
+	// both an empty suggestion set and the band-inversion revert above
+	// (which nils `changes` after restoring the volatility pair).
+	paramDelta := !update.MinVolatilityPct.Equal(current.MinVolatilityPct) ||
+		!update.MaxVolatilityPct.Equal(current.MaxVolatilityPct) ||
+		!update.MaxDrawdownPct.Equal(current.MaxDrawdownPct) ||
+		update.Leverage != current.Leverage
+	if !paramDelta {
+		if _, err := s.db.Exec(ctx, `
+			UPDATE autogrid_settings
+			SET last_autotune_at = NOW(), last_autotune_notes = $2
+			WHERE scope_key = $1
+		`, DefaultScope, notes); err != nil {
+			return nil, nil, fmt.Errorf("apply autotune: %w", err)
+		}
+	} else if _, err := s.db.Exec(ctx, `
 		UPDATE autogrid_settings
 		SET min_volatility_pct = $2, max_volatility_pct = $3,
 		    max_drawdown_pct = $4, leverage = $5,

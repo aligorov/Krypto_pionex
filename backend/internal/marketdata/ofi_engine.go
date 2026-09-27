@@ -712,17 +712,6 @@ func (e *OFIEngine) IngestTradeBatch(symbol string, trades []pionex.Trade) {
 	}
 }
 
-// IngestSnapshot ingests an L2 orderbook snapshot and recent trades together,
-// chronologically rolling windows and finalizing the current state for immediate analysis.
-func (e *OFIEngine) IngestSnapshot(symbol string, bids, asks []pionex.DepthLevel, trades []pionex.Trade, now time.Time) {
-	if now.IsZero() {
-		now = time.Now()
-	}
-	e.IngestL2(symbol, bids, asks, now)
-	e.IngestTradeBatch(symbol, trades)
-	e.FinalizeWindow(symbol, now)
-}
-
 // FinalizeWindow closes the current window explicitly (e.g. at timer tick or test step).
 func (e *OFIEngine) FinalizeWindow(symbol string, now time.Time) {
 	st := e.getOrCreate(symbol)

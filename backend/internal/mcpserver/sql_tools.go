@@ -44,6 +44,11 @@ var sqlAllowedTables = map[string]bool{
 	"market_derivatives_metrics": true, "market_symbols": true, "backtest_jobs": true,
 	"risk_settings": true, "control_commands": true, "audit_events": true,
 	"application_logs": true, "system_incidents": true,
+	// v2.0.142 audit P1 #1: the decision-journal tables (migrations 0052/
+	// 0053) are read-only telemetry — every ledger/entry-chain/OFI/gate
+	// question against them previously had to fall back to manual psql.
+	// They carry no credentials, accounts or order state.
+	"entry_decisions": true, "ofi_decision_snapshots": true, "gate_value_snapshots": true,
 }
 
 var (

@@ -75,9 +75,14 @@ func ConfigVersion(ctx context.Context, db *pgxpool.Pool, settingsID string) str
 	}
 	cvCache.mu.Unlock()
 
-	value := "cv-unknown"
-	if v, err := computeConfigVersion(ctx, db, settingsID); err == nil {
-		value = v
+	// v2.0.143 (audit-2): only successful computations are cached. Caching
+	// the "cv-unknown" degradation would let a transient DB blip stamp a
+	// minute of decisions cv-unknown — the cached failure outlives the blip
+	// by the full TTL. On error return the degraded marker WITHOUT storing,
+	// so the next call retries immediately.
+	value, err := computeConfigVersion(ctx, db, settingsID)
+	if err != nil {
+		return "cv-unknown"
 	}
 
 	cvCache.mu.Lock()
