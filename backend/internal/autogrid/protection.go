@@ -129,7 +129,8 @@ func (worker *Worker) radarBreakFlip(ctx context.Context, settings Settings, b r
 		"escape_trigger": escapeTrigger,
 		"ofi_regime":     b.ofiRegime,
 		"total":          total.StringFixed(2),
-		"message":        "пробой (" + escapeTrigger + ") — сетка закрыта, DGT перезапустит с центра пробоя без старого инвентаря",
+		"status":         "STOP_REQUESTED",
+		"message":        "пробой (" + escapeTrigger + ") — запрошена остановка сетки (STOP_REQUESTED), DGT перезапустит с центра пробоя после закрытия",
 	})
 
 	// DGT intent onto the closing row: fires from the existing
@@ -151,10 +152,16 @@ func (worker *Worker) radarBreakFlip(ctx context.Context, settings Settings, b r
 // for bots suffering confirmed adverse institutional order flow (CONFIRMED_DUMP / CONFIRMED_PUMP).
 // It bypasses the 90s radar score throttle, up to 2-hour recenter cooldowns, and 3-snapshot dwell gates.
 //
-// Routing:
+// In SHADOW mode (settings.StopForecastMode != "ACTIVE"):
+// - Strictly observational: emits STOP_FORECAST_SHADOW events and Telegram advisory,
+//   arms 2m shadow debounce, and never touches bot state or trading execution.
+//
+// In ACTIVE mode (settings.StopForecastMode == "ACTIVE"):
 // - REAL NEUTRAL bots with DGT re-deploy enabled: executes radarBreakFlip (closes grid & queues center-aligned re-deploy).
 // - Directional bots (LONG / SHORT), REAL bots without DgtRedeploy, and PAPER bots:
 //   executes an immediate direct emergency protective stop (EMERGENCY_OFI_DUMP or EMERGENCY_OFI_PUMP).
+//   On DB write failure: arms 2s transient backoff.
+//   On successful DB write: arms 30s debounce and records requested_at timestamp.
 func (worker *Worker) radarMicrostructureEmergencyExit(ctx context.Context, settings Settings, b radarInput) bool {
 	if !b.ofiActionable {
 		return false
@@ -174,7 +181,7 @@ func (worker *Worker) radarMicrostructureEmergencyExit(ctx context.Context, sett
 		return false
 	}
 
-	if !worker.checkAndArmEmergencyExitDebounce(b.botID) {
+	if worker.isEmergencyExitDebounced(b.botID) {
 		return false
 	}
 
@@ -183,40 +190,85 @@ func (worker *Worker) radarMicrostructureEmergencyExit(ctx context.Context, sett
 		adverseReason = "EMERGENCY_OFI_PUMP"
 	}
 
-	if worker.db == nil {
+	// 1. SHADOW mode safety gate: strictly observational!
+	// Never mutate bot status, never stop real positions, never close paper bots.
+	if settings.StopForecastMode != "ACTIVE" {
+		worker.armEmergencyExitDebounce(b.botID, 2*time.Minute)
+		if worker.logger != nil {
+			worker.logger.Info("microstructure emergency protective exit (SHADOW observation)",
+				"component", "autogrid_worker", "bot_number", b.botNumber, "symbol", b.symbol,
+				"direction", b.direction, "reason", adverseReason, "ofi_regime", b.ofiRegime,
+				"total", b.total.StringFixed(2), "edge_progress", progress)
+		}
+		if worker.db != nil {
+			_ = LogBotEvent(ctx, worker.db, b.botID, b.botNumber, b.botSource, b.symbol,
+				"STOP_FORECAST_SHADOW", &b.price, &b.total, map[string]any{
+					"trigger":       adverseReason,
+					"ofi_regime":    b.ofiRegime,
+					"direction":     b.direction,
+					"edge_progress": decimal.NewFromFloat(progress).Round(3).String(),
+					"total":         b.total.StringFixed(2),
+					"advisory":      "emergency exit criteria met in SHADOW mode (no trade action)",
+				})
+			_ = QueueTelegramEvent(ctx, worker.db, "STOP_FORECAST_SHADOW", map[string]any{
+				"bot_number":    b.botNumber,
+				"symbol":        b.symbol,
+				"direction":     b.direction,
+				"reason":        adverseReason,
+				"ofi_regime":    b.ofiRegime,
+				"total":         b.total.StringFixed(2),
+				"edge_progress": fmt.Sprintf("%.0f%%", progress*100),
+				"message":       fmt.Sprintf("👀 [SHADOW] экстренная защитная остановка (%s, %s): институциональный поток против позиции, прогресс %.0f%% — в режиме ACTIVE сетка была бы остановлена", b.symbol, b.ofiRegime, progress*100),
+			})
+		}
 		return false
 	}
 
-	// 1. REAL NEUTRAL with DGT redeploy -> break-flip route
-	if b.botSource == "REAL" && b.direction == "NEUTRAL" && settings.DgtRedeployEnabled {
-		if worker.radarBreakFlip(ctx, settings, b, radarScores{Band: 3}, 0) {
-			return true
-		}
+	if worker.db == nil {
+		worker.armEmergencyExitDebounce(b.botID, 2*time.Second)
+		return false
 	}
 
-	// 2. Direct emergency stop for Directional bots (LONG/SHORT), REAL without DGT, or PAPER
+	// 2. ACTIVE: REAL NEUTRAL with DGT redeploy -> break-flip route
+	if b.botSource == "REAL" && b.direction == "NEUTRAL" && settings.DgtRedeployEnabled {
+		if worker.radarBreakFlip(ctx, settings, b, radarScores{Band: 3}, 0) {
+			worker.armEmergencyExitDebounce(b.botID, 30*time.Second)
+			return true
+		}
+		worker.armEmergencyExitDebounce(b.botID, 2*time.Second)
+		return false
+	}
+
+	// 3. ACTIVE: Direct emergency stop for Directional bots (LONG/SHORT) or REAL without DGT
 	if b.botSource == "REAL" {
+		now := time.Now().UTC()
+		nowStr := now.Format(time.RFC3339)
 		tag, err := worker.db.Exec(ctx, `
 			UPDATE grid_bots
 			SET status = 'STOP_REQUESTED', closed_reason = $2, updated_at = NOW()
 			WHERE id = $1 AND status = 'RUNNING'
 		`, b.botID, adverseReason)
 		if err != nil || tag.RowsAffected() == 0 {
+			worker.armEmergencyExitDebounce(b.botID, 2*time.Second)
 			return false
 		}
 
-		worker.logger.Warn("microstructure emergency protective exit (REAL bot stopped)",
+		worker.armEmergencyExitDebounce(b.botID, 30*time.Second)
+
+		worker.logger.Warn("microstructure emergency protective exit requested (STOP_REQUESTED)",
 			"component", "autogrid_worker", "bot_number", b.botNumber, "symbol", b.symbol,
 			"direction", b.direction, "reason", adverseReason, "ofi_regime", b.ofiRegime,
-			"total", b.total.StringFixed(2), "edge_progress", progress)
+			"total", b.total.StringFixed(2), "edge_progress", progress, "requested_at", nowStr)
 
 		_ = LogBotEvent(ctx, worker.db, b.botID, b.botNumber, b.botSource, b.symbol,
 			adverseReason, &b.price, &b.total, map[string]any{
-				"closed_reason":  adverseReason,
-				"ofi_regime":     b.ofiRegime,
-				"direction":      b.direction,
-				"edge_progress":  decimal.NewFromFloat(progress).Round(3).String(),
-				"total":          b.total.StringFixed(2),
+				"closed_reason": adverseReason,
+				"ofi_regime":    b.ofiRegime,
+				"direction":     b.direction,
+				"edge_progress": decimal.NewFromFloat(progress).Round(3).String(),
+				"total":         b.total.StringFixed(2),
+				"status":        "STOP_REQUESTED",
+				"requested_at":  nowStr,
 			})
 
 		_ = QueueTelegramEvent(ctx, worker.db, adverseReason, map[string]any{
@@ -227,13 +279,17 @@ func (worker *Worker) radarMicrostructureEmergencyExit(ctx context.Context, sett
 			"ofi_regime":    b.ofiRegime,
 			"total":         b.total.StringFixed(2),
 			"edge_progress": fmt.Sprintf("%.0f%%", progress*100),
-			"message":       fmt.Sprintf("экстренный защитный выход (%s): институциональный поток против позиции, прогресс к краю %.0f%% — сетка остановлена для предотвращения ликвидации/стопа", b.ofiRegime, progress*100),
+			"status":        "STOP_REQUESTED",
+			"requested_at":  nowStr,
+			"message":       fmt.Sprintf("🚨 запрошена экстренная защитная остановка (STOP_REQUESTED, %s): институциональный поток против позиции, прогресс к краю %.0f%% — ордера отменяются, позиция закрывается", b.ofiRegime, progress*100),
 		})
 		return true
 	}
 
-	// 3. PAPER bots
+	// 4. ACTIVE: PAPER bots
 	if b.botSource == "PAPER" {
+		now := time.Now().UTC()
+		nowStr := now.Format(time.RFC3339)
 		tag, err := worker.db.Exec(ctx, `
 			UPDATE paper_grid_bots
 			SET status = 'COMPLETED', closed_reason = $2, mark_price = $3,
@@ -242,8 +298,11 @@ func (worker *Worker) radarMicrostructureEmergencyExit(ctx context.Context, sett
 			WHERE id = $1 AND status = 'RUNNING'
 		`, b.botID, adverseReason, b.price, b.total)
 		if err != nil || tag.RowsAffected() == 0 {
+			worker.armEmergencyExitDebounce(b.botID, 2*time.Second)
 			return false
 		}
+
+		worker.armEmergencyExitDebounce(b.botID, 30*time.Second)
 
 		worker.logger.Warn("microstructure emergency protective exit (PAPER bot stopped)",
 			"component", "autogrid_worker", "bot_number", b.botNumber, "symbol", b.symbol,
@@ -257,6 +316,7 @@ func (worker *Worker) radarMicrostructureEmergencyExit(ctx context.Context, sett
 				"direction":     b.direction,
 				"edge_progress": decimal.NewFromFloat(progress).Round(3).String(),
 				"total":         b.total.StringFixed(2),
+				"closed_at":     nowStr,
 			})
 
 		_ = QueueTelegramEvent(ctx, worker.db, adverseReason, map[string]any{
@@ -267,6 +327,7 @@ func (worker *Worker) radarMicrostructureEmergencyExit(ctx context.Context, sett
 			"ofi_regime":    b.ofiRegime,
 			"total":         b.total.StringFixed(2),
 			"edge_progress": fmt.Sprintf("%.0f%%", progress*100),
+			"closed_at":     nowStr,
 			"message":       fmt.Sprintf("экстренный защитный выход (PAPER, %s): институциональный поток против позиции — сетка закрыта", b.ofiRegime),
 		})
 		return true

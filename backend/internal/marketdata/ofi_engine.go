@@ -92,6 +92,7 @@ type MicrostructureAnalysis struct {
 	IsThinBook             bool                 `json:"isThinBook"`
 	IsSpreadIntact         bool                 `json:"isSpreadIntact"`
 	IsFresh                bool                 `json:"isFresh"`
+	IsSynced               bool                 `json:"isSynced"`
 	Reason                 string               `json:"reason"`
 	UpdatedAt              time.Time            `json:"updatedAt"`
 }
@@ -99,7 +100,7 @@ type MicrostructureAnalysis struct {
 // IsActionable returns true only if the signal is fresh, continuous, synchronized, and actionable.
 // Stale, desynced, warming-up, thin-book, and spread-blown states are non-actionable fail-safes.
 func (a MicrostructureAnalysis) IsActionable() bool {
-	if !a.IsFresh {
+	if !a.IsFresh || !a.IsSynced {
 		return false
 	}
 	switch a.Regime {
@@ -113,8 +114,8 @@ func (a MicrostructureAnalysis) IsActionable() bool {
 // CanEnter checks whether a bot entry (LONG, SHORT, or NEUTRAL) is allowed
 // given the current microstructure regime.
 func (a MicrostructureAnalysis) CanEnter(trend string) (allowed bool, reason string) {
-	if a.Regime == RegimeDesync {
-		return false, "order book sequence desynchronized — awaiting fresh snapshot"
+	if a.Regime == RegimeDesync || !a.IsSynced || strings.Contains(a.Reason, "recovering from desync") {
+		return false, fmt.Sprintf("order book desynchronized or recovering: %s", a.Reason)
 	}
 	if !a.IsActionable() {
 		// Non-directional regimes (WARMING_UP, STALE, NEUTRAL, THIN_BOOK, SPREAD_BLOWN)
@@ -240,10 +241,12 @@ type SymbolMicrostate struct {
 	currentWindow   OFIWindow
 	history         []OFIWindow
 	latestAnalysis  MicrostructureAnalysis
-	recentTrades    map[string]time.Time // tradeId -> seenAt for deduplication
-	resyncInFlight  bool
-	lastResyncAt    time.Time
-	resyncAttempts  int
+	recentTrades         map[string]time.Time // tradeId -> seenAt for deduplication
+	resyncInFlight       bool
+	lastResyncAt         time.Time
+	resyncAttempts       int
+	isDesynced           bool
+	recoveringFromDesync bool
 }
 
 func newSymbolMicrostate(symbol string, cfg OFIEngineConfig) *SymbolMicrostate {
@@ -254,10 +257,11 @@ func newSymbolMicrostate(symbol string, cfg OFIEngineConfig) *SymbolMicrostate {
 		history:      make([]OFIWindow, 0, cfg.MaxHistoryWindows),
 		recentTrades: make(map[string]time.Time, 1024),
 		latestAnalysis: MicrostructureAnalysis{
-			Symbol:  symbol,
-			Regime:  RegimeWarmingUp,
-			Reason:  "initializing market data stream",
-			IsFresh: false,
+			Symbol:   symbol,
+			Regime:   RegimeWarmingUp,
+			Reason:   "initializing market data stream",
+			IsFresh:  false,
+			IsSynced: true,
 		},
 	}
 }
@@ -367,23 +371,30 @@ func (e *OFIEngine) IngestOrderbookUpdate(update pionex.OrderbookUpdate) {
 
 	// 1. Synchronize local order book
 	if update.IsSnapshot {
-		wasDesynced := !st.book.IsSynced()
+		wasDesynced := st.isDesynced
 		st.book.ApplySnapshot(update.Bids, update.Asks, update.Number, ts)
 		st.resyncInFlight = false
 		st.resyncAttempts = 0
 		st.hasPrevL1 = false
 		st.prevBestBid = pionex.DepthLevel{}
 		st.prevBestAsk = pionex.DepthLevel{}
-		if wasDesynced || st.lastBookUpdate.IsZero() || ts.Sub(st.lastBookUpdate) > st.config.WindowDuration {
-			// Sequence breach occurred previously or connection gap: purge contaminated history and restart clean warmup!
+		st.isDesynced = false
+		if wasDesynced {
+			// Sequence breach occurred previously: purge contaminated history and restart clean warmup!
 			st.history = st.history[:0]
-			st.currentWindow = OFIWindow{StartTime: ts}
+			st.recoveringFromDesync = true
+			st.latestAnalysis.Regime = RegimeWarmingUp
+			st.latestAnalysis.IsSynced = false
+			st.latestAnalysis.Reason = fmt.Sprintf("order book recovering from desync: warming up (0/%d windows)", st.config.MinWindows)
 		}
 		st.lastBookUpdate = ts
 	} else {
 		if err := st.book.ApplyDelta(update.Bids, update.Asks, update.Number, update.PrevNumber, ts); err != nil {
+			st.isDesynced = true
+			st.recoveringFromDesync = true
 			st.latestAnalysis.Regime = RegimeDesync
 			st.latestAnalysis.IsFresh = false
+			st.latestAnalysis.IsSynced = false
 			st.latestAnalysis.Reason = fmt.Sprintf("order book desync: %v", err)
 			st.latestAnalysis.UpdatedAt = ts
 			now := time.Now()
@@ -405,11 +416,17 @@ func (e *OFIEngine) IngestOrderbookUpdate(update pionex.OrderbookUpdate) {
 	}
 
 	if !st.book.IsSynced() {
+		st.isDesynced = true
+		st.recoveringFromDesync = true
 		st.latestAnalysis.Regime = RegimeDesync
 		st.latestAnalysis.IsFresh = false
+		st.latestAnalysis.IsSynced = false
 		st.latestAnalysis.Reason = "order book waiting for snapshot"
 		st.latestAnalysis.UpdatedAt = ts
 		return
+	}
+	if !st.recoveringFromDesync {
+		st.latestAnalysis.IsSynced = true
 	}
 
 	bestBid, bestAsk, ok := st.book.BestBidAsk()
@@ -657,9 +674,10 @@ func (st *SymbolMicrostate) evaluateLocked(now time.Time) {
 	}
 
 	// 1. Order book synchronization check
-	if !st.book.IsSynced() {
+	if st.isDesynced || !st.book.IsSynced() {
 		analysis.Regime = RegimeDesync
 		analysis.IsFresh = false
+		analysis.IsSynced = false
 		analysis.Reason = "order book sequence desynchronized"
 		st.latestAnalysis = analysis
 		return
@@ -669,6 +687,7 @@ func (st *SymbolMicrostate) evaluateLocked(now time.Time) {
 	if !analysis.IsSpreadIntact {
 		analysis.Regime = RegimeSpreadBlown
 		analysis.IsFresh = false
+		analysis.IsSynced = true
 		analysis.Reason = fmt.Sprintf("spread degraded: %.1f bps > limit %.1f bps", lastW.LastSpreadBps, st.config.MaxSpreadBps)
 		st.latestAnalysis = analysis
 		return
@@ -678,6 +697,7 @@ func (st *SymbolMicrostate) evaluateLocked(now time.Time) {
 	if analysis.IsThinBook {
 		analysis.Regime = RegimeThinBook
 		analysis.IsFresh = false
+		analysis.IsSynced = true
 		analysis.Reason = "thin book liquidity in 2% range"
 		st.latestAnalysis = analysis
 		return
@@ -687,10 +707,20 @@ func (st *SymbolMicrostate) evaluateLocked(now time.Time) {
 	if len(st.history) < st.config.MinWindows {
 		analysis.Regime = RegimeWarmingUp
 		analysis.IsFresh = false
-		analysis.Reason = fmt.Sprintf("warming up (%d/%d windows)", len(st.history), st.config.MinWindows)
+		if st.recoveringFromDesync {
+			analysis.IsSynced = false
+			analysis.Reason = fmt.Sprintf("order book recovering from desync: warming up (%d/%d windows)", len(st.history), st.config.MinWindows)
+		} else {
+			analysis.IsSynced = true
+			analysis.Reason = fmt.Sprintf("warming up (%d/%d windows)", len(st.history), st.config.MinWindows)
+		}
 		st.latestAnalysis = analysis
 		return
 	}
+
+	// Warmup completed: clear recoveringFromDesync
+	st.recoveringFromDesync = false
+	analysis.IsSynced = true
 
 	// 5. Spoofing Detection: Severe queue imbalance (> 4:1) with zero or contrary taker volume
 	hasHugeWall := math.Abs(lastW.QueueImbalance) >= 0.60
@@ -833,10 +863,11 @@ func (e *OFIEngine) Analyze(symbol string) MicrostructureAnalysis {
 
 	if !ok {
 		return MicrostructureAnalysis{
-			Symbol:  sym,
-			Regime:  RegimeWarmingUp,
-			Reason:  "no market data stream",
-			IsFresh: false,
+			Symbol:   sym,
+			Regime:   RegimeWarmingUp,
+			Reason:   "no market data stream",
+			IsFresh:  false,
+			IsSynced: true,
 		}
 	}
 
@@ -845,11 +876,35 @@ func (e *OFIEngine) Analyze(symbol string) MicrostructureAnalysis {
 
 	analysis := st.latestAnalysis
 
-	// Strict Order Book Freshness Check:
+	// 1. Strict Desync & Recovery check takes precedence over staleness:
+	// A desynchronized order book or one recovering from a desync must NEVER
+	// be converted to RegimeStale and allowed to fail-open into trading!
+	if st.isDesynced || (!st.book.IsSynced() && !st.lastBookUpdate.IsZero()) {
+		analysis.Regime = RegimeDesync
+		analysis.IsFresh = false
+		analysis.IsSynced = false
+		if analysis.Reason == "" || !strings.Contains(analysis.Reason, "desync") {
+			analysis.Reason = "order book sequence desynchronized — awaiting fresh snapshot"
+		}
+		return analysis
+	}
+
+	if st.recoveringFromDesync {
+		analysis.Regime = RegimeWarmingUp
+		analysis.IsFresh = false
+		analysis.IsSynced = false
+		if !strings.Contains(analysis.Reason, "recovering from desync") {
+			analysis.Reason = fmt.Sprintf("order book recovering from desync: warming up (%d/%d windows)", len(st.history), st.config.MinWindows)
+		}
+		return analysis
+	}
+
+	// 2. Strict Order Book Freshness Check:
 	// Trades must never mask a stale or stuck order book!
 	if st.lastBookUpdate.IsZero() || time.Since(st.lastBookUpdate) > st.config.MaxStaleness {
 		analysis.Regime = RegimeStale
 		analysis.IsFresh = false
+		analysis.IsSynced = true
 		if st.lastBookUpdate.IsZero() {
 			analysis.Reason = "order book waiting for initial depth data"
 		} else {
@@ -881,11 +936,14 @@ func (e *OFIEngine) ResetSymbol(symbol string) {
 	st.prevBestAsk = pionex.DepthLevel{}
 	st.resyncInFlight = false
 	st.resyncAttempts = 0
+	st.isDesynced = true
+	st.recoveringFromDesync = true
 	st.latestAnalysis = MicrostructureAnalysis{
 		Symbol:    sym,
-		Regime:    RegimeWarmingUp,
-		Reason:    "stream reset (reconnecting)",
+		Regime:    RegimeDesync,
+		Reason:    "stream reset (reconnecting) — awaiting snapshot",
 		IsFresh:   false,
+		IsSynced:  false,
 		UpdatedAt: time.Now(),
 	}
 }

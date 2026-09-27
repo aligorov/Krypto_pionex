@@ -2,6 +2,7 @@ package marketdata
 
 import (
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -787,8 +788,106 @@ func TestOFIEngine_ResetAll(t *testing.T) {
 		t.Fatalf("ResetAll should desynchronize order book until fresh snapshot")
 	}
 	analysis := engine.Analyze(sym)
-	if analysis.Regime != RegimeWarmingUp && analysis.Regime != RegimeStale {
-		t.Fatalf("expected WarmingUp or Stale after ResetAll, got %s", analysis.Regime)
+	if analysis.Regime != RegimeDesync && analysis.Regime != RegimeWarmingUp && analysis.Regime != RegimeStale {
+		t.Fatalf("expected Desync, WarmingUp or Stale after ResetAll, got %s", analysis.Regime)
 	}
 }
+
+func TestOFIEngine_DesyncPersistsAcrossStalenessAndWarmup(t *testing.T) {
+	engine := NewOFIEngine(OFIEngineConfig{
+		WindowDuration: 5 * time.Second,
+		MinWindows:     3,
+		MaxStaleness:   15 * time.Second,
+	})
+	sym := "DESYNC_VETO_PERP"
+	now := time.Now()
+
+	// 1. Initial snapshot + normal delta -> synced
+	engine.IngestOrderbookUpdate(pionex.OrderbookUpdate{
+		Symbol:     sym,
+		Action:     "SNAPSHOT",
+		Bids:       []pionex.DepthLevel{{Price: d("100"), Amount: d("10")}},
+		Asks:       []pionex.DepthLevel{{Price: d("100.1"), Amount: d("10")}},
+		Number:     1,
+		IsSnapshot: true,
+		ReceivedAt: now.Add(-60 * time.Second),
+	})
+
+	// 2. Broken delta (sequence gap: expected 1, got 10)
+	engine.IngestOrderbookUpdate(pionex.OrderbookUpdate{
+		Symbol:     sym,
+		Action:     "UPDATE",
+		Bids:       []pionex.DepthLevel{{Price: d("100"), Amount: d("12")}},
+		Number:     11,
+		PrevNumber: 10,
+		IsSnapshot: false,
+		ReceivedAt: now.Add(-50 * time.Second),
+	})
+
+	// Microstate was updated 50s ago (> 15s MaxStaleness).
+	// Crucial invariant: DESYNC must NOT be overwritten by RegimeStale!
+	analysis := engine.Analyze(sym)
+	if analysis.Regime != RegimeDesync {
+		t.Fatalf("expected RegimeDesync to persist across staleness, got %s", analysis.Regime)
+	}
+	if analysis.IsSynced {
+		t.Fatalf("expected IsSynced == false during desync")
+	}
+	if allowed, reason := analysis.CanEnter("LONG"); allowed {
+		t.Fatalf("CanEnter must reject during desync even when book is stale")
+	} else if !strings.Contains(reason, "desynchronized") {
+		t.Fatalf("expected desynchronized in rejection reason, got %s", reason)
+	}
+
+	// 3. Heal with fresh snapshot -> enters recoveringFromDesync
+	engine.IngestOrderbookUpdate(pionex.OrderbookUpdate{
+		Symbol:     sym,
+		Action:     "SNAPSHOT",
+		Bids:       []pionex.DepthLevel{{Price: d("100"), Amount: d("10")}},
+		Asks:       []pionex.DepthLevel{{Price: d("100.1"), Amount: d("10")}},
+		Number:     100,
+		IsSnapshot: true,
+		ReceivedAt: now.Add(-30 * time.Second),
+	})
+
+	// Check immediate recovery state (0/3 windows completed, timestamp 30s ago > 15s staleness)
+	// Crucial invariant: recoveringFromDesync must still veto entry!
+	analysisRecovering := engine.Analyze(sym)
+	if analysisRecovering.Regime != RegimeWarmingUp {
+		t.Fatalf("expected RegimeWarmingUp while recovering from desync, got %s", analysisRecovering.Regime)
+	}
+	if analysisRecovering.IsSynced {
+		t.Fatalf("expected IsSynced == false while recovering from desync")
+	}
+	if allowed, reason := analysisRecovering.CanEnter("LONG"); allowed {
+		t.Fatalf("CanEnter must reject while recovering from desync")
+	} else if !strings.Contains(reason, "recovering") {
+		t.Fatalf("expected recovering in rejection reason, got %s", reason)
+	}
+
+	// 4. Complete 3 clean windows with fresh data -> recovery completes
+	for i := 0; i < 3; i++ {
+		ts := now.Add(time.Duration(i*5) * time.Second)
+		engine.IngestOrderbookUpdate(pionex.OrderbookUpdate{
+			Symbol:     sym,
+			Action:     "UPDATE",
+			Bids:       []pionex.DepthLevel{{Price: d("100"), Amount: d("10")}},
+			Asks:       []pionex.DepthLevel{{Price: d("100.1"), Amount: d("10")}},
+			Number:     101 + int64(i),
+			PrevNumber: 100 + int64(i),
+			IsSnapshot: false,
+			ReceivedAt: ts,
+		})
+		engine.FinalizeWindow(sym, ts.Add(5*time.Second))
+	}
+
+	analysisClean := engine.Analyze(sym)
+	if !analysisClean.IsSynced {
+		t.Fatalf("expected IsSynced == true after completed warmup windows")
+	}
+	if allowed, _ := analysisClean.CanEnter("LONG"); !allowed {
+		t.Fatalf("CanEnter should allow entry after warmup completes in neutral regime")
+	}
+}
+
 

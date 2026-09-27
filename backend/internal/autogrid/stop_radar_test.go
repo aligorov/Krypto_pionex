@@ -221,7 +221,9 @@ func TestRadarMicrostructureEmergencyExit_Gates(t *testing.T) {
 	worker := &Worker{
 		emergencyExits: make(map[string]time.Time),
 	}
-	settings := Settings{}
+	settings := Settings{
+		StopForecastMode: "ACTIVE",
+	}
 
 	// 1. Non-actionable OFI state must not trigger emergency exit
 	b1 := radarInput{
@@ -260,13 +262,82 @@ func TestRadarMicrostructureEmergencyExit_Gates(t *testing.T) {
 	}
 
 	// 5. Debounce test
-	worker.emergencyExits["b5"] = time.Now().Add(-10 * time.Second) // 10s ago (< 30s)
+	worker.armEmergencyExitDebounce("b5", 20*time.Second)
 	b5 := b1
 	b5.botID = "b5"
 	b5.ofiActionable = true
 	b5.price = d("96.0") // progress = 4/5 = 0.80 >= 0.60
 	if worker.radarMicrostructureEmergencyExit(context.Background(), settings, b5) {
-		t.Fatalf("bot within 30s debounce window must not re-trigger emergency exit")
+		t.Fatalf("bot within debounce window must not re-trigger emergency exit")
+	}
+}
+
+func TestRadarMicrostructureEmergencyExit_ShadowSafety(t *testing.T) {
+	worker := &Worker{
+		emergencyExits: make(map[string]time.Time),
+	}
+	settings := Settings{
+		StopForecastMode: "SHADOW", // SHADOW mode MUST NOT execute trade exits!
+	}
+
+	b := radarInput{
+		botID: "real_shadow_bot", botNumber: 101, botSource: "REAL", direction: "LONG",
+		total: d("-10.0"), price: d("96.0"), lower: d("95.0"), upper: d("105.0"),
+		inventorySide: 1, ofiRegime: "CONFIRMED_DUMP", ofiActionable: true,
+	}
+
+	// In SHADOW mode, emergency exit must NOT fire (returns false)
+	fired := worker.radarMicrostructureEmergencyExit(context.Background(), settings, b)
+	if fired {
+		t.Fatalf("SHADOW mode must never execute emergency exit trade actions")
+	}
+
+	// Shadow debounce should be armed
+	if !worker.isEmergencyExitDebounced("real_shadow_bot") {
+		t.Fatalf("expected shadow debounce to be armed after observation")
+	}
+
+	// Paper bot in SHADOW mode must also never close
+	bPaper := b
+	bPaper.botID = "paper_shadow_bot"
+	bPaper.botSource = "PAPER"
+	if worker.radarMicrostructureEmergencyExit(context.Background(), settings, bPaper) {
+		t.Fatalf("SHADOW mode must never close PAPER bots")
+	}
+}
+
+func TestRadarMicrostructureEmergencyExit_DBFailureRetry(t *testing.T) {
+	worker := &Worker{
+		emergencyExits: make(map[string]time.Time),
+		db:             nil, // db nil simulates transient DB connection failure
+	}
+	settings := Settings{
+		StopForecastMode: "ACTIVE",
+	}
+
+	b := radarInput{
+		botID: "retry_bot", botNumber: 102, botSource: "REAL", direction: "LONG",
+		total: d("-10.0"), price: d("96.0"), lower: d("95.0"), upper: d("105.0"),
+		inventorySide: 1, ofiRegime: "CONFIRMED_DUMP", ofiActionable: true,
+	}
+
+	// Should fail due to db == nil
+	fired := worker.radarMicrostructureEmergencyExit(context.Background(), settings, b)
+	if fired {
+		t.Fatalf("expected failure when DB is nil")
+	}
+
+	// Verify debounce is armed with 2s backoff, NOT 30s blacklist
+	until := worker.emergencyExits["retry_bot"]
+	remaining := time.Until(until)
+	if remaining > 3*time.Second {
+		t.Fatalf("transient failure should arm 2s backoff, not 30s; remaining: %s", remaining)
+	}
+
+	// Simulate 2 seconds passing
+	worker.emergencyExits["retry_bot"] = time.Now().Add(-100 * time.Millisecond)
+	if worker.isEmergencyExitDebounced("retry_bot") {
+		t.Fatalf("bot should be eligible for immediate retry after 2s backoff expires")
 	}
 }
 

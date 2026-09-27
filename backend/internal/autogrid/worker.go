@@ -197,18 +197,30 @@ func NewWorker(
 	return w
 }
 
-func (worker *Worker) checkAndArmEmergencyExitDebounce(botID string) bool {
+func (worker *Worker) isEmergencyExitDebounced(botID string) bool {
+	worker.emergencyExitMu.Lock()
+	defer worker.emergencyExitMu.Unlock()
+	if worker.emergencyExits == nil {
+		return false
+	}
+	until, ok := worker.emergencyExits[botID]
+	if !ok {
+		return false
+	}
+	if time.Now().Before(until) {
+		return true
+	}
+	delete(worker.emergencyExits, botID)
+	return false
+}
+
+func (worker *Worker) armEmergencyExitDebounce(botID string, duration time.Duration) {
 	worker.emergencyExitMu.Lock()
 	defer worker.emergencyExitMu.Unlock()
 	if worker.emergencyExits == nil {
 		worker.emergencyExits = make(map[string]time.Time)
 	}
-	last, ok := worker.emergencyExits[botID]
-	if ok && time.Since(last) < 30*time.Second {
-		return false
-	}
-	worker.emergencyExits[botID] = time.Now()
-	return true
+	worker.emergencyExits[botID] = time.Now().Add(duration)
 }
 
 // LiveMarkPrice returns the freshest known WebSocket mark price for a symbol.
