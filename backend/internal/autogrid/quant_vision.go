@@ -315,6 +315,17 @@ func (worker *Worker) checkKnifePause(
 	symbol string,
 	trend string,
 ) (paused bool, metrics marketdata.TakerFlowMetrics, reason string) {
+	// 1. Fast-path check: Live WebSocket OFI and microstructure state.
+	// If the real-time order flow engine is already tracking the symbol and detects
+	// adverse flow (e.g. dump pressure or confirmed dump for LONG/NEUTRAL), veto immediately.
+	// This guarantees that REST failures or delays cannot bypass an active, streaming OFI veto!
+	if worker.ofiEngine != nil {
+		analysis := worker.ofiEngine.Analyze(symbol)
+		if allowed, ofiReason := analysis.CanEnter(trend); !allowed {
+			return true, marketdata.TakerFlowMetrics{}, ofiReason
+		}
+	}
+
 	if worker.publicClient == nil {
 		return false, marketdata.TakerFlowMetrics{}, "no public client"
 	}

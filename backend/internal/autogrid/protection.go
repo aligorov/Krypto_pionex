@@ -2,6 +2,7 @@ package autogrid
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"time"
 
@@ -54,7 +55,7 @@ const (
 // REAL NEUTRAL bot as a range break with a queued DGT re-deploy. Returns
 // true when the flip path took over (the caller must not re-center).
 func (worker *Worker) radarBreakFlip(ctx context.Context, settings Settings, b radarInput, rs radarScores, velocitySpeed float64) bool {
-	if b.botSource != "REAL" || rs.Band < 3 {
+	if b.botSource != "REAL" {
 		return false
 	}
 	total := b.total
@@ -65,10 +66,10 @@ func (worker *Worker) radarBreakFlip(ctx context.Context, settings Settings, b r
 	isOFIConfirmed := b.ofiActionable && ((b.inventorySide > 0 && b.ofiRegime == "CONFIRMED_DUMP") ||
 		(b.inventorySide < 0 && b.ofiRegime == "CONFIRMED_PUMP"))
 
-	// Standard trigger: progress >= 0.85 and velocity >= breakFlipSpeedATR15.
+	// Standard trigger: progress >= 0.85 and velocity >= breakFlipSpeedATR15 in band >= 3.
 	// OFI accelerated escape: if institutional flow is confirmed adverse, trigger earlier at progress >= 0.60
 	// to prevent absorbing the full knife.
-	standardTrigger := progress >= breakFlipEdgeProgressMin && velocitySpeed >= breakFlipSpeedATR15
+	standardTrigger := rs.Band >= 3 && progress >= breakFlipEdgeProgressMin && velocitySpeed >= breakFlipSpeedATR15
 	ofiTrigger := isOFIConfirmed && progress >= 0.60
 
 	if !standardTrigger && !ofiTrigger {
@@ -144,6 +145,134 @@ func (worker *Worker) radarBreakFlip(ctx context.Context, settings Settings, b r
 		breakPrice:   b.price,
 	})
 	return true
+}
+
+// radarMicrostructureEmergencyExit executes a decoupled fast-path protective exit
+// for bots suffering confirmed adverse institutional order flow (CONFIRMED_DUMP / CONFIRMED_PUMP).
+// It bypasses the 90s radar score throttle, up to 2-hour recenter cooldowns, and 3-snapshot dwell gates.
+//
+// Routing:
+// - REAL NEUTRAL bots with DGT re-deploy enabled: executes radarBreakFlip (closes grid & queues center-aligned re-deploy).
+// - Directional bots (LONG / SHORT), REAL bots without DgtRedeploy, and PAPER bots:
+//   executes an immediate direct emergency protective stop (EMERGENCY_OFI_DUMP or EMERGENCY_OFI_PUMP).
+func (worker *Worker) radarMicrostructureEmergencyExit(ctx context.Context, settings Settings, b radarInput) bool {
+	if !b.ofiActionable {
+		return false
+	}
+	if !b.total.IsNegative() {
+		return false
+	}
+
+	isAdverseDump := b.inventorySide > 0 && b.ofiRegime == "CONFIRMED_DUMP"
+	isAdversePump := b.inventorySide < 0 && b.ofiRegime == "CONFIRMED_PUMP"
+	if !isAdverseDump && !isAdversePump {
+		return false
+	}
+
+	progress := radarB2EarlyEdgeProgress(b.price, b.lower, b.upper, b.inventorySide)
+	if progress < 0.60 {
+		return false
+	}
+
+	if !worker.checkAndArmEmergencyExitDebounce(b.botID) {
+		return false
+	}
+
+	adverseReason := "EMERGENCY_OFI_DUMP"
+	if isAdversePump {
+		adverseReason = "EMERGENCY_OFI_PUMP"
+	}
+
+	if worker.db == nil {
+		return false
+	}
+
+	// 1. REAL NEUTRAL with DGT redeploy -> break-flip route
+	if b.botSource == "REAL" && b.direction == "NEUTRAL" && settings.DgtRedeployEnabled {
+		if worker.radarBreakFlip(ctx, settings, b, radarScores{Band: 3}, 0) {
+			return true
+		}
+	}
+
+	// 2. Direct emergency stop for Directional bots (LONG/SHORT), REAL without DGT, or PAPER
+	if b.botSource == "REAL" {
+		tag, err := worker.db.Exec(ctx, `
+			UPDATE grid_bots
+			SET status = 'STOP_REQUESTED', closed_reason = $2, updated_at = NOW()
+			WHERE id = $1 AND status = 'RUNNING'
+		`, b.botID, adverseReason)
+		if err != nil || tag.RowsAffected() == 0 {
+			return false
+		}
+
+		worker.logger.Warn("microstructure emergency protective exit (REAL bot stopped)",
+			"component", "autogrid_worker", "bot_number", b.botNumber, "symbol", b.symbol,
+			"direction", b.direction, "reason", adverseReason, "ofi_regime", b.ofiRegime,
+			"total", b.total.StringFixed(2), "edge_progress", progress)
+
+		_ = LogBotEvent(ctx, worker.db, b.botID, b.botNumber, b.botSource, b.symbol,
+			adverseReason, &b.price, &b.total, map[string]any{
+				"closed_reason":  adverseReason,
+				"ofi_regime":     b.ofiRegime,
+				"direction":      b.direction,
+				"edge_progress":  decimal.NewFromFloat(progress).Round(3).String(),
+				"total":          b.total.StringFixed(2),
+			})
+
+		_ = QueueTelegramEvent(ctx, worker.db, adverseReason, map[string]any{
+			"bot_number":    b.botNumber,
+			"symbol":        b.symbol,
+			"direction":     b.direction,
+			"reason":        adverseReason,
+			"ofi_regime":    b.ofiRegime,
+			"total":         b.total.StringFixed(2),
+			"edge_progress": fmt.Sprintf("%.0f%%", progress*100),
+			"message":       fmt.Sprintf("экстренный защитный выход (%s): институциональный поток против позиции, прогресс к краю %.0f%% — сетка остановлена для предотвращения ликвидации/стопа", b.ofiRegime, progress*100),
+		})
+		return true
+	}
+
+	// 3. PAPER bots
+	if b.botSource == "PAPER" {
+		tag, err := worker.db.Exec(ctx, `
+			UPDATE paper_grid_bots
+			SET status = 'COMPLETED', closed_reason = $2, mark_price = $3,
+			    realized_pnl_usdt = $4, unrealized_pnl_usdt = 0,
+			    closed_at = NOW(), updated_at = NOW()
+			WHERE id = $1 AND status = 'RUNNING'
+		`, b.botID, adverseReason, b.price, b.total)
+		if err != nil || tag.RowsAffected() == 0 {
+			return false
+		}
+
+		worker.logger.Warn("microstructure emergency protective exit (PAPER bot stopped)",
+			"component", "autogrid_worker", "bot_number", b.botNumber, "symbol", b.symbol,
+			"direction", b.direction, "reason", adverseReason, "ofi_regime", b.ofiRegime,
+			"total", b.total.StringFixed(2), "edge_progress", progress)
+
+		_ = LogBotEvent(ctx, worker.db, b.botID, b.botNumber, b.botSource, b.symbol,
+			adverseReason, &b.price, &b.total, map[string]any{
+				"closed_reason": adverseReason,
+				"ofi_regime":    b.ofiRegime,
+				"direction":     b.direction,
+				"edge_progress": decimal.NewFromFloat(progress).Round(3).String(),
+				"total":         b.total.StringFixed(2),
+			})
+
+		_ = QueueTelegramEvent(ctx, worker.db, adverseReason, map[string]any{
+			"bot_number":    b.botNumber,
+			"symbol":        b.symbol,
+			"direction":     b.direction,
+			"reason":        adverseReason,
+			"ofi_regime":    b.ofiRegime,
+			"total":         b.total.StringFixed(2),
+			"edge_progress": fmt.Sprintf("%.0f%%", progress*100),
+			"message":       fmt.Sprintf("экстренный защитный выход (PAPER, %s): институциональный поток против позиции — сетка закрыта", b.ofiRegime),
+		})
+		return true
+	}
+
+	return false
 }
 
 // ── B+C shared: stress gates ──────────────────────────────────────────────

@@ -350,6 +350,15 @@ func (worker *Worker) radarPass(ctx context.Context, settings Settings, bots []r
 			b.microBiasBps = analysis.MicroPriceBiasBps
 			b.ofiActionable = analysis.IsActionable()
 		}
+
+		// Fast-path: Immediate Microstructure Emergency Exit.
+		// If adverse institutional order flow (CONFIRMED_DUMP or CONFIRMED_PUMP) is hitting an
+		// underwater position racing towards the adverse edge, exit immediately without
+		// being blocked by the 90s scoreThrottle, 2h recenter cooldown, or 3-tick dwell time!
+		if worker.radarMicrostructureEmergencyExit(ctx, settings, b) {
+			continue
+		}
+
 		parkNow, parkMed, hurst := worker.symbolScanStats(ctx, b.symbol)
 		rs := scoreBot(b, parkNow, parkMed, hurst, fleet, legs, maxLeg)
 

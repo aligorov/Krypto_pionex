@@ -396,6 +396,15 @@ func (worker *Worker) radarMaybeRecenter(ctx context.Context, settings Settings,
 		}
 	}
 
+	// v2.0.111 break-flip first: an escape with real adverse momentum or confirmed OFI
+	// closes the grid for a DGT re-deploy instead of dragging toxic inventory.
+	// Must run BEFORE the recenter cooldown and dwell gates — an escape close is NOT a range adjustment!
+	if b.botSource == "REAL" {
+		if worker.radarBreakFlip(ctx, settings, b, rs, velocitySpeed) {
+			return
+		}
+	}
+
 	// Durable dist-aware cooldown: blocked while the bot's last radar
 	// re-center (bot_execution_events) is younger than the window its
 	// current dist_to_stop demands — restart-proof, and a 0.15σ knife waits
@@ -427,13 +436,6 @@ func (worker *Worker) radarMaybeRecenter(ctx context.Context, settings Settings,
 	// band, durable cooldown, dwell) already ran; the arm differs only in
 	// execution — native adjust_params instead of a simulated range UPDATE.
 	if b.botSource == "REAL" {
-		// v2.0.111 break-flip first: a band≥3 escape with real adverse
-		// momentum closes the grid for a DGT re-deploy instead of dragging
-		// the toxic inventory through a keep-investment re-center (ORDI
-		// #1396: −$10.45, the bag rode a +6% break to the stop).
-		if worker.radarBreakFlip(ctx, settings, b, rs, velocitySpeed) {
-			return
-		}
 		worker.radarRecenterReal(ctx, settings, b, rs, early, velocity, velocitySpeed)
 		return
 	}

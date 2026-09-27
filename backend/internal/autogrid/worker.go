@@ -144,6 +144,9 @@ type Worker struct {
 	// orphanSweepAt throttles the v2.0.104 exchange→DB orphan adoption
 	// sweep (single manage goroutine → plain field).
 	orphanSweepAt time.Time
+
+	emergencyExitMu sync.Mutex
+	emergencyExits  map[string]time.Time
 }
 
 type trancheTBTrend struct {
@@ -188,9 +191,24 @@ func NewWorker(
 		realtimeSignal:  make(chan string, 1),
 		realtimeWatch:   make(map[string]realtimePoint),
 		ofiEngine:       marketdata.NewOFIEngine(marketdata.DefaultOFIEngineConfig()),
+		emergencyExits:  make(map[string]time.Time),
 	}
 	service.SetLivePriceResolver(w.LiveMarkPrice)
 	return w
+}
+
+func (worker *Worker) checkAndArmEmergencyExitDebounce(botID string) bool {
+	worker.emergencyExitMu.Lock()
+	defer worker.emergencyExitMu.Unlock()
+	if worker.emergencyExits == nil {
+		worker.emergencyExits = make(map[string]time.Time)
+	}
+	last, ok := worker.emergencyExits[botID]
+	if ok && time.Since(last) < 30*time.Second {
+		return false
+	}
+	worker.emergencyExits[botID] = time.Now()
+	return true
 }
 
 // LiveMarkPrice returns the freshest known WebSocket mark price for a symbol.

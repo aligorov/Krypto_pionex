@@ -113,8 +113,11 @@ func (a MicrostructureAnalysis) IsActionable() bool {
 // CanEnter checks whether a bot entry (LONG, SHORT, or NEUTRAL) is allowed
 // given the current microstructure regime.
 func (a MicrostructureAnalysis) CanEnter(trend string) (allowed bool, reason string) {
+	if a.Regime == RegimeDesync {
+		return false, "order book sequence desynchronized — awaiting fresh snapshot"
+	}
 	if !a.IsActionable() {
-		// Non-actionable regimes (WARMING_UP, DESYNC, STALE, NEUTRAL, THIN_BOOK, SPREAD_BLOWN)
+		// Non-directional regimes (WARMING_UP, STALE, NEUTRAL, THIN_BOOK, SPREAD_BLOWN)
 		// do not veto entry here (thin book and spread checks are governed by their dedicated risk filters).
 		return true, ""
 	}
@@ -238,6 +241,9 @@ type SymbolMicrostate struct {
 	history         []OFIWindow
 	latestAnalysis  MicrostructureAnalysis
 	recentTrades    map[string]time.Time // tradeId -> seenAt for deduplication
+	resyncInFlight  bool
+	lastResyncAt    time.Time
+	resyncAttempts  int
 }
 
 func newSymbolMicrostate(symbol string, cfg OFIEngineConfig) *SymbolMicrostate {
@@ -363,26 +369,35 @@ func (e *OFIEngine) IngestOrderbookUpdate(update pionex.OrderbookUpdate) {
 	if update.IsSnapshot {
 		wasDesynced := !st.book.IsSynced()
 		st.book.ApplySnapshot(update.Bids, update.Asks, update.Number, ts)
-		st.lastBookUpdate = ts
-		if wasDesynced {
-			// Sequence breach occurred previously: purge contaminated history and restart clean warmup!
+		st.resyncInFlight = false
+		st.resyncAttempts = 0
+		st.hasPrevL1 = false
+		st.prevBestBid = pionex.DepthLevel{}
+		st.prevBestAsk = pionex.DepthLevel{}
+		if wasDesynced || st.lastBookUpdate.IsZero() || ts.Sub(st.lastBookUpdate) > st.config.WindowDuration {
+			// Sequence breach occurred previously or connection gap: purge contaminated history and restart clean warmup!
 			st.history = st.history[:0]
 			st.currentWindow = OFIWindow{StartTime: ts}
-			st.hasPrevL1 = false
-			st.prevBestBid = pionex.DepthLevel{}
-			st.prevBestAsk = pionex.DepthLevel{}
 		}
+		st.lastBookUpdate = ts
 	} else {
 		if err := st.book.ApplyDelta(update.Bids, update.Asks, update.Number, update.PrevNumber, ts); err != nil {
 			st.latestAnalysis.Regime = RegimeDesync
 			st.latestAnalysis.IsFresh = false
 			st.latestAnalysis.Reason = fmt.Sprintf("order book desync: %v", err)
 			st.latestAnalysis.UpdatedAt = ts
-			e.mu.RLock()
-			handler := e.onDesync
-			e.mu.RUnlock()
-			if handler != nil {
-				go handler(update.Symbol)
+			now := time.Now()
+			shouldResync := !st.resyncInFlight || now.Sub(st.lastResyncAt) > 10*time.Second
+			if shouldResync {
+				st.resyncInFlight = true
+				st.lastResyncAt = now
+				st.resyncAttempts++
+				e.mu.RLock()
+				handler := e.onDesync
+				e.mu.RUnlock()
+				if handler != nil {
+					go handler(update.Symbol)
+				}
 			}
 			return
 		}
@@ -845,4 +860,45 @@ func (e *OFIEngine) Analyze(symbol string) MicrostructureAnalysis {
 	}
 
 	return analysis
+}
+
+// ResetSymbol resets order book sync, tracking flags, and window history for a symbol (e.g. after socket reconnect).
+func (e *OFIEngine) ResetSymbol(symbol string) {
+	sym := strings.ToUpper(strings.TrimSpace(symbol))
+	e.mu.RLock()
+	st, ok := e.symbols[sym]
+	e.mu.RUnlock()
+	if !ok {
+		return
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	st.book.Reset()
+	st.history = st.history[:0]
+	st.currentWindow = OFIWindow{}
+	st.hasPrevL1 = false
+	st.prevBestBid = pionex.DepthLevel{}
+	st.prevBestAsk = pionex.DepthLevel{}
+	st.resyncInFlight = false
+	st.resyncAttempts = 0
+	st.latestAnalysis = MicrostructureAnalysis{
+		Symbol:    sym,
+		Regime:    RegimeWarmingUp,
+		Reason:    "stream reset (reconnecting)",
+		IsFresh:   false,
+		UpdatedAt: time.Now(),
+	}
+}
+
+// ResetAll resets all tracked symbol microstates (e.g. on WebSocket reconnect).
+func (e *OFIEngine) ResetAll() {
+	e.mu.RLock()
+	syms := make([]string, 0, len(e.symbols))
+	for sym := range e.symbols {
+		syms = append(syms, sym)
+	}
+	e.mu.RUnlock()
+	for _, sym := range syms {
+		e.ResetSymbol(sym)
+	}
 }

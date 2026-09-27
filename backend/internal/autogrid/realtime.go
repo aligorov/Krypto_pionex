@@ -52,6 +52,9 @@ func (worker *Worker) startWSLane(ctx context.Context) {
 				_ = worker.wsLane.ResyncOrderbook(sym)
 			}
 		})
+		worker.wsLane.SetReconnectListener(func() {
+			worker.ofiEngine.ResetAll()
+		})
 	}
 	go worker.wsLane.Run(ctx)
 }

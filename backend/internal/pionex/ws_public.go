@@ -103,6 +103,10 @@ type PublicStream struct {
 	onMark      func(MarkUpdate)
 	onOrderbook func(OrderbookUpdate)
 	onTrade     func(Trade)
+	onReconnect func()
+
+	resyncMu       sync.Mutex
+	resyncInFlight map[string]time.Time
 }
 
 // NewPublicStream builds a lane client for the public futures stream.
@@ -120,6 +124,7 @@ func NewPublicStream(url string, logger *slog.Logger) *PublicStream {
 		subscribed:         make(map[string]struct{}),
 		marks:              make(map[string]MarkUpdate),
 		firstPayloadLogged: make(map[string]struct{}),
+		resyncInFlight:     make(map[string]time.Time),
 	}
 }
 
@@ -195,6 +200,13 @@ func (s *PublicStream) SetOrderbookListener(fn func(OrderbookUpdate)) {
 func (s *PublicStream) SetTradeListener(fn func(Trade)) {
 	s.stateMu.Lock()
 	s.onTrade = fn
+	s.stateMu.Unlock()
+}
+
+// SetReconnectListener registers the consumer invoked whenever the WebSocket reconnects.
+func (s *PublicStream) SetReconnectListener(fn func()) {
+	s.stateMu.Lock()
+	s.onReconnect = fn
 	s.stateMu.Unlock()
 }
 
@@ -298,6 +310,13 @@ func (s *PublicStream) dial(ctx context.Context) error {
 		}
 	}
 	s.logger.Info("ws lane connected", "component", "pionex_ws", "url", s.url, "symbols", len(wish))
+
+	s.stateMu.RLock()
+	onRec := s.onReconnect
+	s.stateMu.RUnlock()
+	if onRec != nil {
+		onRec()
+	}
 	return nil
 }
 
@@ -313,6 +332,10 @@ func (s *PublicStream) markDisconnected() {
 	s.connected = false
 	s.subscribed = make(map[string]struct{})
 	s.stateMu.Unlock()
+
+	s.resyncMu.Lock()
+	s.resyncInFlight = make(map[string]time.Time)
+	s.resyncMu.Unlock()
 }
 
 func (s *PublicStream) sendStreamOp(op, symbol string) error {
@@ -337,11 +360,22 @@ func (s *PublicStream) sendStreamOp(op, symbol string) error {
 }
 
 // ResyncOrderbook requests an immediate fresh full snapshot by cycling the ORDERBOOK subscription.
+// Enforces a single in-flight resync per symbol with a 10s cooldown to prevent subscription stampedes.
 func (s *PublicStream) ResyncOrderbook(symbol string) error {
 	sym := normalizeStreamSymbol(symbol)
 	if sym == "" {
 		return nil
 	}
+
+	s.resyncMu.Lock()
+	lastAt, inFlight := s.resyncInFlight[sym]
+	if inFlight && time.Since(lastAt) < 10*time.Second {
+		s.resyncMu.Unlock()
+		return nil
+	}
+	s.resyncInFlight[sym] = time.Now()
+	s.resyncMu.Unlock()
+
 	s.logger.Info("ws lane requesting fresh orderbook snapshot (resync)", "component", "pionex_ws", "symbol", sym)
 	_ = s.sendTopicOp("UNSUBSCRIBE", "ORDERBOOK", sym)
 	return s.sendTopicOp("SUBSCRIBE", "ORDERBOOK", sym)
@@ -584,6 +618,12 @@ func (s *PublicStream) ingestOrderbook(env wsEnvelope) {
 		PrevNumber: data.PrevNumber,
 		IsSnapshot: isSnapshot,
 		ReceivedAt: time.Now(),
+	}
+
+	if isSnapshot {
+		s.resyncMu.Lock()
+		delete(s.resyncInFlight, sym)
+		s.resyncMu.Unlock()
 	}
 
 	s.stateMu.RLock()

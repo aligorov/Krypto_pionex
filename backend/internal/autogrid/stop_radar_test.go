@@ -1,8 +1,10 @@
 package autogrid
 
 import (
+	"context"
 	"math"
 	"testing"
+	"time"
 
 	"github.com/shopspring/decimal"
 )
@@ -212,6 +214,59 @@ func TestScoreBotOFIAdverseAmplification(t *testing.T) {
 	rsStale := scoreBot(inStale, 10, 10, 0.50, radarFleet{}, 0, 0)
 	if rsStale.M5 != rsBase.M5 {
 		t.Fatalf("non-actionable ofi state must not increase M5: got %f vs base %f", rsStale.M5, rsBase.M5)
+	}
+}
+
+func TestRadarMicrostructureEmergencyExit_Gates(t *testing.T) {
+	worker := &Worker{
+		emergencyExits: make(map[string]time.Time),
+	}
+	settings := Settings{}
+
+	// 1. Non-actionable OFI state must not trigger emergency exit
+	b1 := radarInput{
+		botID: "b1", botSource: "REAL", direction: "LONG",
+		total: d("-5.0"), price: d("96.0"), lower: d("95.0"), upper: d("105.0"),
+		inventorySide: 1, ofiRegime: "CONFIRMED_DUMP", ofiActionable: false,
+	}
+	if worker.radarMicrostructureEmergencyExit(context.Background(), settings, b1) {
+		t.Fatalf("non-actionable ofi state must not trigger emergency exit")
+	}
+
+	// 2. Profitable bot must not trigger emergency exit
+	b2 := b1
+	b2.ofiActionable = true
+	b2.total = d("1.5")
+	if worker.radarMicrostructureEmergencyExit(context.Background(), settings, b2) {
+		t.Fatalf("profitable bot must not trigger emergency exit")
+	}
+
+	// 3. Contrary flow (pump while long) must not trigger emergency exit
+	b3 := b1
+	b3.ofiActionable = true
+	b3.ofiRegime = "CONFIRMED_PUMP"
+	if worker.radarMicrostructureEmergencyExit(context.Background(), settings, b3) {
+		t.Fatalf("contrary flow (pump while long) must not trigger dump exit")
+	}
+
+	// 4. Progress < 0.60 must not trigger emergency exit
+	// upper is 105, lower is 95, span is 10. Progress = (105 - price) / 10.
+	// For price 102.0, progress = 3.0 / 10 = 0.30 (< 0.60)
+	b4 := b1
+	b4.ofiActionable = true
+	b4.price = d("102.0")
+	if worker.radarMicrostructureEmergencyExit(context.Background(), settings, b4) {
+		t.Fatalf("progress < 0.60 must not trigger emergency exit")
+	}
+
+	// 5. Debounce test
+	worker.emergencyExits["b5"] = time.Now().Add(-10 * time.Second) // 10s ago (< 30s)
+	b5 := b1
+	b5.botID = "b5"
+	b5.ofiActionable = true
+	b5.price = d("96.0") // progress = 4/5 = 0.80 >= 0.60
+	if worker.radarMicrostructureEmergencyExit(context.Background(), settings, b5) {
+		t.Fatalf("bot within 30s debounce window must not re-trigger emergency exit")
 	}
 }
 

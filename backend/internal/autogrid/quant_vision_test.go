@@ -289,3 +289,36 @@ func TestCheckKnifePause_DynamicOFI_Integration(t *testing.T) {
 	}
 }
 
+func TestKnifePause_RESTFailurePreservesOFIVeto(t *testing.T) {
+	worker := &Worker{
+		ofiEngine: marketdata.NewOFIEngine(marketdata.DefaultOFIEngineConfig()),
+		// publicClient is nil, simulating REST outage
+	}
+
+	sym := "DUMP_REST_FAIL_PERP"
+	now := time.Now()
+
+	// Feed 3 consecutive bearish windows into worker's ofiEngine
+	for i := 0; i < 3; i++ {
+		ts := now.Add(time.Duration(i*5) * time.Second)
+		worker.ofiEngine.IngestL2(sym,
+			[]pionex.DepthLevel{{Price: decimal.RequireFromString("99.98"), Amount: decimal.NewFromInt(50)}},
+			[]pionex.DepthLevel{{Price: decimal.NewFromInt(100), Amount: decimal.NewFromInt(500)}},
+			ts,
+		)
+		worker.ofiEngine.IngestTrade(sym, pionex.Trade{
+			Symbol: sym, Side: "SELL", Price: decimal.RequireFromString("99.98"), Size: decimal.NewFromInt(200), Time: ts.UnixMilli(),
+		})
+		worker.ofiEngine.FinalizeWindow(sym, ts.Add(5*time.Second))
+	}
+
+	// Under dump pressure, LONG entry must be vetoed even though REST publicClient is nil!
+	pausedLong, _, reason := worker.checkKnifePause(context.Background(), sym, "LONG")
+	if !pausedLong {
+		t.Fatalf("expected checkKnifePause to pause LONG entry under dump pressure even when REST client is nil")
+	}
+	if !strings.Contains(reason, "dump pressure veto") {
+		t.Fatalf("expected dump pressure veto reason, got %q", reason)
+	}
+}
+

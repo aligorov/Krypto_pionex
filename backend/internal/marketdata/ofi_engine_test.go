@@ -629,3 +629,166 @@ func TestOFIEngine_TradeTemporalIsolation(t *testing.T) {
 	}
 }
 
+func TestOFIEngine_SingleInFlightResync(t *testing.T) {
+	engine := NewOFIEngine(DefaultOFIEngineConfig())
+	sym := "THROTTLE_RESYNC_PERP"
+
+	var desyncCalls int
+	var mu sync.Mutex
+	engine.SetDesyncHandler(func(s string) {
+		mu.Lock()
+		desyncCalls++
+		mu.Unlock()
+	})
+
+	now := time.Now()
+	// Initial snapshot
+	engine.IngestOrderbookUpdate(pionex.OrderbookUpdate{
+		Symbol:     sym,
+		Action:     "SNAPSHOT",
+		Bids:       []pionex.DepthLevel{{Price: d("100"), Amount: d("10")}},
+		Asks:       []pionex.DepthLevel{{Price: d("100.1"), Amount: d("10")}},
+		Number:     1,
+		IsSnapshot: true,
+		ReceivedAt: now,
+	})
+
+	// Send 5 broken deltas (gap in sequence) in rapid succession
+	for i := 0; i < 5; i++ {
+		engine.IngestOrderbookUpdate(pionex.OrderbookUpdate{
+			Symbol:     sym,
+			Action:     "UPDATE",
+			Bids:       []pionex.DepthLevel{{Price: d("100"), Amount: d("12")}},
+			Number:     10 + int64(i),
+			PrevNumber: 9 + int64(i), // expected PrevNumber was 1
+			IsSnapshot: false,
+			ReceivedAt: now.Add(time.Duration(i*10) * time.Millisecond),
+		})
+	}
+
+	time.Sleep(50 * time.Millisecond)
+
+	mu.Lock()
+	calls := desyncCalls
+	mu.Unlock()
+
+	if calls != 1 {
+		t.Fatalf("expected exactly 1 resync trigger due to 10s in-flight cooldown, got %d", calls)
+	}
+
+	analysis := engine.Analyze(sym)
+	if analysis.Regime != RegimeDesync {
+		t.Fatalf("expected RegimeDesync after broken delta, got %s", analysis.Regime)
+	}
+	if allowed, _ := analysis.CanEnter("LONG"); allowed {
+		t.Fatalf("expected CanEnter to reject entry during RegimeDesync")
+	}
+
+	// Now snapshot arrives to heal the desync
+	engine.IngestOrderbookUpdate(pionex.OrderbookUpdate{
+		Symbol:     sym,
+		Action:     "SNAPSHOT",
+		Bids:       []pionex.DepthLevel{{Price: d("100"), Amount: d("15")}},
+		Asks:       []pionex.DepthLevel{{Price: d("100.1"), Amount: d("15")}},
+		Number:     20,
+		IsSnapshot: true,
+		ReceivedAt: now.Add(200 * time.Millisecond),
+	})
+
+	st := engine.getOrCreate(sym)
+	st.mu.RLock()
+	inFlight := st.resyncInFlight
+	st.mu.RUnlock()
+	if inFlight {
+		t.Fatalf("snapshot should clear resyncInFlight")
+	}
+}
+
+func TestOFIEngine_SnapshotL1BaselineReset(t *testing.T) {
+	engine := NewOFIEngine(DefaultOFIEngineConfig())
+	sym := "L1_RESET_PERP"
+	now := time.Now()
+
+	// 1. Initial snapshot at price 100
+	engine.IngestOrderbookUpdate(pionex.OrderbookUpdate{
+		Symbol:     sym,
+		Action:     "SNAPSHOT",
+		Bids:       []pionex.DepthLevel{{Price: d("100"), Amount: d("10")}},
+		Asks:       []pionex.DepthLevel{{Price: d("100.1"), Amount: d("10")}},
+		Number:     1,
+		IsSnapshot: true,
+		ReceivedAt: now,
+	})
+
+	// 2. Normal delta moving bid to 100.05
+	engine.IngestOrderbookUpdate(pionex.OrderbookUpdate{
+		Symbol:     sym,
+		Action:     "UPDATE",
+		Bids:       []pionex.DepthLevel{{Price: d("100.05"), Amount: d("10")}},
+		Asks:       []pionex.DepthLevel{{Price: d("100.1"), Amount: d("10")}},
+		Number:     2,
+		PrevNumber: 1,
+		IsSnapshot: false,
+		ReceivedAt: now.Add(time.Second),
+	})
+
+	st := engine.getOrCreate(sym)
+	st.mu.RLock()
+	ofi1 := st.currentWindow.OFI
+	st.mu.RUnlock()
+	if ofi1 <= 0 {
+		t.Fatalf("expected positive OFI after bid price increase, got %f", ofi1)
+	}
+
+	// 3. New snapshot arrives at completely different price (e.g. after reconnect or resync)
+	// Price jumps to 150. This snapshot MUST NOT compute a discrete OFI step against 100.05!
+	engine.IngestOrderbookUpdate(pionex.OrderbookUpdate{
+		Symbol:     sym,
+		Action:     "SNAPSHOT",
+		Bids:       []pionex.DepthLevel{{Price: d("150"), Amount: d("50")}},
+		Asks:       []pionex.DepthLevel{{Price: d("150.1"), Amount: d("50")}},
+		Number:     100,
+		IsSnapshot: true,
+		ReceivedAt: now.Add(2 * time.Second),
+	})
+
+	st.mu.RLock()
+	ofi2 := st.currentWindow.OFI
+	st.mu.RUnlock()
+
+	// OFI in window must be identical to ofi1 (i.e. zero added OFI from snapshot jump), NOT blown up by price delta 150-100!
+	if ofi2 != ofi1 {
+		t.Fatalf("snapshot should not add discrete OFI step: expected ofi2 == ofi1 (%f), got %f", ofi1, ofi2)
+	}
+}
+
+func TestOFIEngine_ResetAll(t *testing.T) {
+	engine := NewOFIEngine(DefaultOFIEngineConfig())
+	sym := "RESET_TEST_PERP"
+
+	engine.IngestOrderbookUpdate(pionex.OrderbookUpdate{
+		Symbol:     sym,
+		Action:     "SNAPSHOT",
+		Bids:       []pionex.DepthLevel{{Price: d("10"), Amount: d("10")}},
+		Asks:       []pionex.DepthLevel{{Price: d("10.1"), Amount: d("10")}},
+		Number:     1,
+		IsSnapshot: true,
+		ReceivedAt: time.Now(),
+	})
+
+	st := engine.getOrCreate(sym)
+	if !st.book.IsSynced() {
+		t.Fatalf("expected book to be synced")
+	}
+
+	engine.ResetAll()
+
+	if st.book.IsSynced() {
+		t.Fatalf("ResetAll should desynchronize order book until fresh snapshot")
+	}
+	analysis := engine.Analyze(sym)
+	if analysis.Regime != RegimeWarmingUp && analysis.Regime != RegimeStale {
+		t.Fatalf("expected WarmingUp or Stale after ResetAll, got %s", analysis.Regime)
+	}
+}
+
