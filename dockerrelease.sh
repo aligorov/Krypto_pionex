@@ -39,7 +39,9 @@ echo "[1/5] Running Backend Test Suite in Docker (unit + DB integration)..."
 # of silently no-op'ing the deploy; (d) a dirty working tree fails the
 # release — update.sh deploys the TAGGED commit, so the suite must test
 # exactly that tree.
-if ! git diff --quiet || ! git diff --cached --quiet; then
+cd "$ROOT_DIR"
+if ! git diff --quiet || ! git diff --cached --quiet ||
+    [[ -n "$(git ls-files --others --exclude-standard -- backend frontend quant-worker migrations docker docker-compose.yml VERSION update.sh dockerrelease.sh)" ]]; then
     echo "Working tree is dirty — the suite would test a tree the tag will not carry. Commit first."
     exit 1
 fi

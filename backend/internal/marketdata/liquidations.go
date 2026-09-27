@@ -3,6 +3,7 @@ package marketdata
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -59,8 +60,9 @@ type LiquidationListener struct {
 	db  *pgxpool.Pool
 	url string
 
-	mu     sync.Mutex
-	buffer []liquidationRecord
+	mu              sync.Mutex
+	buffer          []liquidationRecord
+	lastHealthWrite time.Time
 }
 
 type liquidationRecord struct {
@@ -108,12 +110,14 @@ func (l *LiquidationListener) Run(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
+		l.recordTransport(ctx, source, false)
 		var err error
 		if source == "binance" {
 			err = l.stream(ctx)
 		} else {
 			err = l.bybitStream(ctx)
 		}
+		l.recordTransport(ctx, source, false)
 		if err != nil && ctx.Err() == nil {
 			slog.Warn("liquidation listener: stream closed, reconnecting",
 				"source", source, "error", err)
@@ -177,6 +181,7 @@ func (l *LiquidationListener) bybitStream(ctx context.Context) error {
 
 	slog.Info("liquidation listener connected", "url", DefaultBybitLiquidationWS, "source", "bybit")
 	conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+	subscribed := false
 	for {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -186,6 +191,24 @@ func (l *LiquidationListener) bybitStream(ctx context.Context) error {
 			return err
 		}
 		conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		// A subscription acknowledgement or a topic event proves that the
+		// subscribed stream works. Pongs refresh liveness only after that.
+		var frame struct {
+			Op      string `json:"op"`
+			Success bool   `json:"success"`
+			Topic   string `json:"topic"`
+		}
+		if json.Unmarshal(payload, &frame) == nil {
+			if frame.Op == "subscribe" && !frame.Success {
+				return fmt.Errorf("liquidation subscription rejected")
+			}
+			if (frame.Op == "subscribe" && frame.Success) || strings.HasPrefix(frame.Topic, "allLiquidation.") {
+				subscribed = true
+			}
+			if subscribed && (frame.Op == "ping" || frame.Op == "pong" || frame.Op == "subscribe" || strings.HasPrefix(frame.Topic, "allLiquidation.")) {
+				l.recordTransport(ctx, "bybit", true)
+			}
+		}
 		l.ingestBybit(payload)
 	}
 }
@@ -315,6 +338,13 @@ func (l *LiquidationListener) stream(ctx context.Context) error {
 	defer conn.Close()
 
 	slog.Info("liquidation listener connected", "url", l.url)
+	// Server pings are received even when there are no liquidations.
+	defaultPing := conn.PingHandler()
+	conn.SetPingHandler(func(message string) error {
+		conn.SetReadDeadline(time.Now().Add(4 * time.Minute))
+		l.recordTransport(ctx, "binance", true)
+		return defaultPing(message)
+	})
 	// Binance pings every ~3 minutes; the read deadline covers a full cycle.
 	conn.SetReadDeadline(time.Now().Add(4 * time.Minute))
 	for {
@@ -326,7 +356,38 @@ func (l *LiquidationListener) stream(ctx context.Context) error {
 			return err
 		}
 		conn.SetReadDeadline(time.Now().Add(4 * time.Minute))
+		l.recordTransport(ctx, "binance", true)
 		l.ingest(payload)
+	}
+}
+
+// recordTransport only records the existing connection; it never opens a
+// second market source. Missing/failed writes age out and block fresh risk.
+func (l *LiquidationListener) recordTransport(ctx context.Context, source string, connected bool) {
+	if l.db == nil {
+		return
+	}
+	// A burst may contain thousands of events. Persist transport evidence at
+	// most once per ten seconds; disconnects are always written immediately.
+	if connected && time.Since(l.lastHealthWrite) < 10*time.Second {
+		return
+	}
+	if !connected {
+		l.lastHealthWrite = time.Time{}
+	}
+	writeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	_, err := l.db.Exec(writeCtx, `
+		INSERT INTO liquidation_feed_health (source, connected, last_message_at)
+		VALUES ($1, $2, CASE WHEN $2 THEN NOW() ELSE NULL END)
+		ON CONFLICT (source) DO UPDATE SET connected = EXCLUDED.connected,
+		last_message_at = CASE WHEN EXCLUDED.connected THEN NOW() ELSE liquidation_feed_health.last_message_at END,
+		updated_at = NOW()`, source, connected)
+	if err != nil && ctx.Err() == nil {
+		slog.Warn("liquidation transport health persist failed", "source", source, "error", err)
+	}
+	if err == nil && connected {
+		l.lastHealthWrite = time.Now()
 	}
 }
 

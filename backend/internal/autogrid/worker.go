@@ -110,9 +110,8 @@ type Worker struct {
 	// terminalReopenDone gates the one-time v2.0.99 upgrade heal that reopens
 	// estimate-class finals the old binary froze as confirmed.
 	terminalReopenDone bool
-	// terminalIdentityHealDone gates the one-time v2.0.105 heal that NULLs
-	// the unlock_identity finals written with the exchange's stale
-	// usdtInvestment divisor.
+	// terminalIdentityHealDone gates rechecking explicitly identified legacy
+	// calculations without discarding their previous financial result.
 	terminalIdentityHealDone bool
 	// shiftOffsetHealDone gates the one-time v2.0.107 heal that seeds the
 	// inventory cost-basis offset for bots that shifted range under earlier
@@ -4271,25 +4270,13 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 			// slippage" and poisons the EXIT_SLIPPAGE calibration.
 			totalPnL := realized.Add(supervisionFloor)
 			intentAt := time.Now()
-			intentTag, intentErr := worker.db.Exec(ctx, `
-				UPDATE grid_bots
-				SET status = 'STOP_REQUESTED', closed_reason = $2, updated_at = NOW(),
-				    model_state = jsonb_set(COALESCE(model_state, '{}'::jsonb),
-				        '{stopIntentTotal}', to_jsonb($3::NUMERIC))
-				WHERE id = $1 AND status = 'RUNNING'
-			`, bot.id, decision.Reason, totalPnL)
-			// The status guard races external stop writers (manual close,
-			// close-all, radar break-flip). Losing that race must not lose
-			// the telemetry marker — our engine still made THIS decision at
-			// THIS total, so stamp it unconditionally on the row.
-			if intentErr != nil || intentTag.RowsAffected() == 0 {
-				_, _ = worker.db.Exec(ctx, `
-					UPDATE grid_bots
-					SET model_state = jsonb_set(COALESCE(model_state, '{}'::jsonb),
-					    '{stopIntentTotal}', to_jsonb($2::NUMERIC)),
-					    updated_at = NOW()
-					WHERE id = $1
-				`, bot.id, totalPnL)
+			active, intentErr := worker.recordCloseIntent(ctx, bot.id, decision.Reason, totalPnL)
+			if intentErr != nil {
+				worker.logger.Error("close intent persist failed", "bot_id", bot.id, "error", intentErr)
+			} else if !active {
+				// Another writer already made the bot terminal. Do not turn
+				// it back into STOPPING via cancelRealBot.
+				continue
 			}
 			if err := worker.cancelRealBot(ctx, client, bot.id, bot.remoteID, "autogrid "+decision.Reason); err != nil {
 				worker.logger.Error("close bot by management decision",

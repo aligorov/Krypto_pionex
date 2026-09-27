@@ -217,7 +217,10 @@ func (worker *Worker) applyExchangeFinal(ctx context.Context, item pendingTermin
 		    reconciliation_state = 'REMOTE_TERMINAL_CONFIRMED',
 		    model_state = COALESCE(model_state, '{}'::jsonb)
 		        || jsonb_build_object('finalProfitSource', to_jsonb($3::TEXT),
-		                              'finalUsdtExchange', to_jsonb($2::NUMERIC)),
+		                              'finalUsdtExchange', to_jsonb($2::NUMERIC))
+		        || CASE WHEN $3::TEXT = 'unlock_identity' THEN
+		             jsonb_build_object('unlockIdentityBasis', 'local_investment')
+		           ELSE '{}'::jsonb END,
 		    last_error = NULL, updated_at = NOW()
 		WHERE id = $1 AND reconciliation_state = $4
 	`, item.id, settled, string(source), TerminalFinalPendingExchange)
@@ -289,25 +292,16 @@ func truncateForLog(s string) string {
 	return s
 }
 
-// healV103UnlockIdentity is the v2.0.105 once-ever-per-row heal: every
-// unlock_identity final written by v2.0.100-104 paired unlockUsdtAmount with
-// the exchange's STALE usdtInvestment (prod: +$50 phantom per tranche-2
-// bot, 11 rows). NULLs the final and reopens the row as pending — the fixed
-// sweep re-derives it against OUR final investment within minutes. The
-// buggy figure is archived under model_state.v103UnlockBug, and that key is
-// the durable guard: a re-derived row carries marker unlock_identity again,
-// so WITHOUT the key guard a later restart would re-heal CORRECT rows —
-// >48h ones freezing at NULL forever (adversarial review, agent_a46cd7de).
-// v2.0.106: placeholder contiguity fixed ($1, was a lone $2 — the pgx
-// parameter-class bug, fifth prod strike).
+// healV103UnlockIdentity only rechecks rows explicitly identified as having
+// used exchange investment. An unversioned unlock_identity final is not
+// evidence of the old bug. Preserve its value while awaiting replacement.
 func (worker *Worker) healV103UnlockIdentity(ctx context.Context) {
 	if worker.terminalIdentityHealDone {
 		return
 	}
 	tag, err := worker.db.Exec(ctx, `
 		UPDATE grid_bots
-		SET realized_pnl_usdt = NULL,
-		    unrealized_pnl_usdt = 0,
+		SET unrealized_pnl_usdt = 0,
 		    supervision_floor_pnl_usdt = 0,
 		    reconciliation_state = $1,
 		    model_state = (COALESCE(model_state, '{}'::jsonb)
@@ -319,15 +313,11 @@ func (worker *Worker) healV103UnlockIdentity(ctx context.Context) {
 		WHERE COALESCE(model_state->>'finalProfitSource','') = 'unlock_identity'
 		  AND status IN ('STOPPED', 'COMPLETED', 'CANCELLED', 'LIQUIDATED')
 		  AND NOT (COALESCE(model_state, '{}'::jsonb) ? 'v103UnlockBug')
+		  AND model_state->>'unlockIdentityBasis' = 'exchange_investment'
 		  AND COALESCE(closed_at, updated_at) > NOW() - INTERVAL '48 hours'
 	`, TerminalFinalPendingExchange)
-	// v2.0.120 (review agent): the 48h window. The identity-settled rows the
-	// sweep writes (applyExchangeFinal) never carried the v103UnlockBug
-	// guard, so on every restart this heal reopened them again — an endless
-	// heal→pending→re-correct loop re-logging TERMINAL_FINAL_CORRECTED (and,
-	// new in v2.0.119, EXIT_SLIPPAGE), and for rows older than the re-check
-	// window it froze the final at NULL forever. The 2026-09-26 bug
-	// population is long healed; only fresh closes can still be pending.
+	// The 48h bound matches the recheck window; the durable marker prevents
+	// repeat reopening even if the replacement cannot be fetched immediately.
 	if err != nil {
 		// Flag stays false: a transient DB error retries on the next manage
 		// pass instead of skipping the heal for the whole process lifetime

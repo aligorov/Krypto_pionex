@@ -13,7 +13,7 @@ import (
 )
 
 // TestHealV103UnlockIdentity pins the v2.0.105 heal against a real database:
-// it must reopen phantom unlock_identity finals (NULL + PENDING + archived
+// it must reopen identified phantom finals (retained + PENDING + archived
 // buggy figure), never touch rows that carry the v103UnlockBug guard, and
 // never fail on placeholder arity — the v2.0.106 lesson (a lone $2 made the
 // Exec error out on every boot while the operator watched the phantom TOTAL
@@ -59,7 +59,7 @@ func TestHealV103UnlockIdentity(t *testing.T) {
 
 	seed := func(t *testing.T, id, marker string, guarded bool) {
 		t.Helper()
-		state := `jsonb_build_object('finalProfitSource', '` + marker + `', 'finalUsdtExchange', '52.279854292')`
+		state := `jsonb_build_object('finalProfitSource', '` + marker + `', 'finalUsdtExchange', '52.279854292', 'unlockIdentityBasis', 'exchange_investment')`
 		if guarded {
 			state += ` || jsonb_build_object('v103UnlockBug', '52.279854292')`
 		}
@@ -105,8 +105,8 @@ func TestHealV103UnlockIdentity(t *testing.T) {
 	`, phantomID).Scan(&realized, &recon, &bugFig); err != nil {
 		t.Fatalf("phantom row read: %v", err)
 	}
-	if realized != nil {
-		t.Fatalf("phantom final must be NULL after heal, got %v", *realized)
+	if realized == nil || *realized != 52.27985429 {
+		t.Fatalf("previous final must be retained until replacement, got %v", realized)
 	}
 	if recon != TerminalFinalPendingExchange {
 		t.Fatalf("phantom row must be reopened pending, got %s", recon)

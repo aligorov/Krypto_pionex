@@ -76,28 +76,25 @@ func (worker *Worker) CheckLiquidationCascade(ctx context.Context, thresholdUSD 
 	return totalUSD > thresholdUSD, totalUSD
 }
 
-// liquidationSourceStaleness is the age beyond which the liquidation feed is
-// considered dead. Bybit/Binance perp liquidation streams emit at least a
-// trickle every few minutes on any liquid universe; total silence for 15
-// minutes means the collector is down, not that nobody is being liquidated.
+// liquidationSourceStaleness bounds persisted transport evidence, not the
+// interval between market events. Quiet markets do not expire this evidence.
 const liquidationSourceStaleness = 15 * time.Minute
 
-// LiquidationSourceHealthy reports whether the liquidation feed has produced
-// an event recently enough to trust the cascade gate's "no cascade" answer.
-// An EMPTY table (source never delivered anything — fresh install, test
-// database, collector intentionally off) reads healthy: staleness detection
-// needs evidence of a once-alive feed, and freezing a never-configured
-// system would block every deploy forever. The protected case is the
-// populated table whose stream died quietly — history exists, but nothing
-// arrived within the window.
+// LiquidationSourceHealthy checks transport evidence for the configured
+// source. Quiet markets can be healthy; missing health or SQL errors cannot.
 func (worker *Worker) LiquidationSourceHealthy(ctx context.Context) (healthy bool, lastEvent time.Time) {
 	var last *time.Time
+	var connected bool
 	if err := worker.db.QueryRow(ctx, `
-        SELECT MAX(captured_at) FROM liquidation_events
-    `).Scan(&last); err != nil || last == nil {
-		return true, time.Time{}
+        SELECT connected, last_message_at FROM liquidation_feed_health
+        WHERE source = COALESCE(
+            (SELECT NULLIF(value#>>'{}', '') FROM app_config WHERE key = 'liquidation_source'),
+            'bybit')
+    `).Scan(&connected, &last); err != nil || last == nil {
+		return false, time.Time{}
 	}
-	return time.Since(*last) <= liquidationSourceStaleness, *last
+	age := time.Since(*last)
+	return connected && age >= 0 && age <= liquidationSourceStaleness, *last
 }
 
 // GetFundingForSymbol gets the latest cross-exchange funding rate.

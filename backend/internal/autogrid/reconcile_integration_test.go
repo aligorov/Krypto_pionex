@@ -27,6 +27,19 @@ func integrationDatabaseURL(t *testing.T) string {
 	if url == "" {
 		t.Skip("PIONEX_TEST_DATABASE_URL is not set; skipping integration test")
 	}
+	// Tests unrelated to feed failure explicitly supply a working transport.
+	// An empty liquidation_events table alone is no longer health evidence.
+	pool, err := pgxpool.New(context.Background(), url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	if _, err := pool.Exec(context.Background(), `
+		INSERT INTO liquidation_feed_health (source, connected, last_message_at)
+		VALUES ('bybit', true, NOW()) ON CONFLICT (source) DO NOTHING
+	`); err != nil {
+		t.Fatal(err)
+	}
 	return url
 }
 
