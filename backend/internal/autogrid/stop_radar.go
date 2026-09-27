@@ -71,6 +71,10 @@ type radarInput struct {
 	// inventorySide: +1 long inventory (price below mid / LONG bot),
 	// −1 short inventory, 0 flat.
 	inventorySide float64
+
+	// v2.0.128: Live order flow & microstructure state
+	ofiRegime    string
+	microBiasBps float64
 }
 
 // radarPriceFor resolves a bot's live price from the pass-wide ticker map,
@@ -254,6 +258,20 @@ func scoreBot(in radarInput, parkNow, parkMedian24h, latestHurst float64, fleet 
 		// exactly the "neutral grid in a trend" failure shape.
 		rs.M5 = 1.0 + 0.5*clamp01((latestHurst-0.55)/0.20)*math.Abs(in.inventorySide)
 	}
+	// v2.0.128: Order flow imbalance & microstructure risk amplification
+	if in.inventorySide > 0 {
+		if in.ofiRegime == "DUMP_PRESSURE" {
+			rs.M5 += 0.25
+		} else if in.ofiRegime == "CONFIRMED_DUMP" {
+			rs.M5 += 0.50
+		}
+	} else if in.inventorySide < 0 {
+		if in.ofiRegime == "PUMP_PRESSURE" {
+			rs.M5 += 0.25
+		} else if in.ofiRegime == "CONFIRMED_PUMP" {
+			rs.M5 += 0.50
+		}
+	}
 
 	// Composite: bot-local components under the regime multiplier, plus the
 	// fleet-wide drain as an ADDITIVE term (agent design: it applies to
@@ -323,6 +341,11 @@ func (worker *Worker) radarPass(ctx context.Context, settings Settings, bots []r
 
 	now := time.Now().UTC()
 	for _, b := range bots {
+		if worker.ofiEngine != nil {
+			analysis := worker.ofiEngine.Analyze(b.symbol)
+			b.ofiRegime = string(analysis.Regime)
+			b.microBiasBps = analysis.MicroPriceBiasBps
+		}
 		parkNow, parkMed, hurst := worker.symbolScanStats(ctx, b.symbol)
 		rs := scoreBot(b, parkNow, parkMed, hurst, fleet, legs, maxLeg)
 

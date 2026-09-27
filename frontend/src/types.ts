@@ -392,6 +392,8 @@ export interface AutoGridBot {
   realizedPnlUsdt: string | null;
   unrealizedPnlUsdt: string | null;
   supervisionFloorUsdt?: string | null;
+  ofiRegime?: string | null;
+  microPriceBiasBps?: number | null;
   reconciliationState: string;
   adjustmentsCount: number;
   pnlTargetUsdt: string | null;

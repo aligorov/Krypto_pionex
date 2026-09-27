@@ -62,8 +62,22 @@ func (worker *Worker) radarBreakFlip(ctx context.Context, settings Settings, b r
 		return false // not underwater enough to pay the escape cost
 	}
 	progress := radarB2EarlyEdgeProgress(b.price, b.lower, b.upper, b.inventorySide)
-	if progress < breakFlipEdgeProgressMin || velocitySpeed < breakFlipSpeedATR15 {
+	isOFIConfirmed := (b.inventorySide > 0 && b.ofiRegime == "CONFIRMED_DUMP") ||
+		(b.inventorySide < 0 && b.ofiRegime == "CONFIRMED_PUMP")
+
+	// Standard trigger: progress >= 0.85 and velocity >= breakFlipSpeedATR15.
+	// OFI accelerated escape: if institutional flow is confirmed adverse, trigger earlier at progress >= 0.60
+	// to prevent absorbing the full knife.
+	standardTrigger := progress >= breakFlipEdgeProgressMin && velocitySpeed >= breakFlipSpeedATR15
+	ofiTrigger := isOFIConfirmed && progress >= 0.60
+
+	if !standardTrigger && !ofiTrigger {
 		return false
+	}
+
+	escapeTrigger := "VELOCITY_BREAKOUT"
+	if ofiTrigger {
+		escapeTrigger = "OFI_CONFIRMED_" + b.ofiRegime
 	}
 
 	// The direction of the escape names the break: short inventory fleeing a
@@ -95,18 +109,26 @@ func (worker *Worker) radarBreakFlip(ctx context.Context, settings Settings, b r
 	}
 	worker.logger.Warn("radar break-flip: escape lane closes the grid for DGT re-deploy",
 		"component", "autogrid_worker", "bot_number", b.botNumber, "symbol", b.symbol,
-		"break_reason", breakReason, "total", total.StringFixed(2),
+		"break_reason", breakReason, "escape_trigger", escapeTrigger, "ofi_regime", b.ofiRegime,
+		"total", total.StringFixed(2),
 		"velocity_atr15", velocitySpeed, "edge_progress", progress)
 	_ = LogBotEvent(ctx, worker.db, b.botID, b.botNumber, b.botSource, b.symbol,
 		"RADAR_BREAK_FLIP", &b.price, &total, map[string]any{
-			"break_reason": breakReason, "band": rs.Band,
+			"break_reason":   breakReason,
+			"escape_trigger": escapeTrigger,
+			"ofi_regime":     b.ofiRegime,
+			"band":           rs.Band,
 			"velocity_atr15": decimal.NewFromFloat(velocitySpeed).Round(3).String(),
 			"edge_progress":  decimal.NewFromFloat(progress).Round(3).String(),
 		})
 	_ = QueueTelegramEvent(ctx, worker.db, "RADAR_BREAK_FLIP", map[string]any{
-		"bot_number": b.botNumber, "symbol": b.symbol, "break_reason": breakReason,
-		"total":   total.StringFixed(2),
-		"message": "пробой с ускорением — сетка закрыта, DGT перезапустит с центра пробоя без старого инвентаря",
+		"bot_number":     b.botNumber,
+		"symbol":         b.symbol,
+		"break_reason":   breakReason,
+		"escape_trigger": escapeTrigger,
+		"ofi_regime":     b.ofiRegime,
+		"total":          total.StringFixed(2),
+		"message":        "пробой (" + escapeTrigger + ") — сетка закрыта, DGT перезапустит с центра пробоя без старого инвентаря",
 	})
 
 	// DGT intent onto the closing row: fires from the existing

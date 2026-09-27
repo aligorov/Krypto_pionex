@@ -307,10 +307,16 @@ func (s *PublicStream) sendStreamOp(op, symbol string) error {
 	}
 	s.stateMu.RLock()
 	hasTradeListener := s.onTrade != nil
+	hasOrderbookListener := s.onOrderbook != nil
 	s.stateMu.RUnlock()
 	if hasTradeListener {
 		if err := s.sendTopicOp(op, "TRADE", symbol); err != nil {
 			s.logger.Debug("ws lane trade op", "component", "pionex_ws", "op", op, "symbol", symbol, "error", err)
+		}
+	}
+	if hasOrderbookListener {
+		if err := s.sendTopicOp(op, "ORDERBOOK", symbol); err != nil {
+			s.logger.Debug("ws lane orderbook op", "component", "pionex_ws", "op", op, "symbol", symbol, "error", err)
 		}
 	}
 	return nil

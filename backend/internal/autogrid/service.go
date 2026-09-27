@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"math"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -198,6 +199,8 @@ type ActiveBot struct {
 	RealizedPNLUSDT      *decimal.Decimal `json:"realizedPnlUsdt"`
 	UnrealizedPNLUSDT    *decimal.Decimal `json:"unrealizedPnlUsdt"`
 	SupervisionFloorUSDT *decimal.Decimal `json:"supervisionFloorUsdt,omitempty"`
+	OFIRegime            *string          `json:"ofiRegime,omitempty"`
+	MicroPriceBiasBps    *float64         `json:"microPriceBiasBps,omitempty"`
 	ReconciliationState  string           `json:"reconciliationState"`
 	AdjustmentsCount     int              `json:"adjustmentsCount"`
 	PnLTargetUSDT        *decimal.Decimal `json:"pnlTargetUsdt"`
@@ -1531,8 +1534,20 @@ func (s *Service) listActiveBots(ctx context.Context, settingsID string) ([]Acti
 			}
 		}
 
-		// Real-time floating mark overlay:
+		// Real-time floating mark overlay and microstructure telemetry:
 		if ms, ok := rawModelState.(map[string]any); ok {
+			if regime, ok := ms["ofiRegime"].(string); ok && regime != "" {
+				item.OFIRegime = &regime
+			}
+			if biasVal, ok := ms["microPriceBiasBps"]; ok && biasVal != nil {
+				if bFloat, ok := biasVal.(float64); ok {
+					item.MicroPriceBiasBps = &bFloat
+				} else if bStr, ok := biasVal.(string); ok {
+					if bf, err := strconv.ParseFloat(bStr, 64); err == nil {
+						item.MicroPriceBiasBps = &bf
+					}
+				}
+			}
 			var signedPos, entryMark, rebasePool, rebasePos decimal.Decimal
 			if posVal, ok := ms["payloadSignedPos"]; ok && posVal != nil {
 				signedPos, _ = decimal.NewFromString(fmt.Sprintf("%v", posVal))
@@ -1611,6 +1626,18 @@ func (s *Service) listActiveBots(ctx context.Context, settingsID string) ([]Acti
 			return nil, fmt.Errorf("scan paper AutoGrid bot: %w", err)
 		}
 		if ms, ok := rawModelState.(map[string]any); ok {
+			if regime, ok := ms["ofiRegime"].(string); ok && regime != "" {
+				item.OFIRegime = &regime
+			}
+			if biasVal, ok := ms["microPriceBiasBps"]; ok && biasVal != nil {
+				if bFloat, ok := biasVal.(float64); ok {
+					item.MicroPriceBiasBps = &bFloat
+				} else if bStr, ok := biasVal.(string); ok {
+					if bf, err := strconv.ParseFloat(bStr, 64); err == nil {
+						item.MicroPriceBiasBps = &bf
+					}
+				}
+			}
 			if reason, ok := ms["leverageReason"].(string); ok {
 				item.LeverageReason = reason
 			}

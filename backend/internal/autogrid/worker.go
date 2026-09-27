@@ -3757,6 +3757,24 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 		if bot.lastAdjustmentsCount > 0 {
 			lastAdjustmentsCountParam = &bot.lastAdjustmentsCount
 		}
+		var ofiRegimeParam *string
+		var ofiScoreParam *decimal.Decimal
+		var microBiasParam *decimal.Decimal
+		if worker.ofiEngine != nil {
+			analysis := worker.ofiEngine.Analyze(bot.symbol)
+			if analysis.Regime != "" {
+				regimeStr := string(analysis.Regime)
+				ofiRegimeParam = &regimeStr
+			}
+			if analysis.CurrentOFI != 0 {
+				d := decimal.NewFromFloat(analysis.CurrentOFI).Round(2)
+				ofiScoreParam = &d
+			}
+			if analysis.MicroPriceBiasBps != 0 {
+				d := decimal.NewFromFloat(analysis.MicroPriceBiasBps).Round(2)
+				microBiasParam = &d
+			}
+		}
 		clearKeys := isZeroPos || isFlip
 
 		if _, err := worker.db.Exec(ctx, `
@@ -3778,7 +3796,7 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 					WHEN $8::BOOLEAN THEN
 						COALESCE(model_state, '{}'::jsonb) - 'shiftFloatingOffset' - 'shiftPosition' - 'rebasePool' - 'rebasePos' - 'payloadEntryMark' - 'payloadSignedPos'
 					ELSE
-						(COALESCE(model_state, '{}'::jsonb) - 'rebasePool' - 'rebasePos' - 'payloadEntryMark' - 'payloadSignedPos' - 'peakFloorUsdt' - 'shiftRealizedBase' - 'lastRemoteGridProfit' - 'lastAdjustmentsCount')
+						(COALESCE(model_state, '{}'::jsonb) - 'rebasePool' - 'rebasePos' - 'payloadEntryMark' - 'payloadSignedPos' - 'peakFloorUsdt' - 'shiftRealizedBase' - 'lastRemoteGridProfit' - 'lastAdjustmentsCount' - 'ofiRegime' - 'ofiScore' - 'microPriceBiasBps')
 						|| jsonb_strip_nulls(jsonb_build_object(
 							'payloadEntryMark', $9::NUMERIC,
 							'rebasePool', $10::NUMERIC,
@@ -3787,13 +3805,16 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 							'peakFloorUsdt', $13::NUMERIC,
 							'shiftRealizedBase', $14::NUMERIC,
 							'lastRemoteGridProfit', $15::NUMERIC,
-							'lastAdjustmentsCount', $16::INT
+							'lastAdjustmentsCount', $16::INT,
+							'ofiRegime', $17::TEXT,
+							'ofiScore', $18::NUMERIC,
+							'microPriceBiasBps', $19::NUMERIC
 						))
 				END,
 			    last_reconciled_at = NOW(),
 			    last_error = NULL, updated_at = NOW()
 			WHERE id = $1
-		`, bot.id, bot.localStatus, persistedReconciliation, remoteStatus, realized, unrealized, supervisionFloor, clearKeys, entryMarkParam, rebasePoolParam, signedPosParam, rebasePosParam, peakFloorParam, shiftRealizedBaseParam, lastRemoteGridProfitParam, lastAdjustmentsCountParam); err != nil {
+		`, bot.id, bot.localStatus, persistedReconciliation, remoteStatus, realized, unrealized, supervisionFloor, clearKeys, entryMarkParam, rebasePoolParam, signedPosParam, rebasePosParam, peakFloorParam, shiftRealizedBaseParam, lastRemoteGridProfitParam, lastAdjustmentsCountParam, ofiRegimeParam, ofiScoreParam, microBiasParam); err != nil {
 			// The PnL persist must never fail silently: v2.0.45 lost every
 			// REAL mark for weeks exactly because this error was swallowed.
 			worker.logger.Error("persist remote grid truth and PnL",
@@ -4400,6 +4421,28 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 				worker.logger.Error("adjust native grid range skipped: no live price",
 					"component", "autogrid_worker", "bot_id", bot.id, "symbol", bot.symbol)
 				break
+			}
+			// v2.0.128 OFI Protection for Running Bots:
+			// Freeze range shift if order book and taker flow exhibit persistent toxic pressure or confirmed breakout
+			if worker.ofiEngine != nil {
+				micro := worker.ofiEngine.Analyze(bot.symbol)
+				if decision.Action == ActionAdjustDown {
+					if micro.Regime == marketdata.RegimeDumpPressure || micro.Regime == marketdata.RegimeConfirmedDump {
+						worker.logger.Warn("adjust down frozen by OFI microstructure veto (falling knife protection)",
+							"component", "autogrid_worker", "bot_number", bot.botNumber, "symbol", bot.symbol,
+							"regime", string(micro.Regime), "reason", micro.Reason,
+							"ofi", micro.CurrentOFI, "micro_bias_bps", micro.MicroPriceBiasBps)
+						break
+					}
+				} else if decision.Action == ActionAdjustUp {
+					if micro.Regime == marketdata.RegimePumpPressure || micro.Regime == marketdata.RegimeConfirmedPump {
+						worker.logger.Warn("adjust up frozen by OFI microstructure veto (rocket runaway protection)",
+							"component", "autogrid_worker", "bot_number", bot.botNumber, "symbol", bot.symbol,
+							"regime", string(micro.Regime), "reason", micro.Reason,
+							"ofi", micro.CurrentOFI, "micro_bias_bps", micro.MicroPriceBiasBps)
+						break
+					}
+				}
 			}
 			// v2.0.85 "shift always" (same mode preflight as the radar): the
 			// live remote FLOATING PnL selects HOW the break shift ships —
@@ -5523,6 +5566,25 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 		}
 
 		if decision.Action == ActionAdjustUp || decision.Action == ActionAdjustDown {
+			// v2.0.128 OFI Protection for Running Bots (paper parity):
+			if worker.ofiEngine != nil {
+				micro := worker.ofiEngine.Analyze(bot.symbol)
+				if decision.Action == ActionAdjustDown {
+					if micro.Regime == marketdata.RegimeDumpPressure || micro.Regime == marketdata.RegimeConfirmedDump {
+						worker.logger.Warn("manage paper range shift frozen by OFI dump pressure",
+							"component", "autogrid_worker", "bot_number", bot.botNumber, "symbol", bot.symbol,
+							"regime", string(micro.Regime), "reason", micro.Reason)
+						continue
+					}
+				} else if decision.Action == ActionAdjustUp {
+					if micro.Regime == marketdata.RegimePumpPressure || micro.Regime == marketdata.RegimeConfirmedPump {
+						worker.logger.Warn("manage paper range shift frozen by OFI pump pressure",
+							"component", "autogrid_worker", "bot_number", bot.botNumber, "symbol", bot.symbol,
+							"regime", string(micro.Regime), "reason", micro.Reason)
+						continue
+					}
+				}
+			}
 			// Reset the pair-counting baseline under the NEW geometry. The old
 			// code persisted currentLevel (computed against the OLD bounds),
 			// so the next manage tick saw a phantom half-grid traverse and

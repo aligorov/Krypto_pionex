@@ -365,7 +365,7 @@ function BotRow({
     <>
       <tr>
         <td>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap' }}>
             {bot.botNumber ? (
               <span className="badge neutral" style={{ fontWeight: 700, padding: '2px 6px', fontSize: '0.75rem' }}>
                 #{bot.botNumber}
@@ -378,6 +378,7 @@ function BotRow({
             >
               {bot.symbol}
             </strong>
+            {ofiBadge(bot.ofiRegime, bot.microPriceBiasBps)}
           </div>
         </td>
         <td><span className={`badge ${bot.source === 'REAL' ? 'danger' : 'neutral'}`}>{bot.source}</span></td>
@@ -747,6 +748,55 @@ function reasonBadge(reason: string | null): string {
     return 'danger';
   }
   return 'warning';
+}
+
+function ofiBadge(regime?: string | null, biasBps?: number | null) {
+  if (!regime || regime === 'NEUTRAL') return null;
+  const biasStr = typeof biasBps === 'number' ? ` (${biasBps > 0 ? '+' : ''}${biasBps.toFixed(1)} bps)` : '';
+  switch (regime) {
+    case 'CONFIRMED_DUMP':
+      return (
+        <span
+          className="badge danger"
+          style={{ fontSize: '0.68rem', padding: '1px 5px', fontWeight: 700 }}
+          title={`Подтвержденный институциональный дамп${biasStr} — рецентрирование заморожено, радар защищен`}
+        >
+          🔻 DUMP{biasStr}
+        </span>
+      );
+    case 'DUMP_PRESSURE':
+      return (
+        <span
+          className="badge warning"
+          style={{ fontSize: '0.68rem', padding: '1px 5px', fontWeight: 600 }}
+          title={`Давление на продажу в стакане${biasStr} — усилен контроль риска`}
+        >
+          ⚠️ DUMP-P
+        </span>
+      );
+    case 'CONFIRMED_PUMP':
+      return (
+        <span
+          className="badge success"
+          style={{ fontSize: '0.68rem', padding: '1px 5px', fontWeight: 700 }}
+          title={`Подтвержденный институциональный памп${biasStr} — рецентрирование заморожено, радар защищен`}
+        >
+          🔺 PUMP{biasStr}
+        </span>
+      );
+    case 'PUMP_PRESSURE':
+      return (
+        <span
+          className="badge neutral"
+          style={{ fontSize: '0.68rem', padding: '1px 5px', fontWeight: 600, color: '#38bdf8' }}
+          title={`Давление на покупку в стакане${biasStr} — усилен контроль риска`}
+        >
+          ℹ️ PUMP-P
+        </span>
+      );
+    default:
+      return null;
+  }
 }
 
 function ManualDeployPanel({

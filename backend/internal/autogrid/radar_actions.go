@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/aligorov/pionex-bot/backend/internal/marketdata"
 	"github.com/shopspring/decimal"
 )
 
@@ -488,6 +489,20 @@ func (worker *Worker) radarMaybeRecenter(ctx context.Context, settings Settings,
 	if velocity && mode != shiftModeNormal {
 		return
 	}
+	// v2.0.128 OFI Protection for Running Bots:
+	if worker.ofiEngine != nil {
+		micro := worker.ofiEngine.Analyze(b.symbol)
+		if b.inventorySide >= 0 && (micro.Regime == marketdata.RegimeDumpPressure || micro.Regime == marketdata.RegimeConfirmedDump) {
+			worker.logger.Warn("stop-radar: PAPER recenter frozen by OFI dump pressure",
+				"component", "autogrid_worker", "symbol", b.symbol, "regime", string(micro.Regime), "reason", micro.Reason)
+			return
+		}
+		if b.inventorySide < 0 && (micro.Regime == marketdata.RegimePumpPressure || micro.Regime == marketdata.RegimeConfirmedPump) {
+			worker.logger.Warn("stop-radar: PAPER recenter frozen by OFI pump pressure",
+				"component", "autogrid_worker", "symbol", b.symbol, "regime", string(micro.Regime), "reason", micro.Reason)
+			return
+		}
+	}
 
 	newLower, newUpper := recenterBounds(bot.lower, bot.upper, b.price)
 	newLevel := gridLevelForPrice(newLower, newUpper, bot.gridNum, b.price)
@@ -728,6 +743,20 @@ func (worker *Worker) radarRecenterReal(ctx context.Context, settings Settings, 
 	}
 	if !b.price.GreaterThan(decimal.Zero) || !bot.upper.GreaterThan(bot.lower) {
 		return
+	}
+	// v2.0.128 OFI Protection for Running Bots:
+	if worker.ofiEngine != nil {
+		micro := worker.ofiEngine.Analyze(b.symbol)
+		if b.inventorySide >= 0 && (micro.Regime == marketdata.RegimeDumpPressure || micro.Regime == marketdata.RegimeConfirmedDump) {
+			worker.logger.Warn("stop-radar: REAL recenter frozen by OFI dump pressure",
+				"component", "autogrid_worker", "symbol", b.symbol, "regime", string(micro.Regime), "reason", micro.Reason)
+			return
+		}
+		if b.inventorySide < 0 && (micro.Regime == marketdata.RegimePumpPressure || micro.Regime == marketdata.RegimeConfirmedPump) {
+			worker.logger.Warn("stop-radar: REAL recenter frozen by OFI pump pressure",
+				"component", "autogrid_worker", "symbol", b.symbol, "regime", string(micro.Regime), "reason", micro.Reason)
+			return
+		}
 	}
 
 	newLower, newUpper := recenterBounds(bot.lower, bot.upper, b.price)

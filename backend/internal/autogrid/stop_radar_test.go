@@ -178,3 +178,30 @@ func TestCandidateSpanPct(t *testing.T) {
 		t.Fatalf("zero lower must yield 0, got %f", s)
 	}
 }
+
+func TestScoreBotOFIAdverseAmplification(t *testing.T) {
+	inBaseline := radarInput{
+		botID: "x", botNumber: 1, symbol: "T_USDT_PERP", direction: "NEUTRAL",
+		price: d("99.0"), antiHunt: &[]decimal.Decimal{d("95.0")}[0],
+		lower: d("95"), upper: d("105"), atrEntryPct: 1.0,
+		total: d("-2"), inventorySide: 1, // Long inventory
+	}
+	rsBase := scoreBot(inBaseline, 10, 10, 0.50, radarFleet{}, 0, 0)
+
+	inDumpPressure := inBaseline
+	inDumpPressure.ofiRegime = "DUMP_PRESSURE"
+	rsPressure := scoreBot(inDumpPressure, 10, 10, 0.50, radarFleet{}, 0, 0)
+
+	if rsPressure.M5 <= rsBase.M5 {
+		t.Fatalf("DUMP_PRESSURE must increase M5: got %f vs base %f", rsPressure.M5, rsBase.M5)
+	}
+
+	inConfirmedDump := inBaseline
+	inConfirmedDump.ofiRegime = "CONFIRMED_DUMP"
+	rsConfirmed := scoreBot(inConfirmedDump, 10, 10, 0.50, radarFleet{}, 0, 0)
+
+	if rsConfirmed.M5 <= rsPressure.M5 {
+		t.Fatalf("CONFIRMED_DUMP must increase M5 higher than pressure: got %f vs %f", rsConfirmed.M5, rsPressure.M5)
+	}
+}
+
