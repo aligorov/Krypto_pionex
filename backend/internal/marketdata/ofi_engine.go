@@ -1,6 +1,7 @@
 package marketdata
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"sort"
@@ -27,6 +28,21 @@ const (
 	RegimeConfirmedPump MicrostructureRegime = "CONFIRMED_PUMP"
 	RegimeConfirmedDump MicrostructureRegime = "CONFIRMED_DUMP"
 	RegimeSpoofWarning  MicrostructureRegime = "SPOOF_WARNING"
+)
+
+// Readiness is the single lane-health contract derived from the analysis:
+// it collapses the regime/sync/freshness guards into one machine-readable
+// state. Readiness is about DATA health, not trade direction — a live book
+// in a directional or spoof regime is READY; the direction itself stays in
+// Regime/IsActionable/CanEnter.
+type Readiness string
+
+const (
+	ReadinessReady      Readiness = "READY"
+	ReadinessWarmingUp  Readiness = "WARMING_UP"
+	ReadinessStale      Readiness = "STALE"
+	ReadinessDesync     Readiness = "DESYNC"
+	ReadinessRecovering Readiness = "RECOVERING"
 )
 
 // OFIEngineConfig tunes the dynamic multi-window OFI engine.
@@ -56,23 +72,23 @@ func DefaultOFIEngineConfig() OFIEngineConfig {
 
 // OFIWindow represents an aggregated time window of order book events and taker trades.
 type OFIWindow struct {
-	StartTime       time.Time
-	EndTime         time.Time
-	FirstMidPrice   decimal.Decimal
-	LastMidPrice    decimal.Decimal
-	LastMicroPrice  decimal.Decimal
-	OFI             float64
-	TakerBuyUSDT    float64
-	TakerSellUSDT   float64
-	TakerDeltaUSDT  float64
-	TakerBuyRatio   float64
-	LastSpreadBps   float64
-	BidVolume2Pct   float64
-	AskVolume2Pct   float64
-	QueueImbalance  float64 // (BidVol - AskVol) / (BidVol + AskVol)
-	TradeCount      int
-	L2Count         int
-	IsThin          bool
+	StartTime      time.Time
+	EndTime        time.Time
+	FirstMidPrice  decimal.Decimal
+	LastMidPrice   decimal.Decimal
+	LastMicroPrice decimal.Decimal
+	OFI            float64
+	TakerBuyUSDT   float64
+	TakerSellUSDT  float64
+	TakerDeltaUSDT float64
+	TakerBuyRatio  float64
+	LastSpreadBps  float64
+	BidVolume2Pct  float64
+	AskVolume2Pct  float64
+	QueueImbalance float64 // (BidVol - AskVol) / (BidVol + AskVol)
+	TradeCount     int
+	L2Count        int
+	IsThin         bool
 }
 
 // MicrostructureAnalysis is the output of the OFI and order flow evaluation.
@@ -93,13 +109,26 @@ type MicrostructureAnalysis struct {
 	IsSpreadIntact         bool                 `json:"isSpreadIntact"`
 	IsFresh                bool                 `json:"isFresh"`
 	IsSynced               bool                 `json:"isSynced"`
+	// RecoveringFromDesync is the explicit carrier of the post-desync warmup
+	// state: true only while a healed snapshot rebuilds trust, false while
+	// the breach itself is still active — exactly what Analyze()'s guards
+	// present at each point. Readiness() prefers this bool over string-
+	// matching Reason; the string match stays as a fallback for analyses
+	// built before the field existed.
+	RecoveringFromDesync bool `json:"recoveringFromDesync"`
+	// LaneReadiness caches the Readiness() derivation at every Regime
+	// mutation point, so serialized consumers (JSON logs) and method
+	// callers can never disagree. Named LaneReadiness because Go forbids a
+	// field sharing the Readiness() method's name; it serializes as
+	// "readiness".
+	LaneReadiness Readiness `json:"readiness"`
 	// LastTradeAt is the server timestamp of the last ACCEPTED taker trade
 	// (zero when none). v2.0.137: emergency re-entry gates consult it — a
 	// fresh book alone must not pass as "flow normalized" if the TRADE lane
 	// is silent.
-	LastTradeAt time.Time                `json:"lastTradeAt"`
-	Reason                 string               `json:"reason"`
-	UpdatedAt              time.Time            `json:"updatedAt"`
+	LastTradeAt time.Time `json:"lastTradeAt"`
+	Reason      string    `json:"reason"`
+	UpdatedAt   time.Time `json:"updatedAt"`
 }
 
 // IsActionable returns true only if the signal is fresh, continuous, synchronized, and actionable.
@@ -160,6 +189,45 @@ func (a MicrostructureAnalysis) CanEnter(trend string) (allowed bool, reason str
 		}
 	}
 	return true, ""
+}
+
+// Readiness derives the lane-health state with precedence mirroring
+// Analyze()'s guards exactly: RECOVERING (a snapshot already healed the
+// sequence breach and warmup is rebuilding trust) outranks DESYNC because
+// both carry IsSynced=false and only the marker tells them apart; DESYNC
+// outranks STALE (a breached book must never fail-open as stale-but-synced);
+// STALE outranks WARMING_UP; a fresh, synced, tradeable-informational regime
+// (NEUTRAL, pressure regimes, spoof) is READY — readiness is DATA health,
+// not direction. Market-quality degradations without a lane fault
+// (THIN_BOOK, SPREAD_BLOWN — never IsFresh) collapse into WARMING_UP: their
+// own risk filters stay authoritative and the five-value lane contract has
+// no DEGRADED slot.
+func (a MicrostructureAnalysis) Readiness() Readiness {
+	// 1. Recovery marker: prefer the explicit bool; the reason substring is
+	// the legacy fallback (CanEnter still matches it too).
+	if a.RecoveringFromDesync || strings.Contains(a.Reason, "recovering from desync") {
+		return ReadinessRecovering
+	}
+	// 2. Desync-shaped: an explicit DESYNC regime, or an unsynced book whose
+	// reason blames the sequence. A bare IsSynced=false on a rebuilt
+	// analysis (warmup regime, no desync text) is NOT desync-shaped.
+	if a.Regime == RegimeDesync || (!a.IsSynced && strings.Contains(a.Reason, "desync")) {
+		return ReadinessDesync
+	}
+	// 3. Stale: synced book whose timestamps breached MaxStaleness —
+	// Analyze() maps that guard to RegimeStale.
+	if a.Regime == RegimeStale {
+		return ReadinessStale
+	}
+	// 4. Warmup or no data at all (zero-value / pre-stream analysis).
+	if a.Regime == RegimeWarmingUp || a.Regime == "" {
+		return ReadinessWarmingUp
+	}
+	// 5. Live book in a tradeable-informational regime.
+	if a.IsFresh && a.IsSynced {
+		return ReadinessReady
+	}
+	return ReadinessWarmingUp
 }
 
 // CalculateMicroPrice computes the volume-weighted microprice from top of book.
@@ -234,18 +302,18 @@ func CalculateLevel1OFI(prevBids, prevAsks, nextBids, nextAsks []pionex.DepthLev
 
 // SymbolMicrostate stores the rolling microstructure, local order book, and OFI history for a single symbol.
 type SymbolMicrostate struct {
-	symbol          string
-	config          OFIEngineConfig
-	mu              sync.RWMutex
-	book            *LocalOrderBook
-	lastBookUpdate  time.Time
-	lastTradeUpdate time.Time
-	prevBestBid     pionex.DepthLevel
-	prevBestAsk     pionex.DepthLevel
-	hasPrevL1       bool
-	currentWindow   OFIWindow
-	history         []OFIWindow
-	latestAnalysis  MicrostructureAnalysis
+	symbol               string
+	config               OFIEngineConfig
+	mu                   sync.RWMutex
+	book                 *LocalOrderBook
+	lastBookUpdate       time.Time
+	lastTradeUpdate      time.Time
+	prevBestBid          pionex.DepthLevel
+	prevBestAsk          pionex.DepthLevel
+	hasPrevL1            bool
+	currentWindow        OFIWindow
+	history              []OFIWindow
+	latestAnalysis       MicrostructureAnalysis
 	recentTrades         map[string]time.Time // tradeId -> seenAt for deduplication
 	resyncInFlight       bool
 	lastResyncAt         time.Time
@@ -255,11 +323,17 @@ type SymbolMicrostate struct {
 
 	// v2.0.137 ingest observability: counters are mutated only under st.mu
 	// (single ingest lane) and read by Stats() under st.mu.RLock.
-	ingestedOB        uint64
-	ingestedTrades    uint64
-	droppedDedup      uint64
-	droppedTooOld     uint64
-	droppedIsolation  uint64
+	ingestedOB       uint64
+	ingestedTrades   uint64
+	droppedDedup     uint64
+	droppedTooOld    uint64
+	droppedIsolation uint64
+	// v2.0.137 ORDERBOOK drop reasons — the mirror of the trade-drop
+	// counters: which integrity guard rejected the frame (sequence gap,
+	// crossed book, unsynced-waiting-snapshot). Same st.mu discipline.
+	obDroppedSequence uint64
+	obDroppedCrossed  uint64
+	obDroppedUnsynced uint64
 }
 
 func newSymbolMicrostate(symbol string, cfg OFIEngineConfig) *SymbolMicrostate {
@@ -270,11 +344,12 @@ func newSymbolMicrostate(symbol string, cfg OFIEngineConfig) *SymbolMicrostate {
 		history:      make([]OFIWindow, 0, cfg.MaxHistoryWindows),
 		recentTrades: make(map[string]time.Time, 1024),
 		latestAnalysis: MicrostructureAnalysis{
-			Symbol:   symbol,
-			Regime:   RegimeWarmingUp,
-			Reason:   "initializing market data stream",
-			IsFresh:  false,
-			IsSynced: true,
+			Symbol:        symbol,
+			Regime:        RegimeWarmingUp,
+			Reason:        "initializing market data stream",
+			IsFresh:       false,
+			IsSynced:      true,
+			LaneReadiness: ReadinessWarmingUp,
 		},
 	}
 }
@@ -407,17 +482,38 @@ func (e *OFIEngine) IngestOrderbookUpdate(update pionex.OrderbookUpdate) {
 			st.recoveringFromDesync = true
 			st.latestAnalysis.Regime = RegimeWarmingUp
 			st.latestAnalysis.IsSynced = false
+			// The breach healed: presentation flips from DESYNC to the
+			// explicit RECOVERING marker until MinWindows rebuild trust.
+			st.latestAnalysis.RecoveringFromDesync = true
 			st.latestAnalysis.Reason = fmt.Sprintf("order book recovering from desync: warming up (0/%d windows)", st.config.MinWindows)
+			st.latestAnalysis.LaneReadiness = ReadinessRecovering
 		}
 		st.lastBookUpdate = ts
 	} else {
 		if err := st.book.ApplyDelta(update.Bids, update.Asks, update.Number, update.PrevNumber, ts); err != nil {
+			// Classify WHY the frame died — sequence gap, crossed book, or a
+			// delta onto a still-unsynced book — so Stats() proves which
+			// integrity guard is actually firing (ApplyDelta wraps each
+			// sentinel with %w, hence errors.Is).
+			switch {
+			case errors.Is(err, ErrSequenceGap):
+				st.obDroppedSequence++
+			case errors.Is(err, ErrCrossedBook):
+				st.obDroppedCrossed++
+			case errors.Is(err, ErrNotSynced):
+				st.obDroppedUnsynced++
+			}
 			st.isDesynced = true
 			st.recoveringFromDesync = true
 			st.latestAnalysis.Regime = RegimeDesync
 			st.latestAnalysis.IsFresh = false
 			st.latestAnalysis.IsSynced = false
+			// st.recoveringFromDesync is armed, but the breach is ACTIVE:
+			// the analysis must present DESYNC (Analyze()'s guard order),
+			// so the explicit field stays false here.
+			st.latestAnalysis.RecoveringFromDesync = false
 			st.latestAnalysis.Reason = fmt.Sprintf("order book desync: %v", err)
+			st.latestAnalysis.LaneReadiness = ReadinessDesync
 			st.latestAnalysis.UpdatedAt = ts
 			now := time.Now()
 			shouldResync := !st.resyncInFlight || now.Sub(st.lastResyncAt) > 10*time.Second
@@ -435,12 +531,17 @@ func (e *OFIEngine) IngestOrderbookUpdate(update pionex.OrderbookUpdate) {
 	}
 
 	if !st.book.IsSynced() {
+		// Snapshot/delta applied but the book still cannot serve prices
+		// (e.g. a snapshot with empty sides) — frame is effectively dropped.
+		st.obDroppedUnsynced++
 		st.isDesynced = true
 		st.recoveringFromDesync = true
 		st.latestAnalysis.Regime = RegimeDesync
 		st.latestAnalysis.IsFresh = false
 		st.latestAnalysis.IsSynced = false
+		st.latestAnalysis.RecoveringFromDesync = false
 		st.latestAnalysis.Reason = "order book waiting for snapshot"
+		st.latestAnalysis.LaneReadiness = ReadinessDesync
 		st.latestAnalysis.UpdatedAt = ts
 		return
 	}
@@ -676,6 +777,11 @@ func (st *SymbolMicrostate) evaluateLocked(now time.Time) {
 		analysis.Regime = RegimeWarmingUp
 		analysis.IsFresh = false
 		analysis.Reason = "warming up (no completed history windows)"
+		// History was purged by the recovery snapshot: the first finalize
+		// still lands here while st.recoveringFromDesync is armed — the
+		// field must carry that so the stored analysis reads RECOVERING.
+		analysis.RecoveringFromDesync = st.recoveringFromDesync
+		analysis.LaneReadiness = analysis.Readiness()
 		st.latestAnalysis = analysis
 		return
 	}
@@ -702,6 +808,7 @@ func (st *SymbolMicrostate) evaluateLocked(now time.Time) {
 		analysis.IsFresh = false
 		analysis.IsSynced = false
 		analysis.Reason = "order book sequence desynchronized"
+		analysis.LaneReadiness = ReadinessDesync
 		st.latestAnalysis = analysis
 		return
 	}
@@ -712,6 +819,7 @@ func (st *SymbolMicrostate) evaluateLocked(now time.Time) {
 		analysis.IsFresh = false
 		analysis.IsSynced = true
 		analysis.Reason = fmt.Sprintf("spread degraded: %.1f bps > limit %.1f bps", lastW.LastSpreadBps, st.config.MaxSpreadBps)
+		analysis.LaneReadiness = analysis.Readiness()
 		st.latestAnalysis = analysis
 		return
 	}
@@ -722,6 +830,7 @@ func (st *SymbolMicrostate) evaluateLocked(now time.Time) {
 		analysis.IsFresh = false
 		analysis.IsSynced = true
 		analysis.Reason = "thin book liquidity in 2% range"
+		analysis.LaneReadiness = analysis.Readiness()
 		st.latestAnalysis = analysis
 		return
 	}
@@ -732,11 +841,13 @@ func (st *SymbolMicrostate) evaluateLocked(now time.Time) {
 		analysis.IsFresh = false
 		if st.recoveringFromDesync {
 			analysis.IsSynced = false
+			analysis.RecoveringFromDesync = true
 			analysis.Reason = fmt.Sprintf("order book recovering from desync: warming up (%d/%d windows)", len(st.history), st.config.MinWindows)
 		} else {
 			analysis.IsSynced = true
 			analysis.Reason = fmt.Sprintf("warming up (%d/%d windows)", len(st.history), st.config.MinWindows)
 		}
+		analysis.LaneReadiness = analysis.Readiness()
 		st.latestAnalysis = analysis
 		return
 	}
@@ -753,6 +864,7 @@ func (st *SymbolMicrostate) evaluateLocked(now time.Time) {
 		analysis.Regime = RegimeSpoofWarning
 		analysis.IsFresh = true
 		analysis.Reason = "unconfirmed book wall with zero taker flow confirmation (spoof risk)"
+		analysis.LaneReadiness = analysis.Readiness()
 		st.latestAnalysis = analysis
 		return
 	}
@@ -870,6 +982,7 @@ func (st *SymbolMicrostate) evaluateLocked(now time.Time) {
 		analysis.IsFresh = true
 	}
 
+	analysis.LaneReadiness = analysis.Readiness()
 	st.latestAnalysis = analysis
 }
 
@@ -886,11 +999,12 @@ func (e *OFIEngine) Analyze(symbol string) MicrostructureAnalysis {
 
 	if !ok {
 		return MicrostructureAnalysis{
-			Symbol:   sym,
-			Regime:   RegimeWarmingUp,
-			Reason:   "no market data stream",
-			IsFresh:  false,
-			IsSynced: true,
+			Symbol:        sym,
+			Regime:        RegimeWarmingUp,
+			Reason:        "no market data stream",
+			IsFresh:       false,
+			IsSynced:      true,
+			LaneReadiness: ReadinessWarmingUp,
 		}
 	}
 
@@ -906,9 +1020,14 @@ func (e *OFIEngine) Analyze(symbol string) MicrostructureAnalysis {
 		analysis.Regime = RegimeDesync
 		analysis.IsFresh = false
 		analysis.IsSynced = false
+		// The breach is ACTIVE — recovery has not started, so the explicit
+		// field must read false (Readiness() ranks this DESYNC, mirroring
+		// this guard's precedence over the recovering branch below).
+		analysis.RecoveringFromDesync = false
 		if analysis.Reason == "" || !strings.Contains(analysis.Reason, "desync") {
 			analysis.Reason = "order book sequence desynchronized — awaiting fresh snapshot"
 		}
+		analysis.LaneReadiness = ReadinessDesync
 		return analysis
 	}
 
@@ -916,9 +1035,11 @@ func (e *OFIEngine) Analyze(symbol string) MicrostructureAnalysis {
 		analysis.Regime = RegimeWarmingUp
 		analysis.IsFresh = false
 		analysis.IsSynced = false
+		analysis.RecoveringFromDesync = true
 		if !strings.Contains(analysis.Reason, "recovering from desync") {
 			analysis.Reason = fmt.Sprintf("order book recovering from desync: warming up (%d/%d windows)", len(st.history), st.config.MinWindows)
 		}
+		analysis.LaneReadiness = ReadinessRecovering
 		return analysis
 	}
 
@@ -928,15 +1049,20 @@ func (e *OFIEngine) Analyze(symbol string) MicrostructureAnalysis {
 		analysis.Regime = RegimeStale
 		analysis.IsFresh = false
 		analysis.IsSynced = true
+		// Unreachable with recovery armed (the guard above returned), but
+		// pinned false so the stale presentation can never read RECOVERING.
+		analysis.RecoveringFromDesync = false
 		if st.lastBookUpdate.IsZero() {
 			analysis.Reason = "order book waiting for initial depth data"
 		} else {
 			analysis.Reason = fmt.Sprintf("order book data stale: last depth update was %s ago (>%s)",
 				time.Since(st.lastBookUpdate).Round(time.Second), st.config.MaxStaleness)
 		}
+		analysis.LaneReadiness = ReadinessStale
 		return analysis
 	}
 
+	analysis.LaneReadiness = analysis.Readiness()
 	return analysis
 }
 
@@ -962,12 +1088,13 @@ func (e *OFIEngine) ResetSymbol(symbol string) {
 	st.isDesynced = true
 	st.recoveringFromDesync = true
 	st.latestAnalysis = MicrostructureAnalysis{
-		Symbol:    sym,
-		Regime:    RegimeDesync,
-		Reason:    "stream reset (reconnecting) — awaiting snapshot",
-		IsFresh:   false,
-		IsSynced:  false,
-		UpdatedAt: time.Now(),
+		Symbol:        sym,
+		Regime:        RegimeDesync,
+		Reason:        "stream reset (reconnecting) — awaiting snapshot",
+		IsFresh:       false,
+		IsSynced:      false,
+		LaneReadiness: ReadinessDesync,
+		UpdatedAt:     time.Now(),
 	}
 }
 
@@ -986,14 +1113,18 @@ func (e *OFIEngine) ResetAll() {
 
 // OFIEngineStats is the aggregated ingest observability snapshot: proves
 // (or disproves) that the ORDERBOOK and TRADE lanes actually deliver, and
-// quantifies why trades get dropped.
+// quantifies why frames get dropped on either lane.
 type OFIEngineStats struct {
-	Symbols                    int
-	OrderbookFrames            uint64
-	Trades                     uint64
-	TradesDroppedDedup         uint64
-	TradesDroppedTooOld        uint64
-	TradesDroppedIsolation     uint64
+	Symbols                int
+	OrderbookFrames        uint64
+	Trades                 uint64
+	TradesDroppedDedup     uint64
+	TradesDroppedTooOld    uint64
+	TradesDroppedIsolation uint64
+	// ORDERBOOK drop reasons — which integrity guard rejected the frame.
+	OrderbookDroppedSequence uint64
+	OrderbookDroppedCrossed  uint64
+	OrderbookDroppedUnsynced uint64
 }
 
 // Stats aggregates per-symbol ingest counters across the engine.
@@ -1014,6 +1145,9 @@ func (e *OFIEngine) Stats() OFIEngineStats {
 		out.TradesDroppedDedup += st.droppedDedup
 		out.TradesDroppedTooOld += st.droppedTooOld
 		out.TradesDroppedIsolation += st.droppedIsolation
+		out.OrderbookDroppedSequence += st.obDroppedSequence
+		out.OrderbookDroppedCrossed += st.obDroppedCrossed
+		out.OrderbookDroppedUnsynced += st.obDroppedUnsynced
 		st.mu.RUnlock()
 	}
 	return out

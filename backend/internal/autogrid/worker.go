@@ -108,6 +108,10 @@ type Worker struct {
 	// ofiStatsAt throttles the periodic OFI ingest-stats log (single manage
 	// goroutine → plain field); v2.0.137 lane observability.
 	ofiStatsAt time.Time
+	// ofiStatsPrev holds the previous ingest-stats snapshot so the periodic
+	// log can emit per-interval _5m rates instead of only cumulative totals
+	// (same single manage goroutine → plain field); v2.0.137 lane observability.
+	ofiStatsPrev marketdata.OFIEngineStats
 	// terminalRecheckAt throttles the v2.0.99 finished-record re-check sweep
 	// (single manage goroutine → plain field).
 	terminalRecheckAt time.Time
@@ -279,6 +283,13 @@ func (worker *Worker) Run(ctx context.Context) {
 	defer scheduleTicker.Stop()
 	defer reconcileTicker.Stop()
 	worker.startWSLane(ctx)
+	// v2.0.138 entry chain: expose the worker-owned storm window to the
+	// service layer (manual deploy / invest_in run the shared market-blocker
+	// composer without a Worker). Same process, set once before the loop;
+	// a service built without a worker keeps the documented nil default.
+	if worker.service != nil {
+		worker.service.StormActive = worker.stormActive
+	}
 	worker.sweepRestartGhosts(ctx)
 	// Drift self-heal: an operator editing N/budget/leverage directly in the
 	// DB bypasses Service.UpdateSettings; re-derive the AUTO breaker once at
@@ -1003,9 +1014,6 @@ func (worker *Worker) deployPaper(
 	if err != nil {
 		return err
 	}
-	// Macro context (CoinGecko): loaded once per deploy round — the beta /
-	// alt-drain vetoes below share the same reading.
-	macroCtx := worker.loadMacroContext(ctx)
 	var activeCount int
 	if err := worker.db.QueryRow(ctx, `
 		SELECT COUNT(*) FROM paper_grid_bots
@@ -1013,76 +1021,48 @@ func (worker *Worker) deployPaper(
 	`, settings.ID).Scan(&activeCount); err != nil {
 		return fmt.Errorf("count active paper grids: %w", err)
 	}
-	// Portfolio Circuit Breaker: >= 3 protective closes in the last 1 hour
-	// pauses new deployments. Every loss exit counts — stop-loss, structural
-	// invalidation, range break, liquidation; only profit takes and
-	// operator/exchange-driven closes are excluded.
-	var recentStopLossCount int
-	if err := worker.db.QueryRow(ctx, `
-		SELECT COUNT(*) FROM (
-			SELECT 1 FROM paper_grid_bots
-			WHERE settings_id = $1
-			  AND status = 'COMPLETED'
-			  AND COALESCE(closed_reason, '') NOT IN (
-			      `+protectiveCloseExemptReasons+`)
-			  AND closed_at > NOW() - INTERVAL '1 hour'
-			UNION ALL
-			SELECT 1 FROM grid_bots
-			WHERE status IN ('STOPPED', 'LIQUIDATED')
-			  AND COALESCE(closed_reason, '') NOT IN (
-			      `+protectiveCloseExemptReasons+`)
-			  AND COALESCE(closed_at, updated_at) > NOW() - INTERVAL '1 hour'
-		) recent_stops
-	`, settings.ID).Scan(&recentStopLossCount); err == nil && recentStopLossCount >= 3 {
-		worker.logger.Warn("Portfolio circuit breaker: recent stop-losses holding new deployments", "recentStopLossCount", recentStopLossCount)
-		worker.noteDeployBlock(ctx, fmt.Sprintf("circuit breaker: %d защитных закрытий за последний час — новые деплои на паузе", recentStopLossCount))
+	// v2.0.138 entry chain: the fleet-wide market gates — storm → portfolio
+	// circuit breaker → economic events → liquidation cascade + feed health —
+	// now run through ONE shared composer (evaluateSharedMarketBlockers,
+	// entry_chain.go): the same sequence every entry path clears, closing the
+	// "each lane hand-copied its own subset" drift class. Storm, the breaker
+	// and economic events block the WHOLE pass (every candidate defers);
+	// the cascade/feed legs stay direction-aware and only NOTE here — the
+	// per-candidate cut inside the loop still lets SHORT candidates through.
+	// The macro veto judges each candidate's scanner trend and therefore runs
+	// per candidate, with the final direction known.
+	passCode, _, passNote, passFeatures := worker.probeSharedMarketBlockers(ctx, EntryChainInput{
+		Path: EntryPathScannerPaper, Settings: settings, Fleet: "PAPER", Direction: "NEUTRAL",
+	})
+	switch passCode {
+	case "":
+		// clear
+	case entryBlockedStorm:
+		// v2.0.111 storm deferral (paper parity): opening fresh grids into a
+		// fleet-wide acceleration buys the worst entries of the day; the scan
+		// retries in four minutes and the storm window is rolling.
+		worker.logger.Info("paper deploy deferred by storm mode", "component", "autogrid_worker")
 		return nil
-	}
-	// Smart Grid Engine v2.0 macro gates — PAPER runs the same exam as REAL
-	// capital, otherwise paper statistics prove a pipeline REAL would have
-	// blocked. High-impact economic events ahead or an ongoing liquidation
-	// cascade pause all entries.
-	blocked, blockReason := worker.CheckEconomicEvents(ctx, 2)
-	if blocked {
+	case entryBlockedCircuitBreaker:
+		worker.logger.Warn("Portfolio circuit breaker: recent stop-losses holding new deployments",
+			"component", "autogrid_worker", "recentStopLossCount", passFeatures["closes"])
+		worker.noteDeployBlock(ctx, passNote)
+		return nil
+	case entryBlockedEconomicEvent:
 		worker.logger.Warn("paper deploy blocked by economic event",
-			"component", "autogrid_worker", "reason", blockReason)
-		worker.noteDeployBlock(ctx, "деплой заблокирован: макро-событие USD «"+blockReason+"» (окно T−2ч…T+1ч)")
+			"component", "autogrid_worker", "reason", passFeatures["title"])
+		worker.noteDeployBlock(ctx, passNote)
 		return nil
-	}
-	// v2.0.19: a LONG-side cascade (forced long unwinding) pauses LONG and
-	// NEUTRAL entries but not SHORT — the unwind window is precisely when
-	// short participation pays, and the detector itself is already scoped to
-	// side='long' (v2.0.14). The per-candidate cut happens after the final
-	// direction (smart override included) is known below.
-	cascadeLong, cascadeUSD := worker.CheckLiquidationCascade(ctx, 50_000_000)
-	// v2.0.119 fail-closed cascade: a silent liquidation feed must not read
-	// as "no cascade". The gate's table is fed by one external WebSocket —
-	// when it dies quietly the LONG-freeze disarms exactly for the crash it
-	// exists for. An unhealthy source freezes LONG/NEUTRAL deploys the same
-	// way a detected cascade does (SHORT participation stays live).
-	// v2.0.120 (review agent): a stale feed and a detected cascade are
-	// DIFFERENT durable traces. The first version let the generic cascade
-	// note overwrite the actionable "feed is dead" message with a
-	// meaningless "каскад $0M/час" — exactly the no-durable-trace class
-	// noteDeployBlock exists to prevent.
-	staleLiquidationFeed := false
-	if !cascadeLong {
-		if healthy, lastEvent := worker.LiquidationSourceHealthy(ctx); !healthy {
-			cascadeLong = true
-			staleLiquidationFeed = true
-			worker.logger.Warn("liquidation feed stale: treating as cascade — LONG/NEUTRAL deploys paused until the source recovers",
-				"component", "autogrid_worker",
-				"last_event", lastEvent.Format(time.RFC3339), "staleness_limit", "15m")
-		}
-	}
-	if cascadeLong {
+	case entryBlockedMacro:
+		// Per-candidate leg: the macro veto judges each candidate's SCANNER
+		// trend (shorts exempt) inside the loop — nothing to defer here.
+	default:
+		// CASCADE / FEED_HEALTH: LONG/NEUTRAL defer, SHORT stay live — note
+		// only, the per-candidate cut below decides per direction.
 		worker.logger.Warn("liquidation gate: LONG/NEUTRAL paper deploys paused, SHORT stay live",
-			"component", "autogrid_worker", "usd_1h", cascadeUSD, "stale_feed", staleLiquidationFeed)
-		if staleLiquidationFeed {
-			worker.noteDeployBlock(ctx, "источник ликвидаций нестабилен (тишина >15м) — LONG/NEUTRAL деплои на паузе до восстановления")
-		} else {
-			worker.noteDeployBlock(ctx, fmt.Sprintf("каскад ликвидаций лонгов $%.0fM/час — LONG/NEUTRAL деплои на паузе, SHORT доступны", cascadeUSD/1_000_000))
-		}
+			"component", "autogrid_worker", "code", passCode, "usd_1h", passFeatures["usd_1h"],
+			"block", passNote)
+		worker.noteDeployBlock(ctx, passNote)
 	}
 	fng, _ := worker.GetFearGreed(ctx)
 	// v2.0.21 global beta gate: BTC's tape gates altcoin NEUTRAL/LONG
@@ -1334,16 +1314,6 @@ func (worker *Worker) deployPaper(
 				continue
 			}
 		}
-		// Macro gate (v2.0.44, CoinGecko): beta-drift (BTC 24h ≤ −3%) and
-		// alt-drain (dominance +0.35pp over 24h on flat BTC) veto non-short
-		// entries. Pair-level ADX/Hurst cannot see market-wide rotation —
-		// the 2026-08-30 night (BTC flat, alts −8..−37%) killed 8 NEUTRAL
-		// bots for −$56.71 with every scanner-level gate green. Shorts and
-		// cascade are exempt; fail-open until ~24h of snapshots exist.
-		if veto, reason, macroTel := macroVeto(strings.ToLower(strings.TrimSpace(candidate.RecommendedTrend)), cascadeShort, macroCtx); veto {
-			worker.rejectCandidate(ctx, candidate, reason, macroTel)
-			continue
-		}
 		// Walk-forward backtest gate — PAPER runs the same exam as REAL
 		// capital: otherwise paper statistics prove a pipeline that REAL
 		// would have gated (prod: TUT walked into paper while its 30M
@@ -1444,16 +1414,24 @@ func (worker *Worker) deployPaper(
 			}
 			trend = smartTrend
 		}
-		if cascadeLong && trend != "short" {
-			// v2.0.120: a stale feed must name itself in the per-candidate
-			// trace too — "$0M/час" hid the actionable cause.
-			reason := fmt.Sprintf(
-				"каскад ликвидаций лонгов $%.0fM/час — входы LONG/NEUTRAL на паузе (SHORT доступны)",
-				cascadeUSD/1_000_000)
-			if staleLiquidationFeed {
-				reason = "источник ликвидаций нестабилен (тишина >15м) — входы LONG/NEUTRAL на паузе до восстановления"
-			}
-			worker.rejectCandidate(ctx, candidate, reason, nil)
+		// v2.0.138 entry chain: the shared market-blocker composer now owns
+		// the per-candidate fleet gates — liquidation cascade + feed health
+		// (direction-aware against the FINAL trend: SHORT stays live, the
+		// smart override included) and the macro veto (judging the SCANNER
+		// trend with the cascade-short exemption, exactly the inputs each
+		// leg ran before). Storm, the portfolio breaker and economic events
+		// were cleared once per pass above. Plan order puts the cascade
+		// ahead of the macro veto, so a candidate hitting both now names the
+		// cascade — both statements were always true.
+		entryIn := EntryChainInput{
+			Path: EntryPathScannerPaper, Settings: settings, Symbol: candidate.Symbol,
+			Direction: strings.ToUpper(trend), Fleet: "PAPER", RefID: candidate.ID,
+			ScannerTrend: strings.ToLower(strings.TrimSpace(candidate.RecommendedTrend)),
+			CascadeShort: cascadeShort,
+		}
+		if code, reason, _, features := worker.probeSharedMarketBlockers(ctx, entryIn); code != "" {
+			worker.rejectCandidate(ctx, candidate, reason, features)
+			worker.journalEntryDecision(ctx, entryIn, entryOutcomeReject, code, reason, features)
 			continue
 		}
 		// v2.0.21 cascade-short window: this out-of-turn scan exists to
@@ -1819,6 +1797,13 @@ func (worker *Worker) deployPaper(
 		}
 		activeCount++
 
+		// v2.0.138 entry chain: the ALLOW row — one per created bot, with the
+		// config version that admitted it.
+		worker.journalEntryDecision(ctx, EntryChainInput{
+			Path: EntryPathScannerPaper, Settings: settings, Symbol: candidate.Symbol,
+			Direction: strings.ToUpper(trend), Fleet: "PAPER", RefID: botID,
+		}, entryOutcomeAllow, "CLEAR", "", nil)
+
 		_ = LogBotEvent(ctx, worker.db, botID, botNumber, "PAPER", candidate.Symbol, "CREATED", &candidate.CurrentPrice, nil, map[string]any{
 			"leverage": botLev, "gridNum": mesh.GridNum, "lowerPrice": mesh.LowerPrice, "upperPrice": mesh.UpperPrice, "budget": settings.BudgetUSDT,
 		})
@@ -1917,14 +1902,9 @@ func (worker *Worker) deployReal(
 	if err := worker.realExecutionAllowed(ctx, settings); err != nil {
 		return err
 	}
-	// v2.0.111 storm deferral: opening fresh grids into a fleet-wide
-	// acceleration buys the worst entries of the day; the scan retries in
-	// four minutes and the storm window is rolling.
-	if worker.stormActive() {
-		worker.logger.Info("deploy deferred by storm mode",
-			"component", "autogrid_worker", "scan_id", scanID)
-		return nil
-	}
+	// v2.0.111 storm deferral moved into the shared entry chain below (the
+	// composer's first leg) — same deferral, now journaled and shared with
+	// every other entry path.
 	if settings.AccountID == nil {
 		resolved, err := worker.service.resolveAccount(ctx)
 		if err != nil {
@@ -1959,63 +1939,52 @@ func (worker *Worker) deployReal(
 	`, *settings.AccountID).Scan(&activeCount); err != nil {
 		return fmt.Errorf("count active real grids: %w", err)
 	}
-	// Portfolio Circuit Breaker: if >= 3 stop-losses in the last 1 hour, pause new bot deployments
-	// Portfolio Circuit Breaker (REAL): >= 3 protective closes in the last
-	// hour pauses deployments. Counts every loss exit — stop-loss, structural
-	// invalidation, range break, liquidation (the manage loop writes decision
-	// reasons as closed_reason, so an IN-list silently missed them; the paper
-	// breaker was fixed in v1.3.16, this one lagged). Profit takes and
-	// operator/exchange-driven closes are exempt.
-	var recentStopLossCountReal int
-	if err := worker.db.QueryRow(ctx, `
-		SELECT COUNT(*) FROM grid_bots
-		WHERE status IN ('STOPPED', 'LIQUIDATED')
-		  AND COALESCE(closed_reason, '') NOT IN (
-		      `+protectiveCloseExemptReasons+`)
-		  AND COALESCE(closed_at, updated_at) > NOW() - INTERVAL '1 hour'
-	`).Scan(&recentStopLossCountReal); err == nil && recentStopLossCountReal >= 3 {
-		worker.logger.Warn("Portfolio circuit breaker: recent real stop-losses holding new deployments", "recentStopLossCountReal", recentStopLossCountReal)
-		worker.noteDeployBlock(ctx, fmt.Sprintf("REAL circuit breaker: %d защитных закрытий за последний час — деплои на паузе", recentStopLossCountReal))
+	// v2.0.138 entry chain: the fleet-wide market gates — storm → portfolio
+	// circuit breaker → economic events → liquidation cascade + feed health —
+	// now run through ONE shared composer (evaluateSharedMarketBlockers,
+	// entry_chain.go). The breaker leg is deliberately the JOINT paper+REAL
+	// protective-close count: the old REAL-only copy armed on real losses
+	// alone while a paper fleet under stress proved the exact pipeline REAL
+	// was about to ride. Storm/breaker/economic block the WHOLE pass; the
+	// cascade/feed legs stay direction-aware and only NOTE here — the
+	// per-candidate cut inside the loop still lets SHORT candidates through.
+	passCode, _, passNote, passFeatures := worker.probeSharedMarketBlockers(ctx, EntryChainInput{
+		Path: EntryPathScannerReal, Settings: settings, Fleet: "REAL", Direction: "NEUTRAL",
+	})
+	switch passCode {
+	case "":
+		// clear
+	case entryBlockedStorm:
+		// v2.0.111 storm deferral: opening fresh grids into a fleet-wide
+		// acceleration buys the worst entries of the day; the scan retries in
+		// four minutes and the storm window is rolling.
+		worker.logger.Info("deploy deferred by storm mode",
+			"component", "autogrid_worker", "scan_id", scanID)
 		return nil
+	case entryBlockedCircuitBreaker:
+		worker.logger.Warn("Portfolio circuit breaker: recent real stop-losses holding new deployments",
+			"component", "autogrid_worker", "recentStopLossCountReal", passFeatures["closes"])
+		worker.noteDeployBlock(ctx, passNote)
+		return nil
+	case entryBlockedEconomicEvent:
+		worker.logger.Warn("deploy blocked by economic event",
+			"component", "autogrid_worker", "reason", passFeatures["title"])
+		worker.noteDeployBlock(ctx, passNote)
+		return nil
+	case entryBlockedMacro:
+		// Per-candidate leg: the macro veto judges each candidate's SCANNER
+		// trend (shorts exempt) inside the loop — nothing to defer here.
+	default:
+		// CASCADE / FEED_HEALTH: LONG/NEUTRAL defer, SHORT stay live — note
+		// only, the per-candidate cut below decides per direction.
+		worker.logger.Warn("liquidation gate: LONG/NEUTRAL real deploys paused, SHORT stay live",
+			"component", "autogrid_worker", "code", passCode, "usd_1h", passFeatures["usd_1h"],
+			"block", passNote)
+		worker.noteDeployBlock(ctx, passNote)
 	}
 	deployErrors := make([]string, 0)
 	backtestGateOn := worker.backtestGateEnabled(ctx)
 
-	// Smart Grid Engine v2.0: Smart direction selection + economic gates.
-	// Replaces the old "always use scanner trend" with regime-aware choice:
-	// TREND_DOWN + positive funding → SHORT, TREND_UP + negative funding → LONG,
-	// RANGE + high confidence → NEUTRAL at 2x. Economic events and liquidation
-	// cascades block all entries.
-	blocked, blockReason := worker.CheckEconomicEvents(ctx, 2)
-	if blocked {
-		worker.logger.Warn("deploy blocked by economic event", "component", "autogrid_worker", "reason", blockReason)
-		worker.noteDeployBlock(ctx, "REAL деплой заблокирован: макро-событие USD «"+blockReason+"» (окно T−2ч…T+1ч)")
-		return nil
-	}
-	cascadeLong, cascadeUSD := worker.CheckLiquidationCascade(ctx, 50_000_000)
-	// v2.0.119 fail-closed cascade (REAL arm): a stale liquidation feed
-	// freezes LONG/NEUTRAL REAL deploys like a detected cascade would.
-	// v2.0.120 (review agent): distinct durable traces — the generic
-	// cascade note must not overwrite the actionable feed-dead message.
-	staleLiquidationFeed := false
-	if !cascadeLong {
-		if healthy, lastEvent := worker.LiquidationSourceHealthy(ctx); !healthy {
-			cascadeLong = true
-			staleLiquidationFeed = true
-			worker.logger.Warn("liquidation feed stale (REAL): treating as cascade — LONG/NEUTRAL deploys paused until the source recovers",
-				"component", "autogrid_worker",
-				"last_event", lastEvent.Format(time.RFC3339), "staleness_limit", "15m")
-		}
-	}
-	if cascadeLong {
-		worker.logger.Warn("liquidation gate: LONG/NEUTRAL real deploys paused, SHORT stay live",
-			"component", "autogrid_worker", "usd_1h", cascadeUSD, "stale_feed", staleLiquidationFeed)
-		if staleLiquidationFeed {
-			worker.noteDeployBlock(ctx, "REAL: источник ликвидаций нестабилен (тишина >15м) — LONG/NEUTRAL деплои на паузе до восстановления")
-		} else {
-			worker.noteDeployBlock(ctx, fmt.Sprintf("REAL: каскад ликвидаций лонгов $%.0fM/час — LONG/NEUTRAL деплои на паузе, SHORT доступны", cascadeUSD/1_000_000))
-		}
-	}
 	// When the LLM brain is enabled, an UNAUDITED candidate is not
 	// deployable — regardless of why the audit is missing (beyond the
 	// per-scan audit cap, transport failure, timeout). This is the hard
@@ -2024,10 +1993,6 @@ func (worker *Worker) deployReal(
 	if llmSettings, err := worker.llm.GetSettings(ctx); err == nil {
 		llmBrainEnabled = llmSettings.Enabled && strings.TrimSpace(llmSettings.APIKey) != ""
 	}
-	// v2.0.58 (audit 2026-09-01): deployReal never ran the macro gate —
-	// beta-drift/alt-drain vetoes protected paper only, the exact paths
-	// REAL capital would ride. Same context load as the paper round.
-	macroCtx := worker.loadMacroContext(ctx)
 	// v2.0.94 cumulative symbol cooldown — REAL mirror of the paper gate:
 	// the repeat-loser cohort is strategy-level evidence, not fleet-level.
 	losingSymbols := worker.loadLosingSymbolCooldowns(ctx, settings.ID)
@@ -2050,12 +2015,6 @@ func (worker *Worker) deployReal(
 		if activeCount >= settings.MaxActiveBots {
 			worker.rejectCandidate(ctx, candidate,
 				fmt.Sprintf("портфель полон (%d/%d) — слот занят, вход отложен до освобождения", activeCount, settings.MaxActiveBots), nil)
-			continue
-		}
-		// Macro gate (REAL mirror of the paper path): market-wide rotation
-		// is invisible to pair-level ADX/Hurst — the 2026-08-30 night class.
-		if veto, reason, macroTel := macroVeto(strings.ToLower(strings.TrimSpace(candidate.RecommendedTrend)), cascadeShort, macroCtx); veto {
-			worker.rejectCandidate(ctx, candidate, reason, macroTel)
 			continue
 		}
 		if !isEntryTimingFavorable(candidate) {
@@ -2362,16 +2321,24 @@ func (worker *Worker) deployReal(
 			}
 			trend = smartParam
 		}
-		if cascadeLong && trend != "short" {
-			// v2.0.120: a stale feed must name itself in the per-candidate
-			// trace too — "$0M/час" hid the actionable cause.
-			reason := fmt.Sprintf(
-				"каскад ликвидаций лонгов $%.0fM/час — входы LONG/NEUTRAL на паузе (SHORT доступны)",
-				cascadeUSD/1_000_000)
-			if staleLiquidationFeed {
-				reason = "источник ликвидаций нестабилен (тишина >15м) — входы LONG/NEUTRAL на паузе до восстановления"
-			}
-			worker.rejectCandidate(ctx, candidate, reason, nil)
+		// v2.0.138 entry chain: the shared market-blocker composer now owns
+		// the per-candidate fleet gates — liquidation cascade + feed health
+		// (direction-aware against the FINAL trend: SHORT stays live, smart
+		// override included) and the macro veto (judging the SCANNER trend
+		// with the cascade-short exemption — v2.0.58 closed the paper-only
+		// hole; the composer keeps those exact inputs). Storm, the joint
+		// portfolio breaker and economic events were cleared once per pass
+		// above. Plan order puts the cascade ahead of the macro veto, so a
+		// candidate hitting both now names the cascade.
+		entryIn := EntryChainInput{
+			Path: EntryPathScannerReal, Settings: settings, Symbol: candidate.Symbol,
+			Direction: entryDirectionFromTrend(trend), Fleet: "REAL", RefID: candidate.ID,
+			ScannerTrend: strings.ToLower(strings.TrimSpace(candidate.RecommendedTrend)),
+			CascadeShort: cascadeShort,
+		}
+		if code, reason, _, features := worker.probeSharedMarketBlockers(ctx, entryIn); code != "" {
+			worker.rejectCandidate(ctx, candidate, reason, features)
+			worker.journalEntryDecision(ctx, entryIn, entryOutcomeReject, code, reason, features)
 			continue
 		}
 		// v2.0.21 cascade-short window (REAL mirror).
@@ -2554,6 +2521,15 @@ func (worker *Worker) deployReal(
 			botLev, settings.BudgetUSDT,
 		); err != nil {
 			deployErrors = append(deployErrors, fmt.Sprintf("%s: risk gate: %v", candidate.Symbol, err))
+			// v2.0.138 (audit): the refusal must reach the candidate row too —
+			// deployErrors only feeds the log/last_error, so the candidate
+			// stayed ACCEPTED with no reason and the next scan re-ran the whole
+			// pipeline for it (paper mirror: "risk engine: …", v2.0.27).
+			worker.rejectCandidate(ctx, candidate, "risk engine: "+err.Error(), nil)
+			worker.journalEntryDecision(ctx, EntryChainInput{
+				Path: EntryPathScannerReal, Settings: settings, Symbol: candidate.Symbol,
+				Direction: entryDirectionFromTrend(trend), Fleet: "REAL", RefID: candidate.ID,
+			}, entryOutcomeReject, "RISK_ENGINE", "risk engine: "+err.Error(), nil)
 			continue
 		}
 		base, quote, err := SplitPionexPerp(candidate.Symbol)
@@ -2724,6 +2700,13 @@ func (worker *Worker) deployReal(
 			continue
 		}
 		activeCount++
+
+		// v2.0.138 entry chain: the ALLOW row — one per created bot, with the
+		// config version that admitted it.
+		worker.journalEntryDecision(ctx, EntryChainInput{
+			Path: EntryPathScannerReal, Settings: settings, Symbol: candidate.Symbol,
+			Direction: entryDirectionFromTrend(trend), Fleet: "REAL", RefID: botID,
+		}, entryOutcomeAllow, "CLEAR", "", nil)
 
 		// v2.0.89 round-trip fee ledger: the taker entry fee the wallet paid
 		// at deploy is booked durably — the epoch formula subtracts Σ fees.
@@ -3238,19 +3221,71 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 	// RUNNING fleet before the pass samples prices.
 	worker.syncWSSubscriptions(ctx, *settings)
 	// v2.0.137: lane observability — ORDERBOOK/TRADE delivery volume and
-	// drop reasons, every 5 minutes, so a silently dead or skewed feed is
-	// visible in the logs (not inferred from bot regimes).
+	// drop reasons for BOTH lanes, every 5 minutes, so a silently dead or
+	// skewed feed is visible in the logs (not inferred from bot regimes).
+	// _5m fields are interval deltas against the previous snapshot (rates,
+	// not cumulative totals); ob_clamp_* come from the WS lane's server-ts
+	// clamp. Silence alarms fire only when a real interval was measured —
+	// the first pass right after boot has no baseline yet.
 	if worker.ofiEngine != nil && time.Since(worker.ofiStatsAt) > 5*time.Minute {
+		intervalStart := worker.ofiStatsAt
 		worker.ofiStatsAt = time.Now()
 		stats := worker.ofiEngine.Stats()
-		worker.logger.Info("ofi engine ingest stats",
+		prev := worker.ofiStatsPrev
+		worker.ofiStatsPrev = stats
+		// Counters only grow; a shrink means a fresh engine (restart), so
+		// clamp the delta at zero instead of logging a wrapped uint64.
+		drop := func(cur, was uint64) uint64 {
+			if cur < was {
+				return 0
+			}
+			return cur - was
+		}
+		obDelta := drop(stats.OrderbookFrames, prev.OrderbookFrames)
+		tradesDelta := drop(stats.Trades, prev.Trades)
+		args := []any{
 			"component", "autogrid_worker",
 			"symbols", stats.Symbols,
 			"orderbook_frames", stats.OrderbookFrames,
 			"trades", stats.Trades,
 			"trades_dropped_dedup", stats.TradesDroppedDedup,
 			"trades_dropped_too_old", stats.TradesDroppedTooOld,
-			"trades_dropped_isolation", stats.TradesDroppedIsolation)
+			"trades_dropped_isolation", stats.TradesDroppedIsolation,
+			"orderbook_dropped_sequence", stats.OrderbookDroppedSequence,
+			"orderbook_dropped_crossed", stats.OrderbookDroppedCrossed,
+			"orderbook_dropped_unsynced", stats.OrderbookDroppedUnsynced,
+			"orderbook_frames_5m", obDelta,
+			"trades_5m", tradesDelta,
+			"trades_dropped_dedup_5m", drop(stats.TradesDroppedDedup, prev.TradesDroppedDedup),
+			"trades_dropped_too_old_5m", drop(stats.TradesDroppedTooOld, prev.TradesDroppedTooOld),
+			"trades_dropped_isolation_5m", drop(stats.TradesDroppedIsolation, prev.TradesDroppedIsolation),
+			"orderbook_dropped_sequence_5m", drop(stats.OrderbookDroppedSequence, prev.OrderbookDroppedSequence),
+			"orderbook_dropped_crossed_5m", drop(stats.OrderbookDroppedCrossed, prev.OrderbookDroppedCrossed),
+			"orderbook_dropped_unsynced_5m", drop(stats.OrderbookDroppedUnsynced, prev.OrderbookDroppedUnsynced),
+		}
+		if !intervalStart.IsZero() {
+			args = append(args, "interval_seconds", int64(time.Since(intervalStart).Seconds()))
+		}
+		if worker.wsLane != nil {
+			// WS-side clamp view: server-ts trust rate and worst accepted
+			// skew — a high fallback share or big max skew indicts the time
+			// domain, not the lanes themselves.
+			used, fallback, maxSkewMS := worker.wsLane.OrderbookClampStats()
+			args = append(args, "ob_clamp_used", used, "ob_clamp_fallback", fallback, "ob_max_skew_ms", maxSkewMS)
+		}
+		worker.logger.Info("ofi engine ingest stats", args...)
+		if !intervalStart.IsZero() {
+			// Aggregate simplification: orderbook_frames_5m > 0 already
+			// implies at least one subscribed symbol (the engine only
+			// tracks subscribed symbols) received frames over the interval.
+			if obDelta > 0 && tradesDelta == 0 {
+				worker.logger.Warn("ofi TRADE lane silent while ORDERBOOK flows",
+					"component", "autogrid_worker", "orderbook_frames_5m", obDelta)
+			} else if obDelta == 0 {
+				worker.logger.Warn("ofi ORDERBOOK lane silent",
+					"component", "autogrid_worker", "symbols", stats.Symbols)
+			}
+		}
 	}
 	// v2.0.111: surface storm arm/extend transitions once per arm.
 	worker.maybeLogStormState(ctx)
@@ -4152,9 +4187,31 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 		// (HOLD) tick. The resync/self-heal reconciliation above stays BEFORE
 		// the decision — a doubled position must be judged against doubled
 		// stops, which is exactly what the refreshed locals provide.
-		if decision.Action == ActionHold && !trancheBackoff && bot.trancheDeployed == 1 && bot.trancheBase != nil && bot.localStatus == "RUNNING" && price.IsPositive() &&
-			worker.trancheStressAllowed(ctx, bot.id) {
-			if base, bErr := decimal.NewFromString(*bot.trancheBase); bErr == nil && base.GreaterThan(bot.investment) {
+		if decision.Action == ActionHold && !trancheBackoff && bot.trancheDeployed == 1 && bot.trancheBase != nil && bot.localStatus == "RUNNING" && price.IsPositive() {
+			// v2.0.111 stress moratorium (B): no second tranche while the
+			// bot's radar band is ≥2 or a fleet storm is active. v2.0.138
+			// (audit): the block now leaves a durable trace — one journal row
+			// per hour max, fenced by the same tranche2SkipAt backoff marker
+			// the risk-gate skip uses, so a stressed bot cannot flood the
+			// journal at manage cadence.
+			if !worker.trancheStressAllowed(ctx, bot.id) {
+				tag, tErr2 := worker.db.Exec(ctx, `
+				UPDATE grid_bots
+				SET model_state = jsonb_set(model_state, '{tranche2SkipAt}',
+					to_jsonb(to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'))),
+				    updated_at = NOW()
+				WHERE id = $1
+				  AND COALESCE(NULLIF(model_state->>'trancheDeployed','')::INT, 0) = 1
+				  AND COALESCE((model_state->>'tranche2SkipAt')::TIMESTAMPTZ, '1970-01-01') < NOW() - INTERVAL '1 hour'
+			`, bot.id)
+				if tErr2 == nil && tag.RowsAffected() == 1 {
+					worker.journalEntryDecision(ctx, EntryChainInput{
+						Path: EntryPathTranche2, Settings: *settings, Symbol: bot.symbol,
+						Direction: bot.direction, Fleet: "REAL", RefID: bot.id,
+					}, entryOutcomeReject, "TRANCHE_STRESS",
+						"мораторий стресса: шторм-режим или радар-полоса ≥2 — вторая доля не вливается в спасаемую позицию", nil)
+				}
+			} else if base, bErr := decimal.NewFromString(*bot.trancheBase); bErr == nil && base.GreaterThan(bot.investment) {
 				entry := price
 				if bot.trancheEntry != nil {
 					if e, eErr := decimal.NewFromString(*bot.trancheEntry); eErr == nil && e.IsPositive() {
@@ -4508,6 +4565,11 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 							"component", "autogrid_worker", "bot_number", bot.botNumber, "symbol", bot.symbol,
 							"regime", string(micro.Regime), "reason", micro.Reason,
 							"ofi", micro.CurrentOFI, "micro_bias_bps", micro.MicroPriceBiasBps)
+						// v2.0.138 journal: the freeze's feature vector, so the
+						// veto is auditable/replayable (engine state is memory-only).
+						logOFIDecision(ctx, worker.db, settings.ID, bot.symbol, ofiKindAdjustFreeze,
+							micro, string(micro.Readiness()), "FREEZE", micro.Reason,
+							fmt.Sprintf("#%d", bot.botNumber))
 						break
 					}
 				} else if decision.Action == ActionAdjustUp {
@@ -4516,6 +4578,9 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 							"component", "autogrid_worker", "bot_number", bot.botNumber, "symbol", bot.symbol,
 							"regime", string(micro.Regime), "reason", micro.Reason,
 							"ofi", micro.CurrentOFI, "micro_bias_bps", micro.MicroPriceBiasBps)
+						logOFIDecision(ctx, worker.db, settings.ID, bot.symbol, ofiKindAdjustFreeze,
+							micro, string(micro.Readiness()), "FREEZE", micro.Reason,
+							fmt.Sprintf("#%d", bot.botNumber))
 						break
 					}
 				}
@@ -5650,6 +5715,11 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 						worker.logger.Warn("manage paper range shift frozen by OFI dump pressure",
 							"component", "autogrid_worker", "bot_number", bot.botNumber, "symbol", bot.symbol,
 							"regime", string(micro.Regime), "reason", micro.Reason)
+						// v2.0.138 journal: the freeze's feature vector (REAL
+						// mirror above) — paper freezes count the same.
+						logOFIDecision(ctx, worker.db, settings.ID, bot.symbol, ofiKindAdjustFreeze,
+							micro, string(micro.Readiness()), "FREEZE", micro.Reason,
+							fmt.Sprintf("#%d", bot.botNumber))
 						continue
 					}
 				} else if decision.Action == ActionAdjustUp {
@@ -5657,6 +5727,9 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 						worker.logger.Warn("manage paper range shift frozen by OFI pump pressure",
 							"component", "autogrid_worker", "bot_number", bot.botNumber, "symbol", bot.symbol,
 							"regime", string(micro.Regime), "reason", micro.Reason)
+						logOFIDecision(ctx, worker.db, settings.ID, bot.symbol, ofiKindAdjustFreeze,
+							micro, string(micro.Readiness()), "FREEZE", micro.Reason,
+							fmt.Sprintf("#%d", bot.botNumber))
 						continue
 					}
 				}
@@ -5810,7 +5883,7 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 					// v2.0.56 (F2): gate the doubling — per-bot effective stop
 					// cap + fleet envelope ≤ 0.8× daily breaker. The event
 					// payload now carries the effective target/stop so the
-					// risk desk no longer shows "$8" over a $16 stop.
+					// risk desk no longer shows "$8" over a "$16" stop.
 					effMaxLoss, effTarget := decimal.Zero, decimal.Zero
 					if bot.maxLoss != nil {
 						effMaxLoss = bot.maxLoss.Mul(decimal.NewFromInt(2))
@@ -5818,7 +5891,30 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 					if bot.pnlTarget != nil {
 						effTarget = bot.pnlTarget.Mul(decimal.NewFromInt(2))
 					}
-					if skip := worker.tranche2RiskGate(ctx, settings, bot.id, bot.leverage, effMaxLoss); skip != "" {
+					// v2.0.138 (audit, paper parity): the REAL lane's stress
+					// moratorium — no second tranche while the bot's radar
+					// band is ≥2 or a fleet storm is active; adding margin
+					// into stress doubles exactly the position the radar is
+					// trying to save (prod ORDI #1396). One journal row per
+					// hour max via the tranche2SkipAt backoff marker.
+					if !worker.trancheStressAllowed(ctx, bot.id) {
+						tag, tErr2 := worker.db.Exec(ctx, `
+						UPDATE paper_grid_bots
+						SET model_state = jsonb_set(model_state, '{tranche2SkipAt}',
+							to_jsonb(to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'))),
+						    updated_at = NOW()
+						WHERE id = $1 AND status = 'RUNNING'
+						  AND COALESCE(NULLIF(model_state->>'trancheDeployed','')::INT, 0) = 1
+						  AND COALESCE((model_state->>'tranche2SkipAt')::TIMESTAMPTZ, '1970-01-01') < NOW() - INTERVAL '1 hour'
+					`, bot.id)
+						if tErr2 == nil && tag.RowsAffected() == 1 {
+							worker.journalEntryDecision(ctx, EntryChainInput{
+								Path: EntryPathTranche2, Settings: settings, Symbol: bot.symbol,
+								Direction: bot.direction, Fleet: "PAPER", RefID: bot.id,
+							}, entryOutcomeReject, "TRANCHE_STRESS",
+								"мораторий стресса: шторм-режим или радар-полоса ≥2 — вторая доля не вливается в спасаемую позицию", nil)
+						}
+					} else if skip := worker.tranche2RiskGate(ctx, settings, bot.id, bot.leverage, effMaxLoss); skip != "" {
 						// Backoff marker: the 24h time-box keeps the trigger
 						// armed forever, so a gated skip must not re-log on
 						// every manage pass — one event per hour max.
@@ -5892,6 +5988,11 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 
 	// Telemetry retention, batched like the radar snapshots.
 	_, _ = worker.db.Exec(ctx, `DELETE FROM bot_telemetry WHERE captured_at < NOW() - INTERVAL '14 days' AND id % 1000 = 0`)
+	// v2.0.138 decision journals ride the same retention (batched deletes;
+	// radar rows are throttle-gated, but a sustained storm of actionable
+	// flows across a large fleet still accumulates).
+	_, _ = worker.db.Exec(ctx, `DELETE FROM ofi_decision_snapshots WHERE created_at < NOW() - INTERVAL '14 days' AND id % 1000 = 0`)
+	_, _ = worker.db.Exec(ctx, `DELETE FROM entry_decisions WHERE created_at < NOW() - INTERVAL '14 days' AND id % 1000 = 0`)
 	return nil
 }
 

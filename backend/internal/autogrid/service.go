@@ -306,13 +306,19 @@ type Service struct {
 	// epochMu/epochCache memoize the epoch summary (v2.0.88 «одна правда на
 	// экране»): the state payload and the /equity endpoint share ONE figure
 	// and the 5-second UI poll must not re-run the aggregate per hit.
-	epochMu     sync.Mutex
-	epochCache  *epochCacheEntry
-	clientMu    sync.Mutex
-	clientCache map[string]*clientCacheEntry
+	epochMu           sync.Mutex
+	epochCache        *epochCacheEntry
+	clientMu          sync.Mutex
+	clientCache       map[string]*clientCacheEntry
 	livePriceMu       sync.RWMutex
 	livePriceResolver LivePriceResolver
 	publicAPI         *pionex.Client
+	// StormActive exposes the worker-owned fleet storm window (v2.0.111) to
+	// service-layer entry-chain calls (manual deploy, invest_in) — wired by
+	// the worker's Run in the same process. nil (a service built without a
+	// worker) reads as "not stormy": the one accepted limitation, documented
+	// in entry_chain.go.
+	StormActive func() bool
 }
 
 // LivePriceResolver resolves a live mark price for a symbol.
@@ -1914,7 +1920,11 @@ func (s *Service) SetExecutionMode(ctx context.Context, mode string) (*Settings,
 
 // realExecutionGates mirrors the AutoGrid worker gates: real money requires
 // the explicit app_config switch, the durable feature flag and the kill
-// switch to be off.
+// switch to be off. v2.0.138 (audit): the account permission/verified leg
+// now runs here too — is_enabled, has_read_permission and the declared
+// Futures/Bot grants via pionex_accounts, mirroring worker.realExecutionAllowed.
+// Previously only the worker checked these, so the HTTP manual-deploy lane
+// could create REAL grids on an account that failed its own REAL exam.
 func (s *Service) realExecutionGates(ctx context.Context) error {
 	riskSettings, err := s.risk.LoadSettings(ctx)
 	if err != nil {
@@ -1934,6 +1944,29 @@ func (s *Service) realExecutionGates(ctx context.Context) error {
 	}
 	if !configEnabled || !featureEnabled {
 		return errors.New("REAL bots are blocked by real_grid_execution_enabled or real_native_grid")
+	}
+	settings, err := s.GetSettings(ctx)
+	if err != nil {
+		return err
+	}
+	accountID := settings.AccountID
+	if accountID == nil {
+		resolved, resolveErr := s.resolveAccount(ctx)
+		if resolveErr != nil {
+			return resolveErr
+		}
+		accountID = resolved
+	}
+	var enabled, readPermission, futuresPermission, botPermission bool
+	if err := s.db.QueryRow(ctx, `
+		SELECT is_enabled, has_read_permission,
+		       has_futures_permission, has_bot_permission
+		FROM pionex_accounts WHERE id = $1
+	`, *accountID).Scan(&enabled, &readPermission, &futuresPermission, &botPermission); err != nil {
+		return fmt.Errorf("load REAL AutoGrid account: %w", err)
+	}
+	if !enabled || !readPermission || !futuresPermission || !botPermission {
+		return errors.New("REAL AutoGrid account is not verified and enabled for declared Futures/Bot permissions")
 	}
 	return nil
 }
@@ -2059,6 +2092,20 @@ func (s *Service) AdjustBot(
 		if input.Mode == "invest_in" {
 			if !input.QuoteInvestment.GreaterThan(decimal.Zero) {
 				return "", errors.New("invest_in requires a positive quoteInvestment")
+			}
+			// v2.0.138 entry chain (audit fix #2): the joint portfolio circuit
+			// breaker — the single shared reading every entry path clears
+			// (jointProtectiveClosesLastHour). A manual top-up used to pass
+			// only ValidateGridTopUp, so it could add real margin into the
+			// exact fleet stress the breaker exists to pause.
+			if closes, closesErr := jointProtectiveClosesLastHour(ctx, s.db, settingsID); closesErr == nil && closes >= 3 {
+				investIn := EntryChainInput{
+					Path: EntryPathInvestIn, Settings: Settings{ID: settingsID},
+					Symbol: botSymbol, Direction: botDirection, Fleet: "REAL", RefID: botID,
+				}
+				reason := circuitBreakerReason(EntryPathInvestIn, closes)
+				journalEntryDecisionSvc(ctx, s.db, investIn, entryOutcomeReject, entryBlockedCircuitBreaker, reason, nil)
+				return "", errors.New(reason)
 			}
 			if err := s.risk.ValidateGridTopUp(ctx, *accountID, botSymbol, botLeverage, input.QuoteInvestment); err != nil {
 				return "", fmt.Errorf("invest_in rejected by risk engine: %w", err)
@@ -2610,6 +2657,20 @@ func (s *Service) DeployManualBot(
 	if err := s.realExecutionGates(ctx); err != nil {
 		return nil, "", err
 	}
+	// v2.0.138 entry chain (audit fix #1): manual REAL deploys run the SAME
+	// fleet-wide market gates the scanner paths run — storm, the joint
+	// portfolio circuit breaker, economic events, liquidation cascade + feed
+	// health and the macro veto — through the shared composer. The manual
+	// lane used to bypass every one of them; an operator hand-deploy could
+	// open fresh risk exactly in the windows the autopilot defers.
+	manualEntryIn := EntryChainInput{
+		Path: EntryPathManualDeploy, Settings: *settings, Symbol: input.Symbol,
+		Direction: entryDirectionFromTrend(input.Direction), Fleet: "REAL",
+	}
+	if code, reason := s.evaluateSharedMarketBlockersSvc(ctx, manualEntryIn); code != "" {
+		journalEntryDecisionSvc(ctx, s.db, manualEntryIn, entryOutcomeReject, code, reason, nil)
+		return nil, "", errors.New(reason)
+	}
 	accountID, err := s.resolveAccount(ctx)
 	if err != nil {
 		return nil, "", err
@@ -2690,6 +2751,10 @@ func (s *Service) DeployManualBot(
 		s.logger.Error("entry fee booking failed — ledger fee leg incomplete for this deploy",
 			"component", "autogrid_service", "bot_id", gridID, "error", feeErr)
 	}
+	// v2.0.138 entry chain: the ALLOW row — one per created bot, with the
+	// config version that admitted it.
+	manualEntryIn.RefID = gridID
+	journalEntryDecisionSvc(ctx, s.db, manualEntryIn, entryOutcomeAllow, "CLEAR", "", nil)
 	return &ActiveBot{ID: gridID, Source: "REAL", Symbol: input.Symbol,
 		Status: "RUNNING", Direction: dbDirection(trend),
 		LowerPrice: lower, UpperPrice: upper, GridNum: row,

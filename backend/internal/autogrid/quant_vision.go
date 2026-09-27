@@ -322,7 +322,16 @@ func (worker *Worker) checkKnifePause(
 	if worker.ofiEngine != nil {
 		analysis := worker.ofiEngine.Analyze(symbol)
 		if allowed, ofiReason := analysis.CanEnter(trend); !allowed {
+			logOFIDecision(ctx, worker.db, defaultSettingsID(ctx, worker.db), symbol, ofiKindEntryVeto,
+				analysis, string(analysis.Readiness()), "VETO", ofiReason, "")
 			return true, marketdata.TakerFlowMetrics{}, ofiReason
+		}
+		if analysis.IsActionable() {
+			// Allow with a live directional flow observed — the rare,
+			// analysis-worthy accepts (plain NEUTRAL allows would flood the
+			// journal with every scan).
+			logOFIDecision(ctx, worker.db, defaultSettingsID(ctx, worker.db), symbol, ofiKindEntryVeto,
+				analysis, string(analysis.Readiness()), "ALLOW", "", "")
 		}
 	}
 
@@ -341,7 +350,13 @@ func (worker *Worker) checkKnifePause(
 		worker.ofiEngine.IngestTradeBatch(symbol, trades)
 		analysis := worker.ofiEngine.Analyze(symbol)
 		if allowed, ofiReason := analysis.CanEnter(trend); !allowed {
+			logOFIDecision(ctx, worker.db, defaultSettingsID(ctx, worker.db), symbol, ofiKindEntryVeto,
+				analysis, string(analysis.Readiness()), "VETO", ofiReason, "")
 			return true, metrics, ofiReason
+		}
+		if analysis.IsActionable() {
+			logOFIDecision(ctx, worker.db, defaultSettingsID(ctx, worker.db), symbol, ofiKindEntryVeto,
+				analysis, string(analysis.Readiness()), "ALLOW", "", "")
 		}
 	}
 

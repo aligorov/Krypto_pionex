@@ -910,8 +910,6 @@ func TestOFIEngine_DesyncPersistsAcrossStalenessAndWarmup(t *testing.T) {
 	}
 }
 
-
-
 // v2.0.137: Stats must quantify WHY trades get dropped — dedup, too-old and
 // window-isolation — plus raw ingest volume for both lanes.
 func TestOFIEngine_Stats_CountsDropReasons(t *testing.T) {
@@ -981,8 +979,8 @@ func TestOFIEngine_UpdateConfig_ConcurrentSafe(t *testing.T) {
 			// take e.mu.RLock under st.mu.
 			engine.IngestOrderbookUpdate(pionex.OrderbookUpdate{
 				Symbol: sym, Action: "UPDATE",
-				Bids: []pionex.DepthLevel{{Price: d("50.0"), Amount: d("90.0")}},
-				Asks: []pionex.DepthLevel{{Price: d("50.05"), Amount: d("90.0")}},
+				Bids:   []pionex.DepthLevel{{Price: d("50.0"), Amount: d("90.0")}},
+				Asks:   []pionex.DepthLevel{{Price: d("50.05"), Amount: d("90.0")}},
 				Number: int64(9000 + i), PrevNumber: int64(1),
 			})
 		}
@@ -996,5 +994,177 @@ func TestOFIEngine_UpdateConfig_ConcurrentSafe(t *testing.T) {
 	case <-done:
 	case <-time.After(10 * time.Second):
 		t.Fatal("concurrent UpdateConfig vs ingest deadlocked (lock-order regression)")
+	}
+}
+
+// v2.0.137: Readiness() collapses the regime/sync/freshness guards into a
+// single lane-health value and must mirror Analyze()'s guard precedence
+// exactly — recovery beats the DESYNC label (both carry IsSynced=false),
+// desync beats staleness, staleness beats warmup, and a live book is READY
+// regardless of what its regime says about direction.
+func TestMicrostructureAnalysis_Readiness(t *testing.T) {
+	cfg := OFIEngineConfig{WindowDuration: 5 * time.Second, MinWindows: 3, MaxStaleness: 15 * time.Second}
+
+	// No-symbol early return is explicitly WARMING_UP (no data yet).
+	cold := NewOFIEngine(cfg)
+	if r := cold.Analyze("NEVER_SEEN_PERP").Readiness(); r != ReadinessWarmingUp {
+		t.Fatalf("unknown symbol must read WARMING_UP, got %s", r)
+	}
+
+	// DESYNC: a gapped delta after a clean snapshot.
+	engine := NewOFIEngine(cfg)
+	sym := "LANE_HEALTH_PERP"
+	now := time.Now()
+	engine.IngestOrderbookUpdate(pionex.OrderbookUpdate{
+		Symbol: sym, Action: "SNAPSHOT",
+		Bids:       []pionex.DepthLevel{{Price: d("100"), Amount: d("10")}},
+		Asks:       []pionex.DepthLevel{{Price: d("100.1"), Amount: d("10")}},
+		Number:     1,
+		IsSnapshot: true,
+		ReceivedAt: now,
+	})
+	engine.IngestOrderbookUpdate(pionex.OrderbookUpdate{
+		Symbol: sym, Action: "UPDATE",
+		Bids:   []pionex.DepthLevel{{Price: d("100"), Amount: d("15")}},
+		Number: 6, PrevNumber: 5,
+		IsSnapshot: false, ReceivedAt: now.Add(10 * time.Millisecond),
+	})
+	desynced := engine.Analyze(sym)
+	if r := desynced.Readiness(); r != ReadinessDesync {
+		t.Fatalf("sequence gap must read DESYNC, got %s", r)
+	}
+	if desynced.LaneReadiness != ReadinessDesync {
+		t.Fatalf("cached LaneReadiness must agree with Readiness(), got %s", desynced.LaneReadiness)
+	}
+
+	// RECOVERING: a fresh snapshot heals the breach and starts warmup —
+	// IsSynced is still false, only the marker separates it from DESYNC.
+	engine.IngestOrderbookUpdate(pionex.OrderbookUpdate{
+		Symbol: sym, Action: "SNAPSHOT",
+		Bids:       []pionex.DepthLevel{{Price: d("100"), Amount: d("10")}},
+		Asks:       []pionex.DepthLevel{{Price: d("100.1"), Amount: d("10")}},
+		Number:     10,
+		IsSnapshot: true,
+		ReceivedAt: now.Add(50 * time.Millisecond),
+	})
+	recovering := engine.Analyze(sym)
+	if r := recovering.Readiness(); r != ReadinessRecovering {
+		t.Fatalf("post-snapshot warmup must read RECOVERING, got %s (reason: %s)", r, recovering.Reason)
+	}
+	if !recovering.RecoveringFromDesync {
+		t.Fatalf("explicit RecoveringFromDesync field must be set on the recovering analysis")
+	}
+
+	// READY: MinWindows clean windows on a fresh book → NEUTRAL regime with
+	// live data — live data is READY regardless of direction.
+	for i := 0; i < 3; i++ {
+		ts := now.Add(time.Duration(i) * 5 * time.Second)
+		engine.IngestOrderbookUpdate(pionex.OrderbookUpdate{
+			Symbol: sym, Action: "UPDATE",
+			Bids:   []pionex.DepthLevel{{Price: d("100"), Amount: d("10")}},
+			Asks:   []pionex.DepthLevel{{Price: d("100.1"), Amount: d("10")}},
+			Number: 11 + int64(i), PrevNumber: 10 + int64(i),
+			IsSnapshot: false, ReceivedAt: ts,
+		})
+		engine.FinalizeWindow(sym, ts.Add(5*time.Second))
+	}
+	ready := engine.Analyze(sym)
+	if ready.Regime != RegimeNeutral {
+		t.Fatalf("expected neutral regime after clean warmup, got %s", ready.Regime)
+	}
+	if r := ready.Readiness(); r != ReadinessReady {
+		t.Fatalf("fresh synced neutral book must read READY, got %s", r)
+	}
+	if ready.LaneReadiness != ReadinessReady {
+		t.Fatalf("cached LaneReadiness must agree with Readiness(), got %s", ready.LaneReadiness)
+	}
+
+	// STALE: a book whose last update breached MaxStaleness (separate
+	// engine — timestamps drive the guard, no wall-clock waiting).
+	staleEngine := NewOFIEngine(cfg)
+	staleEngine.IngestL2("STALE_LANE_PERP",
+		[]pionex.DepthLevel{{Price: d("100"), Amount: d("10")}},
+		[]pionex.DepthLevel{{Price: d("100.1"), Amount: d("10")}},
+		time.Now().Add(-30*time.Second),
+	)
+	stale := staleEngine.Analyze("STALE_LANE_PERP")
+	if stale.Regime != RegimeStale {
+		t.Fatalf("expected STALE regime, got %s", stale.Regime)
+	}
+	if r := stale.Readiness(); r != ReadinessStale {
+		t.Fatalf("stale book must read STALE, got %s", r)
+	}
+
+	// Hand-built analyses: the explicit bool wins over string matching, the
+	// reason substring stays as fallback, and a zero-value analysis (no
+	// data) reads WARMING_UP — never DESYNC despite IsSynced=false,
+	// because nothing marks it desync-shaped.
+	if r := (MicrostructureAnalysis{RecoveringFromDesync: true}).Readiness(); r != ReadinessRecovering {
+		t.Fatalf("explicit bool must derive RECOVERING without the string marker, got %s", r)
+	}
+	if r := (MicrostructureAnalysis{Reason: "order book recovering from desync: warming up (1/3 windows)"}).Readiness(); r != ReadinessRecovering {
+		t.Fatalf("reason fallback must derive RECOVERING, got %s", r)
+	}
+	if r := (MicrostructureAnalysis{}).Readiness(); r != ReadinessWarmingUp {
+		t.Fatalf("zero-value analysis (no data) must read WARMING_UP, got %s", r)
+	}
+}
+
+// v2.0.137: ORDERBOOK drop reasons must be attributable — a sequence-gap
+// delta, a crossing delta and a delta onto an unsynced book each bump their
+// own counter, so Stats() shows WHICH integrity guard rejects frames.
+func TestOFIEngine_Stats_OrderbookDropReasons(t *testing.T) {
+	engine := NewOFIEngine(DefaultOFIEngineConfig())
+	sym := "OB_DROP_PERP"
+	now := time.Now()
+
+	// Delta onto a never-snapshotted book → ErrNotSynced → unsynced.
+	engine.IngestOrderbookUpdate(pionex.OrderbookUpdate{
+		Symbol: sym, Action: "UPDATE",
+		Bids:   []pionex.DepthLevel{{Price: d("100"), Amount: d("10")}},
+		Asks:   []pionex.DepthLevel{{Price: d("100.1"), Amount: d("10")}},
+		Number: 1, PrevNumber: 0, IsSnapshot: false, ReceivedAt: now,
+	})
+
+	// Snapshot, then a gapped delta (expected prevNumber 1, got 5) →
+	// ErrSequenceGap.
+	engine.IngestOrderbookUpdate(pionex.OrderbookUpdate{
+		Symbol: sym, Action: "SNAPSHOT",
+		Bids:   []pionex.DepthLevel{{Price: d("100"), Amount: d("10")}},
+		Asks:   []pionex.DepthLevel{{Price: d("100.1"), Amount: d("10")}},
+		Number: 1, IsSnapshot: true, ReceivedAt: now.Add(10 * time.Millisecond),
+	})
+	engine.IngestOrderbookUpdate(pionex.OrderbookUpdate{
+		Symbol: sym, Action: "UPDATE",
+		Bids:   []pionex.DepthLevel{{Price: d("100"), Amount: d("12")}},
+		Number: 6, PrevNumber: 5, IsSnapshot: false, ReceivedAt: now.Add(20 * time.Millisecond),
+	})
+
+	// Fresh snapshot, then a delta lifting the bid over the ask →
+	// ErrCrossedBook.
+	engine.IngestOrderbookUpdate(pionex.OrderbookUpdate{
+		Symbol: sym, Action: "SNAPSHOT",
+		Bids:   []pionex.DepthLevel{{Price: d("100"), Amount: d("10")}},
+		Asks:   []pionex.DepthLevel{{Price: d("100.1"), Amount: d("10")}},
+		Number: 10, IsSnapshot: true, ReceivedAt: now.Add(30 * time.Millisecond),
+	})
+	engine.IngestOrderbookUpdate(pionex.OrderbookUpdate{
+		Symbol: sym, Action: "UPDATE",
+		Bids:   []pionex.DepthLevel{{Price: d("100.2"), Amount: d("10")}},
+		Number: 11, PrevNumber: 10, IsSnapshot: false, ReceivedAt: now.Add(40 * time.Millisecond),
+	})
+
+	stats := engine.Stats()
+	if stats.OrderbookDroppedUnsynced < 1 {
+		t.Fatalf("delta onto unsynced book must count, got %d", stats.OrderbookDroppedUnsynced)
+	}
+	if stats.OrderbookDroppedSequence < 1 {
+		t.Fatalf("sequence-gap delta must count, got %d", stats.OrderbookDroppedSequence)
+	}
+	if stats.OrderbookDroppedCrossed < 1 {
+		t.Fatalf("crossed delta must count, got %d", stats.OrderbookDroppedCrossed)
+	}
+	if stats.OrderbookFrames < 5 {
+		t.Fatalf("all five frames must still count as ingested, got %d", stats.OrderbookFrames)
 	}
 }

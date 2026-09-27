@@ -498,11 +498,15 @@ func (worker *Worker) radarMaybeRecenter(ctx context.Context, settings Settings,
 			if b.inventorySide >= 0 && (micro.Regime == marketdata.RegimeDumpPressure || micro.Regime == marketdata.RegimeConfirmedDump) {
 				worker.logger.Warn("stop-radar: PAPER recenter frozen by OFI dump pressure",
 					"component", "autogrid_worker", "symbol", b.symbol, "regime", string(micro.Regime), "reason", micro.Reason)
+				logOFIDecision(ctx, worker.db, settings.ID, b.symbol, ofiKindReentryGate,
+					micro, string(micro.Readiness()), "FREEZE", micro.Reason, fmt.Sprintf("#%d", b.botNumber))
 				return
 			}
 			if b.inventorySide < 0 && (micro.Regime == marketdata.RegimePumpPressure || micro.Regime == marketdata.RegimeConfirmedPump) {
 				worker.logger.Warn("stop-radar: PAPER recenter frozen by OFI pump pressure",
 					"component", "autogrid_worker", "symbol", b.symbol, "regime", string(micro.Regime), "reason", micro.Reason)
+				logOFIDecision(ctx, worker.db, settings.ID, b.symbol, ofiKindReentryGate,
+					micro, string(micro.Readiness()), "FREEZE", micro.Reason, fmt.Sprintf("#%d", b.botNumber))
 				return
 			}
 		}
@@ -755,11 +759,15 @@ func (worker *Worker) radarRecenterReal(ctx context.Context, settings Settings, 
 			if b.inventorySide >= 0 && (micro.Regime == marketdata.RegimeDumpPressure || micro.Regime == marketdata.RegimeConfirmedDump) {
 				worker.logger.Warn("stop-radar: REAL recenter frozen by OFI dump pressure",
 					"component", "autogrid_worker", "symbol", b.symbol, "regime", string(micro.Regime), "reason", micro.Reason)
+				logOFIDecision(ctx, worker.db, settings.ID, b.symbol, ofiKindReentryGate,
+					micro, string(micro.Readiness()), "FREEZE", micro.Reason, fmt.Sprintf("#%d", b.botNumber))
 				return
 			}
 			if b.inventorySide < 0 && (micro.Regime == marketdata.RegimePumpPressure || micro.Regime == marketdata.RegimeConfirmedPump) {
 				worker.logger.Warn("stop-radar: REAL recenter frozen by OFI pump pressure",
 					"component", "autogrid_worker", "symbol", b.symbol, "regime", string(micro.Regime), "reason", micro.Reason)
+				logOFIDecision(ctx, worker.db, settings.ID, b.symbol, ofiKindReentryGate,
+					micro, string(micro.Readiness()), "FREEZE", micro.Reason, fmt.Sprintf("#%d", b.botNumber))
 				return
 			}
 		}

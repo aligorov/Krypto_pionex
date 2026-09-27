@@ -340,7 +340,6 @@ func testLogger(t *testing.T) *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
-
 // v2.0.137: the ORDERBOOK lane must carry the SERVER timestamp (clamped to
 // ±1min like INDEX) so book windows and trade timestamps live in one time
 // domain; a bogus/far-away server stamp falls back to local receive time.
@@ -388,5 +387,48 @@ func TestPublicStreamOrderbookServerTimestamp(t *testing.T) {
 	<-done
 	if got.ReceivedAt.Before(before.Add(-2 * time.Second)) {
 		t.Fatalf("bogus server stamp must fall back to local receive time, got %v", got.ReceivedAt)
+	}
+}
+
+// v2.0.137: clamp observability — a server timeStamp inside the ±5s window
+// counts as trusted, a far-away stamp counts as a clamp fallback, and the
+// worst trusted |server-local| skew is tracked so a drifting local clock
+// becomes visible without decoding raw frames.
+func TestPublicStreamOrderbookClampStats(t *testing.T) {
+	stream := NewPublicStream("ws://unused", testLogger(t))
+
+	frame := func(offset time.Duration) []byte {
+		payload := fmt.Sprintf(`{
+			"topic": "ORDERBOOK",
+			"symbol": "BTC_USDT_PERP",
+			"timestamp": 1700000000000,
+			"data": {
+				"base": "BTC",
+				"quote": "USDT",
+				"bids": [["50000.0", "1.5"]],
+				"asks": [["50010.0", "1.0"]],
+				"number": 4001,
+				"prevNumber": 4000,
+				"timeStamp": %d
+			}
+		}`, time.Now().Add(offset).UnixMilli())
+		return []byte(payload)
+	}
+
+	// Trusted stamp ~2s ahead of local time.
+	stream.handleFrame(frame(2 * time.Second))
+	// Far-away stamp (10 minutes behind): rejected by the ±5s clamp.
+	stream.handleFrame(frame(-10 * time.Minute))
+	// Trusted stamp ~4s ahead: becomes the new maximum accepted skew.
+	stream.handleFrame(frame(4 * time.Second))
+
+	used, fallback, maxSkewMS := stream.OrderbookClampStats()
+	if used != 2 || fallback != 1 {
+		t.Fatalf("expected used=2 fallback=1, got used=%d fallback=%d", used, fallback)
+	}
+	// The 2s frame sets ~2000ms; the 4s frame must raise it to ~4000ms —
+	// allow scheduling jitter but stay well inside the ±5s acceptance band.
+	if maxSkewMS < 3500 || maxSkewMS > 4999 {
+		t.Fatalf("max skew must track the worst trusted stamp (~4000ms), got %dms", maxSkewMS)
 	}
 }

@@ -224,6 +224,16 @@ func (worker *Worker) radarMicrostructureEmergencyExit(ctx context.Context, sett
 				"edge_progress": fmt.Sprintf("%.0f%%", progress*100),
 				"message":       fmt.Sprintf("👀 [SHADOW] экстренная защитная остановка (%s, %s): институциональный поток против позиции, прогресс %.0f%% — в режиме ACTIVE сетка была бы остановлена", b.symbol, b.ofiRegime, progress*100),
 			})
+			// v2.0.138 journal: the SHADOW observation — verdict SKIP (the
+			// criteria fired, execution is off). The feature vector comes
+			// from the same in-memory lane the decision read.
+			if worker.ofiEngine != nil {
+				analysis := worker.ofiEngine.Analyze(b.symbol)
+				logOFIDecision(ctx, worker.db, settings.ID, b.symbol, ofiKindEmergency,
+					analysis, string(analysis.Readiness()), "SKIP",
+					"shadow: критерий выполнен, исполнения нет (StopForecastMode != ACTIVE)",
+					fmt.Sprintf("#%d", b.botNumber))
+			}
 		}
 		return false
 	}
@@ -258,6 +268,14 @@ func (worker *Worker) radarMicrostructureEmergencyExit(ctx context.Context, sett
 			"component", "autogrid_worker", "bot_number", b.botNumber, "symbol", b.symbol,
 			"direction", b.direction, "reason", adverseReason, "ofi_regime", b.ofiRegime,
 			"total", b.total.StringFixed(2), "edge_progress", progress, "requested_at", nowStr)
+
+		// v2.0.138 journal: the ACTIVE close decision — verdict FIRED.
+		if worker.ofiEngine != nil {
+			analysis := worker.ofiEngine.Analyze(b.symbol)
+			logOFIDecision(ctx, worker.db, settings.ID, b.symbol, ofiKindEmergency,
+				analysis, string(analysis.Readiness()), "FIRED", adverseReason,
+				fmt.Sprintf("#%d", b.botNumber))
+		}
 
 		_ = LogBotEvent(ctx, worker.db, b.botID, b.botNumber, b.botSource, b.symbol,
 			adverseReason, &b.price, &b.total, map[string]any{
@@ -334,6 +352,15 @@ func (worker *Worker) radarMicrostructureEmergencyExit(ctx context.Context, sett
 			"component", "autogrid_worker", "bot_number", b.botNumber, "symbol", b.symbol,
 			"direction", b.direction, "reason", adverseReason, "ofi_regime", b.ofiRegime,
 			"total", b.total.StringFixed(2), "edge_progress", progress)
+
+		// v2.0.138 journal: the ACTIVE close decision — verdict FIRED (the
+		// paper arm closes synchronously above).
+		if worker.ofiEngine != nil {
+			analysis := worker.ofiEngine.Analyze(b.symbol)
+			logOFIDecision(ctx, worker.db, settings.ID, b.symbol, ofiKindEmergency,
+				analysis, string(analysis.Readiness()), "FIRED", adverseReason,
+				fmt.Sprintf("#%d", b.botNumber))
+		}
 
 		_ = LogBotEvent(ctx, worker.db, b.botID, b.botNumber, b.botSource, b.symbol,
 			adverseReason, &b.price, &b.total, map[string]any{

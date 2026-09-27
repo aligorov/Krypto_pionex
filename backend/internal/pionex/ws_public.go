@@ -7,10 +7,11 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	"github.com/shopspring/decimal"
 	"github.com/gorilla/websocket"
+	"github.com/shopspring/decimal"
 )
 
 // v2.0.98 real-time lane: the supervision stack previously sampled prices
@@ -110,6 +111,15 @@ type PublicStream struct {
 
 	resyncMu       sync.Mutex
 	resyncInFlight map[string]time.Time
+
+	// v2.0.137 clamp observability for the ORDERBOOK time domain: how many
+	// frames trusted the server timeStamp vs fell back to local receive
+	// time, and the worst |server-local| skew among trusted stamps. Atomics
+	// because the read pump writes while the manage goroutine reads via
+	// OrderbookClampStats — no lock traffic on the hot ingest path.
+	obServerTSUsed  atomic.Uint64
+	obClampFallback atomic.Uint64
+	obMaxSkewMS     atomic.Int64
 }
 
 // NewPublicStream builds a lane client for the public futures stream.
@@ -236,6 +246,17 @@ func (s *PublicStream) LastFrameAt() time.Time {
 	s.stateMu.RLock()
 	defer s.stateMu.RUnlock()
 	return s.lastFrameAt
+}
+
+// OrderbookClampStats reports the ORDERBOOK time-domain clamp observability:
+// how many frames trusted the server timeStamp (used), how many carried a
+// far-away stamp the ±5s clamp rejected (fallback), and the worst
+// |server-local| skew in milliseconds among trusted stamps (maxSkewMS). A
+// persistently large maxSkewMS with low fallback is the signature of a
+// drifting local clock — the book would still pass the staleness budget but
+// windows would be systematically shifted against the TRADE lane.
+func (s *PublicStream) OrderbookClampStats() (used, fallback uint64, maxSkewMS int64) {
+	return s.obServerTSUsed.Load(), s.obClampFallback.Load(), s.obMaxSkewMS.Load()
 }
 
 // Run maintains the connection for the life of ctx: connect, pump reads,
@@ -621,8 +642,27 @@ func (s *PublicStream) ingestOrderbook(env wsEnvelope) {
 	received := time.Now()
 	if data.TimeStamp > 0 {
 		if srv := time.UnixMilli(data.TimeStamp); srv.After(received.Add(-5*time.Second)) && srv.Before(received.Add(5*time.Second)) {
+			// Trusted: track the accepted |server-local| skew (computed
+			// against local time BEFORE received is overwritten) with a CAS
+			// loop so concurrent readers can never lose a new maximum.
+			skewMS := srv.Sub(received).Milliseconds()
+			if skewMS < 0 {
+				skewMS = -skewMS
+			}
 			received = srv
+			s.obServerTSUsed.Add(1)
+			for {
+				cur := s.obMaxSkewMS.Load()
+				if skewMS <= cur || s.obMaxSkewMS.CompareAndSwap(cur, skewMS) {
+					break
+				}
+			}
+		} else {
+			// Present but far away: rejected by the clamp, local time wins.
+			s.obClampFallback.Add(1)
 		}
+		// timeStamp == 0 counts in neither bucket: there was no server
+		// stamp to trust or reject — the local clock is the only source.
 	}
 
 	update := OrderbookUpdate{

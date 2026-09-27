@@ -390,6 +390,15 @@ func TestManualDeployRealInvestmentOverride(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create account: %v", err)
 	}
+	// Create() leaves the row UNVERIFIED; v2.0.138 realExecutionGates gained
+	// the account permission/verified leg — mark it the way Verify() would.
+	if _, err := pool.Exec(ctx, `
+		UPDATE pionex_accounts
+		SET is_enabled = true, has_read_permission = true, last_verified_at = NOW()
+		WHERE id = $1
+	`, account.ID); err != nil {
+		t.Fatalf("verify account: %v", err)
+	}
 	t.Cleanup(func() {
 		// Detach the settings pointer BEFORE deleting the account: the FK on
 		// autogrid_settings.account_id would otherwise reject the delete (the
@@ -576,6 +585,15 @@ func TestManualDeployRealStopEnvelopeGate(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("create account: %v", err)
+	}
+	// Create() leaves the row UNVERIFIED; v2.0.138 realExecutionGates gained
+	// the account permission/verified leg — mark it the way Verify() would.
+	if _, err := pool.Exec(ctx, `
+		UPDATE pionex_accounts
+		SET is_enabled = true, has_read_permission = true, last_verified_at = NOW()
+		WHERE id = $1
+	`, account.ID); err != nil {
+		t.Fatalf("verify account: %v", err)
 	}
 	t.Cleanup(func() {
 		// Detach the settings pointer BEFORE deleting the account (FK).

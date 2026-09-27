@@ -267,9 +267,10 @@ func slotCapital(trancheBase *string, investment decimal.Decimal) decimal.Decima
 }
 
 // dgtSharedGateBlockers runs the gates a DGT re-deploy must still pass —
-// macro / economic / portfolio / risk-engine / slot — and returns "" when
-// clear, else the human-readable reason (logged on a DGT_REDEPLOY_SKIPPED
-// event so an absent re-deploy is always explainable).
+// microstructure re-entry / market-wide / portfolio / risk-engine / slot —
+// and returns ("", "") when clear, else the human-readable reason (logged on
+// a DGT_REDEPLOY_SKIPPED event so an absent re-deploy is always explainable)
+// plus the machine code of the deciding gate (entry_decisions.code).
 //
 // Deliberately NOT here: the per-symbol protective-close cooldown (a
 // re-center is not a re-entry into the dead zone — see the file header), the
@@ -278,7 +279,10 @@ func slotCapital(trancheBase *string, investment decimal.Decimal) decimal.Decima
 // LOCATION, not quality) and the DOM gate. Microstructure IS here: the
 // EMERGENCY_OFI_* family closes on live order flow, so the re-open must
 // re-verify that exact flow (freshness + sync + direction, one contract).
-func (worker *Worker) dgtSharedGateBlockers(ctx context.Context, settings Settings, spec dgtRedeploySpec) string {
+// v2.0.138: the market-wide legs (storm included — new for DGT) run through
+// the shared entry-chain composer, the same single implementation every
+// entry path clears.
+func (worker *Worker) dgtSharedGateBlockers(ctx context.Context, settings Settings, spec dgtRedeploySpec) (string, string) {
 	// v2.0.136: re-entry microstructure gate. A protective exit fired on a
 	// CONFIRMED dump/pump seconds ago; re-opening a grid into the SAME still
 	// confirmed flow would reload the inventory the exit just shed (audit
@@ -289,7 +293,12 @@ func (worker *Worker) dgtSharedGateBlockers(ctx context.Context, settings Settin
 	if worker.ofiEngine != nil {
 		analysis := worker.ofiEngine.Analyze(spec.symbol)
 		if allowed, ofiReason := analysis.CanEnter(spec.direction); !allowed {
-			return "OFI re-entry veto: " + ofiReason
+			// v2.0.138 journal: the veto's feature vector (regime/readiness
+			// arrive from the analysis already in scope).
+			logOFIDecision(ctx, worker.db, settings.ID, spec.symbol, ofiKindReentryGate,
+				analysis, string(analysis.Readiness()), "VETO", ofiReason,
+				fmt.Sprintf("#%d", spec.oldBotNumber))
+			return "OFI re-entry veto: " + ofiReason, "OFI_REENTRY_VETO"
 		}
 		// v2.0.137 (review follow-up): an EMERGENCY_OFI_* exit fired on LIVE
 		// flow — the re-open must prove the danger is GONE, not merely that
@@ -301,62 +310,30 @@ func (worker *Worker) dgtSharedGateBlockers(ctx context.Context, settings Settin
 		if spec.emergencyExit {
 			tradesFresh := !analysis.LastTradeAt.IsZero() && time.Since(analysis.LastTradeAt) <= 30*time.Second
 			if !analysis.IsFresh || !analysis.IsSynced || analysis.Regime != marketdata.RegimeNeutral || !tradesFresh {
-				return fmt.Sprintf("OFI re-entry: нет свежего подтверждения нормализации потока (regime=%s, fresh=%v, synced=%v, taker_last=%v) — защитный выход был по живому потоку, переоткрытие требует прогретого NEUTRAL-сигнала с живой лентой сделок",
+				reason := fmt.Sprintf("OFI re-entry: нет свежего подтверждения нормализации потока (regime=%s, fresh=%v, synced=%v, taker_last=%v) — защитный выход был по живому потоку, переоткрытие требует прогретого NEUTRAL-сигнала с живой лентой сделок",
 					analysis.Regime, analysis.IsFresh, analysis.IsSynced, analysis.LastTradeAt.Format(time.RFC3339))
+				logOFIDecision(ctx, worker.db, settings.ID, spec.symbol, ofiKindReentryGate,
+					analysis, string(analysis.Readiness()), "BLOCKED", reason,
+					fmt.Sprintf("#%d", spec.oldBotNumber))
+				return reason, "OFI_EMERGENCY_NORMALIZATION"
 			}
 		}
 	}
-	// Economic-event gate: same window the deploy paths run (T−2h…T+1h).
-	if blocked, blockReason := worker.CheckEconomicEvents(ctx, 2); blocked {
-		return "макро-событие USD «" + blockReason + "» — редеплой отложен"
+	// v2.0.138 entry chain: economic events / liquidation cascade + feed
+	// health / macro veto / the JOINT portfolio circuit breaker — and storm
+	// deferral, which the DGT lane lacked — all through the ONE shared
+	// composer, direction-aware against the closed bot's own direction
+	// (a SHORT re-center rides the unwind; LONG/NEUTRAL defer).
+	entryPath, entryFleet := EntryPathDGTReal, "REAL"
+	if spec.accountID == "" {
+		entryPath, entryFleet = EntryPathDGTPaper, "PAPER"
 	}
-	// Liquidation-cascade gate, direction-aware mirror of the deploy paths:
-	// a forced long unwind blocks LONG/NEUTRAL re-entries (SHORT stays — the
-	// unwind window is precisely when short grids harvest).
-	trend := strings.ToLower(spec.direction)
-	if trend == "no_trend" || trend == "neutral" || trend == "" {
-		trend = "neutral"
-	}
-	if cascadeLong, cascadeUSD := worker.CheckLiquidationCascade(ctx, 50_000_000); cascadeLong && trend != "short" {
-		return fmt.Sprintf("каскад ликвидаций лонгов $%.0fM/час — LONG/NEUTRAL редеплой на паузе", cascadeUSD/1_000_000)
-	}
-	// v2.0.120 (review agent): the v2.0.119 staleness contract — "callers
-	// that gate fresh LONG exposure must also consult
-	// LiquidationSourceHealthy and fail closed" (gates.go) — reaches its
-	// third LONG-gating call site. A re-deploy IS a fresh entry: a silently
-	// dead liquidation feed must freeze LONG/NEUTRAL re-entries here exactly
-	// like it freezes the scan deploys, or the break-flip pipeline becomes
-	// the one lane the crash gate cannot cover.
-	if trend != "short" {
-		if healthy, lastEvent := worker.LiquidationSourceHealthy(ctx); !healthy {
-			return fmt.Sprintf("источник ликвидаций нестабилен (тишина >15м, последнее %s) — LONG/NEUTRAL редеплой на паузе до восстановления",
-				lastEvent.Format(time.RFC3339))
-		}
-	}
-	// Macro gate (CoinGecko beta-drift / alt-drain), same exemption shape.
-	if veto, reason, _ := macroVeto(trend, false, worker.loadMacroContext(ctx)); veto {
-		return reason
-	}
-	// Portfolio circuit breaker: the SAME joint paper+REAL 1h protective-close
-	// count the deploy paths use — a fleet under stress stays defensive.
-	var recentStops int
-	if err := worker.db.QueryRow(ctx, `
-		SELECT COUNT(*) FROM (
-			SELECT 1 FROM paper_grid_bots
-			WHERE settings_id = $1
-			  AND status = 'COMPLETED'
-			  AND COALESCE(closed_reason, '') NOT IN (
-			      `+protectiveCloseExemptReasons+`)
-			  AND closed_at > NOW() - INTERVAL '1 hour'
-			UNION ALL
-			SELECT 1 FROM grid_bots
-			WHERE status IN ('STOPPED', 'LIQUIDATED')
-			  AND COALESCE(closed_reason, '') NOT IN (
-			      `+protectiveCloseExemptReasons+`)
-			  AND COALESCE(closed_at, updated_at) > NOW() - INTERVAL '1 hour'
-		) recent_stops
-	`, settings.ID).Scan(&recentStops); err == nil && recentStops >= 3 {
-		return fmt.Sprintf("circuit breaker: %d защитных закрытий за последний час — редеплой на паузе", recentStops)
+	if code, reason := worker.evaluateSharedMarketBlockers(ctx, EntryChainInput{
+		Path: entryPath, Settings: settings, Symbol: spec.symbol,
+		Direction: entryDirectionFromTrend(spec.direction), Fleet: entryFleet,
+		RefID: spec.oldBotID,
+	}); code != "" {
+		return reason, code
 	}
 	// Runaway ladder: durable per-symbol DGT_REDEPLOY count over 24h (the
 	// migration-0046 partial index serves it).
@@ -367,7 +344,7 @@ func (worker *Worker) dgtSharedGateBlockers(ctx context.Context, settings Settin
 		  AND created_at > NOW() - INTERVAL '24 hours'
 	`, spec.symbol, dgtRedeployEvent).Scan(&ladder); err == nil && ladder >= dgtRedeployMaxPerSymbolPer24h {
 		return fmt.Sprintf("DGT-лестница: %d редеплоев за 24ч (потолок %d) — слот уходит сканеру",
-			ladder, dgtRedeployMaxPerSymbolPer24h)
+			ladder, dgtRedeployMaxPerSymbolPer24h), "DGT_LADDER_CAP"
 	}
 	// Slot budget: the closing bot's own seat must actually be free (paper
 	// settles synchronously above; a REAL row may still sit in
@@ -379,19 +356,19 @@ func (worker *Worker) dgtSharedGateBlockers(ctx context.Context, settings Settin
 			SELECT COUNT(*) FROM paper_grid_bots
 			WHERE settings_id = $1 AND symbol = $2 AND status = 'RUNNING'
 		`, settings.ID, spec.symbol).Scan(&active); err == nil && active > 0 {
-			return "символ уже в работе (paper) — редеплой не нужен"
+			return "символ уже в работе (paper) — редеплой не нужен", "SLOT_BUSY"
 		}
 		if err := worker.db.QueryRow(ctx, `
 			SELECT COUNT(*) FROM paper_grid_bots
 			WHERE settings_id = $1 AND status = 'RUNNING'
 		`, settings.ID).Scan(&active); err == nil && active >= settings.MaxActiveBots {
-			return fmt.Sprintf("портфель полон (%d/%d) — редеплой отложен", active, settings.MaxActiveBots)
+			return fmt.Sprintf("портфель полон (%d/%d) — редеплой отложен", active, settings.MaxActiveBots), "PORTFOLIO_FULL"
 		}
 		// Kill switch + exposure caps, the paper deploy exam (v2.0.27 parity).
 		if err := worker.risk.ValidateNewPaperGrid(ctx, spec.symbol, settings.Leverage, spec.slotBudget); err != nil {
-			return "risk engine: " + err.Error()
+			return "risk engine: " + err.Error(), "RISK_ENGINE"
 		}
-		return ""
+		return "", ""
 	}
 	if err := worker.db.QueryRow(ctx, `
 		SELECT COUNT(*) FROM grid_bots
@@ -399,7 +376,7 @@ func (worker *Worker) dgtSharedGateBlockers(ctx context.Context, settings Settin
 		  AND status IN ('PENDING_SUBMISSION', 'SUBMISSION_UNKNOWN', 'RUNNING', 'STOP_REQUESTED', 'STOPPING')
 		  AND id <> $3
 	`, spec.accountID, spec.symbol, spec.oldBotID).Scan(&active); err == nil && active > 0 {
-		return "символ уже в работе (REAL) — редеплой не нужен"
+		return "символ уже в работе (REAL) — редеплой не нужен", "SLOT_BUSY"
 	}
 	if err := worker.db.QueryRow(ctx, `
 		SELECT COUNT(*) FROM grid_bots
@@ -407,12 +384,12 @@ func (worker *Worker) dgtSharedGateBlockers(ctx context.Context, settings Settin
 		  AND status IN ('PENDING_SUBMISSION', 'SUBMISSION_UNKNOWN', 'RUNNING', 'STOP_REQUESTED', 'STOPPING')
 		  AND id <> $2
 	`, spec.accountID, spec.oldBotID).Scan(&active); err == nil && active >= settings.MaxActiveBots {
-		return fmt.Sprintf("портфель полон (%d/%d) — редеплой отложен", active, settings.MaxActiveBots)
+		return fmt.Sprintf("портфель полон (%d/%d) — редеплой отложен", active, settings.MaxActiveBots), "PORTFOLIO_FULL"
 	}
 	if err := worker.risk.ValidateNewGrid(ctx, spec.accountID, spec.symbol, settings.Leverage, spec.slotBudget); err != nil {
-		return "risk engine: " + err.Error()
+		return "risk engine: " + err.Error(), "RISK_ENGINE"
 	}
-	return ""
+	return "", ""
 }
 
 // dgtFreshGeometry builds the re-centered grid from FRESH data: ATR% from
@@ -640,8 +617,14 @@ func (worker *Worker) processDgtRealRedeployIntents(ctx context.Context, setting
 // the RANGE_BREAK close: same slot capital, fresh tranche-1 contract, center
 // at the break price. Returns true when a new RUNNING row exists.
 func (worker *Worker) dgtRedeployPaper(ctx context.Context, settings Settings, spec dgtRedeploySpec) bool {
-	if reason := worker.dgtSharedGateBlockers(ctx, settings, spec); reason != "" {
+	if reason, code := worker.dgtSharedGateBlockers(ctx, settings, spec); reason != "" {
 		worker.noteDgtSkip(ctx, spec, "PAPER", reason)
+		// v2.0.138 entry chain: the blocked re-entry is a journaled decision,
+		// same as every other admission evaluation.
+		worker.journalEntryDecision(ctx, EntryChainInput{
+			Path: EntryPathDGTPaper, Settings: settings, Symbol: spec.symbol,
+			Direction: entryDirectionFromTrend(spec.direction), Fleet: "PAPER", RefID: spec.oldBotID,
+		}, entryOutcomeReject, code, reason, nil)
 		return false
 	}
 	mesh, harGeo, atrPct := worker.dgtFreshGeometry(ctx, settings, spec)
@@ -763,6 +746,12 @@ func (worker *Worker) dgtRedeployPaper(ctx context.Context, settings Settings, s
 		"center", spec.breakPrice.String(), "investment", investAmount.String(),
 		"lower", mesh.LowerPrice.String(), "upper", mesh.UpperPrice.String())
 
+	// v2.0.138 entry chain: the ALLOW row — one per re-deployed bot.
+	worker.journalEntryDecision(ctx, EntryChainInput{
+		Path: EntryPathDGTPaper, Settings: settings, Symbol: spec.symbol,
+		Direction: entryDirectionFromTrend(spec.direction), Fleet: "PAPER", RefID: botID,
+	}, entryOutcomeAllow, "CLEAR", "", nil)
+
 	_ = LogBotEvent(ctx, worker.db, botID, botNumber, "PAPER", spec.symbol, dgtRedeployEvent,
 		&spec.breakPrice, nil, map[string]any{
 			"parent_bot":    spec.oldBotNumber,
@@ -803,8 +792,14 @@ func (worker *Worker) dgtRedeployReal(ctx context.Context, settings Settings, sp
 		worker.noteDgtSkip(ctx, spec, "REAL", "клиент аккаунта недоступен: "+err.Error())
 		return false
 	}
-	if reason := worker.dgtSharedGateBlockers(ctx, settings, spec); reason != "" {
+	if reason, code := worker.dgtSharedGateBlockers(ctx, settings, spec); reason != "" {
 		worker.noteDgtSkip(ctx, spec, "REAL", reason)
+		// v2.0.138 entry chain: the blocked re-entry is a journaled decision,
+		// same as every other admission evaluation.
+		worker.journalEntryDecision(ctx, EntryChainInput{
+			Path: EntryPathDGTReal, Settings: settings, Symbol: spec.symbol,
+			Direction: entryDirectionFromTrend(spec.direction), Fleet: "REAL", RefID: spec.oldBotID,
+		}, entryOutcomeReject, code, reason, nil)
 		return false
 	}
 	mesh, harGeo, atrPct := worker.dgtFreshGeometry(ctx, settings, spec)
@@ -975,6 +970,12 @@ func (worker *Worker) dgtRedeployReal(ctx context.Context, settings Settings, sp
 		"component", "autogrid_worker", "symbol", spec.symbol,
 		"center", spec.breakPrice.String(), "investment", investAmount.String(),
 		"lower", lowerPrice.String(), "upper", upperPrice.String())
+
+	// v2.0.138 entry chain: the ALLOW row — one per re-deployed bot.
+	worker.journalEntryDecision(ctx, EntryChainInput{
+		Path: EntryPathDGTReal, Settings: settings, Symbol: spec.symbol,
+		Direction: entryDirectionFromTrend(spec.direction), Fleet: "REAL", RefID: botID,
+	}, entryOutcomeAllow, "CLEAR", "", nil)
 
 	_ = LogBotEvent(ctx, worker.db, botID, botNum, "REAL", spec.symbol, dgtRedeployEvent,
 		&spec.breakPrice, nil, map[string]any{

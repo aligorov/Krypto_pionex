@@ -2,12 +2,15 @@ package autogrid
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"math"
 	"strings"
 	"time"
 
 	"github.com/shopspring/decimal"
+
+	"github.com/aligorov/pionex-bot/backend/internal/marketdata"
 )
 
 // Stop-radar (Phase 1, SHADOW) — anticipate each running bot's stop before
@@ -76,6 +79,9 @@ type radarInput struct {
 	ofiRegime     string
 	microBiasBps  float64
 	ofiActionable bool
+	// v2.0.138: the analysis captured at pass start, emitted as a journal
+	// row only when the scoreThrottle lets a scoring tick through.
+	pendingRadarJournal marketdata.MicrostructureAnalysis
 }
 
 // radarPriceFor resolves a bot's live price from the pass-wide ticker map,
@@ -344,11 +350,20 @@ func (worker *Worker) radarPass(ctx context.Context, settings Settings, bots []r
 
 	now := time.Now().UTC()
 	for _, b := range bots {
+		radarJournalled := false
 		if worker.ofiEngine != nil {
 			analysis := worker.ofiEngine.Analyze(b.symbol)
 			b.ofiRegime = string(analysis.Regime)
 			b.microBiasBps = analysis.MicroPriceBiasBps
 			b.ofiActionable = analysis.IsActionable()
+			// v2.0.138 journal: the radar's microstructure view per bot —
+			// only for actionable flows AND only on a scoring tick (the
+			// scoreThrottle below gates the write, so a sustained fleet-wide
+			// dump cannot flood the table at manage cadence).
+			if b.ofiActionable {
+				radarJournalled = true
+				b.pendingRadarJournal = analysis
+			}
 		}
 
 		// Fast-path: Immediate Microstructure Emergency Exit.
@@ -367,6 +382,18 @@ func (worker *Worker) radarPass(ctx context.Context, settings Settings, bots []r
 		prevBand, lastAt, ok := worker.lastRadarSnapshot(ctx, b.botID)
 		if ok && now.Sub(lastAt) < scoreThrottle {
 			continue
+		}
+
+		// Scoring tick reached: emit the throttled radar journal row here.
+		if radarJournalled {
+			verdict := "OBSERVED"
+			if (b.inventorySide > 0 && (b.ofiRegime == "DUMP_PRESSURE" || b.ofiRegime == "CONFIRMED_DUMP")) ||
+				(b.inventorySide < 0 && (b.ofiRegime == "PUMP_PRESSURE" || b.ofiRegime == "CONFIRMED_PUMP")) {
+				verdict = "ADVERSE"
+			}
+			logOFIDecision(ctx, worker.db, settings.ID, b.symbol, ofiKindRadar,
+				b.pendingRadarJournal, string(b.pendingRadarJournal.Readiness()), verdict,
+				b.pendingRadarJournal.Reason, fmt.Sprintf("#%d", b.botNumber))
 		}
 
 		if _, err := worker.db.Exec(ctx, `
