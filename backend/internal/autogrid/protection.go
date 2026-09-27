@@ -90,8 +90,12 @@ func (worker *Worker) radarBreakFlip(ctx context.Context, settings Settings, b r
 
 	var direction, accountID string
 	var investment decimal.Decimal
+	// v2.0.136: account_id is a NOT NULL uuid — the old COALESCE(id,'')
+	// failed the uuid cast at plan time on EVERY call, so the swallowed
+	// error kept the whole break-flip escape lane (and its DGT intent)
+	// dead in production.
 	if err := worker.db.QueryRow(ctx, `
-		SELECT direction, COALESCE(account_id, ''), quote_investment
+		SELECT direction, account_id::TEXT, quote_investment
 		FROM grid_bots WHERE id = $1 AND status = 'RUNNING'
 	`, b.botID).Scan(&direction, &accountID, &investment); err != nil {
 		return false // lost the race with a close — let the caller proceed
@@ -281,11 +285,14 @@ func (worker *Worker) radarMicrostructureEmergencyExit(ctx context.Context, sett
 
 		// DGT re-deploy intent for NEUTRAL bots (if enabled):
 		// Decoupled from the emergency exit decision! The risk is ALREADY stopped above.
+		// v2.0.136: account_id is a NOT NULL uuid — the old COALESCE(id,'')
+		// failed uuid-cast at plan time and the swallowed error silently
+		// dropped every REAL emergency DGT intent.
 		if b.direction == "NEUTRAL" && settings.DgtRedeployEnabled {
 			var accountID string
 			var investment decimal.Decimal
 			if err := worker.db.QueryRow(ctx, `
-				SELECT COALESCE(account_id, ''), quote_investment
+				SELECT account_id::TEXT, quote_investment
 				FROM grid_bots WHERE id = $1
 			`, b.botID).Scan(&accountID, &investment); err == nil && accountID != "" {
 				worker.dgtQueueRealRedeploy(ctx, settings, dgtRedeploySpec{

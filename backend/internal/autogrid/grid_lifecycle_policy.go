@@ -269,10 +269,25 @@ func slotCapital(trancheBase *string, investment decimal.Decimal) decimal.Decima
 //
 // Deliberately NOT here: the per-symbol protective-close cooldown (a
 // re-center is not a re-entry into the dead zone — see the file header), the
-// entry-timing/channel gate, the confluence verdict and the DOM gate (the
-// symbol already passed them at the original deploy; the break is new
-// information about LOCATION, not quality).
+// entry-timing/channel gate, the confluence verdict (the symbol already
+// passed it at the original deploy; the break is new information about
+// LOCATION, not quality) and the DOM gate. Microstructure IS here: the
+// EMERGENCY_OFI_* family closes on live order flow, so the re-open must
+// re-verify that exact flow (freshness + sync + direction, one contract).
 func (worker *Worker) dgtSharedGateBlockers(ctx context.Context, settings Settings, spec dgtRedeploySpec) string {
+	// v2.0.136: re-entry microstructure gate. A protective exit fired on a
+	// CONFIRMED dump/pump seconds ago; re-opening a grid into the SAME still
+	// confirmed flow would reload the inventory the exit just shed (audit
+	// finding: the DGT path bypassed CanEnter entirely). Analyze enforces
+	// read-time staleness (STALE cannot veto forever, DESYNC fails closed —
+	// mirroring the deploy paths' knife-pause contract), and CanEnter's
+	// directionality is the same one preflight consults.
+	if worker.ofiEngine != nil {
+		analysis := worker.ofiEngine.Analyze(spec.symbol)
+		if allowed, ofiReason := analysis.CanEnter(spec.direction); !allowed {
+			return "OFI re-entry veto: " + ofiReason
+		}
+	}
 	// Economic-event gate: same window the deploy paths run (T−2h…T+1h).
 	if blocked, blockReason := worker.CheckEconomicEvents(ctx, 2); blocked {
 		return "макро-событие USD «" + blockReason + "» — редеплой отложен"
