@@ -655,11 +655,28 @@ func (worker *Worker) dgtRedeployPaper(ctx context.Context, settings Settings, s
 		investAmount = spec.slotBudget.Div(decimal.NewFromInt(2))
 	}
 
+	atrPrice := spec.breakPrice.Mul(decimal.NewFromFloat(atrPct / 100.0))
+	antiHuntStop := ComputeAntiHuntStop(
+		spec.direction, mesh.LowerPrice, mesh.UpperPrice,
+		spec.breakPrice, atrPrice, 1.5,
+	)
+	// v2.0.93 FIX-I (paper/REAL parity): the ±2% boundary clamp the REAL DGT
+	// arm (below) and both deploy paths apply — a degenerate ATR must not
+	// park the paper re-center's stop inside its own range.
+	antiHuntStop = ClampAntiHuntStopIntoBounds(spec.direction, mesh.LowerPrice, mesh.UpperPrice, antiHuntStop)
+
 	meshSpanPct := 0.0
 	if mesh.UpperPrice.GreaterThan(mesh.LowerPrice) && spec.breakPrice.IsPositive() {
 		meshSpanPct, _ = mesh.UpperPrice.Sub(mesh.LowerPrice).Div(spec.breakPrice).Mul(decimal.NewFromInt(100)).Float64()
 	}
-	target, maxLoss := computeBotTargets(settings, stub, botLev, meshSpanPct)
+	// v2.0.139 (review P2-4): the re-center runs the SAME stress floor as a
+	// fresh deploy — a RANGE_BREAK replacement must not carry an unfloored
+	// stop both deploy gates would have refused.
+	target, maxLoss, _ := computeBotTargetsWithStress(settings, stub, botLev, meshSpanPct, stressGeometry{
+		direction: spec.direction, entry: spec.breakPrice,
+		lower: mesh.LowerPrice, upper: mesh.UpperPrice, stop: antiHuntStop,
+		gridNum: mesh.GridNum, invest: spec.slotBudget,
+	})
 	if trancheOn {
 		// Half capital → half target and half max loss for tranche 1 (the
 		// manage loop's top-up doubles them back — the deploy contract).
@@ -672,16 +689,6 @@ func (worker *Worker) dgtRedeployPaper(ctx context.Context, settings Settings, s
 			maxLoss = &half
 		}
 	}
-
-	atrPrice := spec.breakPrice.Mul(decimal.NewFromFloat(atrPct / 100.0))
-	antiHuntStop := ComputeAntiHuntStop(
-		spec.direction, mesh.LowerPrice, mesh.UpperPrice,
-		spec.breakPrice, atrPrice, 1.5,
-	)
-	// v2.0.93 FIX-I (paper/REAL parity): the ±2% boundary clamp the REAL DGT
-	// arm (below) and both deploy paths apply — a degenerate ATR must not
-	// park the paper re-center's stop inside its own range.
-	antiHuntStop = ClampAntiHuntStopIntoBounds(spec.direction, mesh.LowerPrice, mesh.UpperPrice, antiHuntStop)
 
 	// Entry friction parity: the fresh paper grid books its taker entry fee
 	// exactly like a deploy (v2.0.89 calibrated block).
@@ -857,7 +864,13 @@ func (worker *Worker) dgtRedeployReal(ctx context.Context, settings Settings, sp
 	if mesh.UpperPrice.GreaterThan(mesh.LowerPrice) && spec.breakPrice.IsPositive() {
 		meshSpanPct, _ = mesh.UpperPrice.Sub(mesh.LowerPrice).Div(spec.breakPrice).Mul(decimal.NewFromInt(100)).Float64()
 	}
-	botTarget, botMaxLoss := computeBotTargets(settings, stub, botLev, meshSpanPct)
+	// v2.0.139 (review P2-4): REAL re-centers carry the same stress floor as
+	// fresh deploys — no unfloored replacement stops out of the break lane.
+	botTarget, botMaxLoss, _ := computeBotTargetsWithStress(settings, stub, botLev, meshSpanPct, stressGeometry{
+		direction: spec.direction, entry: spec.breakPrice,
+		lower: lowerPrice, upper: upperPrice, stop: antiHuntStop,
+		gridNum: mesh.GridNum, invest: spec.slotBudget,
+	})
 	if trancheOn {
 		if botTarget != nil {
 			half := botTarget.Div(decimal.NewFromInt(2))

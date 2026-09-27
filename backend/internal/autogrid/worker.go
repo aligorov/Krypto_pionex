@@ -112,6 +112,10 @@ type Worker struct {
 	// log can emit per-interval _5m rates instead of only cumulative totals
 	// (same single manage goroutine → plain field); v2.0.137 lane observability.
 	ofiStatsPrev marketdata.OFIEngineStats
+	// gateValueAt throttles the daily per-gate shadow counterfactual report
+	// (package D, v2.0.139) to one per 24h (single manage goroutine → plain
+	// field). The report builder itself lives in gate_value.go.
+	gateValueAt time.Time
 	// terminalRecheckAt throttles the v2.0.99 finished-record re-check sweep
 	// (single manage goroutine → plain field).
 	terminalRecheckAt time.Time
@@ -858,21 +862,42 @@ func clampAIGridCount(spanPct, notionalUSDT, feeBps, slippageBps float64, aiCoun
 	return adopted
 }
 
-// computeBotTargets derives the per-bot PnL target and stop-out. In DYNAMIC
-// mode the numbers come from the pair's own readings (native AI Kit estimate
-// when enriched, otherwise the scanner sigma/ATR blend and model drawdown),
-// scaled to the budget and the FINAL leverage (v2.0.19: the PnL model marks
-// directional positions on budget×leverage notional — unscaled stops died in
-// noise, prod SKHY #328); FIXED mode returns the operator's amounts verbatim.
-// rangeSpanPct is the deployed mesh span in % — it floors the stop-out above
-// a full normal traverse (v2.0.24); 0 skips the floor.
+// computeBotTargets derives the per-bot PnL target and stop-out (see
+// computeBotTargetsWithStress). Thin v2.0.139 compatibility wrapper for the
+// callers with no deployed geometry in hand (DGT re-center stubs, shadow
+// portfolio): a zero stressGeometry disables the stress floor, so the
+// numbers are exactly the pre-v2.0.139 derivation.
 func computeBotTargets(settings Settings, candidate Candidate, leverage int, rangeSpanPct float64) (*decimal.Decimal, *decimal.Decimal) {
+	target, loss, _ := computeBotTargetsWithStress(settings, candidate, leverage, rangeSpanPct, stressGeometry{})
+	return target, loss
+}
+
+// computeBotTargetsWithStress derives the per-bot PnL target and stop-out. In
+// DYNAMIC mode the numbers come from the pair's own readings (native AI Kit
+// estimate when enriched, otherwise the scanner sigma/ATR blend and model
+// drawdown), scaled to the budget and the FINAL leverage (v2.0.19: the PnL
+// model marks directional positions on budget×leverage notional — unscaled
+// stops died in noise, prod SKHY #328); FIXED mode returns the operator's
+// amounts verbatim. rangeSpanPct is the deployed mesh span in % — it floors
+// the stop-out above a full normal traverse (v2.0.24); 0 skips the floor.
+//
+// v2.0.139 stress-inventory floor (package C1): the dynamic cap can legally
+// land BELOW the mark-to-market of a full adverse traverse to the anti-hunt
+// stop (NEAR #1401 settled −$14.90 on a ~$10 cap) — geo carries the deployed
+// geometry, and when the simulated traverse loss exceeds the derived max-loss
+// the floor lifts maxLoss to it (stress.floored marks the telemetry). The
+// stress loss itself is returned for BOTH modes so the deploy gates can
+// reject geometries whose traverse risk overflows the budget ceiling.
+func computeBotTargetsWithStress(settings Settings, candidate Candidate, leverage int, rangeSpanPct float64, geo stressGeometry) (*decimal.Decimal, *decimal.Decimal, stressResult) {
+	stress := stressResult{loss: stressInventoryLossUSDT(
+		geo.direction, geo.entry, geo.lower, geo.upper, geo.stop,
+		geo.gridNum, geo.invest, leverage)}
 	if settings.PnLTargetMode != "DYNAMIC" {
 		if settings.PnLTargetUSDT.IsZero() || settings.MaxLossUSDT.IsZero() {
-			return nil, nil
+			return nil, nil, stress
 		}
 		target, loss := settings.PnLTargetUSDT, settings.MaxLossUSDT
-		return &target, &loss
+		return &target, &loss, stress
 	}
 	var aiVol, aiDD float64
 	if aiKit, ok := candidate.ModelAssumptions["aiKit"].(map[string]any); ok {
@@ -897,7 +922,14 @@ func computeBotTargets(settings Settings, candidate Candidate, leverage int, ran
 	})
 	target := decimal.NewFromFloat(targets.TargetUSDT)
 	loss := decimal.NewFromFloat(targets.MaxLossUSDT)
-	return &target, &loss
+	// v2.0.139: the floor, not the ceiling, is the missing bound — the stop
+	// must at least cover what the grid's own geometry loses on a full
+	// adverse traverse to the anti-hunt stop.
+	if stress.loss.GreaterThan(loss) {
+		loss = stress.loss.Round(2)
+		stress.floored = true
+	}
+	return &target, &loss, stress
 }
 
 // percentReading normalizes an AI Kit metric that may arrive as a ratio
@@ -1625,7 +1657,49 @@ func (worker *Worker) deployPaper(
 		if mesh.UpperPrice.GreaterThan(mesh.LowerPrice) && candidate.CurrentPrice.IsPositive() {
 			meshSpanPct, _ = mesh.UpperPrice.Sub(mesh.LowerPrice).Div(candidate.CurrentPrice).Mul(decimal.NewFromInt(100)).Float64()
 		}
-		target, maxLoss := computeBotTargets(settings, candidate, botLev, meshSpanPct)
+		target, maxLoss, stress := computeBotTargetsWithStress(settings, candidate, botLev, meshSpanPct, stressGeometry{
+			direction: trend, entry: candidate.CurrentPrice,
+			lower: mesh.LowerPrice, upper: mesh.UpperPrice, stop: antiHuntStop,
+			gridNum: mesh.GridNum,
+			// Full-slot budget, not the tranche-halved investAmount: the
+			// stress model is linear in invest, so this is the SAME number
+			// for the tranche-1 bot, while the post-top-up stop (the floor
+			// doubled back by tranche-2) then covers the doubled inventory
+			// too — sizing the floor on the half would re-open the exact
+			// NEAR #1401 gap one top-up later.
+			invest: settings.BudgetUSDT,
+		})
+		// v2.0.139 stress-inventory gate: the floor keeps the STORED stop
+		// honest, but a geometry whose full-traverse loss overflows the
+		// tranche-2 effective-stop ceiling (DynamicLossMaxPct ×
+		// breakerHeadroom — the SAME budget every cap in the fleet derives
+		// from) is not budget-sized at all: a bot admitted above it deploys
+		// and then has its top-up structurally refused forever. FIXED-mode
+		// targets are exempt — the operator set the stop deliberately.
+		if settings.PnLTargetMode != "FIXED" {
+			stressCeiling := tranche2MaxLossCap(settings.BudgetUSDT, botLev)
+			if stress.loss.GreaterThan(stressCeiling) {
+				worker.logger.Info("skip paper deploy: stress inventory exceeds loss ceiling",
+					"component", "autogrid_worker", "symbol", candidate.Symbol,
+					"stress_loss", stress.loss.StringFixed(2), "ceiling", stressCeiling.StringFixed(2))
+				worker.rejectCandidate(ctx, candidate,
+					fmt.Sprintf("стресс-инвентарь: полный проход сетки до стопа $%s превышает допустимый убыток $%s — геометрия концентрирует риск больше бюджета",
+						stress.loss.StringFixed(2), stressCeiling.StringFixed(2)),
+					map[string]any{"stressLossFloor": map[string]any{
+						"stressLossUsdt": stress.loss.StringFixed(2),
+						"ceilingUsdt":    stressCeiling.StringFixed(2),
+					}})
+				continue
+			}
+		}
+		// v2.0.139 telemetry: the marker rides the bot row's entryFeatures
+		// (model_state on paper) exactly when the floor lifted the cap.
+		if stress.floored {
+			if candidate.ModelAssumptions == nil {
+				candidate.ModelAssumptions = map[string]any{}
+			}
+			candidate.ModelAssumptions["stressLossFloor"] = true
+		}
 		// The envelope gate below reserves the candidate's FULL
 		// (post-tranche-2) stop — the exact amount tranche2RiskGate later
 		// re-doubles the stored half to — so it must be captured BEFORE the
@@ -2557,7 +2631,37 @@ func (worker *Worker) deployReal(
 		if mesh.UpperPrice.GreaterThan(mesh.LowerPrice) && candidate.CurrentPrice.IsPositive() {
 			botTargetSpan, _ = mesh.UpperPrice.Sub(mesh.LowerPrice).Div(candidate.CurrentPrice).Mul(decimal.NewFromInt(100)).Float64()
 		}
-		botTarget, botMaxLoss := computeBotTargets(settings, candidate, botLev, botTargetSpan)
+		botTarget, botMaxLoss, stress := computeBotTargetsWithStress(settings, candidate, botLev, botTargetSpan, stressGeometry{
+			direction: trend, entry: candidate.CurrentPrice,
+			lower: lowerPrice, upper: upperPrice, stop: antiHuntStop,
+			gridNum: mesh.GridNum,
+			// Full-slot budget, not the tranche-halved investAmount (paper
+			// twin's comment): tranche-1 stress is the same number, and the
+			// post-top-up stop then covers the doubled inventory too.
+			invest: settings.BudgetUSDT,
+		})
+		// v2.0.139 stress-inventory gate (paper parity): the floor keeps the
+		// STORED stop honest, but a geometry whose full-traverse loss
+		// overflows the tranche-2 effective-stop ceiling (DynamicLossMaxPct ×
+		// breakerHeadroom — the same budget every fleet cap derives from)
+		// is not budget-sized: refuse BEFORE a grid row or a create fee is
+		// ever submitted. FIXED-mode targets are exempt (operator's stop).
+		if settings.PnLTargetMode != "FIXED" {
+			stressCeiling := tranche2MaxLossCap(settings.BudgetUSDT, botLev)
+			if stress.loss.GreaterThan(stressCeiling) {
+				deployErrors = append(deployErrors, fmt.Sprintf(
+					"%s: stress inventory $%s exceeds loss ceiling $%s",
+					candidate.Symbol, stress.loss.StringFixed(2), stressCeiling.StringFixed(2)))
+				worker.rejectCandidate(ctx, candidate,
+					fmt.Sprintf("стресс-инвентарь: полный проход сетки до стопа $%s превышает допустимый убыток $%s — геометрия концентрирует риск больше бюджета",
+						stress.loss.StringFixed(2), stressCeiling.StringFixed(2)),
+					map[string]any{"stressLossFloor": map[string]any{
+						"stressLossUsdt": stress.loss.StringFixed(2),
+						"ceilingUsdt":    stressCeiling.StringFixed(2),
+					}})
+				continue
+			}
+		}
 		// v2.0.67 parity: the deploy envelope gate reserves the candidate's
 		// FULL (post-tranche-2) stop — the amount the top-up later doubles
 		// the stored half to. It must be captured BEFORE the tranche-1
@@ -2653,6 +2757,18 @@ func (worker *Worker) deployReal(
 			))
 			continue
 		}
+		trancheMarkers := map[string]any{
+			"trancheDeployed": trancheFlag(settings.TrancheDeployEnabled),
+			"trancheBase":     settings.BudgetUSDT.String(),
+			"trancheEntry":    candidate.CurrentPrice.String(),
+			"atrPctEntry":     atrPct,
+		}
+		// v2.0.139 telemetry: the stress-floor marker rides model_state
+		// exactly when the floor lifted the cap (paper twin: the bot row's
+		// entryFeatures field).
+		if stress.floored {
+			trancheMarkers["stressLossFloor"] = true
+		}
 		botID, createErr := manager.CreateGridBot(ctx, grid.CreateInput{
 			AccountID:          *settings.AccountID,
 			AutoGridSettingsID: &settings.ID,
@@ -2671,12 +2787,7 @@ func (worker *Worker) deployReal(
 			// lifecycle INSERT — the old follow-up UPDATE was best-effort and
 			// its failure silently stripped the bot of its tranche contract.
 			// Markers match the paper model_state contract.
-			TrancheState: map[string]any{
-				"trancheDeployed": trancheFlag(settings.TrancheDeployEnabled),
-				"trancheBase":     settings.BudgetUSDT.String(),
-				"trancheEntry":    candidate.CurrentPrice.String(),
-				"atrPctEntry":     atrPct,
-			},
+			TrancheState: trancheMarkers,
 		})
 		if createErr != nil {
 			if errors.Is(createErr, grid.ErrDuplicateActiveBot) {
@@ -3286,6 +3397,11 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 					"component", "autogrid_worker", "symbols", stats.Symbols)
 			}
 		}
+	}
+	// v2.0.139: daily per-gate shadow counterfactual report (package D).
+	if time.Since(worker.gateValueAt) > 24*time.Hour {
+		worker.gateValueAt = time.Now()
+		worker.buildGateValueReport(ctx)
 	}
 	// v2.0.111: surface storm arm/extend transitions once per arm.
 	worker.maybeLogStormState(ctx)
@@ -4557,6 +4673,11 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 			}
 			// v2.0.128 OFI Protection for Running Bots:
 			// Freeze range shift if order book and taker flow exhibit persistent toxic pressure or confirmed breakout
+			// v2.0.139 — PRESSURE-tier widening: adjust-down freezes under dump
+			// flow (DUMP_PRESSURE or CONFIRMED_DUMP), adjust-up under pump flow
+			// — "don't chase the flow" (audit C gap). Deliberately one-sided:
+			// a pump must NOT freeze an adjust-down (that would strand the grid
+			// under a rocket) — the freeze keys on the flow it chases only.
 			if worker.ofiEngine != nil {
 				micro := worker.ofiEngine.Analyze(bot.symbol)
 				if decision.Action == ActionAdjustDown {
@@ -5708,6 +5829,10 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 
 		if decision.Action == ActionAdjustUp || decision.Action == ActionAdjustDown {
 			// v2.0.128 OFI Protection for Running Bots (paper parity):
+			// v2.0.139 — PRESSURE-tier widening (audit C gap, REAL mirror
+			// above): adjust-down freezes under dump flow (DUMP_PRESSURE or
+			// CONFIRMED_DUMP), adjust-up under pump flow — "don't chase the
+			// flow"; a counter-flow regime must not freeze the shift.
 			if worker.ofiEngine != nil {
 				micro := worker.ofiEngine.Analyze(bot.symbol)
 				if decision.Action == ActionAdjustDown {

@@ -969,7 +969,12 @@ func TestDeployPaperCascadeShortFreshPriceExempt(t *testing.T) {
 				scan_id, symbol, decision, current_price, lower_price, upper_price,
 				grid_num, recommended_trend, model_assumptions
 			) VALUES (
-				$1, $2, 'ACCEPTED', 100, 90, 110,
+				-- 98..102: a realistic 4% trend span at atrPct 1.0 — the
+				-- v2.0.139 stress gate prices the SHORT's full traverse to the
+				-- anti-hunt stop (~$11.4 re-anchored at the live price) under
+				-- the $12.5 tranche-2 ceiling; the old 90..110 fixture was a
+				-- $46 traverse the gate correctly refuses.
+				$1, $2, 'ACCEPTED', 100, 98, 102,
 				10, 'short', '{"atrPct": 1.0, "regime": "TREND_DOWN", "rangePositionPct": 60.0}'::jsonb
 			)
 		`, scanID, symbol); err != nil {
@@ -999,7 +1004,13 @@ func TestDeployPaperCascadeShortFreshPriceExempt(t *testing.T) {
 		SELECT direction, entry_price FROM paper_grid_bots
 		WHERE symbol = 'CASC_USDT_PERP' AND status = 'RUNNING'
 	`).Scan(&direction, &entryPrice); err != nil {
-		t.Fatalf("cascade deploy must land a RUNNING bot: %v", err)
+		var why, dd string
+		_ = pool.QueryRow(ctx, `
+			SELECT COALESCE(rejection_reason,''), COALESCE(decision,'')
+			FROM autogrid_candidates WHERE symbol = 'CASC_USDT_PERP'
+			ORDER BY created_at DESC LIMIT 1
+		`).Scan(&why, &dd)
+		t.Fatalf("cascade deploy must land a RUNNING bot: %v (candidate %s: %s)", err, dd, why)
 	}
 	if err := pool.QueryRow(ctx, `
 		SELECT COUNT(*) FROM paper_grid_bots WHERE symbol = 'CASC_USDT_PERP' AND status = 'RUNNING'
