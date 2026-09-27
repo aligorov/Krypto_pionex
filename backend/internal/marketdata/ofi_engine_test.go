@@ -2,6 +2,7 @@ package marketdata
 
 import (
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -116,9 +117,10 @@ func TestOFIEngine_SpoofDetection(t *testing.T) {
 
 func TestOFIEngine_PumpPressure_Persistence(t *testing.T) {
 	engine := NewOFIEngine(OFIEngineConfig{
-		WindowDuration: 5 * time.Second,
-		MinWindows:     3,
-		MaxSpreadBps:   30.0,
+		WindowDuration:     5 * time.Second,
+		MinWindows:         3,
+		MaxSpreadBps:       30.0,
+		MinTakerVolumeUSDT: 1000.0,
 	})
 
 	sym := "PUMP_USDT_PERP"
@@ -443,6 +445,187 @@ func TestOFIEngine_DesyncRecovery(t *testing.T) {
 	st := engine.getOrCreate(sym)
 	if !st.book.IsSynced() {
 		t.Fatalf("expected book to be synced after fresh snapshot")
+	}
+}
+
+func TestOFIEngine_StaleOrderbook_TradesDoNotMask(t *testing.T) {
+	engine := NewOFIEngine(OFIEngineConfig{
+		WindowDuration: 5 * time.Second,
+		MinWindows:     1,
+		MaxStaleness:   100 * time.Millisecond,
+	})
+
+	sym := "STALE_BOOK_PERP"
+	past := time.Now().Add(-500 * time.Millisecond)
+
+	// Order book arrives in the past
+	engine.IngestL2(sym,
+		[]pionex.DepthLevel{{Price: d("100"), Amount: d("10")}},
+		[]pionex.DepthLevel{{Price: d("100.1"), Amount: d("10")}},
+		past,
+	)
+
+	// Trades arrive in real time (now)
+	engine.IngestTrade(sym, pionex.Trade{
+		Symbol: sym, Side: "BUY", Price: d("100.1"), Size: d("5.0"), Time: time.Now().UnixMilli(),
+	})
+
+	analysis := engine.Analyze(sym)
+	if analysis.Regime != RegimeStale {
+		t.Fatalf("expected RegimeStale when orderbook is past staleness threshold, got %s", analysis.Regime)
+	}
+	if analysis.IsFresh {
+		t.Fatalf("stale orderbook must have IsFresh = false")
+	}
+	if analysis.IsActionable() {
+		t.Fatalf("stale orderbook must be non-actionable")
+	}
+}
+
+func TestOFIEngine_MinTakerVolume_Gate(t *testing.T) {
+	engine := NewOFIEngine(OFIEngineConfig{
+		WindowDuration:     5 * time.Second,
+		MinWindows:         3,
+		MaxSpreadBps:       30.0,
+		MinTakerVolumeUSDT: 5000.0, // High taker volume threshold
+	})
+
+	sym := "LOW_VOL_PERP"
+	now := time.Now()
+
+	// Ingest 3 windows with bullish orderbook imbalance, but low taker volume ($500 < $5000)
+	for i := 0; i < 3; i++ {
+		ts := now.Add(time.Duration(i*5) * time.Second)
+		engine.IngestL2(sym,
+			[]pionex.DepthLevel{{Price: d("10.0"), Amount: d("1000.0")}},
+			[]pionex.DepthLevel{{Price: d("10.01"), Amount: d("100.0")}},
+			ts,
+		)
+		// Small taker trade: 50 * 10 = $500 USDT (well below $5000 threshold)
+		engine.IngestTrade(sym, pionex.Trade{
+			Symbol: sym, Side: "BUY", Price: d("10.01"), Size: d("50.0"), Time: ts.UnixMilli(),
+		})
+		engine.FinalizeWindow(sym, ts.Add(5*time.Second))
+	}
+
+	analysis := engine.Analyze(sym)
+	if analysis.Regime == RegimePumpPressure || analysis.Regime == RegimeConfirmedPump {
+		t.Fatalf("expected low taker volume to block pump pressure, got %s", analysis.Regime)
+	}
+	if analysis.ConsecutiveBullWindows != 0 {
+		t.Fatalf("expected 0 consecutive bull windows due to volume threshold, got %d", analysis.ConsecutiveBullWindows)
+	}
+}
+
+func TestOFIEngine_DesyncHandler_AndHistoryPurge(t *testing.T) {
+	engine := NewOFIEngine(OFIEngineConfig{
+		WindowDuration: 5 * time.Second,
+		MinWindows:     2,
+	})
+
+	var desyncTriggered sync.WaitGroup
+	desyncTriggered.Add(1)
+	var reportedSymbol string
+
+	engine.SetDesyncHandler(func(sym string) {
+		reportedSymbol = sym
+		desyncTriggered.Done()
+	})
+
+	sym := "DESYNC_PURGE_PERP"
+	now := time.Now()
+
+	// 1. Initial snapshot
+	engine.IngestOrderbookUpdate(pionex.OrderbookUpdate{
+		Symbol:     sym,
+		Action:     "SNAPSHOT",
+		Bids:       []pionex.DepthLevel{{Price: d("100"), Amount: d("10")}},
+		Asks:       []pionex.DepthLevel{{Price: d("100.1"), Amount: d("10")}},
+		Number:     1,
+		IsSnapshot: true,
+		ReceivedAt: now,
+	})
+	engine.FinalizeWindow(sym, now.Add(5*time.Second))
+
+	// Verify history has 1 window
+	st := engine.getOrCreate(sym)
+	if len(st.history) != 1 {
+		t.Fatalf("expected 1 window of history, got %d", len(st.history))
+	}
+
+	// 2. Trigger desync gap (prevNumber 5 instead of 1)
+	engine.IngestOrderbookUpdate(pionex.OrderbookUpdate{
+		Symbol:     sym,
+		Action:     "UPDATE",
+		Bids:       []pionex.DepthLevel{{Price: d("100"), Amount: d("15")}},
+		Number:     6,
+		PrevNumber: 5,
+		IsSnapshot: false,
+		ReceivedAt: now.Add(6 * time.Second),
+	})
+
+	// Wait for async desync handler
+	desyncTriggered.Wait()
+	if reportedSymbol != sym {
+		t.Fatalf("expected desync handler for %s, got %s", sym, reportedSymbol)
+	}
+
+	analysis := engine.Analyze(sym)
+	if analysis.Regime != RegimeDesync {
+		t.Fatalf("expected RegimeDesync, got %s", analysis.Regime)
+	}
+
+	// 3. Fresh snapshot arrives to recover
+	engine.IngestOrderbookUpdate(pionex.OrderbookUpdate{
+		Symbol:     sym,
+		Action:     "SNAPSHOT",
+		Bids:       []pionex.DepthLevel{{Price: d("100"), Amount: d("20")}},
+		Asks:       []pionex.DepthLevel{{Price: d("100.1"), Amount: d("20")}},
+		Number:     10,
+		IsSnapshot: true,
+		ReceivedAt: now.Add(7 * time.Second),
+	})
+
+	// Verify contaminated history was purged!
+	st.mu.RLock()
+	histLen := len(st.history)
+	st.mu.RUnlock()
+	if histLen != 0 {
+		t.Fatalf("expected history to be purged to 0 upon desync recovery snapshot, got %d", histLen)
+	}
+}
+
+func TestOFIEngine_TradeTemporalIsolation(t *testing.T) {
+	engine := NewOFIEngine(OFIEngineConfig{
+		WindowDuration: 5 * time.Second,
+		MinWindows:     1,
+	})
+
+	sym := "TEMPORAL_PERP"
+	now := time.Now()
+
+	// Initialize window starting at now
+	engine.IngestL2(sym,
+		[]pionex.DepthLevel{{Price: d("100"), Amount: d("10")}},
+		[]pionex.DepthLevel{{Price: d("100.1"), Amount: d("10")}},
+		now,
+	)
+
+	// Attempt to ingest an old trade from 10 seconds ago
+	oldTradeTime := now.Add(-10 * time.Second)
+	engine.IngestTrade(sym, pionex.Trade{
+		Symbol: sym, Side: "BUY", Price: d("100.1"), Size: d("50.0"), Time: oldTradeTime.UnixMilli(),
+	})
+
+	st := engine.getOrCreate(sym)
+	st.mu.RLock()
+	defer st.mu.RUnlock()
+
+	if st.currentWindow.TradeCount != 0 {
+		t.Fatalf("expected 0 trades in window after ingesting out-of-window trade, got %d", st.currentWindow.TradeCount)
+	}
+	if st.currentWindow.TakerBuyUSDT != 0 {
+		t.Fatalf("expected 0 volume in window after ingesting out-of-window trade, got %f", st.currentWindow.TakerBuyUSDT)
 	}
 }
 

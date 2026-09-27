@@ -336,6 +336,17 @@ func (s *PublicStream) sendStreamOp(op, symbol string) error {
 	return nil
 }
 
+// ResyncOrderbook requests an immediate fresh full snapshot by cycling the ORDERBOOK subscription.
+func (s *PublicStream) ResyncOrderbook(symbol string) error {
+	sym := normalizeStreamSymbol(symbol)
+	if sym == "" {
+		return nil
+	}
+	s.logger.Info("ws lane requesting fresh orderbook snapshot (resync)", "component", "pionex_ws", "symbol", sym)
+	_ = s.sendTopicOp("UNSUBSCRIBE", "ORDERBOOK", sym)
+	return s.sendTopicOp("SUBSCRIBE", "ORDERBOOK", sym)
+}
+
 func (s *PublicStream) sendTopicOp(op, topic, symbol string) error {
 	s.connMu.Lock()
 	conn := s.conn

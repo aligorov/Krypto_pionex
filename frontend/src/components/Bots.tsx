@@ -15,6 +15,23 @@ const fmtSigned = (value: string | undefined) => {
   return `${num >= 0 ? '+' : ''}${num.toFixed(2)}`;
 };
 
+const formatPnL = (val: string | number | null | undefined): string => {
+  if (val === null || val === undefined || val === '') return '—';
+  const num = typeof val === 'number' ? val : Number(val);
+  if (Number.isNaN(num)) return String(val);
+  if (num !== 0 && Math.abs(num) < 0.01) {
+    return num.toFixed(4);
+  }
+  return num.toFixed(2);
+};
+
+const formatInvestment = (val: string | number | null | undefined): string => {
+  if (val === null || val === undefined || val === '') return '—';
+  const num = typeof val === 'number' ? val : Number(val);
+  if (Number.isNaN(num)) return String(val);
+  return Number.isInteger(num) ? String(num) : num.toFixed(2);
+};
+
 export default function Bots({ canOperate }: Props) {
   const [state, setState] = useState<AutoGridState | null>(() => getCachedAutoGrid<AutoGridState>());
   const [error, setError] = useState<string | null>(null);
@@ -408,17 +425,17 @@ function BotRow({
             )}
           </div>
         </td>
-        <td>{bot.quoteInvestment}</td>
-        <td className={pnlClass(realized)}>{bot.realizedPnlUsdt ?? '—'}</td>
+        <td>{formatInvestment(bot.quoteInvestment)}</td>
+        <td className={pnlClass(realized)}>{formatPnL(bot.realizedPnlUsdt)}</td>
         <td className={pnlClass(unrealized)}>
-          <div>{bot.unrealizedPnlUsdt ?? '—'}</div>
+          <div>{formatPnL(bot.unrealizedPnlUsdt)}</div>
           {supervisionFloor !== null && Math.abs(supervisionFloor - unrealized) > 0.15 && (
             <div style={{ fontSize: '0.70rem', color: '#94a3b8' }} title="Консервативный пол риска для надзора и стопов">
-              пол: {supervisionFloor.toFixed(2)}
+              пол: {formatPnL(supervisionFloor)}
             </div>
           )}
         </td>
-        <td className={pnlClass(total)}><strong>{total.toFixed(4)}</strong></td>
+        <td className={pnlClass(total)}><strong>{formatPnL(total)}</strong></td>
         <td>{bot.adjustmentsCount}</td>
         <td>
           <div className="row-actions" style={{ display: 'flex', gap: '4px', alignItems: 'center' }}>
@@ -527,7 +544,7 @@ function ClosedBotRow({
   // «финал неизвестен», если телеметрии до закрытия нет.
   const estimate = bot.estimatedFinalUsdt != null ? Number(bot.estimatedFinalUsdt) : null;
   const finalCell = bot.realizedPnlUsdt != null ? (
-    <strong className={pnl > 0 ? 'positive' : pnl < 0 ? 'negative' : ''}>{bot.realizedPnlUsdt}</strong>
+    <strong className={pnl > 0 ? 'positive' : pnl < 0 ? 'negative' : ''}>{formatPnL(bot.realizedPnlUsdt)}</strong>
   ) : estimate != null ? (
     <strong
       className={estimate >= 0 ? 'positive' : 'negative'}

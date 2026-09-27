@@ -285,9 +285,6 @@ func (worker *Worker) checkOrderBookCushion(
 		}
 		return true, marketdata.DepthProfile{}, "depth unavailable (fail-open)"
 	}
-	if worker.ofiEngine != nil && len(bids) > 0 && len(asks) > 0 {
-		worker.ofiEngine.IngestL2(symbol, bids, asks, time.Now())
-	}
 	profile = marketdata.ProfileOrderBook(bids, asks, currentPrice, botNotional, minCushionRatio)
 	if maxSpreadPct.IsPositive() && len(bids) > 0 && len(asks) > 0 {
 		bestBid, bestAsk := bids[0].Price, asks[0].Price

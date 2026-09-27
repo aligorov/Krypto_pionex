@@ -225,17 +225,19 @@ func CalculateLevel1OFI(prevBids, prevAsks, nextBids, nextAsks []pionex.DepthLev
 
 // SymbolMicrostate stores the rolling microstructure, local order book, and OFI history for a single symbol.
 type SymbolMicrostate struct {
-	symbol         string
-	config         OFIEngineConfig
-	mu             sync.RWMutex
-	book           *LocalOrderBook
-	prevBestBid    pionex.DepthLevel
-	prevBestAsk    pionex.DepthLevel
-	hasPrevL1      bool
-	currentWindow  OFIWindow
-	history        []OFIWindow
-	latestAnalysis MicrostructureAnalysis
-	recentTrades   map[string]time.Time // tradeId -> seenAt for deduplication
+	symbol          string
+	config          OFIEngineConfig
+	mu              sync.RWMutex
+	book            *LocalOrderBook
+	lastBookUpdate  time.Time
+	lastTradeUpdate time.Time
+	prevBestBid     pionex.DepthLevel
+	prevBestAsk     pionex.DepthLevel
+	hasPrevL1       bool
+	currentWindow   OFIWindow
+	history         []OFIWindow
+	latestAnalysis  MicrostructureAnalysis
+	recentTrades    map[string]time.Time // tradeId -> seenAt for deduplication
 }
 
 func newSymbolMicrostate(symbol string, cfg OFIEngineConfig) *SymbolMicrostate {
@@ -256,9 +258,10 @@ func newSymbolMicrostate(symbol string, cfg OFIEngineConfig) *SymbolMicrostate {
 
 // OFIEngine manages symbol microstates and processes real-time order book and trade events.
 type OFIEngine struct {
-	config  OFIEngineConfig
-	mu      sync.RWMutex
-	symbols map[string]*SymbolMicrostate
+	config   OFIEngineConfig
+	mu       sync.RWMutex
+	symbols  map[string]*SymbolMicrostate
+	onDesync func(symbol string)
 }
 
 // NewOFIEngine initializes a new OFIEngine.
@@ -291,6 +294,36 @@ func NewOFIEngine(cfg OFIEngineConfig) *OFIEngine {
 	return &OFIEngine{
 		config:  cfg,
 		symbols: make(map[string]*SymbolMicrostate),
+	}
+}
+
+// SetDesyncHandler registers a callback invoked when a symbol's order book loses sequence continuity.
+func (e *OFIEngine) SetDesyncHandler(fn func(symbol string)) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.onDesync = fn
+}
+
+// UpdateConfig dynamically updates engine parameters (e.g. from database risk settings).
+func (e *OFIEngine) UpdateConfig(cfg OFIEngineConfig) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if cfg.MinTakerVolumeUSDT > 0 {
+		e.config.MinTakerVolumeUSDT = cfg.MinTakerVolumeUSDT
+	}
+	if cfg.MaxSpreadBps > 0 {
+		e.config.MaxSpreadBps = cfg.MaxSpreadBps
+	}
+	if cfg.MinDepthNotionalUSDT > 0 {
+		e.config.MinDepthNotionalUSDT = cfg.MinDepthNotionalUSDT
+	}
+	if cfg.MaxStaleness > 0 {
+		e.config.MaxStaleness = cfg.MaxStaleness
+	}
+	for _, st := range e.symbols {
+		st.mu.Lock()
+		st.config = e.config
+		st.mu.Unlock()
 	}
 }
 
@@ -328,15 +361,32 @@ func (e *OFIEngine) IngestOrderbookUpdate(update pionex.OrderbookUpdate) {
 
 	// 1. Synchronize local order book
 	if update.IsSnapshot {
+		wasDesynced := !st.book.IsSynced()
 		st.book.ApplySnapshot(update.Bids, update.Asks, update.Number, ts)
+		st.lastBookUpdate = ts
+		if wasDesynced {
+			// Sequence breach occurred previously: purge contaminated history and restart clean warmup!
+			st.history = st.history[:0]
+			st.currentWindow = OFIWindow{StartTime: ts}
+			st.hasPrevL1 = false
+			st.prevBestBid = pionex.DepthLevel{}
+			st.prevBestAsk = pionex.DepthLevel{}
+		}
 	} else {
 		if err := st.book.ApplyDelta(update.Bids, update.Asks, update.Number, update.PrevNumber, ts); err != nil {
 			st.latestAnalysis.Regime = RegimeDesync
 			st.latestAnalysis.IsFresh = false
 			st.latestAnalysis.Reason = fmt.Sprintf("order book desync: %v", err)
 			st.latestAnalysis.UpdatedAt = ts
+			e.mu.RLock()
+			handler := e.onDesync
+			e.mu.RUnlock()
+			if handler != nil {
+				go handler(update.Symbol)
+			}
 			return
 		}
+		st.lastBookUpdate = ts
 	}
 
 	if !st.book.IsSynced() {
@@ -396,8 +446,19 @@ func (e *OFIEngine) IngestOrderbookUpdate(update pionex.OrderbookUpdate) {
 }
 
 // IngestL2 processes an L2 order book snapshot (e.g. from REST GetDepth).
-// Treats incoming bids/asks as a full snapshot.
+// Treats incoming bids/asks as a full snapshot ONLY if the symbol is not actively streaming via WebSocket.
+// This prevents REST candidate checks from corrupting continuous WebSocket sequence numbers.
 func (e *OFIEngine) IngestL2(symbol string, bids, asks []pionex.DepthLevel, ts time.Time) {
+	st := e.getOrCreate(symbol)
+	st.mu.RLock()
+	// REST snapshots must never overwrite an active, synchronized WebSocket book with positive sequence numbers
+	isWSStreamActive := st.book.IsSynced() && st.book.LastNumber() > 0 && !st.lastBookUpdate.IsZero() && time.Since(st.lastBookUpdate) < st.config.MaxStaleness
+	st.mu.RUnlock()
+
+	if isWSStreamActive {
+		return
+	}
+
 	e.IngestOrderbookUpdate(pionex.OrderbookUpdate{
 		Symbol:     symbol,
 		Action:     "SNAPSHOT",
@@ -409,7 +470,7 @@ func (e *OFIEngine) IngestL2(symbol string, bids, asks []pionex.DepthLevel, ts t
 }
 
 // IngestTrade processes an aggressive taker trade event.
-// Enforces tradeId deduplication and time-window isolation.
+// Enforces tradeId deduplication and strict window temporal isolation.
 func (e *OFIEngine) IngestTrade(symbol string, trade pionex.Trade) {
 	st := e.getOrCreate(symbol)
 	st.mu.Lock()
@@ -436,8 +497,15 @@ func (e *OFIEngine) IngestTrade(symbol string, trade pionex.Trade) {
 		ts = time.Now()
 	}
 
-	// Ignore trades older than 2 minutes to prevent backfill/replay pollution
+	// 1. Ignore trades older than 2 minutes to prevent backfill/replay pollution
 	if time.Since(ts) > 2*time.Minute {
+		return
+	}
+
+	// 2. Strict window temporal isolation:
+	// If the trade timestamp is earlier than the current window start time,
+	// do NOT add past volume into the current forward-looking micro-window!
+	if !st.currentWindow.StartTime.IsZero() && ts.UnixMilli() < st.currentWindow.StartTime.UnixMilli() {
 		return
 	}
 
@@ -466,7 +534,11 @@ func (e *OFIEngine) IngestTrade(symbol string, trade pionex.Trade) {
 		st.currentWindow.TakerBuyRatio = st.currentWindow.TakerBuyUSDT / tot
 	}
 	st.currentWindow.TradeCount++
-	st.latestAnalysis.UpdatedAt = ts
+	st.lastTradeUpdate = ts
+	// Only update latestAnalysis.UpdatedAt if order book is active
+	if !st.lastBookUpdate.IsZero() {
+		st.latestAnalysis.UpdatedAt = ts
+	}
 }
 
 // IngestTradeBatch sorts trades chronologically and ingests each trade, rolling micro-windows.
@@ -578,19 +650,7 @@ func (st *SymbolMicrostate) evaluateLocked(now time.Time) {
 		return
 	}
 
-	// 2. Spoofing Detection: Severe queue imbalance (> 4:1) with zero or contrary taker volume
-	hasHugeWall := math.Abs(lastW.QueueImbalance) >= 0.60
-	totalTaker := lastW.TakerBuyUSDT + lastW.TakerSellUSDT
-	if hasHugeWall && totalTaker < 1000.0 {
-		analysis.IsSpoofRisk = true
-		analysis.Regime = RegimeSpoofWarning
-		analysis.IsFresh = true
-		analysis.Reason = "unconfirmed book wall with zero taker flow confirmation (spoof risk)"
-		st.latestAnalysis = analysis
-		return
-	}
-
-	// 3. Spread degraded check
+	// 2. Spread degraded check
 	if !analysis.IsSpreadIntact {
 		analysis.Regime = RegimeSpreadBlown
 		analysis.IsFresh = false
@@ -599,7 +659,7 @@ func (st *SymbolMicrostate) evaluateLocked(now time.Time) {
 		return
 	}
 
-	// 4. Thin book liquidity check
+	// 3. Thin book liquidity check
 	if analysis.IsThinBook {
 		analysis.Regime = RegimeThinBook
 		analysis.IsFresh = false
@@ -608,11 +668,23 @@ func (st *SymbolMicrostate) evaluateLocked(now time.Time) {
 		return
 	}
 
-	// 5. Warmup check: require at least MinWindows completed windows
+	// 4. Warmup check: require at least MinWindows completed windows before declaring directional/spoof regimes
 	if len(st.history) < st.config.MinWindows {
 		analysis.Regime = RegimeWarmingUp
 		analysis.IsFresh = false
 		analysis.Reason = fmt.Sprintf("warming up (%d/%d windows)", len(st.history), st.config.MinWindows)
+		st.latestAnalysis = analysis
+		return
+	}
+
+	// 5. Spoofing Detection: Severe queue imbalance (> 4:1) with zero or contrary taker volume
+	hasHugeWall := math.Abs(lastW.QueueImbalance) >= 0.60
+	totalTaker := lastW.TakerBuyUSDT + lastW.TakerSellUSDT
+	if hasHugeWall && totalTaker < 1000.0 {
+		analysis.IsSpoofRisk = true
+		analysis.Regime = RegimeSpoofWarning
+		analysis.IsFresh = true
+		analysis.Reason = "unconfirmed book wall with zero taker flow confirmation (spoof risk)"
 		st.latestAnalysis = analysis
 		return
 	}
@@ -632,12 +704,16 @@ func (st *SymbolMicrostate) evaluateLocked(now time.Time) {
 		isMicroBull := wMicroF >= wMidF
 		isMicroBear := wMicroF <= wMidF
 
+		// Check window taker volume satisfies MinTakerVolumeUSDT
+		wTakerTotal := w.TakerBuyUSDT + w.TakerSellUSDT
+		hasTakerVolume := wTakerTotal >= st.config.MinTakerVolumeUSDT
+
 		// Bullish window criteria:
-		// Positive OFI or bid-heavy queue AND microprice >= midprice AND taker buy ratio >= 60%
-		isBull := (w.OFI > 0 || w.QueueImbalance >= 0.15) && isMicroBull && w.TakerBuyRatio >= 0.60
+		// Positive OFI or bid-heavy queue AND microprice >= midprice AND taker buy ratio >= 60% AND taker volume threshold met
+		isBull := (w.OFI > 0 || w.QueueImbalance >= 0.15) && isMicroBull && w.TakerBuyRatio >= 0.60 && hasTakerVolume
 		// Bearish window criteria:
-		// Negative OFI or ask-heavy queue AND microprice <= midprice AND taker sell ratio >= 60% (buy ratio <= 40%)
-		isBear := (w.OFI < 0 || w.QueueImbalance <= -0.15) && isMicroBear && w.TakerBuyRatio <= 0.40
+		// Negative OFI or ask-heavy queue AND microprice <= midprice AND taker sell ratio >= 60% (buy ratio <= 40%) AND taker volume threshold met
+		isBear := (w.OFI < 0 || w.QueueImbalance <= -0.15) && isMicroBear && w.TakerBuyRatio <= 0.40 && hasTakerVolume
 
 		if isBull && bearStreak == 0 {
 			bullStreak++
@@ -730,8 +806,10 @@ func (st *SymbolMicrostate) evaluateLocked(now time.Time) {
 }
 
 // Analyze returns the current microstructure analysis for a symbol.
-// Enforces strict staleness checking: if last update is older than MaxStaleness,
-// returns RegimeStale with IsFresh: false to prevent outdated signals acting on live bots.
+// Enforces strict independent staleness checking:
+// If the order book data has not been updated within MaxStaleness (15s),
+// the analysis is immediately declared STALE and non-actionable,
+// guaranteeing that active taker trades can NEVER mask a stalled order book!
 func (e *OFIEngine) Analyze(symbol string) MicrostructureAnalysis {
 	sym := strings.ToUpper(strings.TrimSpace(symbol))
 	e.mu.RLock()
@@ -751,11 +829,18 @@ func (e *OFIEngine) Analyze(symbol string) MicrostructureAnalysis {
 	defer st.mu.RUnlock()
 
 	analysis := st.latestAnalysis
-	if analysis.UpdatedAt.IsZero() || time.Since(analysis.UpdatedAt) > st.config.MaxStaleness {
+
+	// Strict Order Book Freshness Check:
+	// Trades must never mask a stale or stuck order book!
+	if st.lastBookUpdate.IsZero() || time.Since(st.lastBookUpdate) > st.config.MaxStaleness {
 		analysis.Regime = RegimeStale
 		analysis.IsFresh = false
-		analysis.Reason = fmt.Sprintf("market data stale: last update was %s ago (>%s)",
-			time.Since(analysis.UpdatedAt).Round(time.Second), st.config.MaxStaleness)
+		if st.lastBookUpdate.IsZero() {
+			analysis.Reason = "order book waiting for initial depth data"
+		} else {
+			analysis.Reason = fmt.Sprintf("order book data stale: last depth update was %s ago (>%s)",
+				time.Since(st.lastBookUpdate).Round(time.Second), st.config.MaxStaleness)
+		}
 		return analysis
 	}
 

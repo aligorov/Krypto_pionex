@@ -46,12 +46,19 @@ func (worker *Worker) startWSLane(ctx context.Context) {
 			worker.ofiEngine.IngestTrade(tr.Symbol, tr)
 		}
 	})
+	if worker.ofiEngine != nil {
+		worker.ofiEngine.SetDesyncHandler(func(sym string) {
+			if worker.wsLane != nil {
+				_ = worker.wsLane.ResyncOrderbook(sym)
+			}
+		})
+	}
 	go worker.wsLane.Run(ctx)
 }
 
 // syncWSSubscriptions aligns the lane's INDEX subscriptions with the
-// RUNNING fleet (paper + real). Called once per manage pass: the diff makes
-// a steady fleet free on the wire, and open/close events cost two frames.
+// RUNNING fleet (paper + real) and pre-warms top scan candidates. Called once
+// per manage pass: active bots get priority, candidate slots fill the remainder.
 func (worker *Worker) syncWSSubscriptions(ctx context.Context, settings Settings) {
 	if worker.wsLane == nil {
 		return
@@ -93,6 +100,38 @@ func (worker *Worker) syncWSSubscriptions(ctx context.Context, settings Settings
 	if err := rows.Err(); err != nil {
 		worker.logger.Warn("ws lane symbol sync rows failed", "component", "autogrid_worker", "error", err)
 		return
+	}
+	// v2.0.131: Pre-warm top accepted candidates from latest successful scan
+	// up to wsMaxFleetSymbols so order books and OFI windows are warm before entry.
+	if len(symbols) < wsMaxFleetSymbols {
+		candLimit := wsMaxFleetSymbols - len(symbols)
+		candRows, err := worker.db.Query(ctx, `
+			SELECT symbol
+			FROM autogrid_candidates
+			WHERE scan_id = (
+				SELECT id FROM autogrid_scan_runs
+				WHERE status = 'SUCCEEDED'
+				ORDER BY started_at DESC LIMIT 1
+			)
+			  AND decision = 'ACCEPTED'
+			ORDER BY score DESC NULLS LAST
+			LIMIT $1
+		`, candLimit)
+		if err == nil {
+			for candRows.Next() {
+				var sym string
+				if err := candRows.Scan(&sym); err == nil && sym != "" {
+					if _, dup := seen[sym]; !dup {
+						seen[sym] = struct{}{}
+						symbols = append(symbols, sym)
+						if len(symbols) >= wsMaxFleetSymbols {
+							break
+						}
+					}
+				}
+			}
+			candRows.Close()
+		}
 	}
 	worker.wsLane.SetSymbols(symbols)
 }
