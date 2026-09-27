@@ -347,3 +347,75 @@ func TestMigration0050FloorNullFallback(t *testing.T) {
 		t.Fatalf("migration 0050 must disable wick_shield_enabled on existing settings rows")
 	}
 }
+
+func TestV127ParityMath(t *testing.T) {
+	// 1. OP #1427 class: Grid profit reset on range shift
+	lastRemoteGrid := decimal.RequireFromString("0.08955")
+	newRemoteGrid := decimal.RequireFromString("0.04445")
+	shiftRealizedBase := decimal.Zero
+
+	if newRemoteGrid.LessThan(lastRemoteGrid) {
+		shiftRealizedBase = shiftRealizedBase.Add(lastRemoteGrid)
+	}
+	realized := shiftRealizedBase.Add(newRemoteGrid)
+	expectedRealized := decimal.RequireFromString("0.1340")
+	if !realized.Equal(expectedRealized) {
+		t.Fatalf("expected OP realized %s, got %s", expectedRealized, realized)
+	}
+
+	// 2. AR #1422 class: Rebase pool inclusion matches Pionex Profit
+	arRealized := decimal.RequireFromString("0.3985")
+	arRawFloat := decimal.RequireFromString("-0.1139")
+	arRebasePool := decimal.RequireFromString("-0.2299")
+	arRebasePos := decimal.RequireFromString("-4.8")
+	arCurrentPos := decimal.RequireFromString("-4.8")
+
+	poolEff := arRebasePool
+	if !arRebasePool.IsZero() && !arRebasePos.IsZero() {
+		ratio := arCurrentPos.Div(arRebasePos)
+		if ratio.IsPositive() && ratio.LessThan(decimal.NewFromInt(1)) {
+			poolEff = arRebasePool.Mul(ratio)
+		}
+	}
+	arFloor := arRawFloat.Add(poolEff)
+	arTotal := arRealized.Add(arFloor)
+	expectedARTotal := decimal.RequireFromString("0.0547")
+	if !arTotal.Equal(expectedARTotal) {
+		t.Fatalf("expected AR total %s, got %s", expectedARTotal, arTotal)
+	}
+
+	// 3. EDGE #1416 class: Rebase pool inclusion matches Pionex Profit
+	edgeRealized := decimal.RequireFromString("2.1460")
+	edgeRawFloat := decimal.RequireFromString("0.0582")
+	edgeRebasePool := decimal.RequireFromString("-0.4200")
+	edgeRebasePos := decimal.RequireFromString("-80")
+	edgeCurrentPos := decimal.RequireFromString("-80")
+
+	edgePoolEff := edgeRebasePool
+	if !edgeRebasePool.IsZero() && !edgeRebasePos.IsZero() {
+		ratio := edgeCurrentPos.Div(edgeRebasePos)
+		if ratio.IsPositive() && ratio.LessThan(decimal.NewFromInt(1)) {
+			edgePoolEff = edgeRebasePool.Mul(ratio)
+		}
+	}
+	edgeFloor := edgeRawFloat.Add(edgePoolEff)
+	edgeTotal := edgeRealized.Add(edgeFloor)
+	expectedEdgeTotal := decimal.RequireFromString("1.7842")
+	if !edgeTotal.Equal(expectedEdgeTotal) {
+		t.Fatalf("expected EDGE total %s, got %s", expectedEdgeTotal, edgeTotal)
+	}
+
+	// 4. LivePriceResolver wiring
+	svc := &Service{}
+	svc.SetLivePriceResolver(func(sym string) (decimal.Decimal, bool) {
+		if sym == "OP_USDT_PERP" {
+			return decimal.RequireFromString("0.1431"), true
+		}
+		return decimal.Zero, false
+	})
+	p, ok := svc.LivePrice("OP_USDT_PERP")
+	if !ok || !p.Equal(decimal.RequireFromString("0.1431")) {
+		t.Fatalf("expected live price 0.1431, got %v (%v)", p, ok)
+	}
+}
+

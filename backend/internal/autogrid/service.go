@@ -307,8 +307,13 @@ type Service struct {
 	epochCache  *epochCacheEntry
 	clientMu    sync.Mutex
 	clientCache map[string]*clientCacheEntry
-	publicAPI   *pionex.Client
+	livePriceMu       sync.RWMutex
+	livePriceResolver LivePriceResolver
+	publicAPI         *pionex.Client
 }
+
+// LivePriceResolver resolves a live mark price for a symbol.
+type LivePriceResolver func(symbol string) (decimal.Decimal, bool)
 
 func NewService(db *pgxpool.Pool, riskEngine *risk.Engine) *Service {
 	return &Service{
@@ -316,6 +321,23 @@ func NewService(db *pgxpool.Pool, riskEngine *risk.Engine) *Service {
 		clientCache: make(map[string]*clientCacheEntry),
 		publicAPI:   pionex.NewClient("", "", ""),
 	}
+}
+
+// SetLivePriceResolver registers the source for real-time WebSocket mark prices.
+func (s *Service) SetLivePriceResolver(resolver LivePriceResolver) {
+	s.livePriceMu.Lock()
+	defer s.livePriceMu.Unlock()
+	s.livePriceResolver = resolver
+}
+
+// LivePrice queries the registered live price resolver for a symbol's fresh mark.
+func (s *Service) LivePrice(symbol string) (decimal.Decimal, bool) {
+	s.livePriceMu.RLock()
+	defer s.livePriceMu.RUnlock()
+	if s.livePriceResolver != nil {
+		return s.livePriceResolver(symbol)
+	}
+	return decimal.Zero, false
 }
 
 // PublicAPI returns the shared unauthenticated market-data client so every
@@ -1476,7 +1498,7 @@ func (s *Service) listActiveBots(ctx context.Context, settingsID string) ([]Acti
 		       pnl_target_usdt, max_loss_usdt,
 		       realized_pnl_usdt, unrealized_pnl_usdt, supervision_floor_pnl_usdt,
 		       anti_hunt_stop_price, struct_context->>'entryPrice',
-		       updated_at
+		       updated_at, model_state
 		FROM grid_bots
 		WHERE autogrid_settings_id = $1
 		  AND status NOT IN ('STOPPED', 'CANCELLED', 'COMPLETED', 'LIQUIDATED', 'FAILED')
@@ -1489,6 +1511,7 @@ func (s *Service) listActiveBots(ctx context.Context, settingsID string) ([]Acti
 		var item ActiveBot
 		item.Source = "REAL"
 		var entryPriceStr *string
+		var rawModelState any
 		if err := rows.Scan(
 			&item.ID, &item.BotNumber, &item.AccountID, &item.BUOrderID, &item.Symbol,
 			&item.Status, &item.Direction, &item.GridType, &item.LowerPrice,
@@ -1497,7 +1520,7 @@ func (s *Service) listActiveBots(ctx context.Context, settingsID string) ([]Acti
 			&item.AdjustmentsCount, &item.PnLTargetUSDT, &item.MaxLossUSDT,
 			&item.RealizedPNLUSDT, &item.UnrealizedPNLUSDT, &item.SupervisionFloorUSDT,
 			&item.AntiHuntStop, &entryPriceStr,
-			&item.UpdatedAt,
+			&item.UpdatedAt, &rawModelState,
 		); err != nil {
 			rows.Close()
 			return nil, fmt.Errorf("scan real AutoGrid bot: %w", err)
@@ -1505,6 +1528,45 @@ func (s *Service) listActiveBots(ctx context.Context, settingsID string) ([]Acti
 		if entryPriceStr != nil {
 			if ep, err := decimal.NewFromString(*entryPriceStr); err == nil {
 				item.EntryPrice = &ep
+			}
+		}
+
+		// Real-time floating mark overlay:
+		if ms, ok := rawModelState.(map[string]any); ok {
+			var signedPos, entryMark, rebasePool, rebasePos decimal.Decimal
+			if posVal, ok := ms["payloadSignedPos"]; ok && posVal != nil {
+				signedPos, _ = decimal.NewFromString(fmt.Sprintf("%v", posVal))
+			}
+			if entryVal, ok := ms["payloadEntryMark"]; ok && entryVal != nil {
+				entryMark, _ = decimal.NewFromString(fmt.Sprintf("%v", entryVal))
+			}
+			if !entryMark.IsPositive() && item.EntryPrice != nil {
+				entryMark = *item.EntryPrice
+			}
+			if poolVal, ok := ms["rebasePool"]; ok && poolVal != nil {
+				rebasePool, _ = decimal.NewFromString(fmt.Sprintf("%v", poolVal))
+			}
+			if posVal, ok := ms["rebasePos"]; ok && posVal != nil {
+				rebasePos, _ = decimal.NewFromString(fmt.Sprintf("%v", posVal))
+			}
+			if livePrice, ok := s.LivePrice(item.Symbol); ok && livePrice.IsPositive() {
+				if entryMark.IsPositive() && !signedPos.IsZero() {
+					rawFloating := signedPos.Mul(livePrice.Sub(entryMark))
+					poolEff := rebasePool
+					if !rebasePool.IsZero() && !rebasePos.IsZero() {
+						ratio := signedPos.Div(rebasePos)
+						if ratio.IsPositive() && ratio.LessThan(decimal.NewFromInt(1)) {
+							poolEff = rebasePool.Mul(ratio)
+						}
+					}
+					liveUnrealized := rawFloating.Add(poolEff)
+					item.UnrealizedPNLUSDT = &liveUnrealized
+					item.SupervisionFloorUSDT = &liveUnrealized
+				} else if signedPos.IsZero() {
+					zero := decimal.Zero
+					item.UnrealizedPNLUSDT = &zero
+					item.SupervisionFloorUSDT = &zero
+				}
 			}
 		}
 		items = append(items, item)

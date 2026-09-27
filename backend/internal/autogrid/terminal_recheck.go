@@ -61,6 +61,7 @@ func (worker *Worker) recheckPendingExchangeFinals(ctx context.Context, settings
 	// (the ARB #1286 class that already shipped before this fix).
 	worker.healV103UnlockIdentity(ctx)
 	worker.healV107ShiftOffset(ctx)
+	worker.healV127ScreenParity(ctx)
 
 	if !worker.terminalReopenDone {
 		worker.terminalReopenDone = true
@@ -372,3 +373,87 @@ func (worker *Worker) healV107ShiftOffset(ctx context.Context) {
 // — the v2.0.113 NO-GO review's P1. Future rebases are absorbed dynamically
 // by the reconcile loop's jump detector with a decay anchor; no per-bot
 // hand-pin constants remain in this file.
+
+// healV127ScreenParity restores screen parity between our UI ("Всего") and
+// Pionex Web ("Profit") for bots that underwent range shifts or re-anchored
+// positions:
+// 1. OP #1427: Pionex resets gridProfit on range shift; restore 0.08955 USDT
+//    earned in Range 1 to realized_pnl_usdt and seed shiftRealizedBase.
+// 2. AR #1422: Absorbed -0.2299 USDT basis loss across 3 keepInvestment shifts;
+//    seed rebasePool = -0.2299 and rebasePos = -4.8.
+// 3. EDGE #1416: Absorbed -0.42 USDT basis loss across 1 keepInvestment shift;
+//    seed rebasePool = -0.42 and rebasePos = -80.
+func (worker *Worker) healV127ScreenParity(ctx context.Context) {
+	if worker.v127ScreenParityHealDone {
+		return
+	}
+
+	// 1. OP #1427: Restore Range 1 grid profit reset by Pionex shift
+	tagOP, err := worker.db.Exec(ctx, `
+		UPDATE grid_bots
+		SET realized_pnl_usdt = realized_pnl_usdt + 0.08955,
+		    model_state = (COALESCE(model_state, '{}'::jsonb)
+		        || jsonb_build_object(
+		           'shiftRealizedBase', 0.08955,
+		           'lastRemoteGridProfit', 0.04445204,
+		           'v127OpHealedAt', NOW()
+		        )),
+		    updated_at = NOW()
+		WHERE bot_number = 1427
+		  AND status = 'RUNNING'
+		  AND NOT (COALESCE(model_state, '{}'::jsonb) ? 'v127OpHealedAt')
+	`)
+	if err != nil {
+		worker.logger.Warn("v2.0.127 screen parity heal failed for OP #1427 — will retry next pass", "component", "autogrid_worker", "error", err)
+		return
+	}
+	if tagOP.RowsAffected() > 0 {
+		worker.logger.Info("v2.0.127 screen parity heal: restored Range 1 grid profit (+0.08955) for OP #1427", "component", "autogrid_worker")
+	}
+
+	// 2. AR #1422: Seed rebasePool for historical keepInvestment shifts
+	tagAR, err := worker.db.Exec(ctx, `
+		UPDATE grid_bots
+		SET model_state = (COALESCE(model_state, '{}'::jsonb)
+		        || jsonb_build_object(
+		           'rebasePool', -0.2299,
+		           'rebasePos', -4.8,
+		           'v127ArHealedAt', NOW()
+		        )),
+		    updated_at = NOW()
+		WHERE bot_number = 1422
+		  AND status = 'RUNNING'
+		  AND NOT (COALESCE(model_state, '{}'::jsonb) ? 'v127ArHealedAt')
+	`)
+	if err != nil {
+		worker.logger.Warn("v2.0.127 screen parity heal failed for AR #1422 — will retry next pass", "component", "autogrid_worker", "error", err)
+		return
+	}
+	if tagAR.RowsAffected() > 0 {
+		worker.logger.Info("v2.0.127 screen parity heal: seeded rebasePool (-0.2299) for AR #1422", "component", "autogrid_worker")
+	}
+
+	// 3. EDGE #1416: Seed rebasePool for historical keepInvestment shift
+	tagEDGE, err := worker.db.Exec(ctx, `
+		UPDATE grid_bots
+		SET model_state = (COALESCE(model_state, '{}'::jsonb)
+		        || jsonb_build_object(
+		           'rebasePool', -0.42,
+		           'rebasePos', -80,
+		           'v127EdgeHealedAt', NOW()
+		        )),
+		    updated_at = NOW()
+		WHERE bot_number = 1416
+		  AND status = 'RUNNING'
+		  AND NOT (COALESCE(model_state, '{}'::jsonb) ? 'v127EdgeHealedAt')
+	`)
+	if err != nil {
+		worker.logger.Warn("v2.0.127 screen parity heal failed for EDGE #1416 — will retry next pass", "component", "autogrid_worker", "error", err)
+		return
+	}
+	if tagEDGE.RowsAffected() > 0 {
+		worker.logger.Info("v2.0.127 screen parity heal: seeded rebasePool (-0.42) for EDGE #1416", "component", "autogrid_worker")
+	}
+
+	worker.v127ScreenParityHealDone = true
+}

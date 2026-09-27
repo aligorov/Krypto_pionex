@@ -118,6 +118,9 @@ type Worker struct {
 	// inventory cost-basis offset for bots that shifted range under earlier
 	// versions (AAVE #1288).
 	shiftOffsetHealDone bool
+	// v127ScreenParityHealDone gates the one-time v2.0.127 heal that restores
+	// screen parity with Pionex for shifted bots (OP #1427, AR #1422, EDGE #1416).
+	v127ScreenParityHealDone bool
 	// terminalRawLogged dedups the v2.0.100 raw-payload witness to one line
 	// per pending row (single manage goroutine → plain map).
 	terminalRawLogged map[string]bool
@@ -171,7 +174,7 @@ func NewWorker(
 	logger *slog.Logger,
 ) *Worker {
 	publicClient := service.PublicAPI()
-	return &Worker{
+	w := &Worker{
 		db: db, service: service, accounts: accountService, risk: riskEngine,
 		scanner: marketdata.NewScanner(publicClient), publicClient: publicClient,
 		market:          marketdata.NewService(db),
@@ -186,6 +189,25 @@ func NewWorker(
 		realtimeWatch:   make(map[string]realtimePoint),
 		ofiEngine:       marketdata.NewOFIEngine(marketdata.DefaultOFIEngineConfig()),
 	}
+	service.SetLivePriceResolver(w.LiveMarkPrice)
+	return w
+}
+
+// LiveMarkPrice returns the freshest known WebSocket mark price for a symbol.
+func (worker *Worker) LiveMarkPrice(symbol string) (decimal.Decimal, bool) {
+	if worker.wsLane != nil {
+		if update, ok := worker.wsLane.Mark(symbol); ok && update.Fresh(45*time.Second) && update.MarkPrice.IsPositive() {
+			return update.MarkPrice, true
+		}
+		trimmed := trimPERPAlias(symbol)
+		if update, ok := worker.wsLane.Mark(trimmed); ok && update.Fresh(45*time.Second) && update.MarkPrice.IsPositive() {
+			return update.MarkPrice, true
+		}
+		if update, ok := worker.wsLane.Mark(trimmed + "_PERP"); ok && update.Fresh(45*time.Second) && update.MarkPrice.IsPositive() {
+			return update.MarkPrice, true
+		}
+	}
+	return decimal.Zero, false
 }
 
 func (worker *Worker) Run(ctx context.Context) {
@@ -3202,7 +3224,10 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 		       NULLIF(model_state->>'wickShieldExtreme','')::NUMERIC,
 		       NULLIF(model_state->>'wickShieldLastClearedAt',''),
 		       COALESCE(NULLIF(model_state->>'rebasePos','')::NUMERIC, 0),
-		       NULLIF(model_state->>'peakFloorUsdt','')::NUMERIC
+		       NULLIF(model_state->>'peakFloorUsdt','')::NUMERIC,
+		       COALESCE(NULLIF(model_state->>'shiftRealizedBase','')::NUMERIC, 0),
+		       COALESCE(NULLIF(model_state->>'lastRemoteGridProfit','')::NUMERIC, 0),
+		       COALESCE(NULLIF(model_state->>'lastAdjustmentsCount','')::INT, 0)
 		FROM grid_bots
 		WHERE autogrid_settings_id = $1 AND bu_order_id IS NOT NULL
 		  AND status IN ('RUNNING', 'STOP_REQUESTED', 'STOPPING')
@@ -3241,6 +3266,9 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 		wickShieldLastClearedAt                                 *string
 		rebasePos                                               decimal.Decimal
 		peakFloor                                               *decimal.Decimal
+		shiftRealizedBase                                       decimal.Decimal
+		lastRemoteGridProfit                                    decimal.Decimal
+		lastAdjustmentsCount                                    int
 	}
 	bots := make([]managedBot, 0)
 	for rows.Next() {
@@ -3259,6 +3287,7 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 			&item.supervisionFloor, &item.rebasePool, &item.lastEntryMark, &item.lastSignedPos,
 			&item.wickShieldTriggeredAt, &item.wickShieldExtreme,
 			&item.wickShieldLastClearedAt, &item.rebasePos, &item.peakFloor,
+			&item.shiftRealizedBase, &item.lastRemoteGridProfit, &item.lastAdjustmentsCount,
 		); err != nil {
 			rows.Close()
 			return clampInterval(settings.ManageIntervalSeconds), err
@@ -3431,7 +3460,20 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 		//    detects jumps in positionOpenPrice (>1% across passes from shifts or tranche-2 invest_in),
 		//    absorbing lost historical basis into rebasePool so stops and radar never suffer from
 		//    false optimism on underwater positions (the PENGU #1386 class).
-		realized := remote.BUOrderData.GridProfit()
+		remoteGrid := remote.BUOrderData.GridProfit()
+		// v2.0.127: Detect if Pionex reset gridProfit after a range shift (OP class):
+		if !bot.lastRemoteGridProfit.IsZero() && remoteGrid.LessThan(bot.lastRemoteGridProfit) {
+			bot.shiftRealizedBase = bot.shiftRealizedBase.Add(bot.lastRemoteGridProfit)
+			worker.logger.Info("absorbed prior range grid profit into shiftRealizedBase",
+				"component", "autogrid_worker",
+				"bot_number", bot.botNumber, "symbol", bot.symbol,
+				"prior_grid_profit", bot.lastRemoteGridProfit.String(),
+				"new_grid_profit", remoteGrid.String(),
+				"total_shift_realized_base", bot.shiftRealizedBase.String())
+		}
+		bot.lastRemoteGridProfit = remoteGrid
+		realized := bot.shiftRealizedBase.Add(remoteGrid)
+
 		unrealized := decimal.Zero
 		supervisionFloor := decimal.Zero
 		currentEntry := remote.BUOrderData.PositionOpenPrice
@@ -3479,10 +3521,12 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 				unrealized = signedPos.Mul(price.Sub(currentEntry))
 			}
 
-			// Point Д.1 & Д.5: Rebase detection across passes (> 1% jump on non-flip)
+			// Point Д.1 & Д.5: Rebase detection across passes.
+			// v2.0.127: Trigger if bot has adjusted or jump > 0.1% on non-flip
+			hasAdjusted := bot.adjustments > bot.lastAdjustmentsCount
 			if !isFlip && bot.lastEntryMark != nil && bot.lastEntryMark.IsPositive() && currentEntry.IsPositive() {
 				jump := currentEntry.Sub(*bot.lastEntryMark).Div(*bot.lastEntryMark).Abs()
-				if jump.GreaterThan(decimal.NewFromFloat(0.01)) {
+				if hasAdjusted || jump.GreaterThan(decimal.NewFromFloat(0.001)) {
 					// The exchange re-based positionOpenPrice. The lost floating PnL is signedPos * (newEntry - oldEntry)
 					rebaseDelta := signedPos.Mul(currentEntry.Sub(*bot.lastEntryMark))
 					if rebaseDelta.IsNegative() {
@@ -3502,6 +3546,7 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 					}
 				}
 			}
+			bot.lastAdjustmentsCount = bot.adjustments
 
 			// Point Д.1: payloadEntryMark and payloadSignedPos are tracked EVERY pass
 			bot.lastEntryMark = &currentEntry
@@ -3539,6 +3584,9 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 			} else {
 				supervisionFloor = unrealized
 			}
+			// v2.0.127: Display circuit uses supervisionFloor so that the UI column
+			// "ВСЕГО" (realized + unrealized) strictly matches Pionex Web's Profit.
+			unrealized = supervisionFloor
 		} else {
 			supervisionFloor = decimal.Zero
 		}
@@ -3697,6 +3745,18 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 		if bot.peakFloor != nil && bot.peakFloor.IsPositive() {
 			peakFloorParam = bot.peakFloor
 		}
+		var shiftRealizedBaseParam *decimal.Decimal
+		if !bot.shiftRealizedBase.IsZero() {
+			shiftRealizedBaseParam = &bot.shiftRealizedBase
+		}
+		var lastRemoteGridProfitParam *decimal.Decimal
+		if !bot.lastRemoteGridProfit.IsZero() {
+			lastRemoteGridProfitParam = &bot.lastRemoteGridProfit
+		}
+		var lastAdjustmentsCountParam *int
+		if bot.lastAdjustmentsCount > 0 {
+			lastAdjustmentsCountParam = &bot.lastAdjustmentsCount
+		}
 		clearKeys := isZeroPos || isFlip
 
 		if _, err := worker.db.Exec(ctx, `
@@ -3718,19 +3778,22 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 					WHEN $8::BOOLEAN THEN
 						COALESCE(model_state, '{}'::jsonb) - 'shiftFloatingOffset' - 'shiftPosition' - 'rebasePool' - 'rebasePos' - 'payloadEntryMark' - 'payloadSignedPos'
 					ELSE
-						(COALESCE(model_state, '{}'::jsonb) - 'rebasePool' - 'rebasePos' - 'payloadEntryMark' - 'payloadSignedPos' - 'peakFloorUsdt')
+						(COALESCE(model_state, '{}'::jsonb) - 'rebasePool' - 'rebasePos' - 'payloadEntryMark' - 'payloadSignedPos' - 'peakFloorUsdt' - 'shiftRealizedBase' - 'lastRemoteGridProfit' - 'lastAdjustmentsCount')
 						|| jsonb_strip_nulls(jsonb_build_object(
 							'payloadEntryMark', $9::NUMERIC,
 							'rebasePool', $10::NUMERIC,
 							'payloadSignedPos', $11::NUMERIC,
 							'rebasePos', $12::NUMERIC,
-							'peakFloorUsdt', $13::NUMERIC
+							'peakFloorUsdt', $13::NUMERIC,
+							'shiftRealizedBase', $14::NUMERIC,
+							'lastRemoteGridProfit', $15::NUMERIC,
+							'lastAdjustmentsCount', $16::INT
 						))
 				END,
 			    last_reconciled_at = NOW(),
 			    last_error = NULL, updated_at = NOW()
 			WHERE id = $1
-		`, bot.id, bot.localStatus, persistedReconciliation, remoteStatus, realized, unrealized, supervisionFloor, clearKeys, entryMarkParam, rebasePoolParam, signedPosParam, rebasePosParam, peakFloorParam); err != nil {
+		`, bot.id, bot.localStatus, persistedReconciliation, remoteStatus, realized, unrealized, supervisionFloor, clearKeys, entryMarkParam, rebasePoolParam, signedPosParam, rebasePosParam, peakFloorParam, shiftRealizedBaseParam, lastRemoteGridProfitParam, lastAdjustmentsCountParam); err != nil {
 			// The PnL persist must never fail silently: v2.0.45 lost every
 			// REAL mark for weeks exactly because this error was swallowed.
 			worker.logger.Error("persist remote grid truth and PnL",

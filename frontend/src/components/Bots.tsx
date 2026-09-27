@@ -38,7 +38,7 @@ export default function Bots({ canOperate }: Props) {
 
   useEffect(() => {
     void load();
-    const timer = window.setInterval(() => void load(), 5000);
+    const timer = window.setInterval(() => void load(), 3000);
     return () => window.clearInterval(timer);
   }, [load]);
 
@@ -131,7 +131,7 @@ export default function Bots({ canOperate }: Props) {
             <h3>Активные боты ({state.activeBots.length})</h3>
           </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-            <span className="muted">PnL обновляется циклом reconcile</span>
+            <span className="muted">PnL в реальном времени (WebSocket mark)</span>
             <button className="button secondary" style={{ padding: '4px 10px' }} onClick={() => void load()}>
               🔄 Обновить
             </button>
@@ -153,7 +153,7 @@ export default function Bots({ canOperate }: Props) {
                   <th>Инвест.</th>
                   <th>Реализ. PnL</th>
                   <th>Нереализ. PnL</th>
-                  <th>Всего</th>
+                  <th title="Profit на Pionex в реальном времени (Реализ. + Нереализ.)">Всего</th>
                   <th>Сдвиги</th>
                   <th>Действия</th>
                 </tr>
