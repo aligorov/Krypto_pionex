@@ -304,6 +304,17 @@ func (e *OFIEngine) IngestL2(symbol string, bids, asks []pionex.DepthLevel, ts t
 	st.currentWindow.LastMicroPrice = micro
 	st.currentWindow.L2Count++
 
+	if mid.IsPositive() {
+		biasBps, _ := micro.Sub(mid).Div(mid).Mul(decimal.NewFromInt(10000)).Float64()
+		st.latestAnalysis.CurrentMidPrice = mid
+		st.latestAnalysis.CurrentMicroPrice = micro
+		st.latestAnalysis.MicroPriceBiasBps = biasBps
+		st.latestAnalysis.UpdatedAt = ts
+		if st.latestAnalysis.Regime == "" {
+			st.latestAnalysis.Regime = RegimeNeutral
+		}
+	}
+
 	// Calculate L1 OFI
 	if len(st.prevBids) > 0 && len(st.prevAsks) > 0 {
 		ofiStep := CalculateLevel1OFI(st.prevBids, st.prevAsks, bids, asks)

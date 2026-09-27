@@ -79,9 +79,10 @@ type PublicStream struct {
 
 	// writeMu serializes frames onto the socket (subscribe diffs from the
 	// manage goroutine, PONG replies from the read pump).
-	writeMu sync.Mutex
-	connMu  sync.Mutex
-	conn    *websocket.Conn
+	writeMu   sync.Mutex
+	lastWrite time.Time
+	connMu    sync.Mutex
+	conn      *websocket.Conn
 
 	// stateMu guards the subscription wish and the mark store; reads come
 	// from manage-loop consumers, writes from the read pump and SetSymbols.
@@ -155,11 +156,19 @@ func (s *PublicStream) SetSymbols(symbols []string) {
 	for _, sym := range added {
 		if err := s.sendStreamOp("SUBSCRIBE", sym); err != nil {
 			s.logger.Warn("ws lane subscribe failed", "component", "pionex_ws", "symbol", sym, "error", err)
+		} else {
+			s.stateMu.Lock()
+			s.subscribed[sym] = struct{}{}
+			s.stateMu.Unlock()
 		}
 	}
 	for _, sym := range removed {
 		if err := s.sendStreamOp("UNSUBSCRIBE", sym); err != nil {
 			s.logger.Debug("ws lane unsubscribe failed", "component", "pionex_ws", "symbol", sym, "error", err)
+		} else {
+			s.stateMu.Lock()
+			delete(s.subscribed, sym)
+			s.stateMu.Unlock()
 		}
 	}
 }
@@ -281,6 +290,10 @@ func (s *PublicStream) dial(ctx context.Context) error {
 	for _, sym := range wish {
 		if err := s.sendStreamOp("SUBSCRIBE", sym); err != nil {
 			s.logger.Warn("ws lane resubscribe failed", "component", "pionex_ws", "symbol", sym, "error", err)
+		} else {
+			s.stateMu.Lock()
+			s.subscribed[sym] = struct{}{}
+			s.stateMu.Unlock()
 		}
 	}
 	s.logger.Info("ws lane connected", "component", "pionex_ws", "url", s.url, "symbols", len(wish))
@@ -335,6 +348,16 @@ func (s *PublicStream) sendTopicOp(op, topic, symbol string) error {
 	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+
+	// Rate limit: Pionex public WebSocket strictly enforces max 5-10 msg/sec.
+	// Enforce 200ms minimum spacing between outbound subscription frames to prevent 1008 rate limit disconnects.
+	if !s.lastWrite.IsZero() {
+		if elapsed := time.Since(s.lastWrite); elapsed < 200*time.Millisecond {
+			time.Sleep(200*time.Millisecond - elapsed)
+		}
+	}
+	s.lastWrite = time.Now()
+
 	_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 	return conn.WriteMessage(websocket.TextMessage, frame)
 }

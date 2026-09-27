@@ -751,7 +751,7 @@ function reasonBadge(reason: string | null): string {
 }
 
 function ofiBadge(regime?: string | null, biasBps?: number | null) {
-  if (!regime || regime === 'NEUTRAL') return null;
+  if (!regime) return null;
   const biasStr = typeof biasBps === 'number' ? ` (${biasBps > 0 ? '+' : ''}${biasBps.toFixed(1)} bps)` : '';
   switch (regime) {
     case 'CONFIRMED_DUMP':
@@ -792,6 +792,16 @@ function ofiBadge(regime?: string | null, biasBps?: number | null) {
           title={`Давление на покупку в стакане${biasStr} — усилен контроль риска`}
         >
           ℹ️ PUMP-P
+        </span>
+      );
+    case 'NEUTRAL':
+      return (
+        <span
+          className="badge neutral"
+          style={{ fontSize: '0.68rem', padding: '1px 5px', fontWeight: 500, color: '#94a3b8', border: '1px solid #334155' }}
+          title={`Микроструктура стакана сбалансирована${biasStr} — нормальный режим сетки`}
+        >
+          ⚖️ OFI{biasStr || ' 0.0'}
         </span>
       );
     default:
