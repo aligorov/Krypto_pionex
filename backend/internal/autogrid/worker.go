@@ -44,6 +44,28 @@ func trancheMarkerFresh(marker *string, maxAge time.Duration) bool {
 	return err == nil && time.Since(stamped) < maxAge
 }
 
+// tranchePourGateRefused (v2.0.142, audit P2d) classifies an AdjustBot
+// invest_in error as a GATE refusal: one of the durable pre-flight gates the
+// service invest lane runs BEFORE any native exchange call — the joint
+// circuit breaker, the v2.0.140 margin reserve, the risk engine. Such an
+// error proves the pour never reached Pionex, so the caller may clear the
+// trancheIntentAt fence and let the 1h trancheFailAt backoff govern the
+// retry. The prefixes are the exact reason families service.go's invest
+// lane emits (circuitBreakerReason / marginReserveBlocker / the risk wrap);
+// a native exchange refusal (ErrNativeAdjustRefused) is NOT gate-class —
+// its outcome handling stays with the exchange classifier — and a persist
+// failure after a successful native call ("persist adjustment: …") matches
+// none of these, keeping the fence armed exactly as v2.0.78 CRIT-2 requires.
+func tranchePourGateRefused(err error) bool {
+	if err == nil || errors.Is(err, ErrNativeAdjustRefused) {
+		return false
+	}
+	msg := err.Error()
+	return strings.HasPrefix(msg, "circuit breaker:") ||
+		strings.HasPrefix(msg, "резерв маржи:") ||
+		strings.HasPrefix(msg, "invest_in rejected by risk engine:")
+}
+
 // realFundingReconcileInterval bounds the funding-fee history fetch for REAL
 // bots: funding settles at most every 8h, so a 30-minute anchor keeps each
 // window tiny while capping the signed-endpoint weight per manage pass.
@@ -192,16 +214,16 @@ func NewWorker(
 	w := &Worker{
 		db: db, service: service, accounts: accountService, risk: riskEngine,
 		scanner: marketdata.NewScanner(publicClient), publicClient: publicClient,
-		market:          marketdata.NewService(db),
-		llm:             llmService,
-		logger:          logger,
-		owner:           fmt.Sprintf("autogrid-%d", time.Now().UnixNano()),
-		trancheTBRegime: make(map[string]trancheTBTrend),
-		dataAlarmAt:     make(map[string]time.Time),
-		radarPriceTrail: make(map[string]radarPricePoint),
-		ouReadings:      make(map[string]ouSymbolReading),
-		realtimeSignal:  make(chan string, 1),
-		realtimeWatch:   make(map[string]realtimePoint),
+		market:                  marketdata.NewService(db),
+		llm:                     llmService,
+		logger:                  logger,
+		owner:                   fmt.Sprintf("autogrid-%d", time.Now().UnixNano()),
+		trancheTBRegime:         make(map[string]trancheTBTrend),
+		dataAlarmAt:             make(map[string]time.Time),
+		radarPriceTrail:         make(map[string]radarPricePoint),
+		ouReadings:              make(map[string]ouSymbolReading),
+		realtimeSignal:          make(chan string, 1),
+		realtimeWatch:           make(map[string]realtimePoint),
 		ofiEngine:               marketdata.NewOFIEngine(marketdata.DefaultOFIEngineConfig()),
 		emergencyExits:          make(map[string]time.Time),
 		emergencyShadowDebounce: make(map[string]time.Time),
@@ -1063,9 +1085,13 @@ func (worker *Worker) deployPaper(
 	// per-candidate cut inside the loop still lets SHORT candidates through.
 	// The macro veto judges each candidate's scanner trend and therefore runs
 	// per candidate, with the final direction known.
-	passCode, _, passNote, passFeatures := worker.probeSharedMarketBlockers(ctx, EntryChainInput{
+	// v2.0.142 (audit P2c): the fleet-constant legs (breaker, economic
+	// events) are memoized per pass — the pass-level probe below fills the
+	// cache and every per-candidate cut reuses it.
+	passBlockers := &marketBlockerCache{}
+	passCode, _, passNote, passFeatures := worker.probeSharedMarketBlockersCached(ctx, EntryChainInput{
 		Path: EntryPathScannerPaper, Settings: settings, Fleet: "PAPER", Direction: "NEUTRAL",
-	})
+	}, passBlockers)
 	switch passCode {
 	case "":
 		// clear
@@ -1470,7 +1496,7 @@ func (worker *Worker) deployPaper(
 			ScannerTrend: strings.ToLower(strings.TrimSpace(candidate.RecommendedTrend)),
 			CascadeShort: cascadeShort,
 		}
-		if code, reason, _, features := worker.probeSharedMarketBlockers(ctx, entryIn); code != "" {
+		if code, reason, _, features := worker.probeSharedMarketBlockersCached(ctx, entryIn, passBlockers); code != "" {
 			worker.rejectCandidate(ctx, candidate, reason, features)
 			worker.journalEntryDecision(ctx, entryIn, entryOutcomeReject, code, reason, features)
 			continue
@@ -1611,13 +1637,13 @@ func (worker *Worker) deployPaper(
 			}
 		}
 
-		// Fleet Net Delta Cap (Quant & Vision v3.0)
-		candidateDelta := decimal.Zero
-		if trend == "long" {
-			candidateDelta = settings.BudgetUSDT.Mul(decimal.NewFromInt(int64(botLev)))
-		} else if trend == "short" {
-			candidateDelta = settings.BudgetUSDT.Mul(decimal.NewFromInt(int64(botLev))).Neg()
-		}
+		// Fleet Net Delta Cap (Quant & Vision v3.0). v2.0.142 (audit P2a):
+		// paper now charges NEUTRAL candidates exactly like the REAL gate —
+		// the shared fleetCandidateDelta/projectedFleetDelta helpers keep the
+		// two fleets byte-identical (paper/REAL parity holds in this lane;
+		// the v2.0.93 FIX-G drift class is closed: the sandbox proves the
+		// delta math REAL rides, neutral park and ½-notional included).
+		candidateDelta := fleetCandidateDelta(trend, settings.BudgetUSDT, botLev)
 		if settings.FleetMaxNetDeltaUSDT.IsPositive() && !candidateDelta.IsZero() {
 			fleetDelta, neutralPark, err := worker.calculateFleetNetDelta(ctx, settings.ID, true)
 			if err != nil {
@@ -1629,21 +1655,10 @@ func (worker *Worker) deployPaper(
 					fmt.Sprintf("флот-дельта недоступна (fail-closed): %v — деплой отложен для защиты портфеля", err), nil)
 				continue
 			}
-			// v2.0.140 NEUTRAL park: the fleet's un-shifted NEUTRAL grids
-			// carry zero net delta but ½×invest×lev of POTENTIAL adverse
-			// inventory each — a market-wide move loads them all onto the
-			// SAME side the candidate is about to expose. Charge the park
-			// against the candidate's direction (+ for LONG, − for SHORT).
-			projectedDelta := fleetDelta.Add(candidateDelta)
-			if trend == "short" {
-				projectedDelta = projectedDelta.Sub(neutralPark)
-			} else {
-				projectedDelta = projectedDelta.Add(neutralPark)
-			}
-			projectedDelta = projectedDelta.Abs()
+			projectedDelta := projectedFleetDelta(trend, fleetDelta, candidateDelta, neutralPark)
 			if projectedDelta.GreaterThan(settings.FleetMaxNetDeltaUSDT) {
 				worker.rejectCandidate(ctx, candidate,
-					fmt.Sprintf("Fleet net delta cap: текущая дельта $%s + парк нейтральных $%s + кандидат $%s превысит лимит $%s — пауза направленного входа для защиты портфеля",
+					fmt.Sprintf("Fleet net delta cap: текущая дельта $%s + парк нейтральных $%s + кандидат $%s превысит лимит $%s — пауза входа для защиты портфеля",
 						fleetDelta.StringFixed(2), neutralPark.StringFixed(2), candidateDelta.StringFixed(2), settings.FleetMaxNetDeltaUSDT.StringFixed(2)), nil)
 				continue
 			}
@@ -2062,6 +2077,49 @@ func marginReserveBlocker(
 	return "", ""
 }
 
+// fleetCandidateDelta (v2.0.142, audit P2a) is the ONE candidate pre-charge
+// for the fleet net-delta cap: LONG charges +budget×lev, SHORT −budget×lev,
+// and a NEUTRAL candidate pre-charges ½×budget×lev of adverse inventory —
+// at a boundary a neutral grid already holds ~50% notional long exposure.
+// One helper, both deploy sites (paper above, REAL below) — the paper arm
+// used to charge ZERO for a NEUTRAL candidate while REAL pre-charged the
+// half, so the sandbox's delta gate never saw the neutral inventory REAL
+// was already refusing. That closed the v2.0.93 FIX-G paper/REAL drift
+// class in this lane: paper/REAL parity now holds by construction.
+func fleetCandidateDelta(trend string, budget decimal.Decimal, botLev int) decimal.Decimal {
+	notional := budget.Mul(decimal.NewFromInt(int64(botLev)))
+	switch trend {
+	case "long":
+		return notional
+	case "short":
+		return notional.Neg()
+	default:
+		return notional.Div(decimal.NewFromInt(2))
+	}
+}
+
+// projectedFleetDelta (v2.0.142, audit P2a) folds the fleet reading, the
+// candidate pre-charge and the v2.0.140 NEUTRAL park into the cap's |·|
+// projection: the fleet's un-shifted NEUTRAL grids carry zero net delta but
+// ½×invest×lev of POTENTIAL adverse inventory each — a market-wide move
+// loads them all onto the SAME side the candidate is about to expose.
+// Directional candidates charge the park against their own side (+ for LONG,
+// − for SHORT); a NEUTRAL candidate keeps its ½-notional pre-charge and adds
+// the fleet park on top of |D| — the park is adverse on EITHER side. Shared
+// by the paper and REAL deploy gates so the projection cannot drift again.
+func projectedFleetDelta(trend string, fleetDelta, candidateDelta, neutralPark decimal.Decimal) decimal.Decimal {
+	projected := fleetDelta.Add(candidateDelta)
+	switch trend {
+	case "short":
+		projected = projected.Sub(neutralPark)
+	case "long":
+		projected = projected.Add(neutralPark)
+	default:
+		projected = projected.Abs().Add(neutralPark)
+	}
+	return projected.Abs()
+}
+
 func (worker *Worker) deployReal(
 	ctx context.Context,
 	settings Settings,
@@ -2117,9 +2175,13 @@ func (worker *Worker) deployReal(
 	// was about to ride. Storm/breaker/economic block the WHOLE pass; the
 	// cascade/feed legs stay direction-aware and only NOTE here — the
 	// per-candidate cut inside the loop still lets SHORT candidates through.
-	passCode, _, passNote, passFeatures := worker.probeSharedMarketBlockers(ctx, EntryChainInput{
+	// v2.0.142 (audit P2c): the fleet-constant legs (breaker, economic
+	// events) are memoized per pass — the pass-level probe below fills the
+	// cache and every per-candidate cut reuses it.
+	passBlockers := &marketBlockerCache{}
+	passCode, _, passNote, passFeatures := worker.probeSharedMarketBlockersCached(ctx, EntryChainInput{
 		Path: EntryPathScannerReal, Settings: settings, Fleet: "REAL", Direction: "NEUTRAL",
-	})
+	}, passBlockers)
 	switch passCode {
 	case "":
 		// clear
@@ -2509,7 +2571,7 @@ func (worker *Worker) deployReal(
 			ScannerTrend: strings.ToLower(strings.TrimSpace(candidate.RecommendedTrend)),
 			CascadeShort: cascadeShort,
 		}
-		if code, reason, _, features := worker.probeSharedMarketBlockers(ctx, entryIn); code != "" {
+		if code, reason, _, features := worker.probeSharedMarketBlockersCached(ctx, entryIn, passBlockers); code != "" {
 			worker.rejectCandidate(ctx, candidate, reason, features)
 			worker.journalEntryDecision(ctx, entryIn, entryOutcomeReject, code, reason, features)
 			continue
@@ -2635,16 +2697,12 @@ func (worker *Worker) deployReal(
 			botLev = harGeo.geo.Leverage
 		}
 
-		// Fleet Net Delta Cap (Quant & Vision v3.0)
-		candidateDelta := decimal.Zero
-		if trend == "long" {
-			candidateDelta = settings.BudgetUSDT.Mul(decimal.NewFromInt(int64(botLev)))
-		} else if trend == "short" {
-			candidateDelta = settings.BudgetUSDT.Mul(decimal.NewFromInt(int64(botLev))).Neg()
-		} else {
-			// NEUTRAL bot adverse inventory load: at boundary, it holds ~50% notional long exposure
-			candidateDelta = settings.BudgetUSDT.Mul(decimal.NewFromInt(int64(botLev))).Div(decimal.NewFromInt(2))
-		}
+		// Fleet Net Delta Cap (Quant & Vision v3.0). v2.0.142 (audit P2a):
+		// the charge and the park projection moved into the shared
+		// fleetCandidateDelta/projectedFleetDelta helpers — the paper gate
+		// above runs the identical math, so paper/REAL parity holds in this
+		// lane by construction.
+		candidateDelta := fleetCandidateDelta(trend, settings.BudgetUSDT, botLev)
 		if settings.FleetMaxNetDeltaUSDT.IsPositive() && !candidateDelta.IsZero() {
 			fleetDelta, neutralPark, err := worker.calculateFleetNetDelta(ctx, settings.ID, false)
 			if err != nil {
@@ -2652,21 +2710,7 @@ func (worker *Worker) deployReal(
 					fmt.Sprintf("Fleet net delta error: %v — деплой отложен для защиты портфеля (fail-closed)", err), nil)
 				continue
 			}
-			// v2.0.140 NEUTRAL park: the fleet's un-shifted NEUTRAL grids
-			// carry zero net delta but a shared worst-case inventory load
-			// (paper twin's comment). Directional candidates charge the park
-			// against their own side; a NEUTRAL candidate keeps its ½-notional
-			// pre-charge above and adds the fleet park on top of |D| — the
-			// park is adverse on EITHER side of a market-wide move.
-			projectedDelta := fleetDelta.Add(candidateDelta)
-			if trend == "short" {
-				projectedDelta = projectedDelta.Sub(neutralPark)
-			} else if trend == "long" {
-				projectedDelta = projectedDelta.Add(neutralPark)
-			} else {
-				projectedDelta = projectedDelta.Abs().Add(neutralPark)
-			}
-			projectedDelta = projectedDelta.Abs()
+			projectedDelta := projectedFleetDelta(trend, fleetDelta, candidateDelta, neutralPark)
 			if projectedDelta.GreaterThan(settings.FleetMaxNetDeltaUSDT) {
 				worker.rejectCandidate(ctx, candidate,
 					fmt.Sprintf("Fleet net delta cap: текущая дельта $%s + парк нейтральных $%s + кандидат $%s превысит лимит $%s — пауза входа для защиты портфеля",
@@ -4558,15 +4602,22 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 						}); err != nil {
 							worker.logger.Error("tranche 2 invest_in failed",
 								"component", "autogrid_worker", "bot_id", bot.id, "error", err)
-							if errors.Is(err, ErrNativeAdjustRefused) && !pionex.IsOutcomeUnknown(err) {
-								// The exchange itself refused the call: the pour
-								// provably never landed — clear the intent so the
-								// backoff retry is not fenced by a stale marker.
+							if (errors.Is(err, ErrNativeAdjustRefused) && !pionex.IsOutcomeUnknown(err)) ||
+								tranchePourGateRefused(err) {
+								// The exchange itself refused the call, OR a durable
+								// gate refused it before any native call left the
+								// building (v2.0.142 audit P2d: breaker/margin-reserve/
+								// risk-engine refusals are not ErrNativeAdjustRefused,
+								// so the pour intent used to stay armed and fence the
+								// next attempt for 24h instead of the intended 1h
+								// backoff): the pour provably never landed — clear the
+								// intent so the backoff retry is not fenced by a
+								// stale marker.
 								_, _ = worker.db.Exec(ctx, `
-									UPDATE grid_bots
-									SET model_state = model_state - 'trancheIntentAt', updated_at = NOW()
-									WHERE id = $1
-								`, bot.id)
+								UPDATE grid_bots
+								SET model_state = model_state - 'trancheIntentAt', updated_at = NOW()
+								WHERE id = $1
+							`, bot.id)
 							}
 							if _, markErr := worker.db.Exec(ctx, `
 							UPDATE grid_bots
@@ -4620,6 +4671,23 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 							}
 							worker.logger.Info("tranche 2 deployed (REAL invest_in)",
 								"component", "autogrid_worker", "symbol", bot.symbol, "reason", topUp)
+							// v2.0.142 (audit P3-3): journal the successful pour
+							// as the TRANCHE2 path's ALLOW row — the journal's
+							// "every path" contract needs the landing side, not
+							// only the refusals (the worker owns the tranche-2
+							// success point; the MANUAL invest_in success point
+							// lives in service.go's AdjustBot return, outside
+							// this file).
+							worker.journalEntryDecision(ctx, EntryChainInput{
+								Path: EntryPathTranche2, Settings: *settings, Symbol: bot.symbol,
+								Direction: bot.direction, Fleet: "REAL", RefID: bot.id,
+							}, entryOutcomeAllow, "POUR",
+								"tranche 2 poured: "+topUp,
+								map[string]any{
+									"poured_usdt":       pending.StringFixed(2),
+									"investment_before": investmentBefore.String(),
+									"investment_after":  base.String(),
+								})
 							// v2.0.89 round-trip fee ledger: the pour's taker
 							// entry fee is booked INSIDE AdjustBot's invest_in
 							// persist (the single chokepoint every REAL pour —

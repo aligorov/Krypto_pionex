@@ -306,9 +306,18 @@ func TestDerivedBreakerN10FleetEnvelope(t *testing.T) {
 	pinBreakerFixture(t, pool, live.ID, 11, "100")
 	// STATIC 6/8 gives every candidate a FULL stop of $8 regardless of
 	// leverage (tranche stores the $4 half).
+	// v2.0.142 (audit P2a): the fleet delta cap must be pinned OFF here. The
+	// paper gate now charges a NEUTRAL candidate exactly like the REAL gate
+	// (½-notional pre-charge + the fleet NEUTRAL park), and this fixture's
+	// nine 4x NEUTRAL fillers park 9×½×100×4 = $1800 — past the $1200 default
+	// cap before the tenth candidate is even folded in. This test pins the
+	// derived daily-loss BREAKER envelope, a different gate; leaving the
+	// delta cap armed would refuse the tenth deploy for reasons the fixture
+	// does not mean to exercise.
 	if _, err := pool.Exec(ctx, `
 		UPDATE autogrid_settings
-		SET pnl_target_mode = 'STATIC', pnl_target_usdt = 6, max_loss_usdt = 8
+		SET pnl_target_mode = 'STATIC', pnl_target_usdt = 6, max_loss_usdt = 8,
+		    fleet_max_net_delta_usdt = 0
 		WHERE id = $1
 	`, live.ID); err != nil {
 		t.Fatalf("pin STATIC targets: %v", err)

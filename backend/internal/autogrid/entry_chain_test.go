@@ -97,7 +97,7 @@ func TestEntryBlockReasonsStableTexts(t *testing.T) {
 // storage being reachable first).
 func TestEvaluateSharedMarketBlockersStormFirstLeg(t *testing.T) {
 	code, reason, _, _ := evaluateSharedMarketBlockersDB(context.Background(), nil, func() bool { return true },
-		EntryChainInput{Path: EntryPathScannerReal, Fleet: "REAL"})
+		EntryChainInput{Path: EntryPathScannerReal, Fleet: "REAL"}, nil)
 	if code != entryBlockedStorm {
 		t.Fatalf("code = %q, want %q", code, entryBlockedStorm)
 	}

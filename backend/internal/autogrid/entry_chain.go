@@ -89,6 +89,54 @@ func entryDirectionFromTrend(trend string) string {
 	}
 }
 
+// marketBlockerCache (v2.0.142, audit P2c) memoizes the fleet-constant
+// composer legs for ONE deploy pass. The circuit-breaker and economic-event
+// legs read fleet-wide tables — identical for every candidate of a pass —
+// but the composer ran them per candidate (~41×/pass: two SQL round trips
+// each on the hot scan path). A cache is created at the top of
+// deployPaper/deployReal, filled by the pass-level probe and reused by every
+// per-candidate cut. The direction-aware legs (cascade, feed health) and the
+// macro veto stay per candidate — they judge the candidate's own
+// direction/scanner trend. Storm stays uncached too: it is an in-memory read
+// that may arm MID-pass, and freezing it at pass start would change
+// semantics. Failure semantics are unchanged, only memoized: an SQL error
+// keeps the leg's fail-open behavior for the whole pass, exactly as ~41
+// uncached fail-opens would have. A nil cache reads through uncached, so
+// the single-shot callers (service variant, DGT re-deploy) are unaffected.
+type marketBlockerCache struct {
+	breakerDone  bool
+	breakerCount int
+	breakerErr   error
+	econDone     bool
+	econBlocked  bool
+	econTitle    string
+}
+
+// breakerCloses is the memoized jointProtectiveClosesLastHour reading.
+func (c *marketBlockerCache) breakerCloses(ctx context.Context, db *pgxpool.Pool, settingsID string) (int, error) {
+	if c == nil {
+		return jointProtectiveClosesLastHour(ctx, db, settingsID)
+	}
+	if !c.breakerDone {
+		c.breakerCount, c.breakerErr = jointProtectiveClosesLastHour(ctx, db, settingsID)
+		c.breakerDone = true
+	}
+	return c.breakerCount, c.breakerErr
+}
+
+// economicWindow is the memoized economicEventsAhead reading (the composer's
+// fixed 2h-ahead window).
+func (c *marketBlockerCache) economicWindow(ctx context.Context, db *pgxpool.Pool) (bool, string) {
+	if c == nil {
+		return economicEventsAhead(ctx, db, 2)
+	}
+	if !c.econDone {
+		c.econBlocked, c.econTitle = economicEventsAhead(ctx, db, 2)
+		c.econDone = true
+	}
+	return c.econBlocked, c.econTitle
+}
+
 // evaluateSharedMarketBlockers runs the fleet-wide market gates in plan order
 // for the worker's paths (scanner deploys, DGT re-deploys, tranche-2 pours).
 // Returns ("", "") when clear, else the machine code of the FIRST blocker
@@ -105,10 +153,21 @@ func (worker *Worker) evaluateSharedMarketBlockers(ctx context.Context, in Entry
 // title, cascade USD…) so call sites can log exactly what they logged before
 // and the journal can carry it in features.
 func (worker *Worker) probeSharedMarketBlockers(ctx context.Context, in EntryChainInput) (code, reason, note string, features map[string]any) {
+	return worker.probeSharedMarketBlockersCached(ctx, in, nil)
+}
+
+// probeSharedMarketBlockersCached (v2.0.142, audit P2c) is the pass-scoped
+// cut of the composer: identical legs and order, with the fleet-constant
+// legs (breaker, economic events) served from the pass's marketBlockerCache.
+// deployPaper/deployReal create one cache per pass and thread it through
+// both the pass-level probe and every per-candidate cut — the two SQL legs
+// run once per pass instead of once per candidate. The cache pointer may be
+// nil (single-shot callers get the plain uncached behavior).
+func (worker *Worker) probeSharedMarketBlockersCached(ctx context.Context, in EntryChainInput, cache *marketBlockerCache) (code, reason, note string, features map[string]any) {
 	if worker == nil || worker.db == nil {
 		return "", "", "", nil
 	}
-	return evaluateSharedMarketBlockersDB(ctx, worker.db, worker.stormActive, in)
+	return evaluateSharedMarketBlockersDB(ctx, worker.db, worker.stormActive, in, cache)
 }
 
 // evaluateSharedMarketBlockersSvc is the service-layer variant for paths
@@ -116,6 +175,7 @@ func (worker *Worker) probeSharedMarketBlockers(ctx context.Context, in EntryCha
 // in-memory state; the Service.StormActive hook (wired by the worker's Run —
 // same process) exposes it, and a nil hook reads as "not stormy". That is
 // the one accepted limitation: a service-only binary cannot see storms.
+// Uncached by design: its call sites evaluate once, not per candidate.
 func (s *Service) evaluateSharedMarketBlockersSvc(ctx context.Context, in EntryChainInput) (string, string) {
 	if s == nil || s.db == nil {
 		return "", ""
@@ -124,7 +184,7 @@ func (s *Service) evaluateSharedMarketBlockersSvc(ctx context.Context, in EntryC
 	if s.StormActive != nil {
 		stormHook = s.StormActive
 	}
-	code, reason, _, _ := evaluateSharedMarketBlockersDB(ctx, s.db, stormHook, in)
+	code, reason, _, _ := evaluateSharedMarketBlockersDB(ctx, s.db, stormHook, in, nil)
 	return code, reason
 }
 
@@ -135,12 +195,15 @@ func (s *Service) evaluateSharedMarketBlockersSvc(ctx context.Context, in EntryC
 // ran): storm → circuit breaker → economic events → liquidation cascade +
 // feed health (both direction-aware, SHORT exempt) → macro veto (scanner
 // trend + cascade-short exemption aware). Every leg fail-opens on SQL errors
-// exactly like the inline code it replaces did.
+// exactly like the inline code it replaces did. cache memoizes the
+// fleet-constant legs (breaker, economic events) when the caller is a
+// per-candidate deploy loop; nil reads through uncached.
 func evaluateSharedMarketBlockersDB(
 	ctx context.Context,
 	db *pgxpool.Pool,
 	stormActive func() bool,
 	in EntryChainInput,
+	cache *marketBlockerCache,
 ) (code, reason, note string, features map[string]any) {
 	// 1. Storm (v2.0.111): opening fresh grids into a fleet-wide acceleration
 	//    buys the worst entries of the day. Entries defer; closes, stops and
@@ -152,12 +215,12 @@ func evaluateSharedMarketBlockersDB(
 	// 2. Portfolio circuit breaker: >= 3 joint paper+REAL protective closes
 	//    in the last hour pauses new entries. The joint count is deliberate —
 	//    a paper fleet under stress proves a pipeline REAL would ride.
-	if closes, err := jointProtectiveClosesLastHour(ctx, db, in.Settings.ID); err == nil && closes >= 3 {
+	if closes, err := cache.breakerCloses(ctx, db, in.Settings.ID); err == nil && closes >= 3 {
 		r := circuitBreakerReason(in.Path, closes)
 		return entryBlockedCircuitBreaker, r, r, map[string]any{"closes": closes}
 	}
 	// 3. Economic events: the T−2h…T+1h window around high-impact USD prints.
-	if blocked, title := economicEventsAhead(ctx, db, 2); blocked {
+	if blocked, title := cache.economicWindow(ctx, db); blocked {
 		r := economicEventReason(in.Path, title)
 		return entryBlockedEconomicEvent, r, r, map[string]any{"title": title}
 	}
@@ -394,8 +457,12 @@ func feedHealthReasons(path EntryPath, lastEvent time.Time) (reason, note string
 
 // Entry decision outcomes (entry_decisions.outcome).
 const (
-	entryOutcomeAllow  = "ALLOW"
-	entryOutcomeWait   = "WAIT" // reserved: not written yet
+	entryOutcomeAllow = "ALLOW"
+	// entryOutcomeWait is written by the v2.0.140 DIRECTION_FLIP handoff
+	// (grid_lifecycle_policy.go): the slot does not deploy here — it is
+	// handed to the scanner's cascade-short lane, so the journal records the
+	// deferral instead of an ALLOW/REJECT verdict.
+	entryOutcomeWait   = "WAIT"
 	entryOutcomeReject = "REJECT"
 )
 
@@ -403,7 +470,7 @@ const (
 // (write-only, failure-tolerant — a journal failure must never change, delay
 // or block the trading decision it observes). Written on ALLOW after a
 // successful create/deploy (one row per created bot) and on REJECT at every
-// market-blocker rejection. WAIT is reserved for future deferral semantics.
+// market-blocker rejection; WAIT marks the DIRECTION_FLIP handoff deferral.
 func (worker *Worker) journalEntryDecision(ctx context.Context, in EntryChainInput, outcome, code, reason string, features map[string]any) {
 	if worker == nil || worker.db == nil {
 		return

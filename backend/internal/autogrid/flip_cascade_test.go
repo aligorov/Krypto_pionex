@@ -233,6 +233,108 @@ func TestDgtChainLossBudget_Integration(t *testing.T) {
 	}
 }
 
+// ── v2.0.142 (audit P2b): the stress-CEILING gate on DGT re-centers ────────
+//
+// TestDgtRedeployStressCeiling_Integration pins the ceiling half of the
+// v2.0.139 floor/ceiling pair the re-center arms were missing: a LONG
+// replacement whose full adverse traverse to the anti-hunt stop overflows
+// tranche2MaxLossCap(slotBudget, botLev) must be refused BEFORE any exchange
+// create — noteDgtSkip's DGT_REDEPLOY_SKIPPED event carries the deploy
+// gates' стресс-инвентарь reason. Geometry forcing is deterministic by
+// construction: leverage pinned to 2 (ceiling = 250×2×5%×1.25 = $31.25) and
+// the closed bot's model_state atrPctEntry 5.0 (the intent scan's
+// atrFallback) drives the stub span to the 25% clamp, so the LONG traverse
+// — full 250×2 notional from entry to a stop ≥1.5×5% below the mesh floor —
+// prices ≥$37.50 whatever the HAR layer does to the bounds.
+func TestDgtRedeployStressCeiling_Integration(t *testing.T) {
+	ctx := context.Background()
+	h := newRealDeployHarness(t, 10, "BTC_USDT_PERP")
+	pool := h.pool
+	h.cleanupSymbol(t, "BTC_USDT_PERP")
+	clearCascadeWindow(t, pool)
+
+	// Pin the ceiling small: tranche2MaxLossCap(250, 2) = $31.25 (the
+	// test-side twin of the F1 precedent — a cap-formula change fails here,
+	// not silently in production).
+	if _, err := pool.Exec(ctx, `
+		UPDATE autogrid_settings SET leverage = 2 WHERE id = $1
+	`, h.settings.ID); err != nil {
+		t.Fatalf("pin leverage: %v", err)
+	}
+	reloaded, err := h.service.GetSettings(ctx)
+	if err != nil {
+		t.Fatalf("reload settings: %v", err)
+	}
+	settings := *reloaded
+	settings.StopForecastMode = "ACTIVE"
+	settings.DgtRedeployEnabled = true
+	capPinned := tranche2MaxLossCap(d("250"), 2)
+	if !capPinned.Equal(d("31.25")) {
+		t.Fatalf("pinned ceiling must be $31.25 for the $250 slot at 2x, got %s", capPinned.String())
+	}
+
+	// The closed bot: a settled LONG break whose intent carries a high ATR
+	// fallback (model_state atrPctEntry — the exact field
+	// processDgtRealRedeployIntents reads) and the $250 tranche base.
+	const botNumber = 974
+	botID := insertEmergencyRealBot(t, pool, h.account.ID, settings.ID, botNumber)
+	if _, err := pool.Exec(ctx, `
+		UPDATE grid_bots
+		SET status = 'STOPPED', direction = 'LONG',
+		    closed_reason = 'RANGE_BREAK_DOWN',
+		    closed_at = NOW(), updated_at = NOW(),
+		    model_state = jsonb_build_object(
+		        'atrPctEntry', 5.0::FLOAT8,
+		        'trancheBase', '250',
+		        'dgtBreakPrice', '100')
+		WHERE id = $1
+	`, botID); err != nil {
+		t.Fatalf("settle break bot: %v", err)
+	}
+
+	// The microstructure gates must PASS so the stress ceiling is the
+	// deciding blocker: fresh NEUTRAL flow, no emergency-exit flag.
+	seedNeutralMicrostructure(t, h.worker, "BTC_USDT_PERP")
+
+	spec := dgtRedeploySpec{
+		symbol:       "BTC_USDT_PERP",
+		direction:    "LONG",
+		breakPrice:   d("100"),
+		slotBudget:   d("250"),
+		oldBotID:     botID,
+		oldBotNumber: botNumber,
+		atrFallback:  5.0,
+		accountID:    h.account.ID,
+	}
+
+	if h.worker.dgtRedeployReal(ctx, settings, spec) {
+		t.Fatal("an over-ceiling replacement geometry must not deploy")
+	}
+	var skipReason string
+	err = pool.QueryRow(ctx, `
+		SELECT details->>'reason' FROM bot_execution_events
+		WHERE bot_id = $1 AND event_type = 'DGT_REDEPLOY_SKIPPED'
+		ORDER BY created_at DESC LIMIT 1
+	`, botID).Scan(&skipReason)
+	if err != nil {
+		t.Fatalf("DGT_REDEPLOY_SKIPPED event missing: %v", err)
+	}
+	if !strings.Contains(skipReason, "стресс-инвентарь") {
+		t.Fatalf("expected the stress-inventory skip reason, got %q", skipReason)
+	}
+	if calls := h.mock.createCalls.Load(); calls != 0 {
+		t.Fatalf("stress-blocked re-deploy must not reach the exchange, got %d calls", calls)
+	}
+	var running int
+	if err := pool.QueryRow(ctx, `
+		SELECT COUNT(*) FROM grid_bots
+		WHERE account_id = $1 AND symbol = $2
+		  AND status IN ('PENDING_SUBMISSION', 'SUBMISSION_UNKNOWN', 'RUNNING', 'STOP_REQUESTED', 'STOPPING')
+	`, h.account.ID, "BTC_USDT_PERP").Scan(&running); err != nil || running != 0 {
+		t.Fatalf("stress-blocked re-deploy must leave no live row, got %d (err %v)", running, err)
+	}
+}
+
 // ── helpers ────────────────────────────────────────────────────────────────
 
 // runEmergencyExitUnderDump drives radarMicrostructureEmergencyExit the exact

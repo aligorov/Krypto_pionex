@@ -2197,6 +2197,16 @@ func (s *Service) AdjustBot(
 		if err != nil {
 			return "", fmt.Errorf("persist adjustment: %w", err)
 		}
+		// v2.0.142 (audit P3-3): ALLOW row on the manual invest_in success —
+		// the journal's "every path" contract (0052) saw only rejections here.
+		if input.Mode == "invest_in" {
+			journalEntryDecisionSvc(ctx, s.db, EntryChainInput{
+				Path: EntryPathInvestIn, Settings: Settings{ID: settingsID},
+				Symbol: botSymbol, Direction: botDirection, Fleet: "REAL", RefID: botID,
+			}, entryOutcomeAllow, "INVEST",
+				fmt.Sprintf("invest_in +%s USDT", input.QuoteInvestment.StringFixed(2)),
+				map[string]any{"added_usdt": input.QuoteInvestment.String()})
+		}
 		return "REAL", nil
 	}
 	if input.Mode == "adjust_params" {

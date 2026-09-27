@@ -622,8 +622,12 @@ func (worker *Worker) dgtMaybeFlipToCascadeShort(ctx context.Context, settings S
 	// vanish from entry_decisions analytics), and hand the slot to the
 	// scanner's cascade-short lane.
 	worker.markDgtRealIntentDone(ctx, spec.oldBotID, "flip_short")
+	// v2.0.142 (audit P3-2): Settings rides along so the journal row's
+	// config_version is derived from the real settings row — the input used
+	// to carry no SettingsID, and every flip decision journaled as
+	// "cv-unknown", invisible to config-drift analytics.
 	journalEntryDecisionSvc(ctx, worker.db, EntryChainInput{
-		Path: EntryPathDGTReal, Fleet: "REAL", Symbol: spec.symbol,
+		Path: EntryPathDGTReal, Settings: settings, Fleet: "REAL", Symbol: spec.symbol,
 		Direction: "SHORT", RefID: fmt.Sprintf("#%d", spec.oldBotNumber),
 	}, entryOutcomeWait, "DIRECTION_FLIP",
 		"слот уходит сканеру под cascade-short: NEUTRAL закрыт по "+closedReason+", дамп подтверждён, каскад активен",
@@ -811,11 +815,28 @@ func (worker *Worker) dgtRedeployPaper(ctx context.Context, settings Settings, s
 	// v2.0.139 (review P2-4): the re-center runs the SAME stress floor as a
 	// fresh deploy — a RANGE_BREAK replacement must not carry an unfloored
 	// stop both deploy gates would have refused.
-	target, maxLoss, _ := computeBotTargetsWithStress(settings, stub, botLev, meshSpanPct, stressGeometry{
+	target, maxLoss, stress := computeBotTargetsWithStress(settings, stub, botLev, meshSpanPct, stressGeometry{
 		direction: spec.direction, entry: spec.breakPrice,
 		lower: mesh.LowerPrice, upper: mesh.UpperPrice, stop: antiHuntStop,
 		gridNum: mesh.GridNum, invest: spec.slotBudget,
 	})
+	// v2.0.142 (audit P2b): ...and the SAME ceiling. The floor keeps the
+	// stored stop honest, but a replacement geometry whose full-traverse
+	// loss overflows the tranche-2 effective-stop ceiling (dynamic stop
+	// ceiling × breakerHeadroom, derived from the closed bot's OWN slot
+	// budget — not today's fleet budget) is not budget-sized at all: it
+	// deploys and then has its top-up structurally refused forever, the
+	// exact v2.0.139-deploy-gate class the deploy arms reject. FIXED-mode
+	// targets are exempt — the operator set the stop deliberately.
+	if settings.PnLTargetMode != "FIXED" {
+		stressCeiling := tranche2MaxLossCap(spec.slotBudget, botLev)
+		if stress.loss.GreaterThan(stressCeiling) {
+			worker.noteDgtSkip(ctx, spec, "PAPER", fmt.Sprintf(
+				"стресс-инвентарь: полный проход сетки до стопа $%s превышает допустимый убыток $%s — геометрия концентрирует риск больше бюджета",
+				stress.loss.StringFixed(2), stressCeiling.StringFixed(2)))
+			return false
+		}
+	}
 	if trancheOn {
 		// Half capital → half target and half max loss for tranche 1 (the
 		// manage loop's top-up doubles them back — the deploy contract).
@@ -1005,11 +1026,26 @@ func (worker *Worker) dgtRedeployReal(ctx context.Context, settings Settings, sp
 	}
 	// v2.0.139 (review P2-4): REAL re-centers carry the same stress floor as
 	// fresh deploys — no unfloored replacement stops out of the break lane.
-	botTarget, botMaxLoss, _ := computeBotTargetsWithStress(settings, stub, botLev, meshSpanPct, stressGeometry{
+	botTarget, botMaxLoss, stress := computeBotTargetsWithStress(settings, stub, botLev, meshSpanPct, stressGeometry{
 		direction: spec.direction, entry: spec.breakPrice,
 		lower: lowerPrice, upper: upperPrice, stop: antiHuntStop,
 		gridNum: mesh.GridNum, invest: spec.slotBudget,
 	})
+	// v2.0.142 (audit P2b): ...and the same CEILING (paper twin's comment):
+	// a replacement geometry whose full-traverse loss overflows the
+	// tranche-2 effective-stop ceiling would deploy here and then have its
+	// top-up structurally refused forever — refuse BEFORE a grid row, a
+	// create fee or a native stop is ever submitted. FIXED-mode targets are
+	// exempt — the operator set the stop deliberately.
+	if settings.PnLTargetMode != "FIXED" {
+		stressCeiling := tranche2MaxLossCap(spec.slotBudget, botLev)
+		if stress.loss.GreaterThan(stressCeiling) {
+			worker.noteDgtSkip(ctx, spec, "REAL", fmt.Sprintf(
+				"стресс-инвентарь: полный проход сетки до стопа $%s превышает допустимый убыток $%s — геометрия концентрирует риск больше бюджета",
+				stress.loss.StringFixed(2), stressCeiling.StringFixed(2)))
+			return false
+		}
+	}
 	if trancheOn {
 		if botTarget != nil {
 			half := botTarget.Div(decimal.NewFromInt(2))

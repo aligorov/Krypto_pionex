@@ -339,6 +339,25 @@ func (h *gridLifecyclePaperHarness) seedPaperBot(
 	return botID
 }
 
+// seedDgtAtrFixture pins the closed bot's deploy-time ATR (model_state
+// atrPctEntry — the exact field both DGT re-deploy arms read as the geometry
+// fallback) to a calm 0.8%/bar. v2.0.142 precedent of the v2.0.139 fixture
+// narrowing: the re-center arms now run the deploy gates' stress CEILING
+// (tranche2MaxLossCap = $25 for this $200 slot at 2x), and the old
+// atr-less default (2.0%/bar → 12% span) priced a $36.40 SHORT/LONG
+// traverse the gate correctly refuses; 0.8% prices ~$14.80 — the re-center
+// these tests pin stays admissible.
+func seedDgtAtrFixture(t *testing.T, pool *pgxpool.Pool, table, botID string) {
+	t.Helper()
+	if _, err := pool.Exec(context.Background(), fmt.Sprintf(`
+		UPDATE %s
+		SET model_state = COALESCE(model_state, '{}'::jsonb) || jsonb_build_object('atrPctEntry', 0.8::FLOAT8)
+		WHERE id = $1
+	`, table), botID); err != nil {
+		t.Fatalf("seed DGT atr fixture on %s: %v", table, err)
+	}
+}
+
 // TestPaperDgtRedeploysOnUpBreak pins the paper arm of FIX-1: a SHORT bot
 // whose range breaks UP with the shift budget exhausted closes with
 // RANGE_BREAK_UP AND a fresh RUNNING grid appears in the SAME manage pass —
@@ -349,6 +368,7 @@ func TestPaperDgtRedeploysOnUpBreak(t *testing.T) {
 	h := newGridLifecyclePaperHarness(t, map[string]string{symbol: "130"})
 	h.patchSettings(t, "dgt_redeploy_enabled = TRUE, tranche_deploy_enabled = FALSE")
 	seeded := h.seedPaperBot(t, symbol, "SHORT", 3, "0 minutes")
+	seedDgtAtrFixture(t, h.pool, "paper_grid_bots", seeded)
 
 	if err := h.worker.managePaperBots(context.Background(), h.reloadSettings(t)); err != nil {
 		t.Fatalf("managePaperBots: %v", err)
@@ -418,6 +438,7 @@ func TestPaperDgtRedeploysOnDownBreak(t *testing.T) {
 	h := newGridLifecyclePaperHarness(t, map[string]string{symbol: "70"})
 	h.patchSettings(t, "dgt_redeploy_enabled = TRUE, tranche_deploy_enabled = FALSE")
 	seeded := h.seedPaperBot(t, symbol, "LONG", 3, "0 minutes")
+	seedDgtAtrFixture(t, h.pool, "paper_grid_bots", seeded)
 
 	if err := h.worker.managePaperBots(context.Background(), h.reloadSettings(t)); err != nil {
 		t.Fatalf("managePaperBots: %v", err)
@@ -693,6 +714,7 @@ func TestRealDgtRedeploysAfterTerminalSettle(t *testing.T) {
 	h.enableRealExecution(t)
 	h.patchSettings(t, "dgt_redeploy_enabled = TRUE, tranche_deploy_enabled = FALSE")
 	parent := h.seedRealBot(t, symbol, "SHORT", 3, "2 hours")
+	seedDgtAtrFixture(t, h.pool, "grid_bots", parent)
 	ctx := context.Background()
 
 	// Pass one: RUNNING remotely, price 130 breaks the [90,110] range up,
