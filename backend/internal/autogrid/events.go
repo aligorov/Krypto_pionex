@@ -179,11 +179,19 @@ func QueueTelegramEvent(
 		shouldSend = notifyAdjust
 		tmpl = "🛡 <b>Стоп-радар:</b> бот #{{bot_number}} {{symbol}} — band {{band}} (score {{score}}), total {{total}}"
 	case "DGT_REDEPLOY":
-		// v2.0.89 part B: the DGT break re-start fired — the grid follows
-		// the market (arXiv 2506.11921). Rides the bot-created channel: a
+		// v2.0.89 part B: the DGT break re-start fired — the grid follows the
+		// market (arXiv 2506.11921). Rides the bot-created channel: a
 		// new bot exists on the fleet.
 		shouldSend = notifyCreated
 		tmpl = "🔄 <b>DGT: пробой — сетка перезапущена центром {{center_price}}</b>, символ {{symbol}} (бот #{{bot_number}}, бюджет {{budget}} USDT, диапазон [{{lower_price}}, {{upper_price}}])"
+	case "DIRECTION_FLIP":
+		// v2.0.140 (package E): the first direction-flip experiment — a
+		// NEUTRAL slot that died on a confirmed DOWN-side break mid-cascade
+		// does not re-center into the same knife; the scanner's SHORT-cascade
+		// lane takes the slot. The adjust channel carries it: this is a
+		// routing decision over the closed bot, not a new bot.
+		shouldSend = notifyAdjust
+		tmpl = "🔁 <b>Флип направления (E):</b> бот #{{bot_number}} {{symbol}} — NEUTRAL закрыт по {{trigger}}, дамп подтверждён ({{ofi_regime}}), каскад ликвидаций {{cascade_usd}}/ч — слот уходит сканеру под SHORT-каскад"
 	case "GRID_AGED_HALF_LIFE":
 		// v2.0.89 part B: the OU half-life rotation — the fitted range
 		// statistically decayed; the slot returns to the scanner. A planned

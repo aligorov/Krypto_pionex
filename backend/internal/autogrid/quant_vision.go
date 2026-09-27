@@ -188,7 +188,18 @@ func (worker *Worker) directionalConfirmedByPriceAction(ctx context.Context, sym
 
 // calculateFleetNetDelta sums the total directional delta (USDT notional) across
 // all active running grid bots to prevent over-concentrated directional exposure.
-func (worker *Worker) calculateFleetNetDelta(ctx context.Context, settingsID string, paper bool) (decimal.Decimal, error) {
+//
+// v2.0.140: the second return value is the NEUTRAL park — the sum of
+// ½×invest×leverage across the fleet's RUNNING, UN-shifted NEUTRAL bots.
+// The audit hole: an un-shifted NEUTRAL contributed exactly ZERO to net
+// delta, so an 8-bot NEUTRAL alt fleet was an invisible shared short-vol
+// bet — every one of those grids loads up to ~half its notional of adverse
+// inventory in the SAME market-wide move. The park is direction-agnostic
+// (ABS, no sign): the callers charge it against whichever side the
+// candidate is about to expose. A SHIFTED neutral does not add park — its
+// live inventory is already in the delta through shiftPosition×mark, and
+// stacking the park on top would double-count that bot.
+func (worker *Worker) calculateFleetNetDelta(ctx context.Context, settingsID string, paper bool) (decimal.Decimal, decimal.Decimal, error) {
 	var query string
 	if paper {
 		query = `
@@ -210,11 +221,12 @@ func (worker *Worker) calculateFleetNetDelta(ctx context.Context, settingsID str
 
 	rows, err := worker.db.Query(ctx, query, settingsID)
 	if err != nil {
-		return decimal.Zero, err
+		return decimal.Zero, decimal.Zero, err
 	}
 	defer rows.Close()
 
 	totalDelta := decimal.Zero
+	neutralParkHalfNotional := decimal.Zero
 	for rows.Next() {
 		var direction string
 		var investment, shiftPos, markPrice decimal.Decimal
@@ -236,12 +248,18 @@ func (worker *Worker) calculateFleetNetDelta(ctx context.Context, settingsID str
 				botDelta = investment.Mul(decimal.NewFromInt(int64(leverage)))
 			} else if dir == "SHORT" {
 				botDelta = investment.Mul(decimal.NewFromInt(int64(leverage))).Neg()
+			} else if dir == "NEUTRAL" {
+				// v2.0.140 park load: at boundary this grid holds ~half its
+				// notional of one-sided inventory — worst-case adverse load
+				// the cap must be able to see while the bot is still flat.
+				neutralParkHalfNotional = neutralParkHalfNotional.Add(
+					investment.Mul(decimal.NewFromInt(int64(leverage))).Div(decimal.NewFromInt(2)))
 			}
 		}
 		totalDelta = totalDelta.Add(botDelta)
 	}
 
-	return totalDelta, nil
+	return totalDelta, neutralParkHalfNotional, nil
 }
 
 // checkOrderBookCushion queries the L2 depth and evaluates whether the order book

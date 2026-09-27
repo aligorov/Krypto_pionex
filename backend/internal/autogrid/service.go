@@ -2110,6 +2110,19 @@ func (s *Service) AdjustBot(
 			if err := s.risk.ValidateGridTopUp(ctx, *accountID, botSymbol, botLeverage, input.QuoteInvestment); err != nil {
 				return "", fmt.Errorf("invest_in rejected by risk engine: %w", err)
 			}
+			// v2.0.140 margin reserve: a top-up IS the doubling — the pour
+			// adds its full amount to the committed isolated margin, so
+			// trancheOn is false by construction (no second slot is
+			// scheduled behind it). Fail-open only while the account has no
+			// equity snapshot at all.
+			if code, reserveReason := marginReserveBlocker(ctx, s.db, *accountID, input.QuoteInvestment, false); code != "" {
+				investIn := EntryChainInput{
+					Path: EntryPathInvestIn, Settings: Settings{ID: settingsID},
+					Symbol: botSymbol, Direction: botDirection, Fleet: "REAL", RefID: botID,
+				}
+				journalEntryDecisionSvc(ctx, s.db, investIn, entryOutcomeReject, code, reserveReason, nil)
+				return "", errors.New(reserveReason)
+			}
 		}
 		client, err := s.PrivateClient(ctx, accountService, *accountID)
 		if err != nil {
@@ -2686,6 +2699,15 @@ func (s *Service) DeployManualBot(
 	}
 	if err := s.risk.ValidateNewGrid(ctx, *accountID, input.Symbol, leverage, investment); err != nil {
 		return nil, "", err
+	}
+	// v2.0.140 margin reserve: the manual lane must clear the same free-
+	// margin reserve the scanner clears — a hand deploy could otherwise
+	// spend the last free USDT the autopilot's own reserve keeps. Manual
+	// bots carry no tranche contract, so the slot commits single (the
+	// envelope gate below relies on the same property).
+	if code, reserveReason := marginReserveBlocker(ctx, s.db, *accountID, investment, false); code != "" {
+		journalEntryDecisionSvc(ctx, s.db, manualEntryIn, entryOutcomeReject, code, reserveReason, nil)
+		return nil, "", errors.New(reserveReason)
 	}
 	client, err := s.PrivateClient(ctx, accountService, *accountID)
 	if err != nil {

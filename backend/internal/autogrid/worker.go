@@ -1285,7 +1285,16 @@ func (worker *Worker) deployPaper(
 		`, settings.ID, candidate.Symbol).Scan(&protectiveCloses, &lastProtectiveAt); err == nil &&
 			protectiveCloses > 0 && lastProtectiveAt != nil {
 			window := time.Duration(cooldownHours(protectiveCloses)) * time.Hour
-			if time.Since(*lastProtectiveAt) < window {
+			if time.Since(*lastProtectiveAt) < window &&
+				// v2.0.140 (review P1-1): the cascade-short lane is exempt
+				// when the cooldown is armed SOLELY by the flip family — the
+				// SHORT is the designed harvest of the exact tape that
+				// closed the NEUTRAL, and the flip budget (1/24h) is the
+				// binding anti-saw guard. Without this the flip experiment
+				// can never re-enter its own symbol (its triggers arm a 2h+
+				// cooldown the cascade lane did not bypass).
+				!(cascadeShort && strings.EqualFold(strings.TrimSpace(candidate.RecommendedTrend), "short") &&
+					worker.cascadeFlipCooldownExemptPaper(ctx, settings.ID, candidate.Symbol)) {
 				worker.rejectCandidate(ctx, candidate,
 					fmt.Sprintf("cooldown: %d защитных закрытий за 24ч, окно %s с последнего — повторный вход отложен",
 						protectiveCloses, window), nil)
@@ -1610,15 +1619,33 @@ func (worker *Worker) deployPaper(
 			candidateDelta = settings.BudgetUSDT.Mul(decimal.NewFromInt(int64(botLev))).Neg()
 		}
 		if settings.FleetMaxNetDeltaUSDT.IsPositive() && !candidateDelta.IsZero() {
-			fleetDelta, err := worker.calculateFleetNetDelta(ctx, settings.ID, true)
-			if err == nil {
-				projectedDelta := fleetDelta.Add(candidateDelta).Abs()
-				if projectedDelta.GreaterThan(settings.FleetMaxNetDeltaUSDT) {
-					worker.rejectCandidate(ctx, candidate,
-						fmt.Sprintf("Fleet net delta cap: текущая дельта $%s + кандидат $%s превысит лимит $%s — пауза направленного входа для защиты портфеля",
-							fleetDelta.StringFixed(2), candidateDelta.StringFixed(2), settings.FleetMaxNetDeltaUSDT.StringFixed(2)), nil)
-					continue
-				}
+			fleetDelta, neutralPark, err := worker.calculateFleetNetDelta(ctx, settings.ID, true)
+			if err != nil {
+				// v2.0.140 fail-closed parity: paper used to wave the
+				// candidate through on a delta read error while REAL rejected
+				// it — the sandbox drifted from the capital path exactly when
+				// the DB was flakiest.
+				worker.rejectCandidate(ctx, candidate,
+					fmt.Sprintf("флот-дельта недоступна (fail-closed): %v — деплой отложен для защиты портфеля", err), nil)
+				continue
+			}
+			// v2.0.140 NEUTRAL park: the fleet's un-shifted NEUTRAL grids
+			// carry zero net delta but ½×invest×lev of POTENTIAL adverse
+			// inventory each — a market-wide move loads them all onto the
+			// SAME side the candidate is about to expose. Charge the park
+			// against the candidate's direction (+ for LONG, − for SHORT).
+			projectedDelta := fleetDelta.Add(candidateDelta)
+			if trend == "short" {
+				projectedDelta = projectedDelta.Sub(neutralPark)
+			} else {
+				projectedDelta = projectedDelta.Add(neutralPark)
+			}
+			projectedDelta = projectedDelta.Abs()
+			if projectedDelta.GreaterThan(settings.FleetMaxNetDeltaUSDT) {
+				worker.rejectCandidate(ctx, candidate,
+					fmt.Sprintf("Fleet net delta cap: текущая дельта $%s + парк нейтральных $%s + кандидат $%s превысит лимит $%s — пауза направленного входа для защиты портфеля",
+						fleetDelta.StringFixed(2), neutralPark.StringFixed(2), candidateDelta.StringFixed(2), settings.FleetMaxNetDeltaUSDT.StringFixed(2)), nil)
+				continue
 			}
 		}
 
@@ -1967,6 +1994,74 @@ func (worker *Worker) revalidateCandidateTrend(
 	return true, freshTrend
 }
 
+// marginReserveBlocker enforces the v2.0.140 free-margin reserve: projected
+// committed isolated margin (Σ active REAL quote_investment + this deploy's
+// full slot, including its planned tranche-2 doubling when tranches are on)
+// must leave ≥30% of the last recorded equity free. Built from our own DB
+// (wallet + Σ isolated investments) because the account API is structurally
+// blind to isolated grid margin (equity.go ISOLATED note) — the reserve
+// cannot be read off any account endpoint, only derived.
+//
+// Fail-open applies ONLY to an account with no equity snapshot at all: the
+// snapshot lane bootstraps within 5 minutes of start, and blocking every
+// deploy of a fresh install before the first snapshot lands would deadlock
+// the fleet on its own gate. Once a snapshot exists it is enforced as-is
+// (any age) — stale equity is still the last known truth, not permission.
+// Any read error other than "missing" is fail-closed: a broken equity read
+// must not degrade into an unbounded commitment.
+func marginReserveBlocker(
+	ctx context.Context,
+	db *pgxpool.Pool,
+	accountID string,
+	addCommitment decimal.Decimal,
+	trancheOn bool,
+) (code, reason string) {
+	var equity decimal.Decimal
+	err := db.QueryRow(ctx, `
+		SELECT equity_usdt FROM account_equity_snapshots
+		WHERE account_id = $1
+		ORDER BY captured_at DESC LIMIT 1
+	`, accountID).Scan(&equity)
+	if errors.Is(err, pgx.ErrNoRows) {
+		// No equity truth yet — the snapshot lane bootstraps within 5
+		// minutes of start; refusing deploys before that would deadlock a
+		// fresh install on its own gate.
+		return "", ""
+	}
+	if err != nil {
+		return "MARGIN_RESERVE", fmt.Sprintf(
+			"резерв маржи: чтение снапшота equity не удалось (fail-closed): %v", err)
+	}
+
+	var activeCommitted decimal.Decimal
+	if err := db.QueryRow(ctx, `
+		SELECT COALESCE(SUM(quote_investment), 0)
+		FROM grid_bots
+		WHERE account_id = $1
+		  AND status IN ('PENDING_SUBMISSION', 'SUBMISSION_UNKNOWN', 'RUNNING',
+		                 'STOP_REQUESTED', 'STOPPING')
+	`, accountID).Scan(&activeCommitted); err != nil {
+		return "MARGIN_RESERVE", fmt.Sprintf(
+			"резерв маржи: сумма активных изолированных позиций не читается (fail-closed): %v", err)
+	}
+
+	// The slot commits its FULL budget: with tranches on, tranche-2's top-up
+	// is contractually scheduled (24h time-box), so the doubling is reserved
+	// up front — mirroring the stop envelope's full-stop reservation.
+	slots := decimal.NewFromInt(1)
+	if trancheOn {
+		slots = decimal.NewFromInt(2)
+	}
+	projected := activeCommitted.Add(addCommitment.Mul(slots))
+	ceiling := equity.Mul(decimal.NewFromFloat(0.70))
+	if projected.GreaterThan(ceiling) {
+		return "MARGIN_RESERVE", fmt.Sprintf(
+			"резерв маржи: projected $%s при equity $%s оставляет <30%% свободных — вход отложен",
+			projected.StringFixed(2), equity.StringFixed(2))
+	}
+	return "", ""
+}
+
 func (worker *Worker) deployReal(
 	ctx context.Context,
 	settings Settings,
@@ -2266,7 +2361,11 @@ func (worker *Worker) deployReal(
 		`, *settings.AccountID, candidate.Symbol).Scan(&protectiveCloses, &lastProtectiveAt); err == nil &&
 			protectiveCloses > 0 && lastProtectiveAt != nil {
 			window := time.Duration(cooldownHours(protectiveCloses)) * time.Hour
-			if time.Since(*lastProtectiveAt) < window {
+			if time.Since(*lastProtectiveAt) < window &&
+				// v2.0.140 (review P1-1): cascade-short flip exemption, REAL
+				// mirror of the paper gate — see the paper-site comment.
+				!(cascadeShort && strings.EqualFold(strings.TrimSpace(candidate.RecommendedTrend), "short") &&
+					worker.cascadeFlipCooldownExemptReal(ctx, *settings.AccountID, candidate.Symbol)) {
 				worker.rejectCandidate(ctx, candidate,
 					fmt.Sprintf("cooldown: %d защитных закрытий за 24ч, окно %s с последнего — повторный вход отложен",
 						protectiveCloses, window), nil)
@@ -2547,17 +2646,31 @@ func (worker *Worker) deployReal(
 			candidateDelta = settings.BudgetUSDT.Mul(decimal.NewFromInt(int64(botLev))).Div(decimal.NewFromInt(2))
 		}
 		if settings.FleetMaxNetDeltaUSDT.IsPositive() && !candidateDelta.IsZero() {
-			fleetDelta, err := worker.calculateFleetNetDelta(ctx, settings.ID, false)
+			fleetDelta, neutralPark, err := worker.calculateFleetNetDelta(ctx, settings.ID, false)
 			if err != nil {
 				worker.rejectCandidate(ctx, candidate,
 					fmt.Sprintf("Fleet net delta error: %v — деплой отложен для защиты портфеля (fail-closed)", err), nil)
 				continue
 			}
-			projectedDelta := fleetDelta.Add(candidateDelta).Abs()
+			// v2.0.140 NEUTRAL park: the fleet's un-shifted NEUTRAL grids
+			// carry zero net delta but a shared worst-case inventory load
+			// (paper twin's comment). Directional candidates charge the park
+			// against their own side; a NEUTRAL candidate keeps its ½-notional
+			// pre-charge above and adds the fleet park on top of |D| — the
+			// park is adverse on EITHER side of a market-wide move.
+			projectedDelta := fleetDelta.Add(candidateDelta)
+			if trend == "short" {
+				projectedDelta = projectedDelta.Sub(neutralPark)
+			} else if trend == "long" {
+				projectedDelta = projectedDelta.Add(neutralPark)
+			} else {
+				projectedDelta = projectedDelta.Abs().Add(neutralPark)
+			}
+			projectedDelta = projectedDelta.Abs()
 			if projectedDelta.GreaterThan(settings.FleetMaxNetDeltaUSDT) {
 				worker.rejectCandidate(ctx, candidate,
-					fmt.Sprintf("Fleet net delta cap: текущая дельта $%s + кандидат $%s превысит лимит $%s — пауза входа для защиты портфеля",
-						fleetDelta.StringFixed(2), candidateDelta.StringFixed(2), settings.FleetMaxNetDeltaUSDT.StringFixed(2)), nil)
+					fmt.Sprintf("Fleet net delta cap: текущая дельта $%s + парк нейтральных $%s + кандидат $%s превысит лимит $%s — пауза входа для защиты портфеля",
+						fleetDelta.StringFixed(2), neutralPark.StringFixed(2), candidateDelta.StringFixed(2), settings.FleetMaxNetDeltaUSDT.StringFixed(2)), nil)
 				continue
 			}
 		}
@@ -2604,6 +2717,21 @@ func (worker *Worker) deployReal(
 				Path: EntryPathScannerReal, Settings: settings, Symbol: candidate.Symbol,
 				Direction: entryDirectionFromTrend(trend), Fleet: "REAL", RefID: candidate.ID,
 			}, entryOutcomeReject, "RISK_ENGINE", "risk engine: "+err.Error(), nil)
+			continue
+		}
+		// v2.0.140 margin reserve: insufficient free margin used to surface
+		// only as an exchange rejection AFTER the create fee conversation
+		// started. The reserve is derived from our own equity snapshots
+		// (wallet + Σ isolated investments) — the account API cannot see
+		// isolated grid margin. The full slot (tranche doubling included)
+		// must leave ≥30% of the recorded equity free.
+		if code, reserveReason := marginReserveBlocker(ctx, worker.db, *settings.AccountID, settings.BudgetUSDT, settings.TrancheDeployEnabled); code != "" {
+			deployErrors = append(deployErrors, fmt.Sprintf("%s: %s", candidate.Symbol, reserveReason))
+			worker.rejectCandidate(ctx, candidate, reserveReason, nil)
+			worker.journalEntryDecision(ctx, EntryChainInput{
+				Path: EntryPathScannerReal, Settings: settings, Symbol: candidate.Symbol,
+				Direction: entryDirectionFromTrend(trend), Fleet: "REAL", RefID: candidate.ID,
+			}, entryOutcomeReject, code, reserveReason, nil)
 			continue
 		}
 		base, quote, err := SplitPionexPerp(candidate.Symbol)

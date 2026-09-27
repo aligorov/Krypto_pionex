@@ -57,6 +57,20 @@ const (
 	// follower.
 	dgtRedeployMaxPerSymbolPer24h = 6
 
+	// dgtFlipEvent (v2.0.140 package E) is the durable/telegram event type of
+	// the first direction-flip experiment: a NEUTRAL slot that died on a
+	// DOWN-side break hands the slot to the scanner's cascade-short lane
+	// instead of re-centering into the same knife.
+	dgtFlipEvent = "DIRECTION_FLIP"
+	// dgtFlipMaxPerSymbolPer24h is the experiment's own budget: ONE flip per
+	// symbol per 24h (the ladder query pattern, tighter) — a first experiment
+	// must be audible, never self-amplifying.
+	dgtFlipMaxPerSymbolPer24h = 1
+	// dgtFlipCascadeThresholdUSD mirrors the cascade detector threshold of
+	// maybeQueueCascadeShortScan/scheduleDueScan: the flip hands the slot to
+	// exactly that lane, so the same knife defines it.
+	dgtFlipCascadeThresholdUSD = 50_000_000.0
+
 	// gridAgedHalfLifeReason is the close reason (and event type) of the OU
 	// half-life rotation. It is listed in protectiveCloseExemptReasons: a
 	// planned thesis-expiry exit must neither arm the per-symbol cooldown
@@ -346,6 +360,34 @@ func (worker *Worker) dgtSharedGateBlockers(ctx context.Context, settings Settin
 		return fmt.Sprintf("DGT-лестница: %d редеплоев за 24ч (потолок %d) — слот уходит сканеру",
 			ladder, dgtRedeployMaxPerSymbolPer24h), "DGT_LADDER_CAP"
 	}
+	// v2.0.140 (package F): the ladder counted EVENTS, not LOSSES — a slot
+	// bleeding through 6 cheap breaks stayed eligible while its chain bled
+	// real dollars. The chain budget caps the cumulative 24h realized loss of
+	// the symbol's break-family closes at 2× the slot's designed stop
+	// ceiling (the same tranche2MaxLossCap bound the top-up honors); only
+	// the negative part counts — a profitable break chain must never block
+	// itself. REAL arm only (paper learns, never blocks on REAL losses —
+	// review P2-1); rows without a landed final contribute −max_loss (the
+	// freshest loss must be visible at decision time, review P2-3).
+	if spec.accountID != "" {
+		var chainSum float64
+		if err := worker.db.QueryRow(ctx, `
+			SELECT COALESCE(SUM(COALESCE(realized_pnl_usdt, -COALESCE(max_loss_usdt, 0), 0)), 0)::float8
+			FROM grid_bots
+			WHERE account_id = $1 AND symbol = $2
+			  AND status IN ('STOPPED', 'COMPLETED', 'LIQUIDATED')
+			  AND COALESCE(closed_reason, '') IN (`+dgtBreakReasonSQL+`)
+			  AND COALESCE(closed_at, updated_at) > NOW() - INTERVAL '24 hours'
+		`, spec.accountID, spec.symbol).Scan(&chainSum); err == nil && chainSum < 0 {
+			chainLoss := decimal.NewFromFloat(-chainSum)
+			chainBudget := tranche2MaxLossCap(spec.slotBudget, settings.Leverage).
+				Mul(decimal.NewFromInt(2))
+			if chainLoss.GreaterThan(chainBudget) {
+				return fmt.Sprintf("цепочка прорывов: −$%s убытка по символу за 24ч превышает бюджет цепочки $%s — слот остаётся сканеру",
+					chainLoss.Round(2).String(), chainBudget.Round(2).String()), "CHAIN_LOSS_BUDGET"
+			}
+		}
+	}
 	// Slot budget: the closing bot's own seat must actually be free (paper
 	// settles synchronously above; a REAL row may still sit in
 	// STOP_REQUESTED, which the deploy count includes — exclude it, it is
@@ -527,6 +569,90 @@ func (worker *Worker) markDgtRealIntentDone(ctx context.Context, botID, outcome 
 	`, botID, outcome)
 }
 
+// dgtMaybeFlipToCascadeShort (v2.0.140 package E) is the first
+// direction-flip experiment — the ONE opposite-direction lane the codebase
+// already endorses. When a NEUTRAL bot died on a DOWN-side break
+// (EMERGENCY_OFI_DUMP or RANGE_BREAK_DOWN) and at settle time the dump is
+// STILL confirmed while a long-liquidation cascade runs, the slot flips to
+// the scanner with cascadeShort semantics instead of re-centering a NEUTRAL
+// into the same knife. Flip is optional by construction: every scanner
+// admission gate then judges the SHORT (F9/R1/Vision cascade exemptions
+// already exist for it); any gate failure leaves the slot flat.
+//
+// Returns true when the flip fired (the intent is consumed and the caller
+// must continue to the next intent). When the conditions only partially
+// hold — no live engine, regime decayed, budget spent, cascade over — the
+// normal same-direction path runs unchanged, including its OFI re-entry
+// gates which already block the knife case via CanEnter.
+func (worker *Worker) dgtMaybeFlipToCascadeShort(ctx context.Context, settings Settings, spec dgtRedeploySpec, closedReason string) bool {
+	if spec.direction != "NEUTRAL" {
+		return false
+	}
+	if closedReason != "EMERGENCY_OFI_DUMP" && closedReason != "RANGE_BREAK_DOWN" {
+		return false
+	}
+	if worker.ofiEngine == nil {
+		return false
+	}
+	analysis := worker.ofiEngine.Analyze(spec.symbol)
+	if analysis.Regime != marketdata.RegimeConfirmedDump || !analysis.IsActionable() {
+		return false
+	}
+	// The experiment's one-flip-per-24h budget (the ladder query pattern):
+	// a second flip on the same symbol inside the window falls back to the
+	// normal path. Fail-CLOSED on the budget query (review P2-5) — this is
+	// the experiment's only self-amplification guard.
+	var flips int
+	if err := worker.db.QueryRow(ctx, `
+		SELECT COUNT(*) FROM bot_execution_events
+		WHERE symbol = $1 AND event_type = $2
+		  AND created_at > NOW() - INTERVAL '24 hours'
+	`, spec.symbol, dgtFlipEvent).Scan(&flips); err != nil {
+		return false
+	}
+	if flips >= dgtFlipMaxPerSymbolPer24h {
+		return false
+	}
+	cascade, cascadeUSD := worker.CheckLiquidationCascade(ctx, dgtFlipCascadeThresholdUSD)
+	if !cascade {
+		return false
+	}
+	// All conditions hold: consume the intent, leave the durable/telegram
+	// audit trail, journal the decision (review P2-4 — the intent must not
+	// vanish from entry_decisions analytics), and hand the slot to the
+	// scanner's cascade-short lane.
+	worker.markDgtRealIntentDone(ctx, spec.oldBotID, "flip_short")
+	journalEntryDecisionSvc(ctx, worker.db, EntryChainInput{
+		Path: EntryPathDGTReal, Fleet: "REAL", Symbol: spec.symbol,
+		Direction: "SHORT", RefID: fmt.Sprintf("#%d", spec.oldBotNumber),
+	}, entryOutcomeWait, "DIRECTION_FLIP",
+		"слот уходит сканеру под cascade-short: NEUTRAL закрыт по "+closedReason+", дамп подтверждён, каскад активен",
+		map[string]any{"ofi_regime": string(analysis.Regime), "cascade_usd": math.Round(cascadeUSD)})
+	_ = LogBotEvent(ctx, worker.db, spec.oldBotID, spec.oldBotNumber, "REAL", spec.symbol, dgtFlipEvent,
+		&spec.breakPrice, nil, map[string]any{
+			"symbol":      spec.symbol,
+			"from":        "NEUTRAL",
+			"to":          "SHORT",
+			"trigger":     closedReason,
+			"ofi_regime":  string(analysis.Regime),
+			"cascade_usd": math.Round(cascadeUSD),
+		})
+	_ = QueueTelegramEvent(ctx, worker.db, dgtFlipEvent, map[string]any{
+		"bot_number":  spec.oldBotNumber,
+		"symbol":      spec.symbol,
+		"trigger":     closedReason,
+		"ofi_regime":  string(analysis.Regime),
+		"cascade_usd": fmt.Sprintf("$%.1fM", cascadeUSD/1_000_000),
+		"from":        "NEUTRAL",
+		"to":          "SHORT",
+	})
+	worker.maybeQueueCascadeShortScan(ctx, settings)
+	worker.logger.Info("DGT intent flipped to cascade-short scan",
+		"component", "autogrid_worker", "symbol", spec.symbol,
+		"trigger", closedReason, "cascade_usd", cascadeUSD)
+	return true
+}
+
 // processDgtRealRedeployIntents executes queued REAL re-deploys whose parent
 // row has settled terminal (whichever pass performed the settle — the bot
 // loop's terminal paths or the closed-bot sync). Bounded to a small batch
@@ -604,6 +730,19 @@ func (worker *Worker) processDgtRealRedeployIntents(ctx context.Context, setting
 				continue
 			}
 			spec.breakPrice = breakPrice
+			// v2.0.140 (package E): the first direction-flip experiment — the
+			// ONE opposite-direction lane the codebase already endorses. When
+			// a NEUTRAL bot died on a DOWN-side break (EMERGENCY_OFI_DUMP or
+			// RANGE_BREAK_DOWN) and at settle time the dump is STILL confirmed
+			// while a long-liquidation cascade runs, the slot flips to the
+			// scanner with cascadeShort semantics instead of re-centering a
+			// NEUTRAL into the same knife. Flip is optional by construction:
+			// every scanner admission gate then judges the SHORT (F9/R1/Vision
+			// cascade exemptions already exist for it); any gate failure
+			// leaves the slot flat.
+			if worker.dgtMaybeFlipToCascadeShort(ctx, settings, spec, item.closedReason) {
+				continue
+			}
 			if worker.dgtRedeployReal(ctx, settings, spec) {
 				worker.markDgtRealIntentDone(ctx, item.botID, "deployed")
 			} else {
