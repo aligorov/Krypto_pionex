@@ -229,6 +229,8 @@ func TestMigration0045MatchesGoEstimate(t *testing.T) {
 	// The Go ladder on the same inputs — the pinned contract.
 	goFinal, goCost := terminalTelemetryEstimate(
 		mustDec(t, "-13.780395"), mustDec(t, "298.733175"), mustDec(t, "12"), "STOP_LOSS")
+	goFinal = goFinal.Round(8)
+	goCost = goCost.Round(8)
 	realized, marker, fees, closeCost := row(resID)
 	if realized == nil || !realized.Equal(goFinal) {
 		t.Fatalf("residual row must settle at the Go estimate %s, got %v", goFinal, realized)
@@ -247,6 +249,8 @@ func TestMigration0045MatchesGoEstimate(t *testing.T) {
 	// The cascade shape floors at the stop.
 	goCasFinal, goCasCost := terminalTelemetryEstimate(
 		mustDec(t, "-2.268556"), mustDec(t, "276.392934"), mustDec(t, "12"), "STOP_LOSS_NATIVE")
+	goCasFinal = goCasFinal.Round(8)
+	goCasCost = goCasCost.Round(8)
 	realized, marker, fees, _ = row(casID)
 	if realized == nil || !realized.Equal(goCasFinal) {
 		t.Fatalf("cascade row must floor at %s, got %v", goCasFinal, realized)

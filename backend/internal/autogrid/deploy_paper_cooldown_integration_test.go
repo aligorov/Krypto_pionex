@@ -85,7 +85,7 @@ func TestDeployPaperCooldownAfterProtectiveClose(t *testing.T) {
 		if _, err := pool.Exec(ctx, `
 			INSERT INTO backtest_jobs (symbol, interval, status, result, finished_at)
 			VALUES ($1, $2, 'DONE',
-			        '{"folds": 4, "oos_return_pct": 1.2, "oos_max_drawdown": 0.05, "round_trips": 100, "stop_hits": 0}'::jsonb,
+			        '{"folds": 4, "oos_return_pct": 1.2, "oos_max_drawdown": 0.05, "round_trips": 100, "stop_hits": 0, "net_ev": 0.15, "ci95_lower": 0.05, "ci95_upper": 0.25, "ci95_positive": true, "sample_sufficient": true, "liquidity_ok": true}'::jsonb,
 			        NOW())
 		`, symbol, tf); err != nil {
 			t.Fatalf("seed backtest job %s: %v", tf, err)
@@ -315,7 +315,7 @@ func TestDeployPaperStopEnvelopeGate(t *testing.T) {
 		if _, err := pool.Exec(ctx, `
 			INSERT INTO backtest_jobs (symbol, interval, status, result, finished_at)
 			VALUES ($1, $2, 'DONE',
-			        '{"folds": 4, "oos_return_pct": 1.2, "oos_max_drawdown": 0.05, "round_trips": 100, "stop_hits": 0}'::jsonb,
+			        '{"folds": 4, "oos_return_pct": 1.2, "oos_max_drawdown": 0.05, "round_trips": 100, "stop_hits": 0, "net_ev": 0.15, "ci95_lower": 0.05, "ci95_upper": 0.25, "ci95_positive": true, "sample_sufficient": true, "liquidity_ok": true}'::jsonb,
 			        NOW())
 		`, symbol, tf); err != nil {
 			t.Fatalf("seed backtest job %s: %v", tf, err)
@@ -716,7 +716,7 @@ func TestPaperDeployRunsBacktestGate(t *testing.T) {
 	}
 	if _, err := pool.Exec(ctx, `
 		UPDATE backtest_jobs
-		SET result = '{"folds": 4, "oos_return_pct": 1.56, "oos_max_drawdown": 0.0183, "round_trips": 397, "stop_hits": 0}'::jsonb
+		SET result = '{"folds": 4, "oos_return_pct": 1.56, "oos_max_drawdown": 0.0183, "round_trips": 397, "stop_hits": 0, "net_ev": 0.15, "ci95_lower": 0.05, "ci95_upper": 0.25, "ci95_positive": true, "sample_sufficient": true, "liquidity_ok": true}'::jsonb
 		WHERE symbol = $1 AND interval = $2
 	`, symbol, tradedTF); err != nil {
 		t.Fatalf("pass traded job: %v", err)
@@ -765,7 +765,7 @@ func TestDeployPaperCooldownEscalation(t *testing.T) {
 		if _, err := pool.Exec(ctx, `
 			INSERT INTO backtest_jobs (symbol, interval, status, result, finished_at)
 			VALUES ($1, $2, 'DONE',
-			        '{"folds": 4, "oos_return_pct": 1.2, "oos_max_drawdown": 0.05, "round_trips": 100, "stop_hits": 0}'::jsonb,
+			        '{"folds": 4, "oos_return_pct": 1.2, "oos_max_drawdown": 0.05, "round_trips": 100, "stop_hits": 0, "net_ev": 0.15, "ci95_lower": 0.05, "ci95_upper": 0.25, "ci95_positive": true, "sample_sufficient": true, "liquidity_ok": true}'::jsonb,
 			        NOW())
 		`, symbol, tf); err != nil {
 			t.Fatalf("seed backtest job %s: %v", tf, err)
@@ -947,7 +947,7 @@ func TestDeployPaperCascadeShortFreshPriceExempt(t *testing.T) {
 			if _, err := pool.Exec(ctx, `
 				INSERT INTO backtest_jobs (symbol, interval, status, result, finished_at)
 				VALUES ($1, $2, 'DONE',
-				        '{"folds": 4, "oos_return_pct": 1.2, "oos_max_drawdown": 0.05, "round_trips": 100, "stop_hits": 0}'::jsonb,
+				        '{"folds": 4, "oos_return_pct": 1.2, "oos_max_drawdown": 0.05, "round_trips": 100, "stop_hits": 0, "net_ev": 0.15, "ci95_lower": 0.05, "ci95_upper": 0.25, "ci95_positive": true, "sample_sufficient": true, "liquidity_ok": true}'::jsonb,
 				        NOW())
 			`, symbol, tf); err != nil {
 				t.Fatalf("seed backtest job %s: %v", tf, err)

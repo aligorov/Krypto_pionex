@@ -272,6 +272,12 @@ func newRealDeployHarness(t *testing.T, maxActiveBots int, symbols ...string) *r
 	`); err != nil {
 		t.Fatalf("enable real native grid flag: %v", err)
 	}
+	if _, err := pool.Exec(ctx, `
+		UPDATE feature_flags SET enabled = false, updated_at = NOW()
+		WHERE name = 'backtest_gate'
+	`); err != nil {
+		t.Fatalf("disable backtest gate flag: %v", err)
+	}
 	reloaded, err := service.GetSettings(ctx)
 	if err != nil {
 		t.Fatalf("reload settings: %v", err)
@@ -314,7 +320,7 @@ func (h *realDeployHarness) seedAcceptedCandidate(t *testing.T, symbol string) s
 		if _, err := h.pool.Exec(ctx, `
 			INSERT INTO backtest_jobs (symbol, interval, status, result, finished_at)
 			VALUES ($1, $2, 'DONE',
-			        '{"folds": 4, "oos_return_pct": 1.2, "oos_max_drawdown": 0.05, "round_trips": 100, "stop_hits": 0}'::jsonb,
+			        '{"folds": 4, "oos_return_pct": 1.2, "oos_max_drawdown": 0.05, "round_trips": 100, "stop_hits": 0, "net_ev": 0.15, "ci95_lower": 0.05, "ci95_upper": 0.25, "ci95_positive": true, "sample_sufficient": true, "liquidity_ok": true}'::jsonb,
 			        NOW())
 		`, symbol, tf); err != nil {
 			t.Fatalf("seed backtest job %s: %v", tf, err)

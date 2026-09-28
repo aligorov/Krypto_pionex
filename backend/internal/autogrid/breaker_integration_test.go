@@ -339,7 +339,7 @@ func TestDerivedBreakerN10FleetEnvelope(t *testing.T) {
 			if _, err := pool.Exec(ctx, `
 				INSERT INTO backtest_jobs (symbol, interval, status, result, finished_at)
 				VALUES ($1, $2, 'DONE',
-				        '{"folds": 4, "oos_return_pct": 1.2, "oos_max_drawdown": 0.05, "round_trips": 100, "stop_hits": 0}'::jsonb,
+				        '{"folds": 4, "oos_return_pct": 1.2, "oos_max_drawdown": 0.05, "round_trips": 100, "stop_hits": 0, "net_ev": 0.15, "ci95_lower": 0.05, "ci95_upper": 0.25, "ci95_positive": true, "sample_sufficient": true, "liquidity_ok": true}'::jsonb,
 				        NOW())
 			`, sym, tf); err != nil {
 				t.Fatalf("seed backtest job %s %s: %v", sym, tf, err)
