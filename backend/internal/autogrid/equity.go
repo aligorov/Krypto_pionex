@@ -46,7 +46,7 @@ const (
 	equityTelemetryFreshWindow = 5 * time.Minute
 	// equitySnapshotSourceBotAggregate tags rows written by the bot-aggregate
 	// capture (v2.0.83 semantics) against the legacy wallet snapshots.
-	equitySnapshotSourceBotAggregate = "bot_aggregate"
+	equitySnapshotSourceBotAggregate = "bot_spot_aggregate"
 )
 
 // pnlEpochDefaultStart seeds fresh installs (and predates the backfill):
@@ -251,20 +251,20 @@ func derefTime(t *time.Time) time.Time {
 }
 
 // captureBotAggregateEquity snapshots the fleet's bot-aggregate state into
-// account_equity_snapshots (source='bot_aggregate'):
+// account_equity_snapshots (source='bot_spot_aggregate'):
 //
 //	assets_usdt       = Σ running investment (the isolated margins)
 //	unrealized_pnl    = Σ running floating
-//	equity_usdt       = wallet USDT assets (0 in isolated reality) + assets
+//	equity_usdt       = free Spot USDT (excludes allocated bot funds) + assets
 //	                    + Σ running (realized + floating)
-//	available_usdt    = wallet USDT free
+//	available_usdt    = free Spot USDT
 //
 // It runs AFTER the manage bot loop, so the summed columns were just
 // refreshed from remote truth. Fail-open by design — a failing capture must
 // never disturb the manage pass — but never silent: real failures (fetch,
 // decode, persist) leave a durable EQUITY_CAPTURE_FAILED marker. An account
-// endpoint answering zero/empty is NOT a failure (that is the isolated-bot
-// norm); the aggregate still lands and an hourly Info EQUITY_SNAPSHOT event
+// endpoint answering an explicit empty list is a zero balance; malformed
+// payloads fail capture. An hourly Info EQUITY_SNAPSHOT event
 // carries the heartbeat without touching Telegram.
 func (worker *Worker) captureBotAggregateEquity(ctx context.Context, settings Settings) {
 	accountID := settings.AccountID
@@ -307,25 +307,16 @@ func (worker *Worker) captureBotAggregateEquity(ctx context.Context, settings Se
 		worker.alertEquityCaptureFailure(ctx, "CLIENT_UNAVAILABLE", err.Error())
 		return
 	}
-	// The wallet leg: isolated grids park every cent inside the bots, so the
-	// USDT row answers zero — that is the NORM, not an alarm (the v2.0.80–82
-	// EMPTY_DECODE alarm fired weekly against a healthy fleet). Only a
-	// transport/decode failure is a real capture error.
-	walletAssets, walletAvailable := decimal.Zero, decimal.Zero
-	balances, _, detailErr := client.GetFuturesAccountDetailRaw(ctx)
+	// Native bots are funded by free Spot USDT. Futures trader balances
+	// are a separate account and must not be substituted here.
+	walletAvailable, detailErr := client.GetBotFundingUSDT(ctx)
 	if detailErr != nil {
-		worker.logger.Warn("equity snapshot: account detail fetch failed",
+		worker.logger.Warn("equity snapshot: Spot bot funding fetch failed",
 			"component", "autogrid_worker", "error", detailErr)
 		worker.alertEquityCaptureFailure(ctx, "FETCH_FAILED", detailErr.Error())
 		return
 	}
-	for i := range balances {
-		if strings.EqualFold(balances[i].Coin, "USDT") {
-			walletAssets = balances[i].Assets
-			walletAvailable = balances[i].Available
-			break
-		}
-	}
+	walletAssets := walletAvailable
 
 	epochStart, err := worker.service.PNLEpochStart(ctx)
 	if err != nil {

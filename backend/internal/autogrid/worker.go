@@ -2024,49 +2024,16 @@ func (worker *Worker) revalidateCandidateTrend(
 	return true, freshTrend
 }
 
-// capitalEffectiveBudget derives the slot this account can actually place
-// RIGHT NOW under the v2.0.140 margin reserve, scaling DOWN instead of
-// refusing (v2.0.145): the fleet must stay autonomous at whatever capital
-// the operator left on the account. room = 0.70×equity − Σ committed;
-// slot = min(settingsBudget, floor(room / divisor)) with the tranche
-// doubling as the divisor. Returns zero when even the exchange-minimum
-// class slot ($10) does not fit — that case still rejects, and loudly.
-// Missing equity snapshot (bootstrap) or read errors fail OPEN to the
-// settings budget: the hard-blocker semantics live on in manual/invest_in.
+// capitalEffectiveBudget uses only fresh Spot-funded bot equity. Missing,
+// stale or unreadable funding must never restore the full configured budget.
 func (worker *Worker) capitalEffectiveBudget(ctx context.Context, accountID string, settingsBudget decimal.Decimal, trancheOn bool) (decimal.Decimal, bool) {
-	var equityStr *string
-	if err := worker.db.QueryRow(ctx, `
-		SELECT equity_usdt::TEXT FROM account_equity_snapshots
-		WHERE account_id = $1 ORDER BY captured_at DESC LIMIT 1
-	`, accountID).Scan(&equityStr); err != nil {
-		return settingsBudget, false // no snapshot yet / transient read — fail open (deploy-time parity with the v2.0.140 gate)
+	equity, committed, spendable, err := loadBotFundingReserve(ctx, worker.db, accountID)
+	if err != nil {
+		worker.logger.Warn("bot funding unavailable", "component", "autogrid_worker", "error", err)
+		return decimal.Zero, true
 	}
-	equity, err := decimal.NewFromString(*equityStr)
-	if err != nil || !equity.IsPositive() {
-		return settingsBudget, false
-	}
-	var committed decimal.Decimal
-	if err := worker.db.QueryRow(ctx, `
-		SELECT COALESCE(SUM(quote_investment), 0) FROM grid_bots
-		WHERE account_id = $1
-		  AND status IN ('PENDING_SUBMISSION', 'SUBMISSION_UNKNOWN', 'RUNNING', 'STOP_REQUESTED', 'STOPPING')
-	`, accountID).Scan(&committed); err != nil {
-		return settingsBudget, false
-	}
-	room := equity.Mul(decimal.NewFromFloat(0.70)).Sub(committed)
-	divisor := decimal.NewFromInt(1)
-	if trancheOn {
-		divisor = decimal.NewFromInt(2)
-	}
-	// floor to whole dollars — a $88.33 slot is operator noise
-	fit := room.Div(divisor).Floor()
-	if fit.GreaterThan(settingsBudget) || !fit.IsPositive() {
-		return settingsBudget, false
-	}
-	if fit.LessThan(decimal.NewFromInt(10)) {
-		return decimal.Zero, true // not even an exchange-minimum-class slot fits
-	}
-	return fit, true
+	slot, _ := fitBotFundingBudget(equity, committed, decimal.Min(settingsBudget, spendable.Floor()), trancheOn)
+	return slot, !slot.Equal(settingsBudget)
 }
 
 // capitalDeficiencyAlarm announces a hard capital shortfall at most once an
@@ -2080,59 +2047,39 @@ func (worker *Worker) capitalDeficiencyAlarm(ctx context.Context, settings Setti
 	worker.logger.Warn("capital deficiency: no slot fits the margin reserve",
 		"component", "autogrid_worker", "settings_budget", settings.BudgetUSDT.StringFixed(2))
 	_ = QueueTelegramEvent(ctx, worker.db, "CAPITAL_DEFICIENCY", map[string]any{
-		"message": "⚠️ <b>Дефицит капитала:</b> даже минимальный слот не влезает в 30%-резерв маржи — новые боты не открываются. Долейте USDT на фьючерс-кошелёк или уменьшите бюджет слота.",
+		"message": "⚠️ <b>Дефицит капитала:</b> даже минимальный слот не влезает в 30%-резерв маржи — новые боты не открываются. Проверьте доступные USDT на Spot для финансирования ботов и свежесть снимка капитала.",
 	})
 }
 
-// marginReserveBlocker enforces the v2.0.140 free-margin reserve: projected
-// committed isolated margin (Σ active REAL quote_investment + this deploy's
-// full slot, including its planned tranche-2 doubling when tranches are on)
-// must leave ≥30% of the last recorded equity free. Built from our own DB
-// (wallet + Σ isolated investments) because the account API is structurally
-// blind to isolated grid margin (equity.go ISOLATED note) — the reserve
-// cannot be read off any account endpoint, only derived.
-//
-// Fail-open applies ONLY to an account with no equity snapshot at all: the
-// snapshot lane bootstraps within 5 minutes of start, and blocking every
-// deploy of a fresh install before the first snapshot lands would deadlock
-// the fleet on its own gate. Once a snapshot exists it is enforced as-is
-// (any age) — stale equity is still the last known truth, not permission.
-// Any read error other than "missing" is fail-closed: a broken equity read
-// must not degrade into an unbounded commitment.
+// marginReserveBlocker protects fixed manual commitments with the same
+// fresh Spot-funded equity and planned bot commitments used by auto sizing.
+// Missing, stale, legacy or unreadable snapshots defer new risk.
 func marginReserveBlocker(
 	ctx context.Context,
 	db *pgxpool.Pool,
 	accountID string,
 	addCommitment decimal.Decimal,
 	trancheOn bool,
+	topUpBotID ...string,
 ) (code, reason string) {
-	var equity decimal.Decimal
-	err := db.QueryRow(ctx, `
-		SELECT equity_usdt FROM account_equity_snapshots
-		WHERE account_id = $1
-		ORDER BY captured_at DESC LIMIT 1
-	`, accountID).Scan(&equity)
-	if errors.Is(err, pgx.ErrNoRows) {
-		// No equity truth yet — the snapshot lane bootstraps within 5
-		// minutes of start; refusing deploys before that would deadlock a
-		// fresh install on its own gate.
-		return "", ""
-	}
+	equity, activeCommitted, spendable, err := loadBotFundingReserve(ctx, db, accountID)
 	if err != nil {
-		return "MARGIN_RESERVE", fmt.Sprintf(
-			"резерв маржи: чтение снапшота equity не удалось (fail-closed): %v", err)
+		return "MARGIN_RESERVE", fmt.Sprintf("резерв маржи: капитал ботов недоступен: %v", err)
 	}
 
-	var activeCommitted decimal.Decimal
-	if err := db.QueryRow(ctx, `
-		SELECT COALESCE(SUM(quote_investment), 0)
-		FROM grid_bots
-		WHERE account_id = $1
-		  AND status IN ('PENDING_SUBMISSION', 'SUBMISSION_UNKNOWN', 'RUNNING',
-		                 'STOP_REQUESTED', 'STOPPING')
-	`, accountID).Scan(&activeCommitted); err != nil {
-		return "MARGIN_RESERVE", fmt.Sprintf(
-			"резерв маржи: сумма активных изолированных позиций не читается (fail-closed): %v", err)
+	// A top-up consumes its already reserved tranche, not a second copy.
+	if len(topUpBotID) > 0 {
+		var reserved decimal.Decimal
+		err := db.QueryRow(ctx, `
+			SELECT CASE WHEN model_state->>'trancheDeployed' = '1' THEN
+			 GREATEST(0, COALESCE(CASE WHEN model_state->>'trancheBase' ~ '^[0-9]+(\.[0-9]+)?$'
+			     THEN (model_state->>'trancheBase')::NUMERIC END, quote_investment*2) - quote_investment)
+			 ELSE 0 END FROM grid_bots WHERE id=$1 AND account_id=$2
+		`, topUpBotID[0], accountID).Scan(&reserved)
+		if err != nil {
+			return "MARGIN_RESERVE", fmt.Sprintf("read reserved tranche: %v", err)
+		}
+		addCommitment = decimal.Max(decimal.Zero, addCommitment.Sub(reserved))
 	}
 
 	// The slot commits its FULL budget: with tranches on, tranche-2's top-up
@@ -2144,7 +2091,7 @@ func marginReserveBlocker(
 	}
 	projected := activeCommitted.Add(addCommitment.Mul(slots))
 	ceiling := equity.Mul(decimal.NewFromFloat(0.70))
-	if projected.GreaterThan(ceiling) {
+	if projected.GreaterThan(ceiling) || addCommitment.Mul(slots).GreaterThan(spendable) {
 		return "MARGIN_RESERVE", fmt.Sprintf(
 			"резерв маржи: projected $%s при equity $%s оставляет <30%% свободных — вход отложен",
 			projected.StringFixed(2), equity.StringFixed(2))
@@ -2559,8 +2506,7 @@ func (worker *Worker) deployReal(
 		slotBudget, capitalScaled := worker.capitalEffectiveBudget(ctx, *settings.AccountID, settings.BudgetUSDT, settings.TrancheDeployEnabled)
 		if !slotBudget.IsPositive() {
 			worker.capitalDeficiencyAlarm(ctx, settings, slotBudget)
-			reason := fmt.Sprintf("резерв маржи: свободно под новый слот $0 при equity ниже минимума — даже минимальный слот не влезает в 30%%-резерв, нужен долив капитала",
-			)
+			reason := fmt.Sprintf("резерв маржи: свободно под новый слот $0 — капитал Spot для ботов недоступен или минимальный слот не влезает в 30%%-резерв")
 			deployErrors = append(deployErrors, fmt.Sprintf("%s: %s", candidate.Symbol, reason))
 			worker.rejectCandidate(ctx, candidate, reason, nil)
 			worker.journalEntryDecision(ctx, EntryChainInput{
@@ -3119,6 +3065,10 @@ func (worker *Worker) deployReal(
 			_, _ = worker.db.Exec(ctx, `UPDATE autogrid_settings SET last_error = $1 WHERE id = $2`, deployErrors[0], settings.ID)
 		}
 	} else if activeCount > 0 {
+		// Only a pass that actually ran deploys owns last_error: an idle
+		// clean pass must not wipe freeze notes set in THIS same pass by
+		// noteDeployBlock (cascade/feed-health defer with zero ACCEPTED
+		// candidates and per-candidate cuts never touch deployErrors).
 		_, _ = worker.db.Exec(ctx, `UPDATE autogrid_settings SET last_error = NULL WHERE id = $1`, settings.ID)
 	}
 	return nil

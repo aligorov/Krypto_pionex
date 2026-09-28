@@ -177,6 +177,10 @@ func trancheSelfHealFixture(t *testing.T, mockServerURL string) (*Worker, *pgxpo
 	if err != nil {
 		t.Fatalf("create account: %v", err)
 	}
+
+	// Fresh Spot funding so the fail-closed capital gate stays GREEN and
+	// the suite exercises the gate it actually targets.
+	seedBotFundingSnapshot(t, pool, account.ID, 5000, 0)
 	t.Cleanup(func() {
 		_, _ = pool.Exec(ctx, `DELETE FROM bot_telemetry WHERE bot_id IN (
 			SELECT id FROM grid_bots WHERE account_id = $1)`, account.ID)

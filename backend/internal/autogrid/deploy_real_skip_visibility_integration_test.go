@@ -198,6 +198,10 @@ func newRealDeployHarness(t *testing.T, maxActiveBots int, symbols ...string) *r
 	if err != nil {
 		t.Fatalf("create account: %v", err)
 	}
+
+	// Fresh Spot funding so the fail-closed capital gate stays GREEN and
+	// the suite exercises the gate it actually targets.
+	seedBotFundingSnapshot(t, pool, account.ID, 5000, 0)
 	t.Cleanup(func() {
 		// Detach the settings pointer BEFORE deleting the account (FK), and
 		// clear any last_error the deploy round wrote (the snapshot restore

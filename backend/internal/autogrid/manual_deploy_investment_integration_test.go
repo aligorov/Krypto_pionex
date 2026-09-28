@@ -390,6 +390,10 @@ func TestManualDeployRealInvestmentOverride(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create account: %v", err)
 	}
+
+	// Fresh Spot funding so the fail-closed capital gate stays GREEN and
+	// the suite exercises the gate it actually targets.
+	seedBotFundingSnapshot(t, pool, account.ID, 5000, 0)
 	// Create() leaves the row UNVERIFIED; v2.0.138 realExecutionGates gained
 	// the account permission/verified leg — mark it the way Verify() would.
 	if _, err := pool.Exec(ctx, `
@@ -586,6 +590,10 @@ func TestManualDeployRealStopEnvelopeGate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create account: %v", err)
 	}
+
+	// Fresh Spot funding so the fail-closed capital gate stays GREEN and
+	// the suite exercises the gate it actually targets.
+	seedBotFundingSnapshot(t, pool, account.ID, 5000, 0)
 	// Create() leaves the row UNVERIFIED; v2.0.138 realExecutionGates gained
 	// the account permission/verified leg — mark it the way Verify() would.
 	if _, err := pool.Exec(ctx, `

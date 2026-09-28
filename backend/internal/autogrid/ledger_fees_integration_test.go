@@ -70,6 +70,10 @@ func newLedgerFeeEnv(t *testing.T) *ledgerFeeEnv {
 	if err != nil {
 		t.Fatalf("create account: %v", err)
 	}
+
+	// Fresh Spot funding so the fail-closed capital gate stays GREEN and
+	// the suite exercises the gate it actually targets.
+	seedBotFundingSnapshot(t, pool, account.ID, 5000, 0)
 	env := &ledgerFeeEnv{pool: pool, service: service, account: account}
 	t.Cleanup(func() {
 		for i := len(env.teardown) - 1; i >= 0; i-- {

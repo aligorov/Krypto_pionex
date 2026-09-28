@@ -21,7 +21,7 @@ import (
 
 // equityAggregateMock serves the exchange surfaces the bot-aggregate capture
 // touches: the grid-order detail endpoint (running remote PnL truth for the
-// manage loop) and /uapi/v1/account/detail (the wallet leg, structurally
+// manage loop) and /api/v1/account/balances (the wallet leg, structurally
 // zero on an isolated-grid account — the prod shape v2.0.83 was built for).
 // Modes:
 //   - normal: detail answers all-zero USDT (the isolated norm, NOT an alarm)
@@ -53,7 +53,7 @@ func newEquityAggregateMock(t *testing.T) *equityAggregateMock {
 		_ = json.NewEncoder(w).Encode(payload)
 	}
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /uapi/v1/account/detail", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("GET /api/v1/account/balances", func(w http.ResponseWriter, _ *http.Request) {
 		mock.mu.Lock()
 		defer mock.mu.Unlock()
 		if mock.mode == "error" {
@@ -149,7 +149,7 @@ func newEquityTestEnv(t *testing.T) *equityTestEnv {
 
 	accountName := "integration-equity-test-" + time.Now().Format("150405.000000000")
 	// Other integration suites drive reconcileAndManage against mocks that
-	// do not serve /uapi/v1/account/detail — their captures legitimately
+	// do not serve /api/v1/account/balances — their captures legitimately
 	// leave FETCH_FAILED markers (bot_id='equity', 1h dedup, GLOBAL). Clear
 	// them so this suite's zero-alarm assertions are hermetic.
 	_, _ = pool.Exec(ctx, `DELETE FROM bot_execution_events WHERE bot_id = 'equity'`)
@@ -291,7 +291,7 @@ func (env *equityTestEnv) snapshots(t *testing.T) int {
 	var count int
 	if err := env.pool.QueryRow(context.Background(), `
 		SELECT COUNT(*) FROM account_equity_snapshots
-		WHERE account_id = $1 AND source = 'bot_aggregate'
+		WHERE account_id = $1 AND source = 'bot_spot_aggregate'
 	`, env.account.ID).Scan(&count); err != nil {
 		t.Fatalf("count snapshots: %v", err)
 	}
@@ -315,7 +315,7 @@ func (env *equityTestEnv) ageSnapshots(t *testing.T) {
 	if _, err := env.pool.Exec(context.Background(), `
 		UPDATE account_equity_snapshots
 		SET captured_at = NOW() - INTERVAL '6 minutes'
-		WHERE account_id = $1 AND source = 'bot_aggregate'
+		WHERE account_id = $1 AND source = 'bot_spot_aggregate'
 	`, env.account.ID); err != nil {
 		t.Fatalf("age snapshots: %v", err)
 	}
@@ -392,7 +392,7 @@ func TestBotAggregateSnapshotAndEpoch(t *testing.T) {
 	if err := env.pool.QueryRow(ctx, `
 		SELECT equity_usdt::TEXT, assets_usdt::TEXT, available_usdt::TEXT, unrealized_pnl_usdt::TEXT
 		FROM account_equity_snapshots
-		WHERE account_id = $1 AND source = 'bot_aggregate'
+		WHERE account_id = $1 AND source = 'bot_spot_aggregate'
 		ORDER BY captured_at DESC LIMIT 1
 	`, env.account.ID).Scan(&equity, &assets, &avail, &unrealized); err != nil {
 		t.Fatalf("load aggregate snapshot: %v", err)

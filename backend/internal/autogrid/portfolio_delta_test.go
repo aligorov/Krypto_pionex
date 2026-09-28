@@ -144,7 +144,7 @@ func (env *portfolioTestEnv) seedSnapshot(t *testing.T, equity decimal.Decimal, 
 	if _, err := env.pool.Exec(context.Background(), `
 		INSERT INTO account_equity_snapshots
 			(account_id, equity_usdt, assets_usdt, available_usdt, unrealized_pnl_usdt, source, captured_at)
-		VALUES ($1, $2, $3, $4, 0, 'bot_aggregate', $5)
+		VALUES ($1, $2, $3, $4, 0, 'bot_spot_aggregate', $5)
 	`, env.account.ID, equity, equity, equity, capturedAt); err != nil {
 		t.Fatalf("seed equity snapshot: %v", err)
 	}
@@ -270,18 +270,14 @@ func TestMarginReserveBlocker(t *testing.T) {
 		t.Errorf("add 90 trancheOff: code = %q, want allowed", code)
 	}
 
-	// Fail-open applies ONLY to an account with no snapshot at all: an
-	// account id with no rows has no equity truth yet — the snapshot lane
-	// bootstraps within 5 minutes of start, and the gate must not deadlock
-	// the fleet.
+	// Missing funding evidence must defer entry; capture runs independently.
 	code, _ = marginReserveBlocker(ctx, env.pool, "00000000-0000-0000-0000-000000000000",
 		decimal.NewFromInt(999999), true)
-	if code != "" {
-		t.Errorf("missing snapshot: code = %q, want fail-open", code)
+	if code != "MARGIN_RESERVE" {
+		t.Errorf("missing snapshot: code = %q, want fail-closed", code)
 	}
 
-	// A snapshot that exists is enforced AS-IS, whatever its age: stale
-	// equity is the last known truth, not permission to over-commit.
+	// Stale funding evidence also defers entry.
 	if _, err := env.pool.Exec(ctx,
 		`DELETE FROM account_equity_snapshots WHERE account_id = $1`, env.account.ID); err != nil {
 		t.Fatalf("clear snapshots: %v", err)
@@ -327,19 +323,19 @@ func TestCapitalEffectiveBudgetScalesDown(t *testing.T) {
 	})
 
 	// equity $253 (the prod freeze scenario), empty fleet, tranche ON:
-	// room = 0.70×253 = 177; slot = floor(177/2) = $88.
+	// room = floor(0.70×253) = 177; full $100 slot fits (first tranche $50).
 	if _, err := pool.Exec(ctx, `
-		INSERT INTO account_equity_snapshots (account_id, equity_usdt, captured_at)
-		VALUES ($1, 253, NOW())
+		INSERT INTO account_equity_snapshots (account_id, equity_usdt, available_usdt, assets_usdt, captured_at, source)
+		VALUES ($1, 253, 253, 0, NOW(), 'bot_spot_aggregate')
 	`, account.ID); err != nil {
 		t.Fatalf("seed equity: %v", err)
 	}
 	slot, scaled := worker.capitalEffectiveBudget(ctx, account.ID, decimal.NewFromInt(100), true)
-	if !scaled || !slot.Equal(decimal.NewFromInt(88)) {
-		t.Fatalf("want scaled $88 slot, got %s (scaled=%v)", slot, scaled)
+	if scaled || !slot.Equal(decimal.NewFromInt(100)) {
+		t.Fatalf("want full $100 slot, got %s (scaled=%v)", slot, scaled)
 	}
 
-	// No snapshot → fail open to the settings budget.
+	// No snapshot → defer until a Spot funding capture exists.
 	openAcct := fmt.Sprintf("itest-cap-open-%d", time.Now().UnixNano())
 	acct2, err := accountService.Create(ctx, accounts.CreateInput{
 		Name: openAcct, APIKey: "itest-key", APISecret: "itest-secret",
@@ -350,21 +346,19 @@ func TestCapitalEffectiveBudgetScalesDown(t *testing.T) {
 	}
 	t.Cleanup(func() { _, _ = pool.Exec(ctx, `DELETE FROM pionex_accounts WHERE id = $1`, acct2.ID) })
 	slot2, scaled2 := worker.capitalEffectiveBudget(ctx, acct2.ID, decimal.NewFromInt(100), false)
-	if scaled2 || !slot2.Equal(decimal.NewFromInt(100)) {
-		t.Fatalf("missing snapshot must fail open to $100, got %s (scaled=%v)", slot2, scaled2)
+	if !scaled2 || !slot2.IsZero() {
+		t.Fatalf("missing snapshot must fail closed to $0, got %s (scaled=%v)", slot2, scaled2)
 	}
 
-	// Equity so low that even a $10-class slot does not fit → zero (hard
-	// reject + alarm). $12 equity → room 8.4 → floor 8 < 10. ($25 equity
-	// legitimately yields a $17 slot — scaling, not deficiency.)
+	// $6 equity leaves $4 after the reserve, below a $5 initial investment.
 	if _, err := pool.Exec(ctx, `
-		INSERT INTO account_equity_snapshots (account_id, equity_usdt, captured_at)
-		VALUES ($1, 12, NOW())
+		INSERT INTO account_equity_snapshots (account_id, equity_usdt, available_usdt, assets_usdt, captured_at, source)
+		VALUES ($1, 6, 6, 0, NOW(), 'bot_spot_aggregate')
 	`, acct2.ID); err != nil {
 		t.Fatalf("seed low equity: %v", err)
 	}
 	slot3, _ := worker.capitalEffectiveBudget(ctx, acct2.ID, decimal.NewFromInt(100), false)
 	if !slot3.IsZero() {
-		t.Fatalf("equity $12 must yield zero slot, got %s", slot3)
+		t.Fatalf("equity $6 must yield zero slot, got %s", slot3)
 	}
 }

@@ -1251,9 +1251,9 @@ func (s *Service) AccountEquityEpoch(ctx context.Context) (*AccountEquitySummary
 	if err := s.db.QueryRow(ctx, `
 		SELECT COUNT(*),
 		       (SELECT MAX(captured_at) FROM account_equity_snapshots
-		        WHERE account_id = $1 AND source = 'bot_aggregate')
+		        WHERE account_id = $1 AND source IN ('bot_aggregate', 'bot_spot_aggregate'))
 		FROM account_equity_snapshots
-		WHERE account_id = $1 AND source = 'bot_aggregate'
+		WHERE account_id = $1 AND source IN ('bot_aggregate', 'bot_spot_aggregate')
 	`, *accountID).Scan(&summary.Snapshots, &capturedAt); err != nil {
 		return nil, fmt.Errorf("load equity snapshots: %w", err)
 	}
@@ -2113,9 +2113,8 @@ func (s *Service) AdjustBot(
 			// v2.0.140 margin reserve: a top-up IS the doubling — the pour
 			// adds its full amount to the committed isolated margin, so
 			// trancheOn is false by construction (no second slot is
-			// scheduled behind it). Fail-open only while the account has no
-			// equity snapshot at all.
-			if code, reserveReason := marginReserveBlocker(ctx, s.db, *accountID, input.QuoteInvestment, false); code != "" {
+			// scheduled behind it). Fresh Spot funding is required.
+			if code, reserveReason := marginReserveBlocker(ctx, s.db, *accountID, input.QuoteInvestment, false, botID); code != "" {
 				investIn := EntryChainInput{
 					Path: EntryPathInvestIn, Settings: Settings{ID: settingsID},
 					Symbol: botSymbol, Direction: botDirection, Fleet: "REAL", RefID: botID,
