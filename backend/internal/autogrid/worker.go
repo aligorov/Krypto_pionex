@@ -1377,8 +1377,10 @@ func (worker *Worker) deployPaper(
 		// The live price still re-anchors the candidate (fresh > 0); only an
 		// UNREADABLE price (fresh zero) stays fail-closed even in cascade —
 		// a grid centered on an unreadable tape is the stale-anchor bug
-		// itself.
-		if freshPrice, ok := worker.revalidateFreshPrice(ctx, &candidate, atrPct); ok || (cascadeShort && freshPrice.IsPositive()) {
+		// itself. v2.0.148: a beta-down pair-confirmed short gets the same
+		// treatment — a downward drift since scan is the short's payload;
+		// the fresh price re-anchors geometry instead of voiding the entry.
+		if freshPrice, ok := worker.revalidateFreshPrice(ctx, &candidate, atrPct); ok || ((cascadeShort || betaDownShortExempt(candidate, betaDown)) && freshPrice.IsPositive()) {
 			candidate.CurrentPrice = freshPrice
 		} else {
 			worker.logger.Info("entry gate: stale candidate price, skip",
@@ -1474,12 +1476,20 @@ func (worker *Worker) deployPaper(
 			forecastPct = harGeo.forecastPct
 		}
 		if blocked, ratio := worker.volExpansionBlocked(ctx, candidate.Symbol, forecastPct); blocked {
-			worker.logger.Info("entry gate: volatility expansion, skip",
-				"component", "autogrid_worker", "symbol", candidate.Symbol,
-				"rv_ref_ratio", math.Round(ratio*100)/100)
-			worker.rejectCandidate(ctx, candidate,
-				fmt.Sprintf("entry gate: расширение волатильности (RV/базлайн %.2f ≥ 1.5) — вход в ускорение заблокирован", math.Round(ratio*100)/100), nil)
-			continue
+			if betaDownShortExempt(candidate, betaDown) {
+				// v2.0.148: the RV gate is direction-blind by design, but for a
+				// pair-confirmed downtrend short the "expansion" IS the move the
+				// short is paid to ride (counterfactual 2026-09-28: the cut
+				// cohort fell a median −1.09%/2h, 4.3:1). Stamp the cohort.
+				candidate.ModelAssumptions["betaDownExempt"] = true
+			} else {
+				worker.logger.Info("entry gate: volatility expansion, skip",
+					"component", "autogrid_worker", "symbol", candidate.Symbol,
+					"rv_ref_ratio", math.Round(ratio*100)/100)
+				worker.rejectCandidate(ctx, candidate,
+					fmt.Sprintf("entry gate: расширение волатильности (RV/базлайн %.2f ≥ 1.5) — вход в ускорение заблокирован", math.Round(ratio*100)/100), nil)
+				continue
+			}
 		}
 		if harGeo != nil {
 			harGeo.applyToMesh(candidate.CurrentPrice, &mesh)
@@ -1991,6 +2001,7 @@ func (worker *Worker) revalidateCandidateTrend(
 	candidate *Candidate,
 	settings Settings,
 	cascadeShort bool,
+	exemptDownShort bool,
 ) (bool, string) {
 	candles, err := worker.publicClient.GetKlines(ctx, candidate.Symbol, settings.CandleInterval, settings.LookbackCandles)
 	if err != nil || len(candles) < 30 {
@@ -2009,8 +2020,10 @@ func (worker *Worker) revalidateCandidateTrend(
 		// price ages through the whole enrichment pipeline; geometry, entry
 		// and the anti-hunt stop must anchor to the live price, and a drift
 		// beyond half an ATR voids the candidate itself — except in the
-		// cascade-short window (FIX-H, mirror of the paper path's exemption).
-		if fresh, ok := worker.revalidateFreshPrice(ctx, candidate, atrPct); ok || (cascadeShort && fresh.IsPositive()) {
+		// cascade-short window (FIX-H, mirror of the paper path's exemption)
+		// and for a v2.0.148 beta-down confirmed short, where a downward
+		// drift is the entry's own thesis (fresh price still re-anchors).
+		if fresh, ok := worker.revalidateFreshPrice(ctx, candidate, atrPct); ok || ((cascadeShort || exemptDownShort) && fresh.IsPositive()) {
 			candidate.CurrentPrice = fresh
 		} else {
 			return false, fmt.Sprintf("price drifted beyond 0.5 ATR since scan (%s → %s)",
@@ -2320,7 +2333,7 @@ func (worker *Worker) deployReal(
 			worker.rejectCandidate(ctx, candidate, "entry gate: "+flushWhyReal, nil)
 			continue
 		}
-		if ok, reason := worker.revalidateCandidateTrend(ctx, &candidate, settings, cascadeShort); !ok {
+		if ok, reason := worker.revalidateCandidateTrend(ctx, &candidate, settings, cascadeShort, betaDownShortExempt(candidate, betaDownEntry)); !ok {
 			worker.logger.Info("skip real deploy after fresh trend revalidation",
 				"component", "autogrid_worker", "symbol", candidate.Symbol, "reason", reason)
 			worker.rejectCandidate(ctx, candidate, "ре-валидация тренда: "+reason, nil)
@@ -2580,12 +2593,19 @@ func (worker *Worker) deployReal(
 			forecastPct = harGeo.forecastPct
 		}
 		if blocked, ratio := worker.volExpansionBlocked(ctx, candidate.Symbol, forecastPct); blocked {
-			worker.logger.Info("entry gate: volatility expansion, skip real deploy",
-				"component", "autogrid_worker", "symbol", candidate.Symbol,
-				"rv_ref_ratio", math.Round(ratio*100)/100)
-			worker.rejectCandidate(ctx, candidate,
-				fmt.Sprintf("entry gate: расширение волатильности (RV/базлайн %.2f ≥ 1.5) — вход в ускорение заблокирован", math.Round(ratio*100)/100), nil)
-			continue
+			if betaDownShortExempt(candidate, betaDownEntry) {
+				// v2.0.148 (REAL mirror): expansion-down is the confirmed
+				// short's payload, not its hazard — RV gate stands down for
+				// the beta-down cohort, every later gate stays armed.
+				candidate.ModelAssumptions["betaDownExempt"] = true
+			} else {
+				worker.logger.Info("entry gate: volatility expansion, skip real deploy",
+					"component", "autogrid_worker", "symbol", candidate.Symbol,
+					"rv_ref_ratio", math.Round(ratio*100)/100)
+				worker.rejectCandidate(ctx, candidate,
+					fmt.Sprintf("entry gate: расширение волатильности (RV/базлайн %.2f ≥ 1.5) — вход в ускорение заблокирован", math.Round(ratio*100)/100), nil)
+				continue
+			}
 		}
 		if harGeo != nil {
 			harGeo.applyToMesh(candidate.CurrentPrice, &mesh)
