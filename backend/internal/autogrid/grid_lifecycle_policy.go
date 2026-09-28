@@ -820,6 +820,42 @@ func (worker *Worker) dgtRedeployPaper(ctx context.Context, settings Settings, s
 		lower: mesh.LowerPrice, upper: mesh.UpperPrice, stop: antiHuntStop,
 		gridNum: mesh.GridNum, invest: spec.slotBudget,
 	})
+
+	minRR := 1.8
+	if settings.MinRiskReward.IsPositive() {
+		minRR = settings.MinRiskReward.InexactFloat64()
+	}
+	adaptiveRes := marketdata.ComputeIndividualTargetPrices(marketdata.AdaptiveBotTargetInput{
+		Symbol:        spec.symbol,
+		Direction:     strings.ToLower(spec.direction),
+		CurrentPrice:  spec.breakPrice,
+		LowerPrice:    mesh.LowerPrice,
+		UpperPrice:    mesh.UpperPrice,
+		GridNum:       mesh.GridNum,
+		Budget:        spec.slotBudget.InexactFloat64(),
+		Leverage:      botLev,
+		ATR:           atrPrice.InexactFloat64(),
+		MinRiskReward: minRR,
+		TakerFeeBps:   settings.FeeBps.InexactFloat64(),
+		SlippageBps:   settings.SlippageBps.InexactFloat64(),
+	})
+
+	targetPriceDec := adaptiveRes.TargetPrice
+	stopLossPriceDec := adaptiveRes.StopLossPrice
+	stopLossHighDec := adaptiveRes.StopLossHigh
+	riskRewardDec := decimal.NewFromFloat(adaptiveRes.RiskRewardRatio)
+	adaptiveStrat := adaptiveRes.AdaptiveStrategy
+
+	if settings.PnLTargetMode != "FIXED" {
+		botTargetVal := decimal.NewFromFloat(adaptiveRes.TargetUSDT).Round(2)
+		target = &botTargetVal
+		botMaxLossVal := decimal.NewFromFloat(adaptiveRes.MaxLossUSDT).Round(2)
+		maxLoss = &botMaxLossVal
+		if stress.loss.GreaterThan(*maxLoss) {
+			botMaxLossVal = stress.loss.Round(2)
+			maxLoss = &botMaxLossVal
+		}
+	}
 	// v2.0.142 (audit P2b): ...and the SAME ceiling. The floor keeps the
 	// stored stop honest, but a replacement geometry whose full-traverse
 	// loss overflows the tranche-2 effective-stop ceiling (dynamic stop
@@ -864,7 +900,9 @@ func (worker *Worker) dgtRedeployPaper(ctx context.Context, settings Settings, s
 			entry_price, mark_price, model_state,
 			pnl_target_usdt, max_loss_usdt,
 			grid_step_pct, anti_hunt_stop_price,
-			realized_pnl_usdt, fees_paid_usdt
+			realized_pnl_usdt, fees_paid_usdt,
+			target_price, stop_loss_price, stop_loss_high, trailing_sl_price,
+			adaptive_strategy, risk_reward_ratio
 		) VALUES (
 			$1, $2, $3, 'RUNNING', $4, $5, $6, $7, $8, $9, $10, $11, $11,
 			jsonb_build_object(
@@ -884,7 +922,8 @@ func (worker *Worker) dgtRedeployPaper(ctx context.Context, settings Settings, s
 			),
 			$13, $14,
 			$23, $24,
-			-$22::NUMERIC, $22::NUMERIC
+			-$22::NUMERIC, $22::NUMERIC,
+			$25, $26, $27, $28, $29, $30
 		)
 		ON CONFLICT (settings_id, symbol) WHERE status = 'RUNNING'
 		DO NOTHING
@@ -897,7 +936,9 @@ func (worker *Worker) dgtRedeployPaper(ctx context.Context, settings Settings, s
 		levMode, settings.Leverage, spec.oldBotNumber, "RANGE_BREAK",
 		trancheFlag(trancheOn), spec.slotBudget.String(), atrPct,
 		paperEntryFeePaid.Round(8).String(),
-		mesh.GridStepPct, antiHuntStop).Scan(&botID, &botNumber)
+		mesh.GridStepPct, antiHuntStop,
+		targetPriceDec, stopLossPriceDec, stopLossHighDec, stopLossPriceDec,
+		adaptiveStrat, riskRewardDec).Scan(&botID, &botNumber)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			worker.noteDgtSkip(ctx, spec, "PAPER", "символ уже в работе — конфликт INSERT, редеплой не нужен")
@@ -1031,6 +1072,42 @@ func (worker *Worker) dgtRedeployReal(ctx context.Context, settings Settings, sp
 		lower: lowerPrice, upper: upperPrice, stop: antiHuntStop,
 		gridNum: mesh.GridNum, invest: spec.slotBudget,
 	})
+
+	minRR := 1.8
+	if settings.MinRiskReward.IsPositive() {
+		minRR = settings.MinRiskReward.InexactFloat64()
+	}
+	adaptiveRes := marketdata.ComputeIndividualTargetPrices(marketdata.AdaptiveBotTargetInput{
+		Symbol:        spec.symbol,
+		Direction:     strings.ToLower(spec.direction),
+		CurrentPrice:  spec.breakPrice,
+		LowerPrice:    lowerPrice,
+		UpperPrice:    upperPrice,
+		GridNum:       mesh.GridNum,
+		Budget:        spec.slotBudget.InexactFloat64(),
+		Leverage:      botLev,
+		ATR:           atrPrice.InexactFloat64(),
+		MinRiskReward: minRR,
+		TakerFeeBps:   settings.FeeBps.InexactFloat64(),
+		SlippageBps:   settings.SlippageBps.InexactFloat64(),
+	})
+
+	targetPriceDec := adaptiveRes.TargetPrice
+	stopLossPriceDec := adaptiveRes.StopLossPrice
+	stopLossHighDec := adaptiveRes.StopLossHigh
+	riskRewardDec := decimal.NewFromFloat(adaptiveRes.RiskRewardRatio)
+	adaptiveStrat := adaptiveRes.AdaptiveStrategy
+
+	if settings.PnLTargetMode != "FIXED" {
+		botTargetVal := decimal.NewFromFloat(adaptiveRes.TargetUSDT).Round(2)
+		botTarget = &botTargetVal
+		botMaxLossVal := decimal.NewFromFloat(adaptiveRes.MaxLossUSDT).Round(2)
+		botMaxLoss = &botMaxLossVal
+		if stress.loss.GreaterThan(*botMaxLoss) {
+			botMaxLossVal = stress.loss.Round(2)
+			botMaxLoss = &botMaxLossVal
+		}
+	}
 	// v2.0.142 (audit P2b): ...and the same CEILING (paper twin's comment):
 	// a replacement geometry whose full-traverse loss overflows the
 	// tranche-2 effective-stop ceiling would deploy here and then have its
@@ -1069,30 +1146,19 @@ func (worker *Worker) dgtRedeployReal(ctx context.Context, settings Settings, sp
 		Leverage:        botLev,
 		QuoteInvestment: investAmount.Round(2),
 	}
-	if settings.StopLossMode == "ADAPTIVE_ATR" {
-		data.LossStopType = "price"
-		data.LossStop = &antiHuntStop
+	data.ProfitStopType = "price"
+	data.ProfitStop = &adaptiveRes.TargetPrice
+	profitDelay := 15
+	data.ProfitStopDelay = &profitDelay
+
+	data.LossStopType = "price"
+	data.LossStop = &adaptiveRes.StopLossPrice
+	if adaptiveRes.StopLossHigh != nil {
+		data.LossStopHigh = adaptiveRes.StopLossHigh
 	}
-	// v2.0.111: the break-flip's replacement grid carries the same native
-	// loss bound as a fresh deploy (agent_3217d33f: without this mirror the
-	// ORDI-scenario re-deploy ran unbounded if the process died).
-	if botMaxLoss != nil && botMaxLoss.IsPositive() && data.LossStopType == "" {
-		neg := botMaxLoss.Neg().Round(2)
-		data.LossStopType = "profit_amount"
-		data.LossStop = &neg
-	}
-	if botTarget != nil && botTarget.GreaterThan(decimal.Zero) {
-		targetVal := botTarget.Round(2)
-		data.ProfitStopType = "profit_amount"
-		data.ProfitStop = &targetVal
-	} else if settings.SmartPNLEnabled && spec.direction != "NEUTRAL" {
-		profit := upperPrice
-		if spec.direction == "SHORT" {
-			profit = lowerPrice
-		}
-		data.ProfitStopType = "price"
-		data.ProfitStop = &profit
-	}
+	lossDelay := 15
+	data.LossStopDelay = &lossDelay
+
 	futuresBase := base
 	if !strings.HasSuffix(futuresBase, ".PERP") && !strings.HasSuffix(futuresBase, "_PERP") {
 		futuresBase = fmt.Sprintf("%s.PERP", base)
@@ -1132,6 +1198,12 @@ func (worker *Worker) dgtRedeployReal(ctx context.Context, settings Settings, sp
 			"trancheEntry":    spec.breakPrice.String(),
 			"atrPctEntry":     atrPct,
 		},
+		TargetPrice:      &targetPriceDec,
+		StopLossPrice:    &stopLossPriceDec,
+		StopLossHigh:     stopLossHighDec,
+		TrailingSLPrice:  &stopLossPriceDec,
+		AdaptiveStrategy: &adaptiveStrat,
+		RiskRewardRatio:  &riskRewardDec,
 	})
 	if createErr != nil {
 		if errors.Is(createErr, grid.ErrDuplicateActiveBot) {

@@ -1792,6 +1792,58 @@ func (worker *Worker) deployPaper(
 			}
 			candidate.ModelAssumptions["stressLossFloor"] = true
 		}
+
+		atrVal := 0.0
+		if aVal, ok := candidate.ModelAssumptions["atrPct"].(float64); ok && aVal > 0 {
+			atrVal = aVal * candidate.CurrentPrice.InexactFloat64() / 100.0
+		}
+		var obProfile *marketdata.DepthProfile
+		if dp, ok := candidate.ModelAssumptions["orderBookDepth"].(*marketdata.DepthProfile); ok {
+			obProfile = dp
+		}
+		var srRes *marketdata.SRAnalysisResult
+		if sr, ok := candidate.ModelAssumptions["srAnalysis"].(*marketdata.SRAnalysisResult); ok {
+			srRes = sr
+		}
+
+		minRR := 1.8
+		if settings.MinRiskReward.IsPositive() {
+			minRR = settings.MinRiskReward.InexactFloat64()
+		}
+
+		adaptiveRes := marketdata.ComputeIndividualTargetPrices(marketdata.AdaptiveBotTargetInput{
+			Symbol:         candidate.Symbol,
+			Direction:      trend,
+			CurrentPrice:   candidate.CurrentPrice,
+			LowerPrice:     mesh.LowerPrice,
+			UpperPrice:     mesh.UpperPrice,
+			GridNum:        mesh.GridNum,
+			Budget:         settings.BudgetUSDT.InexactFloat64(),
+			Leverage:       botLev,
+			ATR:            atrVal,
+			OrderBookDepth: obProfile,
+			SRAnalysis:     srRes,
+			MinRiskReward:  minRR,
+			TakerFeeBps:    settings.FeeBps.InexactFloat64(),
+			SlippageBps:    settings.SlippageBps.InexactFloat64(),
+		})
+
+		targetPriceDec := adaptiveRes.TargetPrice
+		stopLossPriceDec := adaptiveRes.StopLossPrice
+		stopLossHighDec := adaptiveRes.StopLossHigh
+		riskRewardDec := decimal.NewFromFloat(adaptiveRes.RiskRewardRatio)
+		adaptiveStrat := adaptiveRes.AdaptiveStrategy
+
+		if settings.PnLTargetMode != "FIXED" {
+			botTargetVal := decimal.NewFromFloat(adaptiveRes.TargetUSDT).Round(2)
+			target = &botTargetVal
+			botMaxLossVal := decimal.NewFromFloat(adaptiveRes.MaxLossUSDT).Round(2)
+			maxLoss = &botMaxLossVal
+			if stress.loss.GreaterThan(*maxLoss) {
+				botMaxLossVal = stress.loss.Round(2)
+				maxLoss = &botMaxLossVal
+			}
+		}
 		// The envelope gate below reserves the candidate's FULL
 		// (post-tranche-2) stop — the exact amount tranche2RiskGate later
 		// re-doubles the stored half to — so it must be captured BEFORE the
@@ -1921,7 +1973,9 @@ func (worker *Worker) deployPaper(
 				entry_price, mark_price, model_state,
 				pnl_target_usdt, max_loss_usdt,
 				grid_step_pct, confluence_score, anti_hunt_stop_price,
-				realized_pnl_usdt, fees_paid_usdt
+				realized_pnl_usdt, fees_paid_usdt,
+				target_price, stop_loss_price, stop_loss_high, trailing_sl_price,
+				adaptive_strategy, risk_reward_ratio
 			) VALUES (
 				$1, $2, $3, 'RUNNING', $4, $5, $6, $7, $8, $9, $10, $11, $11,
 				jsonb_build_object(
@@ -1941,7 +1995,8 @@ func (worker *Worker) deployPaper(
 				),
 				$13, $14,
 				$16, $17, $18,
-				-$26::NUMERIC, $26::NUMERIC
+				-$26::NUMERIC, $26::NUMERIC,
+				$27, $28, $29, $30, $31, $32
 			)
 			ON CONFLICT (settings_id, symbol) WHERE status = 'RUNNING'
 			DO NOTHING
@@ -1954,7 +2009,9 @@ func (worker *Worker) deployPaper(
 			confluence.Status, mesh.GridStepPct, confluence.Score, antiHuntStop,
 			levReason, levMode, settings.Leverage,
 			trancheFlag(trancheOn), settings.BudgetUSDT.String(), atrPct, entryFeaturesJSON(candidate),
-			paperEntryFeePaid.Round(8).String()).Scan(&botID, &botNumber)
+			paperEntryFeePaid.Round(8).String(),
+			targetPriceDec, stopLossPriceDec, stopLossHighDec, stopLossPriceDec,
+			adaptiveStrat, riskRewardDec).Scan(&botID, &botNumber)
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				continue
@@ -2931,6 +2988,14 @@ func (worker *Worker) deployReal(
 		if botMaxLoss != nil {
 			candidateFullStop = *botMaxLoss
 		}
+		if botMaxLoss != nil {
+			if reason := deployStopEnvelopeGate(ctx, worker.db, worker.risk, worker.logger, settings.ID, candidateFullStop); reason != "" {
+				deployErrors = append(deployErrors, fmt.Sprintf("%s: %s", candidate.Symbol, reason))
+				worker.logger.Info("real deploy blocked by fleet stop envelope",
+					"component", "autogrid_worker", "symbol", candidate.Symbol)
+				continue
+			}
+		}
 		if settings.TrancheDeployEnabled {
 			// v2.0.15 (restored — the v2.0.13 patch was lost to a failed
 			// batch): tranche 1 commits HALF the capital, so native
@@ -2945,49 +3010,63 @@ func (worker *Worker) deployReal(
 				botMaxLoss = &half
 			}
 		}
-		if botTarget != nil && botTarget.GreaterThan(decimal.Zero) {
-			targetVal := botTarget.Round(2)
-			data.ProfitStopType = "profit_amount"
-			data.ProfitStop = &targetVal
-		} else if settings.SmartPNLEnabled && trend != "no_trend" {
-			profit := upperPrice
-			if trend == "short" {
-				profit = lowerPrice
-			}
-			data.ProfitStopType = "price"
-			data.ProfitStop = &profit
+		atrVal := 0.0
+		if aVal, ok := candidate.ModelAssumptions["atrPct"].(float64); ok && aVal > 0 {
+			atrVal = aVal * candidate.CurrentPrice.InexactFloat64() / 100.0
 		}
-		// v2.0.67 parity: the SAME fleet stop-envelope gate the paper path
-		// runs (joint paper+REAL sum, full-stop reservation, 0.8× derived
-		// breaker). REAL used to skip it entirely — a REAL deploy could
-		// overflow the account's stop envelope while every paper deploy was
-		// being refused for it.
-		if botMaxLoss != nil {
-			if reason := deployStopEnvelopeGate(ctx, worker.db, worker.risk, worker.logger, settings.ID, candidateFullStop); reason != "" {
-				deployErrors = append(deployErrors, fmt.Sprintf("%s: %s", candidate.Symbol, reason))
-				worker.logger.Info("real deploy blocked by fleet stop envelope",
-					"component", "autogrid_worker", "symbol", candidate.Symbol)
-				continue
-			}
+		var obProfile *marketdata.DepthProfile
+		if dp, ok := candidate.ModelAssumptions["orderBookDepth"].(*marketdata.DepthProfile); ok {
+			obProfile = dp
 		}
-		futuresBase := base
-		if !strings.HasSuffix(futuresBase, ".PERP") && !strings.HasSuffix(futuresBase, "_PERP") {
-			futuresBase = fmt.Sprintf("%s.PERP", base)
+		var srRes *marketdata.SRAnalysisResult
+		if sr, ok := candidate.ModelAssumptions["srAnalysis"].(*marketdata.SRAnalysisResult); ok {
+			srRes = sr
 		}
-		// v2.0.111 native loss-stop: the exchange's own executor bounds the
-		// position even if our whole process dies (SUI/ORDI overshoots were
-		// 12-31% over cap on our-side reactive stops). Two reviewer-forced
-		// decisions (agent_3217d33f): (a) arm at candidateFullStop — the
-		// post-tranche envelope — because invest_in cannot widen an
-		// exchange stop, and the pre-pour manage stop (halved cap) fires
-		// first in the normal path, leaving this as the process-dead bound;
-		// (b) ADAPTIVE_ATR's price stop keeps priority when set — the
-		// anti-hunt machinery owns that stop positionally, and a silent
-		// displacement would change the guarantee's shape.
-		if candidateFullStop.IsPositive() && data.LossStopType == "" {
-			neg := candidateFullStop.Neg().Round(2)
-			data.LossStopType = "profit_amount"
-			data.LossStop = &neg
+
+		minRR := 1.8
+		if settings.MinRiskReward.IsPositive() {
+			minRR = settings.MinRiskReward.InexactFloat64()
+		}
+
+		adaptiveRes := marketdata.ComputeIndividualTargetPrices(marketdata.AdaptiveBotTargetInput{
+			Symbol:         candidate.Symbol,
+			Direction:      trend,
+			CurrentPrice:   candidate.CurrentPrice,
+			LowerPrice:     lowerPrice,
+			UpperPrice:     upperPrice,
+			GridNum:        mesh.GridNum,
+			Budget:         slotBudget.InexactFloat64(),
+			Leverage:       botLev,
+			ATR:            atrVal,
+			OrderBookDepth: obProfile,
+			SRAnalysis:     srRes,
+			MinRiskReward:  minRR,
+			TakerFeeBps:    settings.FeeBps.InexactFloat64(),
+			SlippageBps:    settings.SlippageBps.InexactFloat64(),
+		})
+
+		// Configure native Pionex price-based take-profit and stop-loss directly on the bot card
+		data.ProfitStopType = "price"
+		data.ProfitStop = &adaptiveRes.TargetPrice
+		profitDelay := 15
+		data.ProfitStopDelay = &profitDelay
+
+		data.LossStopType = "price"
+		data.LossStop = &adaptiveRes.StopLossPrice
+		if adaptiveRes.StopLossHigh != nil {
+			data.LossStopHigh = adaptiveRes.StopLossHigh
+		}
+		lossDelay := 15
+		data.LossStopDelay = &lossDelay
+
+		// Sized net true USDT targets
+		botTargetVal := decimal.NewFromFloat(adaptiveRes.TargetUSDT).Round(2)
+		botTarget = &botTargetVal
+		botMaxLossVal := decimal.NewFromFloat(adaptiveRes.MaxLossUSDT).Round(2)
+		botMaxLoss = &botMaxLossVal
+		if stress.loss.GreaterThan(*botMaxLoss) {
+			botMaxLossVal = stress.loss.Round(2)
+			botMaxLoss = &botMaxLossVal
 		}
 
 		// Walk-forward backtest gate: the traded TF must pass empirical walk-forward
@@ -3074,7 +3153,7 @@ func (worker *Worker) deployReal(
 		}
 
 		params := pionex.NativeFuturesGridCreateParams{
-			Base: futuresBase, Quote: quote, BUOrderData: data,
+			Base: base, Quote: quote, BUOrderData: data,
 		}
 		// Native pre-flight validation: check parameters against Pionex estimation
 		check, checkErr := client.CheckFuturesGridParams(ctx, params)
@@ -3114,6 +3193,12 @@ func (worker *Worker) deployReal(
 		if stress.floored {
 			trancheMarkers["stressLossFloor"] = true
 		}
+		targetPriceDec := adaptiveRes.TargetPrice
+		stopLossPriceDec := adaptiveRes.StopLossPrice
+		stopLossHighDec := adaptiveRes.StopLossHigh
+		riskRewardDec := decimal.NewFromFloat(adaptiveRes.RiskRewardRatio)
+		adaptiveStrat := adaptiveRes.AdaptiveStrategy
+
 		botID, createErr := manager.CreateGridBot(ctx, grid.CreateInput{
 			AccountID:          *settings.AccountID,
 			AutoGridSettingsID: &settings.ID,
@@ -3132,7 +3217,13 @@ func (worker *Worker) deployReal(
 			// lifecycle INSERT — the old follow-up UPDATE was best-effort and
 			// its failure silently stripped the bot of its tranche contract.
 			// Markers match the paper model_state contract.
-			TrancheState: trancheMarkers,
+			TrancheState:     trancheMarkers,
+			TargetPrice:      &targetPriceDec,
+			StopLossPrice:    &stopLossPriceDec,
+			StopLossHigh:     stopLossHighDec,
+			TrailingSLPrice:  &stopLossPriceDec,
+			AdaptiveStrategy: &adaptiveStrat,
+			RiskRewardRatio:  &riskRewardDec,
 		})
 		if createErr != nil {
 			if errors.Is(createErr, grid.ErrDuplicateActiveBot) {
@@ -3690,6 +3781,9 @@ type managedBot struct {
 	shiftRealizedBase                                       decimal.Decimal
 	lastRemoteGridProfit                                    decimal.Decimal
 	lastAdjustmentsCount                                    int
+	targetPrice, stopLossPrice, stopLossHigh, trailingSLPrice *decimal.Decimal
+	adaptiveStrategy                                          string
+	riskRewardRatio                                           *decimal.Decimal
 }
 
 // managedBot is the per-pass supervision row for REAL bots (v2.0.149:
@@ -3845,7 +3939,9 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 		       NULLIF(model_state->>'peakFloorUsdt','')::NUMERIC,
 		       COALESCE(NULLIF(model_state->>'shiftRealizedBase','')::NUMERIC, 0),
 		       COALESCE(NULLIF(model_state->>'lastRemoteGridProfit','')::NUMERIC, 0),
-		       COALESCE(NULLIF(model_state->>'lastAdjustmentsCount','')::INT, 0)
+		       COALESCE(NULLIF(model_state->>'lastAdjustmentsCount','')::INT, 0),
+		       target_price, stop_loss_price, stop_loss_high, trailing_sl_price,
+		       COALESCE(adaptive_strategy, ''), risk_reward_ratio
 		FROM grid_bots
 		WHERE autogrid_settings_id = $1 AND bu_order_id IS NOT NULL
 		  AND status IN ('RUNNING', 'STOP_REQUESTED', 'STOPPING')
@@ -3872,6 +3968,8 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 			&item.wickShieldTriggeredAt, &item.wickShieldExtreme,
 			&item.wickShieldLastClearedAt, &item.rebasePos, &item.peakFloor,
 			&item.shiftRealizedBase, &item.lastRemoteGridProfit, &item.lastAdjustmentsCount,
+			&item.targetPrice, &item.stopLossPrice, &item.stopLossHigh, &item.trailingSLPrice,
+			&item.adaptiveStrategy, &item.riskRewardRatio,
 		); err != nil {
 			rows.Close()
 			return clampInterval(settings.ManageIntervalSeconds), err
@@ -4672,21 +4770,46 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 		}
 		bot.peakFloor = &peakFloorNow
 		closeDecidedAt := time.Now()
+		var ofiRegime *string
+		var microBias *float64
+		if worker.ofiEngine != nil {
+			micro := worker.ofiEngine.Analyze(bot.symbol)
+			rStr := string(micro.Regime)
+			ofiRegime = &rStr
+			microBias = &micro.MicroPriceBiasBps
+		}
+		ouReading := worker.ouReadingForSymbol(ctx, bot.symbol, *settings)
+		ouHalfLife := 0.0
+		if ouReading.ok && ouReading.halfLifeHours > 0 {
+			ouHalfLife = ouReading.halfLifeHours
+		}
+
 		decision := decideBotAction(botActionInput{
-			Direction:        bot.direction,
-			Lower:            bot.lower,
-			Upper:            bot.upper,
-			CurrentPrice:     price,
-			RealizedPNL:      realized,
-			UnrealizedPNL:    supervisionFloor,
-			PeakPNL:          peakFloorNow,
-			Budget:           bot.investment,
-			PnLTarget:        botTarget,
-			MaxLoss:          botMaxLoss,
-			RangeBreakBuffer: settings.RangeBreakBufferPct,
-			AdjustmentsLeft:  settings.MaxAdjustmentsPerBot - bot.adjustments,
-			Regime:           regime,
-			AntiHuntStop:     bot.antiHuntStop,
+			Direction:         bot.direction,
+			Lower:             bot.lower,
+			Upper:             bot.upper,
+			CurrentPrice:      price,
+			RealizedPNL:       realized,
+			UnrealizedPNL:     supervisionFloor,
+			PeakPNL:           peakFloorNow,
+			Budget:            bot.investment,
+			PnLTarget:         botTarget,
+			MaxLoss:           botMaxLoss,
+			RangeBreakBuffer:  settings.RangeBreakBufferPct,
+			AdjustmentsLeft:   settings.MaxAdjustmentsPerBot - bot.adjustments,
+			Regime:            regime,
+			AntiHuntStop:      bot.antiHuntStop,
+			TargetPrice:       bot.targetPrice,
+			StopLossPrice:     bot.stopLossPrice,
+			StopLossHigh:      bot.stopLossHigh,
+			TrailingSLPrice:   bot.trailingSLPrice,
+			OFIRegime:         ofiRegime,
+			MicroPriceBiasBps: microBias,
+			AgeHours:          time.Since(bot.createdAt).Hours(),
+			OUHalfLifeHours:   ouHalfLife,
+			SmartExitEnabled:  settings.SmartExitEnabled,
+			OFIHarvestEnabled: settings.OFIHarvestEnabled,
+			OURotationEnabled: settings.OURotationEnabled,
 		})
 		// v2.0.93 FIX-E (paper-canonical order): the tranche-2 pour runs AFTER
 		// the stop decision, not before it. The old order poured on the very
@@ -5016,7 +5139,7 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 				wickShieldClear()
 			}
 			fallthrough
-		case ActionCloseStopLoss, ActionCloseTakeProfit:
+		case ActionCloseStopLoss, ActionCloseTakeProfit, ActionCloseSmartHarvest, ActionCloseOURotation:
 			// v2.0.120 (review agent): the stop DECISION runs on the floor
 			// basis (UnrealizedPNL = supervisionFloor), so the intent marker
 			// must carry the same basis — a raw-basis marker on a pooled bot
@@ -5044,6 +5167,10 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 				eventType := "STOP_LOSS"
 				if decision.Action == ActionCloseTakeProfit {
 					eventType = "TAKE_PROFIT"
+				} else if decision.Action == ActionCloseSmartHarvest {
+					eventType = "SMART_HARVEST"
+				} else if decision.Action == ActionCloseOURotation {
+					eventType = "OU_ROTATION"
 				}
 				pnlPct := decimal.Zero
 				if !bot.investment.IsZero() {
@@ -5212,6 +5339,43 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 					"bot_number": bot.botNumber, "symbol": bot.symbol,
 					"lower_price": decision.NewLower.StringFixed(6), "upper_price": decision.NewUpper.StringFixed(6),
 					"reason": decision.Reason, "mode": shiftMode, "adjustments_count": bot.adjustments + 1,
+				})
+			}
+		case ActionUpdateTrailingSL:
+			if decision.TrailingSLPrice == nil || !decision.TrailingSLPrice.IsPositive() {
+				break
+			}
+			newSLStr := decision.TrailingSLPrice.String()
+			worker.logger.Info("advancing trailing stop-loss natively on Pionex bot card",
+				"component", "autogrid_worker", "bot_id", bot.id, "symbol", bot.symbol,
+				"remote_id", bot.remoteID, "new_sl", newSLStr)
+
+			req := pionex.FuturesGridUpdateTriggerProfitLossRequest{
+				BUOrderID: bot.remoteID,
+				List: []pionex.FuturesGridTriggerProfitLossItem{
+					{
+						Type:     "stop_loss",
+						StopType: "price",
+						Value:    newSLStr,
+					},
+				},
+			}
+			_, updateErr := client.UpdateFuturesGridTriggerProfitLoss(ctx, req)
+			if updateErr != nil {
+				worker.logger.Error("failed to update native trailing stop-loss on Pionex",
+					"component", "autogrid_worker", "bot_id", bot.id, "remote_id", bot.remoteID,
+					"error", updateErr)
+			} else {
+				_, _ = worker.db.Exec(ctx, `
+					UPDATE grid_bots
+					SET trailing_sl_price = $1, stop_loss_price = $1, updated_at = NOW()
+					WHERE id = $2
+				`, decision.TrailingSLPrice, bot.id)
+				_ = LogBotEvent(ctx, worker.db, bot.id, bot.botNumber, "REAL", bot.symbol, "TRAILING_SL_ADVANCED", &price, nil, map[string]any{
+					"new_sl": newSLStr, "reason": decision.Reason,
+				})
+				_ = QueueTelegramEvent(ctx, worker.db, "TRAILING_SL_ADVANCED", map[string]any{
+					"bot_number": bot.botNumber, "symbol": bot.symbol, "new_sl": newSLStr, "reason": decision.Reason,
 				})
 			}
 		}
@@ -5801,7 +5965,9 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 		       candidate_id, COALESCE(pairs_completed, 0), COALESCE(funding_paid_usdt, 0),
 		       NULLIF(model_state->>'wickShieldTriggeredAt',''),
 		       NULLIF(model_state->>'wickShieldExtreme','')::NUMERIC,
-		       NULLIF(model_state->>'wickShieldLastClearedAt','')
+		       NULLIF(model_state->>'wickShieldLastClearedAt',''),
+		       target_price, stop_loss_price, stop_loss_high, trailing_sl_price,
+		       COALESCE(adaptive_strategy, ''), risk_reward_ratio
 		FROM paper_grid_bots
 		WHERE settings_id = $1 AND status = 'RUNNING'
 	`, settings.ID)
@@ -5833,6 +5999,12 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 		wickShieldTriggeredAt    *string
 		wickShieldExtreme        *decimal.Decimal
 		wickShieldLastClearedAt  *string
+		targetPrice              *decimal.Decimal
+		stopLossPrice            *decimal.Decimal
+		stopLossHigh             *decimal.Decimal
+		trailingSLPrice          *decimal.Decimal
+		adaptiveStrategy         string
+		riskRewardRatio          *decimal.Decimal
 	}
 	bots := make([]paperBot, 0)
 	for rows.Next() {
@@ -5846,6 +6018,8 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 			&item.peak, &item.trancheDeployed, &item.trancheBase, &item.atrEntry,
 			&item.candidateID, &item.pairsCompleted, &item.fundingPaid,
 			&item.wickShieldTriggeredAt, &item.wickShieldExtreme, &item.wickShieldLastClearedAt,
+			&item.targetPrice, &item.stopLossPrice, &item.stopLossHigh, &item.trailingSLPrice,
+			&item.adaptiveStrategy, &item.riskRewardRatio,
 		); err != nil {
 			rows.Close()
 			return err
@@ -6109,21 +6283,46 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 			regime = worker.regimeForSymbol(ctx, bot.symbol)
 		}
 
+		var ofiRegime *string
+		var microBias *float64
+		if worker.ofiEngine != nil {
+			micro := worker.ofiEngine.Analyze(bot.symbol)
+			rStr := string(micro.Regime)
+			ofiRegime = &rStr
+			microBias = &micro.MicroPriceBiasBps
+		}
+		ouReading := worker.ouReadingForSymbol(ctx, bot.symbol, settings)
+		ouHalfLife := 0.0
+		if ouReading.ok && ouReading.halfLifeHours > 0 {
+			ouHalfLife = ouReading.halfLifeHours
+		}
+
 		decision := decideBotAction(botActionInput{
-			Direction:        bot.direction,
-			Lower:            bot.lower,
-			Upper:            bot.upper,
-			CurrentPrice:     price,
-			RealizedPNL:      realized,
-			UnrealizedPNL:    unrealized,
-			PeakPNL:          peakPnL,
-			Budget:           bot.investment,
-			PnLTarget:        botTarget,
-			MaxLoss:          botMaxLoss,
-			RangeBreakBuffer: settings.RangeBreakBufferPct,
-			AdjustmentsLeft:  settings.MaxAdjustmentsPerBot - bot.adjustmentsCount,
-			Regime:           regime,
-			AntiHuntStop:     bot.antiHuntStop,
+			Direction:         bot.direction,
+			Lower:             bot.lower,
+			Upper:             bot.upper,
+			CurrentPrice:      price,
+			RealizedPNL:       realized,
+			UnrealizedPNL:     unrealized,
+			PeakPNL:           peakPnL,
+			Budget:            bot.investment,
+			PnLTarget:         botTarget,
+			MaxLoss:           botMaxLoss,
+			RangeBreakBuffer:  settings.RangeBreakBufferPct,
+			AdjustmentsLeft:   settings.MaxAdjustmentsPerBot - bot.adjustmentsCount,
+			Regime:            regime,
+			AntiHuntStop:      bot.antiHuntStop,
+			TargetPrice:       bot.targetPrice,
+			StopLossPrice:     bot.stopLossPrice,
+			StopLossHigh:      bot.stopLossHigh,
+			TrailingSLPrice:   bot.trailingSLPrice,
+			OFIRegime:         ofiRegime,
+			MicroPriceBiasBps: microBias,
+			AgeHours:          time.Since(bot.openedAt).Hours(),
+			OUHalfLifeHours:   ouHalfLife,
+			SmartExitEnabled:  settings.SmartExitEnabled,
+			OFIHarvestEnabled: settings.OFIHarvestEnabled,
+			OURotationEnabled: settings.OURotationEnabled,
 		})
 
 		if decision.Action == ActionHold || decision.Action == ActionAdjustUp || decision.Action == ActionAdjustDown {
@@ -6194,7 +6393,8 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 		}
 
 		if decision.Action == ActionCloseTakeProfit || decision.Action == ActionCloseStopLoss ||
-			decision.Action == ActionCloseRangeBreak || decision.Action == ActionCloseStructInvalid {
+			decision.Action == ActionCloseRangeBreak || decision.Action == ActionCloseStructInvalid ||
+			decision.Action == ActionCloseSmartHarvest || decision.Action == ActionCloseOURotation {
 			_, err := worker.db.Exec(ctx, `
 				UPDATE paper_grid_bots
 				SET status = 'COMPLETED', closed_reason = $2,
@@ -6215,6 +6415,10 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 			eventType := "STOP_LOSS"
 			if decision.Action == ActionCloseTakeProfit {
 				eventType = "TAKE_PROFIT"
+			} else if decision.Action == ActionCloseSmartHarvest {
+				eventType = "SMART_HARVEST"
+			} else if decision.Action == ActionCloseOURotation {
+				eventType = "OU_ROTATION"
 			}
 			pnlPct := decimal.Zero
 			if !bot.investment.IsZero() {
@@ -6246,6 +6450,20 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 					oldBotNumber: bot.botNumber,
 					candidateID:  bot.candidateID,
 					atrFallback:  bot.atrEntry,
+				})
+			}
+			continue
+		}
+
+		if decision.Action == ActionUpdateTrailingSL {
+			if decision.TrailingSLPrice != nil && decision.TrailingSLPrice.IsPositive() {
+				_, _ = worker.db.Exec(ctx, `
+					UPDATE paper_grid_bots
+					SET trailing_sl_price = $1, stop_loss_price = $1, updated_at = NOW()
+					WHERE id = $2
+				`, decision.TrailingSLPrice, bot.id)
+				_ = LogBotEvent(ctx, worker.db, bot.id, bot.botNumber, "PAPER", bot.symbol, "TRAILING_SL_ADVANCED", &price, nil, map[string]any{
+					"new_sl": decision.TrailingSLPrice.String(), "reason": decision.Reason,
 				})
 			}
 			continue

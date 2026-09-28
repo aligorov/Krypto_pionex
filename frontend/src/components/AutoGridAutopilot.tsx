@@ -546,6 +546,10 @@ function SettingsSummary({ settings }: { settings: AutoGridSettings }) {
     ['Order Book Cushion & Walls', settings.orderbookProfilerEnabled ? `включён (мин. подушка ${settings.minDepthCushionRatio ?? '50'}x)` : 'выключен'],
     ['Knife Pause (защита от ножа)', settings.knifePauseEnabled ? 'включён (пауза при >75% taker sell)' : 'выключен'],
     ['Gaussian Grid Density', settings.gaussianDensityEnabled ? 'включён (сгущение уровней у POC)' : 'выключен'],
+    ['Умный выход (Smart Exit)', settings.smartExitEnabled !== false ? 'включён (OFI истощение + OU полураспад)' : 'выключен'],
+    ['OFI Harvest (тейк на вершине)', settings.ofiHarvestEnabled !== false ? 'включён (своевременная фиксация)' : 'выключен'],
+    ['OU Rotation (ротация застрявших)', settings.ouRotationEnabled !== false ? 'включена (при t > 1.5 × t½)' : 'выключена'],
+    ['Мин. Risk/Reward (R:R)', settings.minRiskReward ? `≥ ${settings.minRiskReward}` : '≥ 1.80'],
   ];
   return (
     <div>
@@ -659,6 +663,10 @@ function SettingsForm({
           orderbookProfilerEnabled: !!form.orderbookProfilerEnabled,
           knifePauseEnabled: !!form.knifePauseEnabled,
           minDepthCushionRatio: dec(form.minDepthCushionRatio ?? '50'),
+          smartExitEnabled: !!form.smartExitEnabled,
+          ofiHarvestEnabled: !!form.ofiHarvestEnabled,
+          ouRotationEnabled: !!form.ouRotationEnabled,
+          minRiskReward: dec(form.minRiskReward ?? '1.80'),
         }),
       });
       await onSaved();
@@ -972,6 +980,63 @@ function SettingsForm({
               type="number"
               value={form.universeScanCap || 250}
               onChange={(event) => setForm((current) => ({ ...current, universeScanCap: Number(event.target.value) }))}
+            />
+          </label>
+        </div>
+
+        <div className="section-divider" style={{ margin: '16px 0', borderTop: '1px solid var(--border)' }} />
+        <h4 style={{ margin: '0 0 12px 0' }}>🎯 Индивидуальные адаптивные цели &amp; Smart Exit (Pionex Native Card)</h4>
+
+        <div className="toggle-row">
+          <div>
+            <strong>Умный выход (Smart Exit Engine)</strong>
+            <span>
+              Включает адаптивное сопровождение позиций: подтягивание трейлинг-стопа на бирже, раннюю фиксацию при истощении книги ордеров (OFI Exhaustion) и ротацию застрявшего капитала.
+            </span>
+          </div>
+          <input
+            type="checkbox"
+            checked={form.smartExitEnabled !== false}
+            onChange={(event) => setForm((current) => ({ ...current, smartExitEnabled: event.target.checked }))}
+          />
+        </div>
+
+        <div className="toggle-row">
+          <div>
+            <strong>OFI Top Harvest (тейк на вершине)</strong>
+            <span>
+              Фиксирует накопленную прибыль на локальных пиках при резком развороте институционального потока лимитных заявок (OFI &lt; -1.5), защищая прибыль от обратного отката.
+            </span>
+          </div>
+          <input
+            type="checkbox"
+            checked={form.ofiHarvestEnabled !== false}
+            onChange={(event) => setForm((current) => ({ ...current, ofiHarvestEnabled: event.target.checked }))}
+          />
+        </div>
+
+        <div className="toggle-row">
+          <div>
+            <strong>OU Half-Life Rotation (ротация застрявших ботов)</strong>
+            <span>
+              Анализирует процесс Ornstein-Uhlenbeck: если бот находится в сетке дольше 1.5× времени полураспада (t &gt; 1.5 × t½) и не генерирует прибыль, капитал освобождается для новых лидеров рынка.
+            </span>
+          </div>
+          <input
+            type="checkbox"
+            checked={form.ouRotationEnabled !== false}
+            onChange={(event) => setForm((current) => ({ ...current, ouRotationEnabled: event.target.checked }))}
+          />
+        </div>
+
+        <div className="field-grid">
+          <label>
+            <span>Мин. соотношение Risk/Reward (R:R)</span>
+            <input
+              type="text"
+              value={form.minRiskReward || '1.80'}
+              onChange={(event) => setForm((current) => ({ ...current, minRiskReward: event.target.value }))}
+              placeholder="1.80"
             />
           </label>
         </div>

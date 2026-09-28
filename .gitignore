@@ -14,3 +14,4 @@ node_modules/
 .DS_Store
 .playwright-mcp/
 graphify-out/
+docs/deck/

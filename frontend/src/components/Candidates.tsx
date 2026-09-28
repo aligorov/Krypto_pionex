@@ -252,6 +252,7 @@ export default function Candidates({ canOperate: _canOperate }: Props) {
                   </th>
                   <th>ADX</th>
                   <th>Грид (диапазон)</th>
+                  <th>Стратегия &amp; Цели (R:R)</th>
                   <th>Направление</th>
                   <th>Плечо</th>
                   <th onClick={() => handleSort('expectedValuePct')} style={{ cursor: 'pointer', whiteSpace: 'nowrap' }}>
@@ -335,6 +336,53 @@ export default function Candidates({ canOperate: _canOperate }: Props) {
       )}
     </div>
   );
+}
+
+function candidateStrategyBadge(strat?: string | null) {
+  if (!strat) return null;
+  switch (strat) {
+    case 'OFI_WALL_DEFENSE':
+      return (
+        <span
+          className="badge"
+          style={{ background: 'rgba(56, 189, 248, 0.15)', color: '#38bdf8', border: '1px solid rgba(56, 189, 248, 0.3)', fontSize: '0.68rem', padding: '1px 5px', fontWeight: 600 }}
+          title="Защита крупной стенки в стакане L2 (Front-run wall)"
+        >
+          🛡️ Wall Defense
+        </span>
+      );
+    case 'SR_MOMENTUM_RUNNER':
+      return (
+        <span
+          className="badge"
+          style={{ background: 'rgba(16, 185, 129, 0.15)', color: '#34d399', border: '1px solid rgba(16, 185, 129, 0.3)', fontSize: '0.68rem', padding: '1px 5px', fontWeight: 600 }}
+          title="Импульсный пробой уровней поддержки/сопротивления (R:R runner)"
+        >
+          🚀 Momentum Runner
+        </span>
+      );
+    case 'MEAN_REVERSION_OU':
+      return (
+        <span
+          className="badge"
+          style={{ background: 'rgba(168, 85, 247, 0.15)', color: '#c084fc', border: '1px solid rgba(168, 85, 247, 0.3)', fontSize: '0.68rem', padding: '1px 5px', fontWeight: 600 }}
+          title="Возврат к средней по процессу Орнштейна-Уленбека"
+        >
+          🔄 OU Mean Rev
+        </span>
+      );
+    case 'VOLATILITY_EXPANSION':
+    default:
+      return (
+        <span
+          className="badge"
+          style={{ background: 'rgba(234, 179, 8, 0.15)', color: '#facc15', border: '1px solid rgba(234, 179, 8, 0.3)', fontSize: '0.68rem', padding: '1px 5px', fontWeight: 600 }}
+          title="Волатильностный канал с ATR буфером"
+        >
+          ⚡ Vol Expansion
+        </span>
+      );
+  }
 }
 
 function CandidateRow({
@@ -421,6 +469,22 @@ function CandidateRow({
       <td>
         {candidate.lowerPrice} – {candidate.upperPrice}
         <small>{candidate.gridNum} уровней</small>
+      </td>
+      <td>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '2px', minWidth: '120px' }}>
+          {candidateStrategyBadge(candidate.adaptiveStrategy)}
+          {(candidate.targetPrice || candidate.stopLossPrice) && (
+            <div style={{ fontSize: '0.74rem', display: 'flex', flexDirection: 'column', gap: '1px' }}>
+              {candidate.targetPrice && <span style={{ color: '#34d399' }}>TP: {candidate.targetPrice}</span>}
+              {candidate.stopLossPrice && <span style={{ color: '#f87171' }}>SL: {candidate.stopLossPrice}</span>}
+            </div>
+          )}
+          {candidate.riskRewardRatio && Number(candidate.riskRewardRatio) > 0 && (
+            <div style={{ fontSize: '0.68rem', color: '#94a3b8' }}>
+              R:R 1:{Number(candidate.riskRewardRatio).toFixed(2)}
+            </div>
+          )}
+        </div>
       </td>
       <td>
         <span className={`badge ${candidate.recommendedTrend === 'long' ? 'success' : candidate.recommendedTrend === 'short' ? 'danger' : 'neutral'}`}>

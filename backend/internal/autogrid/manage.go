@@ -8,12 +8,16 @@ import (
 )
 
 // Management actions for a running native grid bot.
+// Management actions for a running native grid bot.
 const (
 	ActionHold               = "HOLD"
 	ActionCloseTakeProfit    = "CLOSE_TAKE_PROFIT"
 	ActionCloseStopLoss      = "CLOSE_STOP_LOSS"
 	ActionCloseRangeBreak    = "CLOSE_RANGE_BREAK"
 	ActionCloseStructInvalid = "CLOSE_STRUCT_INVALID"
+	ActionCloseSmartHarvest  = "CLOSE_SMART_HARVEST"
+	ActionCloseOURotation    = "CLOSE_OU_ROTATION"
+	ActionUpdateTrailingSL   = "UPDATE_TRAILING_SL"
 	ActionAdjustUp           = "ADJUST_UP"
 	ActionAdjustDown         = "ADJUST_DOWN"
 )
@@ -35,38 +39,132 @@ type botActionInput struct {
 	// AntiHuntStop is the deploy-time invalidation level: price beyond it
 	// against the bot's direction means the thesis the grid was opened
 	// under is dead — close before the exchange stop gets swept.
-	AntiHuntStop *decimal.Decimal
+	AntiHuntStop      *decimal.Decimal
+	TargetPrice       *decimal.Decimal
+	StopLossPrice     *decimal.Decimal
+	StopLossHigh      *decimal.Decimal
+	TrailingSLPrice   *decimal.Decimal
+	OFIRegime         *string
+	MicroPriceBiasBps *float64
+	AgeHours          float64
+	OUHalfLifeHours   float64
+	SmartExitEnabled  bool
+	OFIHarvestEnabled bool
+	OURotationEnabled bool
 }
 
 type manageDecision struct {
-	Action   string
-	Reason   string
-	NewLower decimal.Decimal
-	NewUpper decimal.Decimal
+	Action          string
+	Reason          string
+	NewLower        decimal.Decimal
+	NewUpper        decimal.Decimal
+	TrailingSLPrice *decimal.Decimal
 }
 
 // decideBotAction is the pure supervision policy for a running bot:
+//  0. check price-based take-profit and stop-loss;
 //  1. take the money when the per-bot PnL target is reached;
-//  2. lock in profit on trailing pullback once peak profit arms at >= 50% of target;
-//  3. protect breakeven when an armed peak decays back near flat;
-//  4. cut the loss at the configured maximum;
-//  5. when price escapes the grid range, follow the break with a native range
-//     shift when the regime allows, otherwise close to avoid trend damage.
-//
-// Break matrix (down / up):
-//
-//	LONG   down: TREND_DOWN or unknown -> close; RANGE/TREND_UP -> shift down
-//	LONG   up:   follow with shift up (inventory was sold into strength)
-//	SHORT  up:   TREND_UP or unknown -> close; RANGE/TREND_DOWN -> shift up
-//	SHORT  down: follow with shift down (shorts harvest the fall)
-//	NEUTRAL: adverse break closes unless the regime still supports a shift;
-//	the profitable side of a neutral grid keeps shifting with the market.
+//  2. harvest tops on OFI exhaustion (SmartProfitHarvest);
+//  3. lock in profit on trailing pullback once peak profit arms at >= 50% of target;
+//  4. advance native trailing SL to protect gains on the exchange card;
+//  5. rotate capital out of stagnant bots via Ornstein-Uhlenbeck half-life;
+//  6. cut the loss at the configured maximum or structural invalidation;
+//  7. when price escapes the grid range, follow the break with a native range shift.
 func decideBotAction(input botActionInput) manageDecision {
 	total := input.RealizedPNL.Add(input.UnrealizedPNL)
+
+	// 0. Price-based Take-Profit: if target price is set and reached natively
+	if input.TargetPrice != nil && input.TargetPrice.GreaterThan(decimal.Zero) && input.CurrentPrice.GreaterThan(decimal.Zero) {
+		tpReached := false
+		switch input.Direction {
+		case "SHORT":
+			tpReached = input.CurrentPrice.LessThanOrEqual(*input.TargetPrice)
+		default: // LONG, NEUTRAL
+			tpReached = input.CurrentPrice.GreaterThanOrEqual(*input.TargetPrice)
+		}
+		if tpReached && total.IsPositive() {
+			return manageDecision{Action: ActionCloseTakeProfit, Reason: "TAKE_PROFIT_PRICE_HIT"}
+		}
+	}
+
+	// 0.5 Price-based Stop-Loss: if stop loss price is set and breached
+	if input.StopLossPrice != nil && input.StopLossPrice.GreaterThan(decimal.Zero) && input.CurrentPrice.GreaterThan(decimal.Zero) {
+		slBreached := false
+		switch input.Direction {
+		case "SHORT":
+			slBreached = input.CurrentPrice.GreaterThanOrEqual(*input.StopLossPrice)
+		default: // LONG, NEUTRAL
+			slBreached = input.CurrentPrice.LessThanOrEqual(*input.StopLossPrice)
+		}
+		if slBreached {
+			return manageDecision{Action: ActionCloseStopLoss, Reason: "STOP_LOSS_PRICE_BREACH"}
+		}
+	}
+
+	// Neutral Grid Upper Stop-Loss Breach
+	if input.StopLossHigh != nil && input.StopLossHigh.GreaterThan(decimal.Zero) && input.CurrentPrice.GreaterThan(decimal.Zero) {
+		if input.CurrentPrice.GreaterThanOrEqual(*input.StopLossHigh) {
+			return manageDecision{Action: ActionCloseStopLoss, Reason: "STOP_LOSS_HIGH_BREACH"}
+		}
+	}
 
 	// 1. Direct Take-Profit
 	if input.PnLTarget.GreaterThan(decimal.Zero) && total.GreaterThanOrEqual(input.PnLTarget) {
 		return manageDecision{Action: ActionCloseTakeProfit, Reason: "TAKE_PROFIT"}
+	}
+
+	// 1.5 Smart Profit Harvest: Exit at the peak before pullback on OFI/Microstructure exhaustion
+	if input.SmartExitEnabled && input.OFIHarvestEnabled && total.GreaterThan(input.Budget.Mul(decimal.NewFromFloat(0.015))) {
+		isExhausted := false
+		if input.Direction == "LONG" {
+			if input.MicroPriceBiasBps != nil && *input.MicroPriceBiasBps < -2.5 {
+				if input.OFIRegime != nil && (*input.OFIRegime == "STRONG_SELLER_ABSORPTION" || *input.OFIRegime == "OFI_DIVERGENCE_BEARISH" || *input.OFIRegime == "DUMP_PRESSURE") {
+					isExhausted = true
+				}
+			}
+		} else if input.Direction == "SHORT" {
+			if input.MicroPriceBiasBps != nil && *input.MicroPriceBiasBps > 2.5 {
+				if input.OFIRegime != nil && (*input.OFIRegime == "STRONG_BUYER_ABSORPTION" || *input.OFIRegime == "OFI_DIVERGENCE_BULLISH" || *input.OFIRegime == "PUMP_PRESSURE") {
+					isExhausted = true
+				}
+			}
+		}
+		if isExhausted {
+			return manageDecision{Action: ActionCloseSmartHarvest, Reason: "SMART_PROFIT_HARVEST_OFI"}
+		}
+	}
+
+	// 1.8 Trailing Stop Loss Advance: if bot is in significant profit (>= 50% of target), advance native SL
+	if input.PnLTarget.GreaterThan(decimal.Zero) && total.GreaterThanOrEqual(input.PnLTarget.Mul(decimal.NewFromFloat(0.50))) && input.CurrentPrice.GreaterThan(decimal.Zero) {
+		var candidateSL decimal.Decimal
+		if input.Direction == "LONG" {
+			candidateSL = input.CurrentPrice.Mul(decimal.NewFromFloat(0.985)).Round(4)
+			if (input.TrailingSLPrice == nil || candidateSL.GreaterThan(*input.TrailingSLPrice)) &&
+				(input.StopLossPrice == nil || candidateSL.GreaterThan(*input.StopLossPrice)) {
+				return manageDecision{
+					Action:          ActionUpdateTrailingSL,
+					Reason:          "TRAILING_SL_ADVANCE",
+					TrailingSLPrice: &candidateSL,
+				}
+			}
+		} else if input.Direction == "SHORT" {
+			candidateSL = input.CurrentPrice.Mul(decimal.NewFromFloat(1.015)).Round(4)
+			if (input.TrailingSLPrice == nil || candidateSL.LessThan(*input.TrailingSLPrice)) &&
+				(input.StopLossPrice == nil || candidateSL.LessThan(*input.StopLossPrice)) {
+				return manageDecision{
+					Action:          ActionUpdateTrailingSL,
+					Reason:          "TRAILING_SL_ADVANCE",
+					TrailingSLPrice: &candidateSL,
+				}
+			}
+		}
+	}
+
+	// 1.9 Ornstein-Uhlenbeck Half-Life Rotation: prevents capital lock-in during prolonged flat consolidation
+	if input.OURotationEnabled && input.OUHalfLifeHours > 0 && input.AgeHours > 2.0*input.OUHalfLifeHours {
+		if total.Abs().LessThan(input.Budget.Mul(decimal.NewFromFloat(0.01))) {
+			return manageDecision{Action: ActionCloseOURotation, Reason: "OU_HALFLIFE_ROTATION"}
+		}
 	}
 
 	// 2. Trailing Take-Profit & Early Profit Lock

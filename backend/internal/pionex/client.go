@@ -106,8 +106,11 @@ type BUOrderData struct {
 	QuoteInvestment     decimal.Decimal  `json:"quoteInvestment"`
 	LossStopType        string           `json:"lossStopType,omitempty"`
 	LossStop            *decimal.Decimal `json:"lossStop,omitempty"`
+	LossStopHigh        *decimal.Decimal `json:"lossStopHigh,omitempty"`
+	LossStopDelay       *int             `json:"lossStopDelay,omitempty"`
 	ProfitStopType      string           `json:"profitStopType,omitempty"`
 	ProfitStop          *decimal.Decimal `json:"profitStop,omitempty"`
+	ProfitStopDelay     *int             `json:"profitStopDelay,omitempty"`
 	InvestCoin          string           `json:"investCoin,omitempty"`
 	InvestmentFrom      string           `json:"investmentFrom,omitempty"`
 	MovingIndicatorType string           `json:"movingIndicatorType,omitempty"`
@@ -165,6 +168,10 @@ type BUOrderDataResponse struct {
 	UsdtInvestmentRaw   json.RawMessage `json:"usdtInvestment"`
 	RiskStatus           string          `json:"riskStatus"`
 	LiquidationPriceRaw  json.RawMessage `json:"liquidationPrice"`
+	LossStopRaw          json.RawMessage `json:"lossStop"`
+	ProfitStopRaw        json.RawMessage `json:"profitStop"`
+	LossStopType         string          `json:"lossStopType"`
+	ProfitStopType       string          `json:"profitStopType"`
 
 	Top               decimal.Decimal `json:"-"`
 	Bottom            decimal.Decimal `json:"-"`
@@ -178,6 +185,8 @@ type BUOrderDataResponse struct {
 	TotalProfit       decimal.Decimal `json:"-"`
 	ClosedBaseAmount  decimal.Decimal `json:"-"`
 	LiquidationPrice  decimal.Decimal `json:"-"`
+	LossStop          decimal.Decimal `json:"-"`
+	ProfitStop        decimal.Decimal `json:"-"`
 }
 
 func parseDecimalRaw(raw json.RawMessage) decimal.Decimal {
@@ -246,6 +255,8 @@ func (b *BUOrderDataResponse) UnmarshalJSON(data []byte) error {
 	}
 	b.ClosedBaseAmount = parseDecimalRaw(b.ClosedBaseAmountRaw)
 	b.LiquidationPrice = parseDecimalRaw(b.LiquidationPriceRaw)
+	b.LossStop = parseDecimalRaw(b.LossStopRaw)
+	b.ProfitStop = parseDecimalRaw(b.ProfitStopRaw)
 	return nil
 }
 

@@ -204,3 +204,79 @@ func TestCheckAdjustFuturesGridBotContract(t *testing.T) {
 		t.Fatalf("the refusal must carry the exchange reason, got %v", err)
 	}
 }
+
+func TestUpdateFuturesGridTriggerProfitLossContract(t *testing.T) {
+	var receivedBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/bot/orders/futuresGrid/updateTriggerProfitLoss" {
+			t.Errorf("expected updateTriggerProfitLoss path, got %s", r.URL.Path)
+		}
+		if r.Method != http.MethodPost {
+			t.Errorf("expected POST method, got %s", r.Method)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&receivedBody); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(APIEnvelope[FuturesGridTriggerProfitLossResponse]{
+			Result: true,
+			Code:   "200",
+			Data: FuturesGridTriggerProfitLossResponse{
+				BUOrderID: "GRID_99",
+				Result:    0,
+				List: []FuturesGridTriggerProfitLossItem{
+					{Type: "stop_loss", StopType: "price", Value: "135.50"},
+					{Type: "stop_profit", StopType: "price", Value: "155.00"},
+				},
+			},
+		})
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, "testKey", "testSecret")
+	delay := int64(15)
+	highPrice := "170.00"
+	resp, err := client.UpdateFuturesGridTriggerProfitLoss(context.Background(), FuturesGridUpdateTriggerProfitLossRequest{
+		BUOrderID: "GRID_99",
+		List: []FuturesGridTriggerProfitLossItem{
+			{
+				Type:              "stop_loss",
+				StopType:          "price",
+				Value:             "135.50",
+				StopDelay:         &delay,
+				LossStopSellModel: "TO_USDT",
+				StopHighPrice:     &highPrice,
+			},
+			{
+				Type:                "stop_profit",
+				StopType:            "price",
+				Value:               "155.00",
+				StopDelay:           &delay,
+				ProfitStopSellModel: "TO_USDT",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("UpdateFuturesGridTriggerProfitLoss failed: %v", err)
+	}
+	if resp.BUOrderID != "GRID_99" || len(resp.List) != 2 {
+		t.Fatalf("unexpected response: %+v", resp)
+	}
+
+	// Verify snake_case serialization per official Pionex API docs
+	if receivedBody["bu_order_id"] != "GRID_99" {
+		t.Fatalf("expected bu_order_id snake_case, got %v", receivedBody)
+	}
+	items, ok := receivedBody["list"].([]any)
+	if !ok || len(items) != 2 {
+		t.Fatalf("expected list of 2 items, got %v", receivedBody["list"])
+	}
+	item0 := items[0].(map[string]any)
+	if item0["type"] != "stop_loss" || item0["stop_type"] != "price" || item0["value"] != "135.50" {
+		t.Fatalf("unexpected item0 serialization: %+v", item0)
+	}
+	if item0["stop_high_price"] != "170.00" || item0["loss_stop_sell_model"] != "TO_USDT" {
+		t.Fatalf("unexpected item0 extras: %+v", item0)
+	}
+}
+

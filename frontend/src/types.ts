@@ -327,6 +327,10 @@ export interface AutoGridSettings {
   orderbookProfilerEnabled?: boolean;
   knifePauseEnabled?: boolean;
   minDepthCushionRatio?: string;
+  smartExitEnabled?: boolean;
+  ofiHarvestEnabled?: boolean;
+  ouRotationEnabled?: boolean;
+  minRiskReward?: string;
   lastError: string | null;
   lastStartedAt: string | null;
   lastStoppedAt: string | null;
@@ -366,6 +370,11 @@ export interface AutoGridCandidate {
   recommendedLeverage: number;
   recommendedTrend: 'long' | 'short' | 'no_trend';
   modelAssumptions: Record<string, unknown>;
+  targetPrice?: string;
+  stopLossPrice?: string;
+  stopLossHigh?: string;
+  adaptiveStrategy?: string;
+  riskRewardRatio?: string;
   createdAt: string;
 }
 
@@ -398,6 +407,12 @@ export interface AutoGridBot {
   adjustmentsCount: number;
   pnlTargetUsdt: string | null;
   maxLossUsdt: string | null;
+  targetPrice?: string;
+  stopLossPrice?: string;
+  stopLossHigh?: string;
+  trailingSlPrice?: string;
+  adaptiveStrategy?: string;
+  riskRewardRatio?: string;
   updatedAt: string;
 }
 
@@ -416,6 +431,10 @@ export interface AutoGridClosedBot {
   estimatedFinalUsdt?: string | null;
   closedReason: string | null;
   status: string;
+  targetPrice?: string;
+  stopLossPrice?: string;
+  adaptiveStrategy?: string;
+  riskRewardRatio?: string;
   closedAt: string | null;
 }
 

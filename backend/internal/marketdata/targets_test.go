@@ -1,6 +1,10 @@
 package marketdata
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/shopspring/decimal"
+)
 
 func TestComputeDynamicTargetsScalesWithVolatility(t *testing.T) {
 	quiet := ComputeDynamicTargets(DynamicTargetsInput{
@@ -224,3 +228,105 @@ func TestGridLevelsForRangeFloorFollowsFees(t *testing.T) {
 		t.Fatalf("degenerate costs must yield the documented default 0.35%%, got %.4f", got)
 	}
 }
+
+func TestComputeIndividualTargetPrices(t *testing.T) {
+	// Test 1: LONG with Ask Wall in order book -> OFI_WALL_DEFENSE
+	currPrice := decimal.NewFromFloat(100.0)
+	lowerPrice := decimal.NewFromFloat(95.0)
+	upperPrice := decimal.NewFromFloat(105.0)
+	askWall := decimal.NewFromFloat(104.0)
+
+	depth := &DepthProfile{
+		HasAskWall:     true,
+		AskWallPrice:   askWall,
+		ImbalanceRatio: 0.35, // Strong imbalance
+	}
+
+	resLong := ComputeIndividualTargetPrices(AdaptiveBotTargetInput{
+		Symbol:         "SOL_USDT",
+		Direction:      "LONG",
+		CurrentPrice:   currPrice,
+		LowerPrice:     lowerPrice,
+		UpperPrice:     upperPrice,
+		Budget:         200.0,
+		Leverage:       2,
+		ATR:            2.0,
+		OrderBookDepth: depth,
+		MinRiskReward:  1.8,
+	})
+
+	if resLong.AdaptiveStrategy != StrategyOFIWallDefense {
+		t.Fatalf("expected strategy %s, got %s", StrategyOFIWallDefense, resLong.AdaptiveStrategy)
+	}
+	if resLong.RiskRewardRatio < 1.8 {
+		t.Fatalf("expected RR >= 1.8, got %f", resLong.RiskRewardRatio)
+	}
+	if !resLong.TargetPrice.GreaterThan(currPrice) {
+		t.Fatalf("LONG target price %s must be above current price %s", resLong.TargetPrice, currPrice)
+	}
+	if !resLong.StopLossPrice.LessThan(currPrice) {
+		t.Fatalf("LONG stop price %s must be below current price %s", resLong.StopLossPrice, currPrice)
+	}
+	// Check that target is not hardcoded to $9 or $18
+	if resLong.TargetUSDT == 9.0 || resLong.TargetUSDT == 18.0 {
+		t.Fatalf("target must be individualized, not rigid $9 or $18: got %f", resLong.TargetUSDT)
+	}
+
+	// Test 2: SHORT with Support shelf -> SR_MOMENTUM_RUNNER
+	sr := &SRAnalysisResult{
+		NearestSupport:  92.0,
+		SupportStrength: 0.85,
+	}
+	resShort := ComputeIndividualTargetPrices(AdaptiveBotTargetInput{
+		Symbol:        "ETH_USDT",
+		Direction:     "SHORT",
+		CurrentPrice:  currPrice,
+		LowerPrice:    lowerPrice,
+		UpperPrice:    upperPrice,
+		Budget:        150.0,
+		Leverage:      3,
+		ATR:           1.5,
+		SRAnalysis:    sr,
+		MinRiskReward: 1.8,
+	})
+
+	if resShort.AdaptiveStrategy != StrategySRMomentumRunner {
+		t.Fatalf("expected strategy %s, got %s", StrategySRMomentumRunner, resShort.AdaptiveStrategy)
+	}
+	if resShort.RiskRewardRatio < 1.8 {
+		t.Fatalf("expected RR >= 1.8, got %f", resShort.RiskRewardRatio)
+	}
+	if !resShort.TargetPrice.LessThan(currPrice) {
+		t.Fatalf("SHORT target price %s must be below current price %s", resShort.TargetPrice, currPrice)
+	}
+	if !resShort.StopLossPrice.GreaterThan(currPrice) {
+		t.Fatalf("SHORT stop price %s must be above current price %s", resShort.StopLossPrice, currPrice)
+	}
+
+	// Test 3: NEUTRAL grid -> MEAN_REVERSION_OU with upper & lower stop
+	resNeutral := ComputeIndividualTargetPrices(AdaptiveBotTargetInput{
+		Symbol:        "BTC_USDT",
+		Direction:     "NEUTRAL",
+		CurrentPrice:  currPrice,
+		LowerPrice:    lowerPrice,
+		UpperPrice:    upperPrice,
+		Budget:        300.0,
+		Leverage:      1,
+		ATR:           2.5,
+		MinRiskReward: 1.8,
+	})
+
+	if resNeutral.AdaptiveStrategy != StrategyMeanReversionOU {
+		t.Fatalf("expected strategy %s, got %s", StrategyMeanReversionOU, resNeutral.AdaptiveStrategy)
+	}
+	if resNeutral.StopLossHigh == nil {
+		t.Fatalf("NEUTRAL grid must return StopLossHigh")
+	}
+	if !resNeutral.StopLossHigh.GreaterThan(upperPrice) {
+		t.Fatalf("StopLossHigh %s must be above upperPrice %s", resNeutral.StopLossHigh, upperPrice)
+	}
+	if !resNeutral.StopLossPrice.LessThan(lowerPrice) {
+		t.Fatalf("StopLossPrice %s must be below lowerPrice %s", resNeutral.StopLossPrice, lowerPrice)
+	}
+}
+

@@ -551,7 +551,11 @@ type AutoGridSettingsUpdateInput struct {
 	AIKitEnabled         *bool  `json:"aiKitEnabled,omitempty"`
 	AIAutotuneEnabled    *bool  `json:"aiAutotuneEnabled,omitempty"`
 	// 0 preserves the stored interval (service-side default fill).
-	AIAutotuneIntervalSeconds int `json:"aiAutotuneIntervalSeconds,omitempty"`
+	AIAutotuneIntervalSeconds int    `json:"aiAutotuneIntervalSeconds,omitempty"`
+	SmartExitEnabled          *bool  `json:"smartExitEnabled,omitempty"`
+	OFIHarvestEnabled         *bool  `json:"ofiHarvestEnabled,omitempty"`
+	OURotationEnabled         *bool  `json:"ouRotationEnabled,omitempty"`
+	MinRiskReward             string `json:"minRiskReward,omitempty"`
 }
 
 type AutoGridBotIDInput struct {
@@ -695,6 +699,22 @@ func registerAutoGridTools(
 		}
 		if input.AIAutotuneEnabled != nil {
 			update.AIAutotuneEnabled = *input.AIAutotuneEnabled
+		}
+		if input.SmartExitEnabled != nil {
+			update.SmartExitEnabled = input.SmartExitEnabled
+		}
+		if input.OFIHarvestEnabled != nil {
+			update.OFIHarvestEnabled = input.OFIHarvestEnabled
+		}
+		if input.OURotationEnabled != nil {
+			update.OURotationEnabled = input.OURotationEnabled
+		}
+		if input.MinRiskReward != "" {
+			d, err := decimal.NewFromString(input.MinRiskReward)
+			if err != nil {
+				return nil, DataOutput{}, fmt.Errorf("invalid minRiskReward %q: %w", input.MinRiskReward, err)
+			}
+			update.MinRiskReward = &d
 		}
 		decimalFields := []struct {
 			raw  string

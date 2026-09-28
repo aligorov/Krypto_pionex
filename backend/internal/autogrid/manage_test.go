@@ -703,3 +703,78 @@ func TestDecideBotActionTrailingSmallTargetStillExitsEarly(t *testing.T) {
 		t.Fatalf("sub-arm peak on a small target must hold, got %+v", decision)
 	}
 }
+
+func TestDecideBotActionPriceHit(t *testing.T) {
+	input := baseActionInput()
+	tp := mustDecimal("110.0")
+	sl := mustDecimal("88.0")
+	input.TargetPrice = &tp
+	input.StopLossPrice = &sl
+	input.RealizedPNL = mustDecimal("5.0")
+
+	// Price reaches target price
+	input.CurrentPrice = mustDecimal("110.5")
+	decision := decideBotAction(input)
+	if decision.Action != ActionCloseTakeProfit || decision.Reason != "TAKE_PROFIT_PRICE_HIT" {
+		t.Fatalf("expected TAKE_PROFIT_PRICE_HIT, got %+v", decision)
+	}
+
+	// Price breaches stop loss price
+	input.CurrentPrice = mustDecimal("87.9")
+	decision = decideBotAction(input)
+	if decision.Action != ActionCloseStopLoss || decision.Reason != "STOP_LOSS_PRICE_BREACH" {
+		t.Fatalf("expected STOP_LOSS_PRICE_BREACH, got %+v", decision)
+	}
+}
+
+func TestDecideBotActionSmartProfitHarvestOFI(t *testing.T) {
+	input := baseActionInput()
+	input.Direction = "LONG"
+	input.Budget = mustDecimal("200.0")
+	input.RealizedPNL = mustDecimal("8.0")
+	input.UnrealizedPNL = mustDecimal("2.0") // Total 10.0 > 1.5% of 200 = 3.0
+	input.SmartExitEnabled = true
+	input.OFIHarvestEnabled = true
+
+	ofiRegime := "STRONG_SELLER_ABSORPTION"
+	microBias := -4.5
+	input.OFIRegime = &ofiRegime
+	input.MicroPriceBiasBps = &microBias
+
+	decision := decideBotAction(input)
+	if decision.Action != ActionCloseSmartHarvest || decision.Reason != "SMART_PROFIT_HARVEST_OFI" {
+		t.Fatalf("expected SMART_PROFIT_HARVEST_OFI, got %+v", decision)
+	}
+}
+
+func TestDecideBotActionOURotation(t *testing.T) {
+	input := baseActionInput()
+	input.Budget = mustDecimal("200.0")
+	input.RealizedPNL = mustDecimal("0.5")
+	input.UnrealizedPNL = mustDecimal("0.0") // Flat (< 1% of 200)
+	input.OURotationEnabled = true
+	input.OUHalfLifeHours = 3.0
+	input.AgeHours = 7.5 // > 2 * 3.0 = 6.0h
+
+	decision := decideBotAction(input)
+	if decision.Action != ActionCloseOURotation || decision.Reason != "OU_HALFLIFE_ROTATION" {
+		t.Fatalf("expected OU_HALFLIFE_ROTATION, got %+v", decision)
+	}
+}
+
+func TestDecideBotActionTrailingSLAdvance(t *testing.T) {
+	input := baseActionInput()
+	input.Direction = "LONG"
+	input.PnLTarget = mustDecimal("20.0")
+	input.RealizedPNL = mustDecimal("12.0") // >= 50% of 20.0
+	input.CurrentPrice = mustDecimal("100.0")
+
+	decision := decideBotAction(input)
+	if decision.Action != ActionUpdateTrailingSL || decision.Reason != "TRAILING_SL_ADVANCE" {
+		t.Fatalf("expected TRAILING_SL_ADVANCE, got %+v", decision)
+	}
+	if decision.TrailingSLPrice == nil || !decision.TrailingSLPrice.Equal(mustDecimal("98.5000")) {
+		t.Fatalf("expected trailing SL 98.5000, got %v", decision.TrailingSLPrice)
+	}
+}
+

@@ -162,6 +162,7 @@ export default function Bots({ canOperate }: Props) {
               <thead>
                 <tr>
                   <th>Бот / Символ</th>
+                  <th>Стратегия &amp; Карточка Pionex</th>
                   <th>Источник</th>
                   <th>Статус</th>
                   <th>Направление</th>
@@ -280,6 +281,7 @@ export default function Bots({ canOperate }: Props) {
                   <thead>
                     <tr>
                       <th>Бот / Символ</th>
+                      <th>Стратегия &amp; Цели</th>
                       <th>Источник</th>
                       <th>Причина закрытия</th>
                       <th>Направление</th>
@@ -398,6 +400,29 @@ function BotRow({
             {ofiBadge(bot.ofiRegime, bot.microPriceBiasBps)}
           </div>
         </td>
+        <td>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '2px', minWidth: '125px' }}>
+            {strategyBadge(bot.adaptiveStrategy)}
+            <div style={{ fontSize: '0.75rem', display: 'flex', justifyContent: 'space-between', gap: '4px' }}>
+              <span style={{ color: '#34d399', fontWeight: 600 }}>TP:</span>
+              <span>{bot.targetPrice ? bot.targetPrice : (bot.pnlTargetUsdt ? `${bot.pnlTargetUsdt}$` : '—')}</span>
+            </div>
+            <div style={{ fontSize: '0.75rem', display: 'flex', justifyContent: 'space-between', gap: '4px' }}>
+              <span style={{ color: '#f87171', fontWeight: 600 }}>SL:</span>
+              <span>{bot.stopLossPrice ? bot.stopLossPrice : (bot.maxLossUsdt ? `-${bot.maxLossUsdt}$` : '—')}</span>
+            </div>
+            {bot.trailingSlPrice && (
+              <div style={{ fontSize: '0.70rem', color: '#38bdf8', fontWeight: 600 }} title="Трейлинг стоп-лосс на бирже Pionex">
+                🟢 Трейлинг: {bot.trailingSlPrice}
+              </div>
+            )}
+            {bot.riskRewardRatio && Number(bot.riskRewardRatio) > 0 && (
+              <div style={{ fontSize: '0.68rem', color: '#94a3b8' }}>
+                R:R 1:{Number(bot.riskRewardRatio).toFixed(2)}
+              </div>
+            )}
+          </div>
+        </td>
         <td><span className={`badge ${bot.source === 'REAL' ? 'danger' : 'neutral'}`}>{bot.source}</span></td>
         <td>
           <span className={`badge ${bot.status === 'RUNNING' ? 'success' : 'warning'}`}>{bot.status}</span>
@@ -476,7 +501,7 @@ function BotRow({
       </tr>
       {adjusting && (
         <tr>
-          <td colSpan={12}>
+          <td colSpan={13}>
             <form className="inline-form" onSubmit={submitAdjust}>
               <select
                 value={adjustMode}
@@ -570,6 +595,17 @@ function ClosedBotRow({
             </span>
           ) : null}
           <strong>{bot.symbol}</strong>
+        </div>
+      </td>
+      <td>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '2px' }}>
+          {strategyBadge(bot.adaptiveStrategy)}
+          {(bot.targetPrice || bot.stopLossPrice) && (
+            <div style={{ fontSize: '0.70rem', color: '#94a3b8' }}>
+              {bot.targetPrice && <span style={{ color: '#34d399', marginRight: 4 }}>TP: {bot.targetPrice}</span>}
+              {bot.stopLossPrice && <span style={{ color: '#f87171' }}>SL: {bot.stopLossPrice}</span>}
+            </div>
+          )}
         </div>
       </td>
       <td><span className={`badge ${bot.source === 'REAL' ? 'danger' : 'neutral'}`}>{bot.source}</span></td>
@@ -777,6 +813,53 @@ function reasonBadge(reason: string | null): string {
     return 'danger';
   }
   return 'warning';
+}
+
+function strategyBadge(strat?: string | null) {
+  if (!strat) return null;
+  switch (strat) {
+    case 'OFI_WALL_DEFENSE':
+      return (
+        <span
+          className="badge"
+          style={{ background: 'rgba(56, 189, 248, 0.15)', color: '#38bdf8', border: '1px solid rgba(56, 189, 248, 0.3)', fontSize: '0.68rem', padding: '1px 5px', fontWeight: 600 }}
+          title="Защита крупной стенки в стакане L2 (Front-run wall)"
+        >
+          🛡️ Wall Defense
+        </span>
+      );
+    case 'SR_MOMENTUM_RUNNER':
+      return (
+        <span
+          className="badge"
+          style={{ background: 'rgba(16, 185, 129, 0.15)', color: '#34d399', border: '1px solid rgba(16, 185, 129, 0.3)', fontSize: '0.68rem', padding: '1px 5px', fontWeight: 600 }}
+          title="Импульсный пробой уровней поддержки/сопротивления (R:R runner)"
+        >
+          🚀 Momentum Runner
+        </span>
+      );
+    case 'MEAN_REVERSION_OU':
+      return (
+        <span
+          className="badge"
+          style={{ background: 'rgba(168, 85, 247, 0.15)', color: '#c084fc', border: '1px solid rgba(168, 85, 247, 0.3)', fontSize: '0.68rem', padding: '1px 5px', fontWeight: 600 }}
+          title="Возврат к средней по процессу Орнштейна-Уленбека"
+        >
+          🔄 OU Mean Rev
+        </span>
+      );
+    case 'VOLATILITY_EXPANSION':
+    default:
+      return (
+        <span
+          className="badge"
+          style={{ background: 'rgba(234, 179, 8, 0.15)', color: '#facc15', border: '1px solid rgba(234, 179, 8, 0.3)', fontSize: '0.68rem', padding: '1px 5px', fontWeight: 600 }}
+          title="Волатильностный канал с ATR буфером"
+        >
+          ⚡ Vol Expansion
+        </span>
+      );
+  }
 }
 
 function ofiBadge(regime?: string | null, biasBps?: number | null) {

@@ -4,8 +4,9 @@ This repository (/Users/aleksey/Documents/Krypto_pionex) is a standalone, produc
 
 ## Strict Operating Rules
 
-1. **Pionex-Only Sources**:
-   - Every API call must adhere strictly to official Pionex documentation: `https://www.pionex.com/docs/api-docs`.
+1. **Pionex-Only Sources & Strict API Documentation Policy**:
+   - Every API call, endpoint, request body, field naming convention (`camelCase` vs `snake_case`), parameter type, and response schema MUST adhere strictly to official Pionex documentation: `https://www.pionex.com/docs/api-docs` (and raw Markdown endpoints `https://www.pionex.com/docs/api-docs/*.md`).
+   - **ZERO GUESSWORK**: Never guess endpoint paths, parameter names, or payload structures. Always read the official documentation before writing or modifying any API client or service code.
    - Never introduce fallback logic to Binance, Bybit, or CCXT.
    - Never construct invalid symbol strings. Verify all symbols against `/api/v1/market/symbols`.
 

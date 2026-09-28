@@ -286,3 +286,58 @@ func (c *Client) GetSpotBalances(ctx context.Context) ([]SpotBalance, error) {
 	}
 	return data.Balances, nil
 }
+
+// FuturesGridTriggerProfitLossItem represents a single trigger in the
+// POST /api/v1/bot/orders/futuresGrid/updateTriggerProfitLoss endpoint.
+// Per official OpenAPI spec, field names are strictly snake_case.
+type FuturesGridTriggerProfitLossItem struct {
+	Type                string  `json:"type"`                           // "stop_loss" | "stop_profit"
+	StopType            string  `json:"stop_type"`                      // "price" | "price_limit" | "profit_amount" | "profit_ratio"
+	Value               string  `json:"value"`                          // target price/ratio, or "" to clear
+	LimitPrice          *string `json:"limit_price,omitempty"`          // limit price when stop_type="price_limit"
+	StopDelay           *int64  `json:"stop_delay,omitempty"`           // delay in seconds before triggering (0 = immediate)
+	LossStopSellModel   string  `json:"loss_stop_sell_model,omitempty"` // "TO_QUOTE" | "TO_USDT"
+	ProfitStopSellModel string  `json:"profit_stop_sell_model,omitempty"` // "TO_QUOTE" | "TO_USDT"
+	StopHighPrice       *string `json:"stop_high_price,omitempty"`      // upper stop-loss for neutral grid (no_trend)
+	LimitHighPrice      *string `json:"limit_high_price,omitempty"`     // upper limit stop for neutral grid
+}
+
+// FuturesGridUpdateTriggerProfitLossRequest payload for updating or clearing
+// stop-loss and take-profit on a running futures grid bot in real time.
+type FuturesGridUpdateTriggerProfitLossRequest struct {
+	BUOrderID string                             `json:"bu_order_id"`
+	List      []FuturesGridTriggerProfitLossItem `json:"list"`
+}
+
+// FuturesGridTriggerProfitLossResponse is the echo response returned by
+// POST /api/v1/bot/orders/futuresGrid/updateTriggerProfitLoss.
+type FuturesGridTriggerProfitLossResponse struct {
+	BUOrderID string                             `json:"bu_order_id"`
+	Result    int32                              `json:"result"`
+	List      []FuturesGridTriggerProfitLossItem `json:"list"`
+}
+
+// UpdateFuturesGridTriggerProfitLoss sets, updates, or clears the take-profit
+// and/or stop-loss of a running native Pionex Futures Grid order in place.
+// Weight: 1. Field names are strictly snake_case.
+func (c *Client) UpdateFuturesGridTriggerProfitLoss(
+	ctx context.Context,
+	req FuturesGridUpdateTriggerProfitLossRequest,
+) (*FuturesGridTriggerProfitLossResponse, error) {
+	if req.BUOrderID == "" {
+		return nil, fmt.Errorf("bu_order_id is required")
+	}
+	if len(req.List) == 0 {
+		return nil, fmt.Errorf("trigger list cannot be empty")
+	}
+	body, err := json.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("marshal futures grid updateTriggerProfitLoss request: %w", err)
+	}
+	var resp FuturesGridTriggerProfitLossResponse
+	if err := c.do(ctx, http.MethodPost, "/api/v1/bot/orders/futuresGrid/updateTriggerProfitLoss", nil, body, true, 1, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+

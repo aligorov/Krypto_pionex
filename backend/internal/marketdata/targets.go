@@ -3,6 +3,8 @@ package marketdata
 import (
 	"fmt"
 	"math"
+
+	"github.com/shopspring/decimal"
 )
 
 // Dynamic targets replace fixed USDT amounts: each bot's take-profit and
@@ -112,6 +114,236 @@ func ComputeDynamicTargets(input DynamicTargetsInput) DynamicTargets {
 		LossPct:        lossPct,
 		VolSource:      volSource,
 		DrawdownSource: ddSource,
+	}
+}
+
+// AdaptiveBotTargetInput carries market structure, volatility, and order book
+// characteristics needed to calculate native price-based TP/SL and strategy.
+type AdaptiveBotTargetInput struct {
+	Symbol         string
+	Direction      string // "LONG", "SHORT", "NEUTRAL"
+	CurrentPrice   decimal.Decimal
+	LowerPrice     decimal.Decimal
+	UpperPrice     decimal.Decimal
+	GridNum        int
+	Budget         float64
+	Leverage       int
+	ATR            float64
+	OrderBookDepth *DepthProfile
+	SRAnalysis     *SRAnalysisResult
+	MinRiskReward  float64
+	TakerFeeBps    float64
+	SlippageBps    float64
+	FundingFeeBps  float64
+}
+
+// AdaptiveBotTargetsResult returns individualized price targets, stops,
+// and net true USDT profit/loss projections for the bot.
+type AdaptiveBotTargetsResult struct {
+	TargetPrice      decimal.Decimal  `json:"targetPrice"`
+	StopLossPrice    decimal.Decimal  `json:"stopLossPrice"`
+	StopLossHigh     *decimal.Decimal `json:"stopLossHigh,omitempty"`
+	TargetUSDT       float64          `json:"targetUsdt"`
+	MaxLossUSDT      float64          `json:"maxLossUsdt"`
+	RiskRewardRatio  float64          `json:"riskRewardRatio"`
+	AdaptiveStrategy string           `json:"adaptiveStrategy"`
+	Reason           string           `json:"reason"`
+}
+
+// Strategy taxonomy for individual bots
+const (
+	StrategyOFIWallDefense      = "OFI_WALL_DEFENSE"
+	StrategySRMomentumRunner    = "SR_MOMENTUM_RUNNER"
+	StrategyMeanReversionOU     = "MEAN_REVERSION_OU"
+	StrategyVolatilityExpansion = "VOLATILITY_EXPANSION"
+)
+
+// ComputeIndividualTargetPrices computes individualized, structural TP and SL
+// price levels for a bot using L2 order book wall front-running, S/R swing shelves,
+// and ATR buffers. Replaces rigid USDT clamps with true quantitative market levels,
+// enforcing R:R >= 1.80 and calculating net profit after taker fees, slippage, and funding.
+func ComputeIndividualTargetPrices(input AdaptiveBotTargetInput) AdaptiveBotTargetsResult {
+	currPriceF, _ := input.CurrentPrice.Float64()
+	if currPriceF <= 0 {
+		return AdaptiveBotTargetsResult{AdaptiveStrategy: StrategyVolatilityExpansion}
+	}
+	lowerF, _ := input.LowerPrice.Float64()
+	upperF, _ := input.UpperPrice.Float64()
+
+	minRR := input.MinRiskReward
+	if minRR <= 0 {
+		minRR = 1.8 // Default quantitative minimum R:R
+	}
+	atr := input.ATR
+	if atr <= 0 {
+		atr = 0.02 * currPriceF
+	}
+	takerBps := input.TakerFeeBps
+	if takerBps <= 0 {
+		takerBps = 5.0
+	}
+	slipBps := input.SlippageBps
+	if slipBps <= 0 {
+		slipBps = 2.0
+	}
+	fundBps := input.FundingFeeBps
+	if fundBps <= 0 {
+		fundBps = 1.5
+	}
+	budget := input.Budget
+	if budget <= 0 {
+		budget = 100.0
+	}
+	lev := input.Leverage
+	if lev < 1 {
+		lev = 1
+	}
+
+	strategy := StrategyVolatilityExpansion
+	direction := input.Direction
+	if direction == "" {
+		direction = "LONG"
+	}
+
+	// Strategy selection based on market microstructure & order flow
+	if input.OrderBookDepth != nil && (input.OrderBookDepth.HasBidWall || input.OrderBookDepth.HasAskWall) {
+		if input.OrderBookDepth.ImbalanceRatio > 0.58 || input.OrderBookDepth.ImbalanceRatio < 0.42 {
+			strategy = StrategyOFIWallDefense
+		}
+	} else if input.SRAnalysis != nil && (input.SRAnalysis.ResistStrength > 0.6 || input.SRAnalysis.SupportStrength > 0.6) {
+		strategy = StrategySRMomentumRunner
+	} else if direction == "NEUTRAL" {
+		strategy = StrategyMeanReversionOU
+	}
+
+	var tp, sl decimal.Decimal
+	var slHigh *decimal.Decimal
+
+	switch direction {
+	case "SHORT":
+		// Target: front-run nearest bid wall or support shelf
+		if input.OrderBookDepth != nil && input.OrderBookDepth.HasBidWall && input.OrderBookDepth.BidWallPrice.GreaterThan(decimal.Zero) && input.OrderBookDepth.BidWallPrice.LessThan(input.CurrentPrice) {
+			tp = input.OrderBookDepth.BidWallPrice.Mul(decimal.NewFromFloat(1.0015))
+		} else if input.SRAnalysis != nil && input.SRAnalysis.NearestSupport > 0 && input.SRAnalysis.NearestSupport < currPriceF {
+			tp = decimal.NewFromFloat(input.SRAnalysis.NearestSupport * 1.0010)
+		} else {
+			tp = input.LowerPrice
+			if tp.GreaterThanOrEqual(input.CurrentPrice) {
+				tp = input.CurrentPrice.Sub(decimal.NewFromFloat(2.0 * atr))
+			}
+		}
+
+		// Stop loss: placed above upper price and resistance with ATR buffer
+		rVal := upperF
+		if rVal <= currPriceF {
+			rVal = currPriceF + 1.5*atr
+		}
+		if input.OrderBookDepth != nil && input.OrderBookDepth.HasAskWall && input.OrderBookDepth.AskWallPrice.GreaterThan(input.UpperPrice) {
+			awF, _ := input.OrderBookDepth.AskWallPrice.Float64()
+			if awF > rVal {
+				rVal = awF
+			}
+		} else if input.SRAnalysis != nil && input.SRAnalysis.NearestResist > rVal {
+			rVal = input.SRAnalysis.NearestResist
+		}
+		sl = decimal.NewFromFloat(rVal + 0.4*atr)
+
+	case "NEUTRAL":
+		strategy = StrategyMeanReversionOU
+		// Stop loss below lower grid and above upper grid
+		slLowVal := lowerF - 0.4*atr
+		if slLowVal <= 0 {
+			slLowVal = lowerF * 0.95
+		}
+		sl = decimal.NewFromFloat(slLowVal)
+		slHighVal := upperF + 0.4*atr
+		slHighDec := decimal.NewFromFloat(slHighVal)
+		slHigh = &slHighDec
+		// Take profit front-running upper range
+		tp = input.UpperPrice.Mul(decimal.NewFromFloat(0.9985))
+
+	default: // "LONG"
+		// Target: front-run nearest ask wall or resistance shelf
+		if input.OrderBookDepth != nil && input.OrderBookDepth.HasAskWall && input.OrderBookDepth.AskWallPrice.GreaterThan(input.CurrentPrice) {
+			tp = input.OrderBookDepth.AskWallPrice.Mul(decimal.NewFromFloat(0.9985))
+		} else if input.SRAnalysis != nil && input.SRAnalysis.NearestResist > currPriceF {
+			tp = decimal.NewFromFloat(input.SRAnalysis.NearestResist * 0.9990)
+		} else {
+			tp = input.UpperPrice
+			if tp.LessThanOrEqual(input.CurrentPrice) {
+				tp = input.CurrentPrice.Add(decimal.NewFromFloat(2.0 * atr))
+			}
+		}
+
+		// Stop loss: placed below lower price and support with ATR buffer
+		sVal := lowerF
+		if sVal >= currPriceF || sVal <= 0 {
+			sVal = currPriceF - 1.5*atr
+		}
+		if input.OrderBookDepth != nil && input.OrderBookDepth.HasBidWall && input.OrderBookDepth.BidWallPrice.LessThan(input.LowerPrice) && input.OrderBookDepth.BidWallPrice.GreaterThan(decimal.Zero) {
+			bwF, _ := input.OrderBookDepth.BidWallPrice.Float64()
+			if bwF < sVal && bwF > 0 {
+				sVal = bwF
+			}
+		} else if input.SRAnalysis != nil && input.SRAnalysis.NearestSupport > 0 && input.SRAnalysis.NearestSupport < sVal {
+			sVal = input.SRAnalysis.NearestSupport
+		}
+		slVal := sVal - 0.4*atr
+		if slVal <= 0 {
+			slVal = sVal * 0.95
+		}
+		sl = decimal.NewFromFloat(slVal)
+	}
+
+	// Calculate distances and enforce R:R >= minRR
+	rewardDist := math.Abs(tp.Sub(input.CurrentPrice).InexactFloat64())
+	riskDist := math.Abs(input.CurrentPrice.Sub(sl).InexactFloat64())
+	if riskDist <= 0 {
+		riskDist = 0.01 * currPriceF
+	}
+
+	rr := rewardDist / riskDist
+	if rr < minRR {
+		// Extend target so that reward / risk matches minRR
+		requiredReward := minRR * riskDist
+		if direction == "SHORT" {
+			tp = input.CurrentPrice.Sub(decimal.NewFromFloat(requiredReward))
+			if tp.LessThanOrEqual(decimal.Zero) {
+				tp = input.CurrentPrice.Mul(decimal.NewFromFloat(0.5))
+			}
+		} else { // LONG or NEUTRAL
+			tp = input.CurrentPrice.Add(decimal.NewFromFloat(requiredReward))
+		}
+		rewardDist = math.Abs(tp.Sub(input.CurrentPrice).InexactFloat64())
+		rr = rewardDist / riskDist
+	}
+
+	// Calculate net true profit and max loss accounting for taker fees, slippage, and funding
+	notional := budget * float64(lev)
+	roundTripFeeFrac := (2.0*(takerBps+slipBps) + fundBps) / 10000.0
+	frictionUSDT := notional * roundTripFeeFrac
+
+	grossTargetUSDT := notional * (rewardDist / currPriceF)
+	netTargetUSDT := grossTargetUSDT - frictionUSDT
+	if netTargetUSDT < 1.0 {
+		netTargetUSDT = 1.0
+	}
+
+	grossLossUSDT := notional * (riskDist / currPriceF)
+	netLossUSDT := grossLossUSDT + frictionUSDT
+
+	reason := fmt.Sprintf("strategy=%s direction=%s TP=%s SL=%s RR=%.2f net_target=$%.2f max_loss=$%.2f",
+		strategy, direction, tp.StringFixed(4), sl.StringFixed(4), rr, netTargetUSDT, netLossUSDT)
+
+	return AdaptiveBotTargetsResult{
+		TargetPrice:      tp,
+		StopLossPrice:    sl,
+		StopLossHigh:     slHigh,
+		TargetUSDT:       netTargetUSDT,
+		MaxLossUSDT:      netLossUSDT,
+		RiskRewardRatio:  rr,
+		AdaptiveStrategy: strategy,
+		Reason:           reason,
 	}
 }
 

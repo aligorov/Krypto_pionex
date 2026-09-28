@@ -55,6 +55,13 @@ type CreateInput struct {
 	// bot of its tranche contract (v2.0.78). nil keeps the empty-object
 	// model_state the schema default always wrote.
 	TrancheState map[string]any
+	// Adaptive quantitative target fields for native Pionex bot card
+	TargetPrice      *decimal.Decimal
+	StopLossPrice    *decimal.Decimal
+	StopLossHigh     *decimal.Decimal
+	TrailingSLPrice  *decimal.Decimal
+	AdaptiveStrategy *string
+	RiskRewardRatio  *decimal.Decimal
 }
 
 func NewLifecycleManager(db *pgxpool.Pool, pionexClient *pionex.Client) *LifecycleManager {
@@ -129,11 +136,12 @@ func (manager *LifecycleManager) CreateGridBot(
 				quote_investment, extra_margin, stop_loss, take_profit,
 				request_fingerprint, execution_mode, reconciliation_state,
 				pnl_target_usdt, max_loss_usdt, anti_hunt_stop_price, struct_context,
-				model_state
+				model_state, target_price, stop_loss_price, stop_loss_high,
+				trailing_sl_price, adaptive_strategy, risk_reward_ratio
 			) VALUES (
 				$1, $2, $3, 'PENDING_SUBMISSION', $4, $5, $6, $7, $8, $9,
 				$10, $11, $12, $13, $14, 'REAL', 'PENDING', $15, $16, $17, $18,
-				$19::JSONB
+				$19::JSONB, $20, $21, $22, $23, $24, $25
 			)
 			ON CONFLICT (request_fingerprint) DO NOTHING
 			RETURNING id
@@ -154,6 +162,12 @@ func (manager *LifecycleManager) CreateGridBot(
 			// model_state is NOT NULL in the schema; callers without tranche
 			// markers (manual deploys) keep the historical empty-object shape.
 			orEmptyJSON(input.TrancheState),
+			input.TargetPrice,
+			input.StopLossPrice,
+			input.StopLossHigh,
+			input.TrailingSLPrice,
+			input.AdaptiveStrategy,
+			input.RiskRewardRatio,
 		).Scan(&gridID)
 		if errors.Is(insertErr, pgx.ErrNoRows) {
 			loadErr := tx.QueryRow(ctx, `

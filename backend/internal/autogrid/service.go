@@ -88,6 +88,10 @@ type Settings struct {
 	OrderbookProfilerEnabled bool            `json:"orderbookProfilerEnabled"`
 	KnifePauseEnabled        bool            `json:"knifePauseEnabled"`
 	MinDepthCushionRatio     decimal.Decimal `json:"minDepthCushionRatio"`
+	SmartExitEnabled         bool            `json:"smartExitEnabled"`
+	OFIHarvestEnabled        bool            `json:"ofiHarvestEnabled"`
+	OURotationEnabled        bool            `json:"ouRotationEnabled"`
+	MinRiskReward            decimal.Decimal `json:"minRiskReward"`
 	CreatedAt                time.Time       `json:"createdAt"`
 	UpdatedAt                time.Time       `json:"updatedAt"`
 }
@@ -144,6 +148,10 @@ type UpdateSettingsInput struct {
 	OrderbookProfilerEnabled *bool            `json:"orderbookProfilerEnabled"`
 	KnifePauseEnabled        *bool            `json:"knifePauseEnabled"`
 	MinDepthCushionRatio     *decimal.Decimal `json:"minDepthCushionRatio"`
+	SmartExitEnabled         *bool            `json:"smartExitEnabled"`
+	OFIHarvestEnabled        *bool            `json:"ofiHarvestEnabled"`
+	OURotationEnabled        *bool            `json:"ouRotationEnabled"`
+	MinRiskReward            *decimal.Decimal `json:"minRiskReward"`
 }
 
 type ScanRun struct {
@@ -178,6 +186,11 @@ type Candidate struct {
 	RecommendedLeverage int              `json:"recommendedLeverage"`
 	RecommendedTrend    string           `json:"recommendedTrend"`
 	ModelAssumptions    map[string]any   `json:"modelAssumptions"`
+	TargetPrice         *decimal.Decimal `json:"targetPrice,omitempty"`
+	StopLossPrice       *decimal.Decimal `json:"stopLossPrice,omitempty"`
+	StopLossHigh        *decimal.Decimal `json:"stopLossHigh,omitempty"`
+	AdaptiveStrategy    *string          `json:"adaptiveStrategy,omitempty"`
+	RiskRewardRatio     *decimal.Decimal `json:"riskRewardRatio,omitempty"`
 	CreatedAt           time.Time        `json:"createdAt"`
 }
 
@@ -210,6 +223,12 @@ type ActiveBot struct {
 	LeverageReason       string           `json:"leverageReason,omitempty"`
 	LeverageMode         string           `json:"leverageMode,omitempty"`
 	BaseLeverage         int              `json:"baseLeverage,omitempty"`
+	TargetPrice          *decimal.Decimal `json:"targetPrice,omitempty"`
+	StopLossPrice        *decimal.Decimal `json:"stopLossPrice,omitempty"`
+	StopLossHigh         *decimal.Decimal `json:"stopLossHigh,omitempty"`
+	TrailingSLPrice      *decimal.Decimal `json:"trailingSlPrice,omitempty"`
+	AdaptiveStrategy     *string          `json:"adaptiveStrategy,omitempty"`
+	RiskRewardRatio      *decimal.Decimal `json:"riskRewardRatio,omitempty"`
 	UpdatedAt            time.Time        `json:"updatedAt"`
 }
 
@@ -234,6 +253,10 @@ type ClosedBot struct {
 	EstimatedFinalUSDT *decimal.Decimal `json:"estimatedFinalUsdt,omitempty"`
 	ClosedReason       *string          `json:"closedReason"`
 	Status             string           `json:"status"`
+	TargetPrice        *decimal.Decimal `json:"targetPrice,omitempty"`
+	StopLossPrice      *decimal.Decimal `json:"stopLossPrice,omitempty"`
+	AdaptiveStrategy   *string          `json:"adaptiveStrategy,omitempty"`
+	RiskRewardRatio    *decimal.Decimal `json:"riskRewardRatio,omitempty"`
 	ClosedAt           *time.Time       `json:"closedAt"`
 }
 
@@ -414,7 +437,11 @@ func (s *Service) GetSettings(ctx context.Context) (*Settings, error) {
 		       COALESCE(gaussian_density_enabled, true),
 		       COALESCE(orderbook_profiler_enabled, true),
 		       COALESCE(knife_pause_enabled, true),
-		       COALESCE(min_depth_cushion_ratio, 50.00)
+		       COALESCE(min_depth_cushion_ratio, 50.00),
+		       COALESCE(smart_exit_enabled, true),
+		       COALESCE(ofi_harvest_enabled, true),
+		       COALESCE(ou_rotation_enabled, true),
+		       COALESCE(min_risk_reward, 1.8)
 		FROM autogrid_settings WHERE scope_key = $1
 	`, DefaultScope).Scan(settingsScanTargets(&item)...)
 	if err != nil {
@@ -542,6 +569,22 @@ func (s *Service) UpdateSettings(
 	if input.MinDepthCushionRatio != nil && input.MinDepthCushionRatio.IsPositive() {
 		minDepthCushion = *input.MinDepthCushionRatio
 	}
+	smartExit := current.SmartExitEnabled
+	if input.SmartExitEnabled != nil {
+		smartExit = *input.SmartExitEnabled
+	}
+	ofiHarvest := current.OFIHarvestEnabled
+	if input.OFIHarvestEnabled != nil {
+		ofiHarvest = *input.OFIHarvestEnabled
+	}
+	ouRotation := current.OURotationEnabled
+	if input.OURotationEnabled != nil {
+		ouRotation = *input.OURotationEnabled
+	}
+	minRR := current.MinRiskReward
+	if input.MinRiskReward != nil && input.MinRiskReward.IsPositive() {
+		minRR = *input.MinRiskReward
+	}
 	accountID := input.AccountID
 	if accountID != nil && strings.TrimSpace(*accountID) == "" {
 		accountID = nil
@@ -568,6 +611,8 @@ func (s *Service) UpdateSettings(
 		    max_spread_pct = $42, gaussian_density_enabled = $43,
 		    orderbook_profiler_enabled = $44, knife_pause_enabled = $45,
 		    min_depth_cushion_ratio = $46,
+		    smart_exit_enabled = $47, ofi_harvest_enabled = $48,
+		    ou_rotation_enabled = $49, min_risk_reward = $50,
 		    last_error = NULL, updated_at = NOW()
 		WHERE scope_key = $1
 	`, DefaultScope, accountID, input.ExecutionMode, input.BudgetUSDT,
@@ -583,7 +628,8 @@ func (s *Service) UpdateSettings(
 		input.AIAutotuneEnabled, input.AIAutotuneInterval, input.ScanMode,
 		trancheDeploy, input.StopForecastMode, input.RadarAutoCloseMode,
 		dgtRedeploy, wickShield, wickGrace, fleetMaxDelta, universeCap,
-		maxSpread, gaussDensity, obProfiler, knifePause, minDepthCushion)
+		maxSpread, gaussDensity, obProfiler, knifePause, minDepthCushion,
+		smartExit, ofiHarvest, ouRotation, minRR)
 	if err != nil {
 		return nil, fmt.Errorf("update AutoGrid settings: %w", err)
 	}
@@ -988,6 +1034,30 @@ func (s *Service) CompleteScan(
 		return fmt.Errorf("begin scan persistence: %w", err)
 	}
 	defer tx.Rollback(ctx)
+
+	var budgetUSDT decimal.Decimal = decimal.NewFromInt(100)
+	var minRR float64 = 1.8
+	var feeBps, slippageBps float64 = 5.0, 5.0
+
+	var sBudget decimal.Decimal
+	var sMinRR *decimal.Decimal
+	var sFee, sSlip decimal.Decimal
+	if err := tx.QueryRow(ctx, `
+		SELECT s.budget_usdt, s.min_risk_reward, s.fee_bps, s.slippage_bps
+		FROM autogrid_scan_runs r
+		JOIN autogrid_settings s ON s.id = r.settings_id
+		WHERE r.id = $1
+	`, scanID).Scan(&sBudget, &sMinRR, &sFee, &sSlip); err == nil {
+		if sBudget.IsPositive() {
+			budgetUSDT = sBudget
+		}
+		if sMinRR != nil && sMinRR.IsPositive() {
+			minRR = sMinRR.InexactFloat64()
+		}
+		feeBps = sFee.InexactFloat64()
+		slippageBps = sSlip.InexactFloat64()
+	}
+
 	for _, item := range items {
 		var reason *string
 		if item.RejectionReason != "" {
@@ -998,23 +1068,81 @@ func (s *Service) CompleteScan(
 		if err != nil {
 			return fmt.Errorf("marshal scanner model assumptions: %w", err)
 		}
+
+		var targetPriceDec *decimal.Decimal
+		var stopLossPriceDec *decimal.Decimal
+		var stopLossHighDec *decimal.Decimal
+		var adaptiveStrat *string
+		var riskRewardDec *decimal.Decimal
+
+		if item.Price.IsPositive() && item.LowerPrice.IsPositive() && item.UpperPrice.IsPositive() {
+			atrVal := 0.0
+			if item.ATRPct > 0 {
+				atrVal = item.ATRPct * item.Price.InexactFloat64() / 100.0
+			} else if aVal, ok := item.ModelAssumptions["atrPct"].(float64); ok && aVal > 0 {
+				atrVal = aVal * item.Price.InexactFloat64() / 100.0
+			}
+			var obProfile *marketdata.DepthProfile
+			if dp, ok := item.ModelAssumptions["orderBookDepth"].(*marketdata.DepthProfile); ok {
+				obProfile = dp
+			}
+			var srRes *marketdata.SRAnalysisResult
+			if sr, ok := item.ModelAssumptions["srAnalysis"].(*marketdata.SRAnalysisResult); ok {
+				srRes = sr
+			}
+
+			lev := item.RecommendedLeverage
+			if lev <= 0 {
+				lev = 1
+			}
+
+			adaptiveRes := marketdata.ComputeIndividualTargetPrices(marketdata.AdaptiveBotTargetInput{
+				Symbol:         item.Symbol,
+				Direction:      item.RecommendedTrend,
+				CurrentPrice:   item.Price,
+				LowerPrice:     item.LowerPrice,
+				UpperPrice:     item.UpperPrice,
+				GridNum:        item.GridNum,
+				Budget:         budgetUSDT.InexactFloat64(),
+				Leverage:       lev,
+				ATR:            atrVal,
+				OrderBookDepth: obProfile,
+				SRAnalysis:     srRes,
+				MinRiskReward:  minRR,
+				TakerFeeBps:    feeBps,
+				SlippageBps:    slippageBps,
+			})
+
+			targetPriceDec = &adaptiveRes.TargetPrice
+			stopLossPriceDec = &adaptiveRes.StopLossPrice
+			stopLossHighDec = adaptiveRes.StopLossHigh
+			strat := adaptiveRes.AdaptiveStrategy
+			adaptiveStrat = &strat
+			rr := decimal.NewFromFloat(adaptiveRes.RiskRewardRatio)
+			riskRewardDec = &rr
+		}
+
 		_, err = tx.Exec(ctx, `
 			INSERT INTO autogrid_candidates (
 				scan_id, symbol, volatility, volume_24h, funding_rate,
 				ev_pct, sharpe, decision, rejection_reason, current_price,
 				score, lower_price, upper_price, grid_num, recommended_leverage,
 				recommended_trend, max_drawdown_pct, sortino, win_rate_pct, profit_factor,
-				turnover_proxy, model_assumptions
+				turnover_proxy, model_assumptions,
+				target_price, stop_loss_price, stop_loss_high, adaptive_strategy, risk_reward_ratio
 			) VALUES (
 				$1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-				$11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22
+				$11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
+				$21, $22,
+				$23, $24, $25, $26, $27
 			)
 		`, scanID, item.Symbol, item.VolatilityPct, item.Volume24h,
 			item.FundingRate, item.ExpectedValuePct, item.Sharpe,
 			item.Decision, reason, item.Price, item.Score, item.LowerPrice,
 			item.UpperPrice, item.GridNum, item.RecommendedLeverage,
 			item.RecommendedTrend, item.MaxDrawdownPct, item.Sortino, item.WinRatePct,
-			item.ProfitFactor, item.TurnoverProxy, assumptions)
+			item.ProfitFactor, item.TurnoverProxy, assumptions,
+			targetPriceDec, stopLossPriceDec, stopLossHighDec, adaptiveStrat, riskRewardDec)
 		if err != nil {
 			return fmt.Errorf("persist AutoGrid candidate %s: %w", item.Symbol, err)
 		}
@@ -1469,7 +1597,9 @@ func (s *Service) listCandidates(ctx context.Context, scanID string) ([]Candidat
 		       COALESCE(score, 0), decision, rejection_reason,
 		       COALESCE(lower_price, 0), COALESCE(upper_price, 0),
 		       COALESCE(grid_num, 0), COALESCE(recommended_leverage, 1),
-		       COALESCE(recommended_trend, 'no_trend'), model_assumptions, created_at
+		       COALESCE(recommended_trend, 'no_trend'), model_assumptions,
+		       target_price, stop_loss_price, stop_loss_high, adaptive_strategy, risk_reward_ratio,
+		       created_at
 		FROM autogrid_candidates
 		WHERE scan_id = $1
 		ORDER BY (decision = 'ACCEPTED') DESC, score DESC NULLS LAST, symbol
@@ -1489,7 +1619,10 @@ func (s *Service) listCandidates(ctx context.Context, scanID string) ([]Candidat
 			&item.Score, &item.Decision, &item.RejectionReason,
 			&item.LowerPrice, &item.UpperPrice, &item.GridNum,
 			&item.RecommendedLeverage, &item.RecommendedTrend,
-			&item.ModelAssumptions, &item.CreatedAt,
+			&item.ModelAssumptions,
+			&item.TargetPrice, &item.StopLossPrice, &item.StopLossHigh,
+			&item.AdaptiveStrategy, &item.RiskRewardRatio,
+			&item.CreatedAt,
 		); err != nil {
 			return nil, fmt.Errorf("scan AutoGrid candidate: %w", err)
 		}
@@ -1507,6 +1640,8 @@ func (s *Service) listActiveBots(ctx context.Context, settingsID string) ([]Acti
 		       pnl_target_usdt, max_loss_usdt,
 		       realized_pnl_usdt, unrealized_pnl_usdt, supervision_floor_pnl_usdt,
 		       anti_hunt_stop_price, struct_context->>'entryPrice',
+		       target_price, stop_loss_price, stop_loss_high, trailing_sl_price,
+		       adaptive_strategy, risk_reward_ratio,
 		       updated_at, model_state
 		FROM grid_bots
 		WHERE autogrid_settings_id = $1
@@ -1529,6 +1664,8 @@ func (s *Service) listActiveBots(ctx context.Context, settingsID string) ([]Acti
 			&item.AdjustmentsCount, &item.PnLTargetUSDT, &item.MaxLossUSDT,
 			&item.RealizedPNLUSDT, &item.UnrealizedPNLUSDT, &item.SupervisionFloorUSDT,
 			&item.AntiHuntStop, &entryPriceStr,
+			&item.TargetPrice, &item.StopLossPrice, &item.StopLossHigh, &item.TrailingSLPrice,
+			&item.AdaptiveStrategy, &item.RiskRewardRatio,
 			&item.UpdatedAt, &rawModelState,
 		); err != nil {
 			rows.Close()
@@ -1605,6 +1742,8 @@ func (s *Service) listActiveBots(ctx context.Context, settingsID string) ([]Acti
 		       realized_pnl_usdt, unrealized_pnl_usdt,
 		       pnl_target_usdt, max_loss_usdt,
 		       entry_price, anti_hunt_stop_price,
+		       target_price, stop_loss_price, stop_loss_high, trailing_sl_price,
+		       adaptive_strategy, risk_reward_ratio,
 		       updated_at, model_state
 		FROM paper_grid_bots
 		WHERE settings_id = $1 AND status = 'RUNNING'
@@ -1627,6 +1766,8 @@ func (s *Service) listActiveBots(ctx context.Context, settingsID string) ([]Acti
 			&item.RealizedPNLUSDT, &item.UnrealizedPNLUSDT,
 			&item.PnLTargetUSDT, &item.MaxLossUSDT,
 			&item.EntryPrice, &item.AntiHuntStop,
+			&item.TargetPrice, &item.StopLossPrice, &item.StopLossHigh, &item.TrailingSLPrice,
+			&item.AdaptiveStrategy, &item.RiskRewardRatio,
 			&item.UpdatedAt, &rawModelState,
 		); err != nil {
 			return nil, fmt.Errorf("scan paper AutoGrid bot: %w", err)
@@ -1682,6 +1823,7 @@ func settingsScanTargets(item *Settings) []any {
 		&item.WickShieldEnabled, &item.WickGraceSec, &item.FleetMaxNetDeltaUSDT,
 		&item.UniverseScanCap, &item.MaxSpreadPct, &item.GaussianDensityEnabled,
 		&item.OrderbookProfilerEnabled, &item.KnifePauseEnabled, &item.MinDepthCushionRatio,
+		&item.SmartExitEnabled, &item.OFIHarvestEnabled, &item.OURotationEnabled, &item.MinRiskReward,
 	}
 }
 
@@ -1710,6 +1852,7 @@ func (s *Service) listClosedBots(ctx context.Context, settingsID string) ([]Clos
 	rows, err := s.db.Query(ctx, `
 		SELECT g.id, COALESCE(g.bot_number, 0), g.symbol, g.direction, g.quote_investment,
 		       g.realized_pnl_usdt, g.closed_reason, g.status,
+		       g.target_price, g.stop_loss_price, g.adaptive_strategy, g.risk_reward_ratio,
 		       COALESCE(g.closed_at, g.updated_at),
 		       est.total_pnl
 		FROM grid_bots g
@@ -1734,7 +1877,9 @@ func (s *Service) listClosedBots(ctx context.Context, settingsID string) ([]Clos
 		item.Source = "REAL"
 		if err := rows.Scan(
 			&item.ID, &item.BotNumber, &item.Symbol, &item.Direction, &item.QuoteInvestment,
-			&item.RealizedPNLUSDT, &item.ClosedReason, &item.Status, &item.ClosedAt,
+			&item.RealizedPNLUSDT, &item.ClosedReason, &item.Status,
+			&item.TargetPrice, &item.StopLossPrice, &item.AdaptiveStrategy, &item.RiskRewardRatio,
+			&item.ClosedAt,
 			&item.EstimatedFinalUSDT,
 		); err != nil {
 			rows.Close()
@@ -1748,7 +1893,9 @@ func (s *Service) listClosedBots(ctx context.Context, settingsID string) ([]Clos
 	// at close), so no estimate leg exists for them.
 	rows, err = s.db.Query(ctx, `
 		SELECT id, COALESCE(bot_number, 0), symbol, direction, quote_investment,
-		       COALESCE(realized_pnl_usdt, 0) + COALESCE(unrealized_pnl_usdt, 0), closed_reason, status, COALESCE(closed_at, updated_at)
+		       COALESCE(realized_pnl_usdt, 0) + COALESCE(unrealized_pnl_usdt, 0), closed_reason, status,
+		       target_price, stop_loss_price, adaptive_strategy, risk_reward_ratio,
+		       COALESCE(closed_at, updated_at)
 		FROM paper_grid_bots
 		WHERE settings_id = $1
 		  AND status IN ('STOPPED', 'COMPLETED', 'EMERGENCY_STOPPED')
@@ -1764,7 +1911,9 @@ func (s *Service) listClosedBots(ctx context.Context, settingsID string) ([]Clos
 		item.Source = "PAPER"
 		if err := rows.Scan(
 			&item.ID, &item.BotNumber, &item.Symbol, &item.Direction, &item.QuoteInvestment,
-			&item.RealizedPNLUSDT, &item.ClosedReason, &item.Status, &item.ClosedAt,
+			&item.RealizedPNLUSDT, &item.ClosedReason, &item.Status,
+			&item.TargetPrice, &item.StopLossPrice, &item.AdaptiveStrategy, &item.RiskRewardRatio,
+			&item.ClosedAt,
 		); err != nil {
 			return nil, fmt.Errorf("scan closed paper AutoGrid bot: %w", err)
 		}
