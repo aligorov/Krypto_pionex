@@ -680,6 +680,9 @@ const EVENT_REASON_LABELS: Record<string, string> = {
   EMERGENCY_OFI_PUMP: '🚨 экстренный выход (OFI-памп)',
   RANGE_BREAK_DOWN: 'пробой диапазона вниз',
   RANGE_BREAK_UP: 'пробой диапазона вверх',
+  SMART_PROFIT_HARVEST_OFI: '🌾 умный сбор профита (OFI)',
+  TAKE_PROFIT_PRICE_HIT: '🎯 достигнута цель цены (TP)',
+  OU_HALFLIFE_ROTATION: '⏱️ ротация капитала (OU)',
 };
 const formatEventDetails = (details: Record<string, any> | null | undefined): string => {
   if (!details) return '';
@@ -696,6 +699,8 @@ const formatEventDetails = (details: Record<string, any> | null | undefined): st
     switch (type) {
       case 'CREATED': return <span className="badge success">🚀 ЗАПУСК</span>;
       case 'TAKE_PROFIT': return <span className="badge success">🎯 ТЕЙК-ПРОФИТ</span>;
+      case 'SMART_HARVEST': return <span className="badge success">🌾 УМНЫЙ ПРОФИТ</span>;
+      case 'OU_ROTATION': return <span className="badge warning">⏱️ РОТАЦИЯ OU</span>;
       case 'STOP_LOSS': return <span className="badge danger">🛡️ СТОП-ЛОСС</span>;
       case 'ADJUST_RANGE': return <span className="badge warning">🔄 СДВИГ</span>;
       // v2.0.143 (audit-2): the cascade-short flip is a routing decision over
@@ -800,7 +805,12 @@ const formatEventDetails = (details: Record<string, any> | null | undefined): st
 
 function reasonBadge(reason: string | null): string {
   if (!reason) return 'neutral';
-  if (reason.startsWith('TAKE_PROFIT') || reason.startsWith('TRAILING_TAKE_PROFIT') || reason.startsWith('BREAKEVEN_LOCK')) {
+  if (
+    reason.startsWith('TAKE_PROFIT') ||
+    reason.startsWith('TRAILING_TAKE_PROFIT') ||
+    reason.startsWith('BREAKEVEN_LOCK') ||
+    reason.startsWith('SMART_PROFIT_HARVEST')
+  ) {
     return 'success';
   }
   if (

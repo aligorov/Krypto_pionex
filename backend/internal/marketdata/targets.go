@@ -135,6 +135,7 @@ type AdaptiveBotTargetInput struct {
 	TakerFeeBps    float64
 	SlippageBps    float64
 	FundingFeeBps  float64
+	PricePrecision int
 }
 
 // AdaptiveBotTargetsResult returns individualized price targets, stops,
@@ -311,7 +312,20 @@ func ComputeIndividualTargetPrices(input AdaptiveBotTargetInput) AdaptiveBotTarg
 			if tp.LessThanOrEqual(decimal.Zero) {
 				tp = input.CurrentPrice.Mul(decimal.NewFromFloat(0.5))
 			}
-		} else { // LONG or NEUTRAL
+		} else if direction == "NEUTRAL" {
+			// In a NEUTRAL grid, inventory exists only between LowerPrice and UpperPrice.
+			// Target must stay strictly within the upper envelope front-running UpperPrice (0.9985).
+			maxNeutralTP := input.UpperPrice.Mul(decimal.NewFromFloat(0.9985))
+			extendedTP := input.CurrentPrice.Add(decimal.NewFromFloat(requiredReward))
+			if extendedTP.GreaterThan(maxNeutralTP) {
+				tp = maxNeutralTP
+			} else {
+				tp = extendedTP
+			}
+			if tp.LessThanOrEqual(input.CurrentPrice) && input.UpperPrice.GreaterThan(input.CurrentPrice) {
+				tp = input.UpperPrice
+			}
+		} else { // LONG
 			tp = input.CurrentPrice.Add(decimal.NewFromFloat(requiredReward))
 		}
 		rewardDist = math.Abs(tp.Sub(input.CurrentPrice).InexactFloat64())
@@ -331,9 +345,41 @@ func ComputeIndividualTargetPrices(input AdaptiveBotTargetInput) AdaptiveBotTarg
 
 	grossLossUSDT := notional * (riskDist / currPriceF)
 	netLossUSDT := grossLossUSDT + frictionUSDT
+	minLossUSDT := notional * (DynamicLossMinPct / 100.0)
+	maxLossUSDT := notional * (DynamicLossMaxPct / 100.0)
+	if netLossUSDT < minLossUSDT {
+		netLossUSDT = minLossUSDT
+	}
+	if netLossUSDT > maxLossUSDT {
+		netLossUSDT = maxLossUSDT
+	}
+
+	prec := input.PricePrecision
+	if prec <= 0 && input.CurrentPrice.GreaterThan(decimal.Zero) {
+		exp := input.CurrentPrice.Exponent()
+		if exp < 0 {
+			prec = int(-exp)
+		}
+	}
+	if prec > 8 {
+		prec = 8
+	}
+	if prec > 0 {
+		tp = tp.Round(int32(prec))
+		sl = sl.Round(int32(prec))
+		if slHigh != nil {
+			r := slHigh.Round(int32(prec))
+			slHigh = &r
+		}
+	}
+
+	formatPrec := prec
+	if formatPrec <= 0 {
+		formatPrec = 4
+	}
 
 	reason := fmt.Sprintf("strategy=%s direction=%s TP=%s SL=%s RR=%.2f net_target=$%.2f max_loss=$%.2f",
-		strategy, direction, tp.StringFixed(4), sl.StringFixed(4), rr, netTargetUSDT, netLossUSDT)
+		strategy, direction, tp.StringFixed(int32(formatPrec)), sl.StringFixed(int32(formatPrec)), rr, netTargetUSDT, netLossUSDT)
 
 	return AdaptiveBotTargetsResult{
 		TargetPrice:      tp,

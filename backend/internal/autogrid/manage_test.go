@@ -2,6 +2,7 @@ package autogrid
 
 import (
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -736,14 +737,48 @@ func TestDecideBotActionSmartProfitHarvestOFI(t *testing.T) {
 	input.SmartExitEnabled = true
 	input.OFIHarvestEnabled = true
 
-	ofiRegime := "STRONG_SELLER_ABSORPTION"
+	// Real OFI engine regime: CONFIRMED_DUMP
+	ofiRegime := "CONFIRMED_DUMP"
 	microBias := -4.5
 	input.OFIRegime = &ofiRegime
 	input.MicroPriceBiasBps = &microBias
 
 	decision := decideBotAction(input)
 	if decision.Action != ActionCloseSmartHarvest || decision.Reason != "SMART_PROFIT_HARVEST_OFI" {
-		t.Fatalf("expected SMART_PROFIT_HARVEST_OFI, got %+v", decision)
+		t.Fatalf("expected SMART_PROFIT_HARVEST_OFI on CONFIRMED_DUMP, got %+v", decision)
+	}
+
+	// Real OFI engine regime: DUMP_PRESSURE
+	dumpPressure := "DUMP_PRESSURE"
+	input.OFIRegime = &dumpPressure
+	decision = decideBotAction(input)
+	if decision.Action != ActionCloseSmartHarvest || decision.Reason != "SMART_PROFIT_HARVEST_OFI" {
+		t.Fatalf("expected SMART_PROFIT_HARVEST_OFI on DUMP_PRESSURE, got %+v", decision)
+	}
+
+	// SHORT bot with CONFIRMED_PUMP
+	inputShort := baseActionInput()
+	inputShort.Direction = "SHORT"
+	inputShort.Budget = mustDecimal("200.0")
+	inputShort.RealizedPNL = mustDecimal("8.0")
+	inputShort.UnrealizedPNL = mustDecimal("2.0")
+	inputShort.SmartExitEnabled = true
+	inputShort.OFIHarvestEnabled = true
+	pumpRegime := "CONFIRMED_PUMP"
+	posBias := 3.2
+	inputShort.OFIRegime = &pumpRegime
+	inputShort.MicroPriceBiasBps = &posBias
+	decisionShort := decideBotAction(inputShort)
+	if decisionShort.Action != ActionCloseSmartHarvest || decisionShort.Reason != "SMART_PROFIT_HARVEST_OFI" {
+		t.Fatalf("expected SMART_PROFIT_HARVEST_OFI on CONFIRMED_PUMP for SHORT, got %+v", decisionShort)
+	}
+
+	// Fictional regime must NOT trigger Smart Harvest
+	fakeRegime := "STRONG_SELLER_ABSORPTION"
+	input.OFIRegime = &fakeRegime
+	decisionFake := decideBotAction(input)
+	if decisionFake.Action == ActionCloseSmartHarvest {
+		t.Fatalf("fictional regime must NOT trigger SMART_PROFIT_HARVEST_OFI, got %+v", decisionFake)
 	}
 }
 
@@ -777,4 +812,25 @@ func TestDecideBotActionTrailingSLAdvance(t *testing.T) {
 		t.Fatalf("expected trailing SL 98.5000, got %v", decision.TrailingSLPrice)
 	}
 }
+
+func TestProtectiveCloseExemptReasons_IncludesAllProfitableExits(t *testing.T) {
+	required := []string{
+		"TAKE_PROFIT",
+		"TAKE_PROFIT_NATIVE",
+		"TAKE_PROFIT_PRICE_HIT",
+		"TRAILING_TAKE_PROFIT",
+		"BREAKEVEN_LOCK",
+		"SMART_PROFIT_HARVEST_OFI",
+		"RANGE_BREAK_UP_PROFIT_TAKE",
+		"GRID_AGED_HALF_LIFE",
+		"OU_HALFLIFE_ROTATION",
+	}
+	for _, reason := range required {
+		quoted := "'" + reason + "'"
+		if !strings.Contains(protectiveCloseExemptReasons, quoted) {
+			t.Errorf("protectiveCloseExemptReasons missing required profitable/planned reason %s", quoted)
+		}
+	}
+}
+
 

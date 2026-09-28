@@ -84,8 +84,8 @@ const realFundingReconcileInterval = 30 * time.Minute
 // lock the symbol out of the scanner's next entry nor feed the portfolio
 // breaker (a synchronized age wave would otherwise freeze deploys for an
 // hour with zero protective meaning).
-const protectiveCloseExemptReasons = `'TAKE_PROFIT', 'TAKE_PROFIT_NATIVE', 'TRAILING_TAKE_PROFIT', 'BREAKEVEN_LOCK',
-	'RANGE_BREAK_UP_PROFIT_TAKE', 'GRID_AGED_HALF_LIFE',
+const protectiveCloseExemptReasons = `'TAKE_PROFIT', 'TAKE_PROFIT_NATIVE', 'TAKE_PROFIT_PRICE_HIT', 'TRAILING_TAKE_PROFIT', 'BREAKEVEN_LOCK',
+	'SMART_PROFIT_HARVEST_OFI', 'RANGE_BREAK_UP_PROFIT_TAKE', 'GRID_AGED_HALF_LIFE', 'OU_HALFLIFE_ROTATION',
 	'MANUAL_CLOSE', 'MCP_MANUAL_CLOSE', 'USER_CANCEL', 'ALREADY_CLOSED', 'EXTERNAL_CLOSE', 'REMOTE_FAILED',
 	'STOPPED', 'EMERGENCY_STOPPED', 'AUTOGRID_STOP', 'EMERGENCY_STOP',
 	'DELISTED_NO_PRICE'`
@@ -1829,8 +1829,12 @@ func (worker *Worker) deployPaper(
 		})
 
 		targetPriceDec := adaptiveRes.TargetPrice
-		stopLossPriceDec := adaptiveRes.StopLossPrice
-		stopLossHighDec := adaptiveRes.StopLossHigh
+		var stopLossPriceDec decimal.Decimal
+		var stopLossHighDec *decimal.Decimal
+		if settings.StopLossMode == "ADAPTIVE_ATR" {
+			stopLossPriceDec = adaptiveRes.StopLossPrice
+			stopLossHighDec = adaptiveRes.StopLossHigh
+		}
 		riskRewardDec := decimal.NewFromFloat(adaptiveRes.RiskRewardRatio)
 		adaptiveStrat := adaptiveRes.AdaptiveStrategy
 
@@ -3051,29 +3055,49 @@ func (worker *Worker) deployReal(
 			MinRiskReward:  minRR,
 			TakerFeeBps:    settings.FeeBps.InexactFloat64(),
 			SlippageBps:    settings.SlippageBps.InexactFloat64(),
+			PricePrecision: pricePrecision,
 		})
 
-		// Configure native Pionex price-based take-profit and stop-loss directly on the bot card
+		// Configure native Pionex price-based take-profit directly on the bot card
+		targetPrice := adaptiveRes.TargetPrice.Round(int32(pricePrecision))
 		data.ProfitStopType = "price"
-		data.ProfitStop = &adaptiveRes.TargetPrice
+		data.ProfitStop = &targetPrice
 		profitDelay := 15
 		data.ProfitStopDelay = &profitDelay
 
-		data.LossStopType = "price"
-		data.LossStop = &adaptiveRes.StopLossPrice
-		if adaptiveRes.StopLossHigh != nil {
-			data.LossStopHigh = adaptiveRes.StopLossHigh
+		// Configure native Pionex price-based stop-loss: strictly respect settings.StopLossMode
+		var slPrice decimal.Decimal
+		var slHighPrice *decimal.Decimal
+		if settings.StopLossMode == "ADAPTIVE_ATR" {
+			slPrice = ClampAntiHuntStopIntoBounds(trend, lowerPrice, upperPrice, adaptiveRes.StopLossPrice).Round(int32(pricePrecision))
+			data.LossStopType = "price"
+			data.LossStop = &slPrice
+			if adaptiveRes.StopLossHigh != nil {
+				h := adaptiveRes.StopLossHigh.Round(int32(pricePrecision))
+				slHighPrice = &h
+				data.LossStopHigh = slHighPrice
+			}
+			lossDelay := 15
+			data.LossStopDelay = &lossDelay
+		} else {
+			data.LossStopType = ""
+			data.LossStop = nil
+			data.LossStopHigh = nil
+			data.LossStopDelay = nil
 		}
-		lossDelay := 15
-		data.LossStopDelay = &lossDelay
 
-		// Sized net true USDT targets
-		botTargetVal := decimal.NewFromFloat(adaptiveRes.TargetUSDT).Round(2)
-		botTarget = &botTargetVal
-		botMaxLossVal := decimal.NewFromFloat(adaptiveRes.MaxLossUSDT).Round(2)
-		botMaxLoss = &botMaxLossVal
-		if stress.loss.GreaterThan(*botMaxLoss) {
-			botMaxLossVal = stress.loss.Round(2)
+		// Sized net true USDT targets: respect PnLTargetMode (DYNAMIC vs FIXED) and TrancheDeployEnabled
+		if settings.PnLTargetMode == "DYNAMIC" {
+			botTargetVal := decimal.NewFromFloat(adaptiveRes.TargetUSDT).Round(2)
+			botMaxLossVal := decimal.NewFromFloat(adaptiveRes.MaxLossUSDT).Round(2)
+			if stress.loss.GreaterThan(botMaxLossVal) {
+				botMaxLossVal = stress.loss.Round(2)
+			}
+			if settings.TrancheDeployEnabled {
+				botTargetVal = botTargetVal.Div(decimal.NewFromInt(2)).Round(2)
+				botMaxLossVal = botMaxLossVal.Div(decimal.NewFromInt(2)).Round(2)
+			}
+			botTarget = &botTargetVal
 			botMaxLoss = &botMaxLossVal
 		}
 
@@ -3201,9 +3225,13 @@ func (worker *Worker) deployReal(
 		if stress.floored {
 			trancheMarkers["stressLossFloor"] = true
 		}
-		targetPriceDec := adaptiveRes.TargetPrice
-		stopLossPriceDec := adaptiveRes.StopLossPrice
-		stopLossHighDec := adaptiveRes.StopLossHigh
+		targetPriceDec := targetPrice
+		var storedSL *decimal.Decimal
+		var storedSLHigh *decimal.Decimal
+		if settings.StopLossMode == "ADAPTIVE_ATR" {
+			storedSL = &slPrice
+			storedSLHigh = slHighPrice
+		}
 		riskRewardDec := decimal.NewFromFloat(adaptiveRes.RiskRewardRatio)
 		adaptiveStrat := adaptiveRes.AdaptiveStrategy
 
@@ -3227,9 +3255,9 @@ func (worker *Worker) deployReal(
 			// Markers match the paper model_state contract.
 			TrancheState:     trancheMarkers,
 			TargetPrice:      &targetPriceDec,
-			StopLossPrice:    &stopLossPriceDec,
-			StopLossHigh:     stopLossHighDec,
-			TrailingSLPrice:  &stopLossPriceDec,
+			StopLossPrice:    storedSL,
+			StopLossHigh:     storedSLHigh,
+			TrailingSLPrice:  storedSL,
 			AdaptiveStrategy: &adaptiveStrat,
 			RiskRewardRatio:  &riskRewardDec,
 		})

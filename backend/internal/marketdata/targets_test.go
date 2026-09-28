@@ -328,5 +328,37 @@ func TestComputeIndividualTargetPrices(t *testing.T) {
 	if !resNeutral.StopLossPrice.LessThan(lowerPrice) {
 		t.Fatalf("StopLossPrice %s must be below lowerPrice %s", resNeutral.StopLossPrice, lowerPrice)
 	}
+	// NEUTRAL target MUST NOT overshoot upper grid boundary
+	if resNeutral.TargetPrice.GreaterThan(upperPrice) {
+		t.Fatalf("NEUTRAL target %s must NOT overshoot upperPrice %s", resNeutral.TargetPrice, upperPrice)
+	}
+	// MaxLossUSDT must be clamped between [2%..5%] of notional (300 * 1 = $300 -> [$6..$15])
+	if resNeutral.MaxLossUSDT < 6.0 || resNeutral.MaxLossUSDT > 15.0 {
+		t.Fatalf("NEUTRAL MaxLossUSDT %f must be clamped between $6 and $15, got %f", resNeutral.MaxLossUSDT, resNeutral.MaxLossUSDT)
+	}
+
+	// Test 4: Precision rounding and wide-stop clamp [2..5%]
+	resPrec := ComputeIndividualTargetPrices(AdaptiveBotTargetInput{
+		Symbol:         "BTC_USDT",
+		Direction:      "LONG",
+		CurrentPrice:   decimal.NewFromFloat(95.94812398129841),
+		LowerPrice:     decimal.NewFromFloat(80.0), // very wide stop
+		UpperPrice:     decimal.NewFromFloat(110.0),
+		Budget:         100.0,
+		Leverage:       5, // notional = $500 -> 2..5% = [$10..$25]
+		ATR:            6.0,
+		MinRiskReward:  1.8,
+		PricePrecision: 2,
+	})
+
+	if resPrec.TargetPrice.Exponent() < -2 {
+		t.Fatalf("TargetPrice %s has exponent %d, expected <= -2 precision", resPrec.TargetPrice, resPrec.TargetPrice.Exponent())
+	}
+	if resPrec.StopLossPrice.Exponent() < -2 {
+		t.Fatalf("StopLossPrice %s has exponent %d, expected <= -2 precision", resPrec.StopLossPrice, resPrec.StopLossPrice.Exponent())
+	}
+	if resPrec.MaxLossUSDT > 25.0 || resPrec.MaxLossUSDT < 10.0 {
+		t.Fatalf("MaxLossUSDT %f must be clamped in [$10..$25], got %f", resPrec.MaxLossUSDT, resPrec.MaxLossUSDT)
+	}
 }
 

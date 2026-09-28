@@ -118,13 +118,13 @@ func decideBotAction(input botActionInput) manageDecision {
 		isExhausted := false
 		if input.Direction == "LONG" {
 			if input.MicroPriceBiasBps != nil && *input.MicroPriceBiasBps < -2.5 {
-				if input.OFIRegime != nil && (*input.OFIRegime == "STRONG_SELLER_ABSORPTION" || *input.OFIRegime == "OFI_DIVERGENCE_BEARISH" || *input.OFIRegime == "DUMP_PRESSURE") {
+				if input.OFIRegime != nil && (*input.OFIRegime == "CONFIRMED_DUMP" || *input.OFIRegime == "DUMP_PRESSURE") {
 					isExhausted = true
 				}
 			}
 		} else if input.Direction == "SHORT" {
 			if input.MicroPriceBiasBps != nil && *input.MicroPriceBiasBps > 2.5 {
-				if input.OFIRegime != nil && (*input.OFIRegime == "STRONG_BUYER_ABSORPTION" || *input.OFIRegime == "OFI_DIVERGENCE_BULLISH" || *input.OFIRegime == "PUMP_PRESSURE") {
+				if input.OFIRegime != nil && (*input.OFIRegime == "CONFIRMED_PUMP" || *input.OFIRegime == "PUMP_PRESSURE") {
 					isExhausted = true
 				}
 			}
