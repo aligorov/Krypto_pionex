@@ -1,6 +1,11 @@
 package autogrid
 
-import "testing"
+import (
+	"strings"
+	"testing"
+
+	"github.com/shopspring/decimal"
+)
 
 func TestNeighborBacktestTFs(t *testing.T) {
 	if got := neighborBacktestTFs("60M"); len(got) != 2 || got[0] != "30M" || got[1] != "4H" {
@@ -140,5 +145,79 @@ func TestBacktestGatePending(t *testing.T) {
 	)
 	if !verdict.Allowed {
 		t.Fatalf("pending neighbors must not block: %s", verdict.Reason)
+	}
+}
+
+func TestMatchesDeployParams_EmptyParamsFailClosed(t *testing.T) {
+	dp := &BacktestDeployParams{
+		Symbol:     "BTC_USDT",
+		LowerPrice: decimal.NewFromInt(60000),
+		UpperPrice: decimal.NewFromInt(70000),
+		GridNum:    50,
+		Leverage:   2,
+	}
+
+	// When deploy params are expected, empty job params must NEVER match (fail-closed)
+	if matchesDeployParams([]byte{}, dp) {
+		t.Fatalf("empty job params must NOT match non-nil deploy params")
+	}
+	if matchesDeployParams(nil, dp) {
+		t.Fatalf("nil job params must NOT match non-nil deploy params")
+	}
+
+	// Valid matching params
+	matchingJSON := []byte(`{"lower_price":60000,"upper_price":70000,"grid_num":50,"leverage":2}`)
+	if !matchesDeployParams(matchingJSON, dp) {
+		t.Fatalf("matching job params must match")
+	}
+
+	// Mismatched params
+	mismatchedJSON := []byte(`{"lower_price":55000,"upper_price":70000,"grid_num":50,"leverage":2}`)
+	if matchesDeployParams(mismatchedJSON, dp) {
+		t.Fatalf("mismatched job params must not match")
+	}
+
+	// When deploy params is nil, any params match (unconstrained query)
+	if !matchesDeployParams(matchingJSON, nil) {
+		t.Fatalf("nil deploy params should allow any job params")
+	}
+}
+
+func TestParseBacktestResult_NoOptimisticDefaults(t *testing.T) {
+	// JSON with missing CI and liquidity fields
+	raw := []byte(`{
+		"folds": 4,
+		"oos_return_pct": 5.2,
+		"oos_max_drawdown": 0.03,
+		"round_trips": 30,
+		"stop_hits": 0,
+		"net_ev": 0.15
+	}`)
+
+	summary, ok := parseBacktestResult(raw)
+	if !ok {
+		t.Fatalf("parseBacktestResult must parse valid json")
+	}
+
+	// LiquidityOK must default to false (fail-closed)
+	if summary.LiquidityOK {
+		t.Fatalf("LiquidityOK must default to false when omitted, got true")
+	}
+
+	// CI95 must NOT be synthesized from oos_return_pct
+	if summary.CI95Positive {
+		t.Fatalf("CI95Positive must NOT be synthesized from OOS return, got true")
+	}
+	if summary.CI95Lower != 0.0 {
+		t.Fatalf("CI95Lower must NOT be synthesized, got %f", summary.CI95Lower)
+	}
+
+	// Gate evaluation on this summary must reject with 'нет подтверждения'
+	verdict := evaluateBacktestGate(summary, nil)
+	if verdict.Allowed {
+		t.Fatalf("unconfirmed CI/liquidity must reject, got allowed=true")
+	}
+	if verdict.Reason == "" || !strings.Contains(verdict.Reason, "нет подтверждения") {
+		t.Fatalf("verdict reason must state 'нет подтверждения', got: %s", verdict.Reason)
 	}
 }

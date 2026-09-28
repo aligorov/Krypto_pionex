@@ -54,6 +54,39 @@ def detect_regime(candles: List[Dict[str, Any]]) -> str:
     return "RANGE"
 
 
+def lag1_autocorr(series: List[float]) -> float:
+    """Computes sample lag-1 autocorrelation rho_1 of a trade sequence."""
+    if len(series) < 3:
+        return 0.0
+    arr = np.array(series, dtype=float)
+    x = arr[:-1]
+    y = arr[1:]
+    std_x = float(np.std(x))
+    std_y = float(np.std(y))
+    if std_x == 0.0 or std_y == 0.0:
+        return 0.0
+    r = float(np.corrcoef(x, y)[0, 1])
+    if np.isnan(r):
+        return 0.0
+    return max(-0.99, min(0.99, r))
+
+
+def effective_sample_size(n: int, rho1: float) -> float:
+    """
+    Adjusts sample size for serial correlation / trade dependence:
+    N_eff = N * (1 - rho1) / (1 + rho1).
+    When rho1 > 0, trades are positively clustered/dependent -> N_eff < N.
+    Conservative: we do not inflate N_eff above N for negative rho1.
+    Bounded below by 2.0 (if N >= 2).
+    """
+    if n < 2:
+        return float(n)
+    if rho1 > 0:
+        n_eff = float(n) * (1.0 - rho1) / (1.0 + rho1)
+        return max(2.0, min(float(n), n_eff))
+    return float(n)
+
+
 class QuantBacktestEngine:
     """
     Event-driven backtesting engine with strict intrabar execution logic,
@@ -81,6 +114,10 @@ class QuantBacktestEngine:
                 "ci95_upper": 0.0,
                 "ci95_positive": False,
                 "sample_sufficient": False,
+                "autocorr_rho1": 0.0,
+                "n_eff": 0.0,
+                "is_proxy": True,
+                "evaluation_status": "indicative_proxy",
             }
 
         pnls = [t.get("pnl", 0.0) for t in trades]
@@ -113,14 +150,17 @@ class QuantBacktestEngine:
         downside_std = float(np.std(downside_returns)) if len(downside_returns) > 1 else 0.0
         sortino_ratio = (float(np.mean(returns)) / downside_std * np.sqrt(365 * 24)) if downside_std > 0 else 0.0
 
-        # 95% Confidence Interval for Net EV
+        # 95% Confidence Interval for Net EV with autocorrelation adjustment
+        rho_1 = lag1_autocorr(pnls)
+        n_eff = effective_sample_size(total_trades, rho_1)
         pnl_std = float(np.std(pnls, ddof=1)) if len(pnls) > 1 else 0.0
-        se = pnl_std / np.sqrt(total_trades) if total_trades > 1 else 0.0
-        t_crit = t_critical_95(total_trades - 1)
+        se = (pnl_std / np.sqrt(n_eff)) if n_eff > 1 else 0.0
+        df = max(1, int(round(n_eff)) - 1)
+        t_crit = t_critical_95(df)
         ci95_lower = expected_value - t_crit * se
         ci95_upper = expected_value + t_crit * se
         ci95_positive = bool(ci95_lower > 0.0)
-        sample_sufficient = bool(total_trades >= 15)
+        sample_sufficient = bool(n_eff >= 15)
 
         return {
             "total_trades": total_trades,
@@ -134,6 +174,10 @@ class QuantBacktestEngine:
             "ci95_upper": round(ci95_upper, 4),
             "ci95_positive": ci95_positive,
             "sample_sufficient": sample_sufficient,
+            "autocorr_rho1": round(rho_1, 4),
+            "n_eff": round(n_eff, 2),
+            "is_proxy": True,
+            "evaluation_status": "indicative_proxy",
         }
 
 
@@ -161,8 +205,18 @@ class GridSimulator:
 
     def simulate(self, candles, lower, upper, levels, investment, leverage=1.0, direction="neutral",
                  stop_loss_pct=None):
+        """
+        Simulates grid execution against OHLCV candle sequence.
+        
+        NOTE: OHLCV simulation is an indicative proxy (is_proxy=True):
+        1. Intrabar trajectory is reconstructed via _candle_path heuristic (O-H-L-C or O-L-H-C).
+        2. Fills assume 0.5 touch / 1.0 penetration partial execution heuristics.
+        3. Perpetual funding accrual uses a constant 8h rate proxy.
+        This serves as a relative qualification filter, requiring paper or shadow verification
+        before real capital allocation.
+        """
         if upper <= lower or levels < 2 or investment <= 0 or not candles:
-            return {"error": "invalid parameters"}
+            return {"error": "invalid parameters", "is_proxy": True, "evaluation_status": "indicative_proxy"}
 
         leverage = max(float(leverage), 1.0)
         direction = str(direction or "neutral").lower()
@@ -389,6 +443,9 @@ class GridSimulator:
             "duration_bars": duration_bars,
             "equity_curve": equity_curve,
             "trades": trades,
+            "is_proxy": True,
+            "evaluation_status": "indicative_proxy",
+            "proxy_warning": "OHLCV simulation relies on intra-candle path reconstruction, heuristic fills, and fixed funding; indicative only.",
         }
 
 
@@ -417,42 +474,62 @@ def walk_forward(engine: QuantBacktestEngine, candles: List[Dict[str, Any]],
                  bar_hours: float = 1.0, deployed_params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """
     Purged walk-forward evaluation across sequential time periods and diverse market regimes.
-    If deployed_params are provided, evaluates the candidate's exact parameters across
-    consecutive Out-Of-Sample test periods without in-sample overfitting.
+    Historical fold parameters are calculated strictly on the training window without peeking into OOS.
+    When deployed_params are provided, candidate exact parameters are separately evaluated on subsequent data.
+    Trade dependence (autocorrelation) is incorporated into Net EV confidence interval (N_eff).
+    OHLCV simulation is flagged as an indicative proxy (is_proxy=True).
     """
+    if not candles:
+        return {
+            "folds": 0, "oos_return_pct": 0.0, "oos_max_drawdown": 0.0,
+            "round_trips": 0, "stop_hits": 0, "net_ev": 0.0,
+            "ci95_lower": 0.0, "ci95_upper": 0.0, "ci95_positive": False,
+            "sample_sufficient": False, "oos_sharpe": 0.0, "oos_sharpe_valid": False,
+            "oos_sortino": 0.0, "oos_sortino_valid": False, "win_rate": 0.0,
+            "profit_factor": 0.0, "turnover": 0.0, "regimes_tested": [],
+            "liquidity_ok": False, "liquidity_reason": "no candles provided",
+            "worst_period": None, "is_proxy": True, "evaluation_status": "indicative_proxy",
+            "proxy_warning": "OHLCV simulation relies on intra-candle path reconstruction, heuristic fills, and fixed funding; indicative only.",
+        }
+
     folds = []
     all_trades = []
     all_equity = []
-    
+
+    total_bars = len(candles)
+    eff_test_bars = test_bars
+    eff_purge_bars = purge_bars
+    eff_train_bars = train_bars
+    if total_bars < eff_train_bars + eff_purge_bars + eff_test_bars and total_bars >= 40:
+        eff_test_bars = max(10, min(test_bars, total_bars // 4))
+        eff_purge_bars = min(purge_bars, max(1, eff_test_bars // 5))
+        eff_train_bars = max(20, min(train_bars, (total_bars - eff_purge_bars - eff_test_bars) // 3))
+
     use_exact_params = bool(deployed_params and "lower" in deployed_params and "upper" in deployed_params and "levels" in deployed_params)
-    
-    if use_exact_params:
-        # Sequential OOS test periods without training parameter fitting
-        test_step = test_bars
-        start = 0
-        fold_idx = 0
-        while start + test_bars <= len(candles):
-            test = candles[start : start + test_bars]
+
+    # 1. Historical Purged Walk-Forward: parameters derived strictly on in-sample train window without peeking
+    start = 0
+    fold_idx = 0
+    while start + eff_train_bars + eff_purge_bars + eff_test_bars <= total_bars:
+        train = candles[start : start + eff_train_bars]
+        test = candles[start + eff_train_bars + eff_purge_bars : start + eff_train_bars + eff_purge_bars + eff_test_bars]
+        params = derive_grid_params(train, fee_bps=(engine.maker_fee + engine.slippage) * 1e4)
+        if params:
             regime = detect_regime(test)
             sim = GridSimulator(
                 maker_fee=engine.maker_fee, taker_fee=engine.taker_fee, slippage=engine.slippage,
                 funding_rate_8h=engine.funding_rate_8h, bar_hours=bar_hours
             )
+            # Historical walk-forward simulation of derived strategy parameters on out-of-sample test window
             res = sim.simulate(
-                test,
-                lower=deployed_params["lower"],
-                upper=deployed_params["upper"],
-                levels=deployed_params["levels"],
-                investment=deployed_params.get("investment", investment),
-                leverage=deployed_params.get("leverage", 1.0),
-                direction=deployed_params.get("direction", "neutral"),
-                stop_loss_pct=deployed_params.get("stop_loss_pct", stop_loss_pct),
+                test, params["lower"], params["upper"], params["levels"], investment,
+                stop_loss_pct=stop_loss_pct
             )
             if "error" not in res:
                 fold_data = {
                     "fold_idx": fold_idx + 1,
-                    "test_start": start,
-                    "test_end": start + test_bars,
+                    "test_start": start + eff_train_bars + eff_purge_bars,
+                    "test_end": start + eff_train_bars + eff_purge_bars + eff_test_bars,
                     "regime": regime,
                     "return_pct": res["return_pct"],
                     "max_drawdown": res["max_drawdown"],
@@ -466,48 +543,66 @@ def walk_forward(engine: QuantBacktestEngine, candles: List[Dict[str, Any]],
                     "trades": res.get("trades", []),
                 }
                 folds.append(fold_data)
-                all_trades.extend(res.get("trades", []))
-                all_equity.extend(res.get("equity_curve", []))
-            start += test_step
-            fold_idx += 1
-    else:
-        # Classical purged train/test walk-forward with derived parameters
-        start = 0
-        fold_idx = 0
-        while start + train_bars + purge_bars + test_bars <= len(candles):
-            train = candles[start : start + train_bars]
-            test = candles[start + train_bars + purge_bars : start + train_bars + purge_bars + test_bars]
-            params = derive_grid_params(train, fee_bps=(engine.maker_fee + engine.slippage) * 1e4)
-            if params:
-                regime = detect_regime(test)
-                sim = GridSimulator(
-                    maker_fee=engine.maker_fee, taker_fee=engine.taker_fee, slippage=engine.slippage,
-                    funding_rate_8h=engine.funding_rate_8h, bar_hours=bar_hours
-                )
-                res = sim.simulate(test, params["lower"], params["upper"], params["levels"], investment,
-                                   stop_loss_pct=stop_loss_pct)
-                if "error" not in res:
-                    fold_data = {
-                        "fold_idx": fold_idx + 1,
-                        "test_start": start + train_bars + purge_bars,
-                        "test_end": start + train_bars + purge_bars + test_bars,
-                        "regime": regime,
-                        "return_pct": res["return_pct"],
-                        "max_drawdown": res["max_drawdown"],
-                        "round_trips": res["round_trips"],
-                        "stop_hit": res["end_reason"] in ("STOP_LOSS", "LIQUIDATION"),
-                        "end_reason": res["end_reason"],
-                        "realized_pnl": res["realized_pnl"],
-                        "fees_paid": res["fees_paid"],
-                        "funding_paid": res["funding_paid"],
-                        "final_equity": res["final_equity"],
-                        "trades": res.get("trades", []),
-                    }
-                    folds.append(fold_data)
+                if not use_exact_params:
                     all_trades.extend(res.get("trades", []))
                     all_equity.extend(res.get("equity_curve", []))
-            start += test_bars
-            fold_idx += 1
+        start += eff_test_bars
+        fold_idx += 1
+
+    # 2. Exact Candidate Parameter Evaluation on Subsequent / Out-Of-Sample Data
+    candidate_evaluation = None
+    if use_exact_params:
+        cand_sim = GridSimulator(
+            maker_fee=engine.maker_fee, taker_fee=engine.taker_fee, slippage=engine.slippage,
+            funding_rate_8h=engine.funding_rate_8h, bar_hours=bar_hours
+        )
+        # Evaluate candidate across out-of-sample slices post initial train window
+        cand_start = eff_train_bars + eff_purge_bars if total_bars > eff_train_bars + eff_purge_bars else 0
+        cand_slice = candles[cand_start:]
+        cand_res = cand_sim.simulate(
+            cand_slice,
+            lower=deployed_params["lower"],
+            upper=deployed_params["upper"],
+            levels=deployed_params["levels"],
+            investment=deployed_params.get("investment", investment),
+            leverage=deployed_params.get("leverage", 1.0),
+            direction=deployed_params.get("direction", "neutral"),
+            stop_loss_pct=deployed_params.get("stop_loss_pct", stop_loss_pct),
+        )
+        if "error" not in cand_res:
+            c_trades = cand_res.get("trades", [])
+            all_trades = c_trades
+            all_equity = cand_res.get("equity_curve", [])
+            cand_pnls = [t.get("pnl", 0.0) for t in c_trades]
+            c_rho = lag1_autocorr(cand_pnls)
+            c_neff = effective_sample_size(len(cand_pnls), c_rho)
+            c_ev = float(np.mean(cand_pnls)) if cand_pnls else 0.0
+            c_std = float(np.std(cand_pnls, ddof=1)) if len(cand_pnls) > 1 else 0.0
+            c_se = c_std / np.sqrt(c_neff) if c_neff > 1 else 0.0
+            c_tcrit = t_critical_95(max(1, int(round(c_neff)) - 1))
+            candidate_evaluation = {
+                "lower": deployed_params["lower"],
+                "upper": deployed_params["upper"],
+                "levels": deployed_params["levels"],
+                "leverage": deployed_params.get("leverage", 1.0),
+                "direction": deployed_params.get("direction", "neutral"),
+                "investment": deployed_params.get("investment", investment),
+                "return_pct": cand_res["return_pct"],
+                "max_drawdown": cand_res["max_drawdown"],
+                "round_trips": cand_res["round_trips"],
+                "end_reason": cand_res["end_reason"],
+                "realized_pnl": cand_res["realized_pnl"],
+                "fees_paid": cand_res["fees_paid"],
+                "funding_paid": cand_res["funding_paid"],
+                "net_ev": round(c_ev, 4),
+                "ci95_lower": round(c_ev - c_tcrit * c_se, 4),
+                "ci95_upper": round(c_ev + c_tcrit * c_se, 4),
+                "ci95_positive": bool((c_ev - c_tcrit * c_se) > 0.0),
+                "autocorr_rho1": round(c_rho, 4),
+                "n_eff": round(c_neff, 2),
+                "is_proxy": True,
+                "evaluation_status": "indicative_proxy",
+            }
 
     if not folds:
         return {
@@ -517,26 +612,33 @@ def walk_forward(engine: QuantBacktestEngine, candles: List[Dict[str, Any]],
             "sample_sufficient": False, "oos_sharpe": 0.0, "oos_sharpe_valid": False,
             "oos_sortino": 0.0, "oos_sortino_valid": False, "win_rate": 0.0,
             "profit_factor": 0.0, "turnover": 0.0, "regimes_tested": [],
-            "liquidity_ok": True, "worst_period": None,
+            "liquidity_ok": False, "liquidity_reason": "no valid walk-forward folds formed",
+            "worst_period": None, "is_proxy": True, "evaluation_status": "indicative_proxy",
+            "proxy_warning": "OHLCV simulation relies on intra-candle path reconstruction, heuristic fills, and fixed funding; indicative only.",
         }
 
     returns = [f["return_pct"] for f in folds]
     dds = [f["max_drawdown"] for f in folds]
     stop_hits = sum(1 for f in folds if f["stop_hit"])
     round_trips = sum(f["round_trips"] for f in folds)
+    if use_exact_params and candidate_evaluation:
+        round_trips = candidate_evaluation["round_trips"]
 
-    # Trade-level statistical metrics
+    # Trade-level statistical metrics with autocorrelation (trade dependence) adjustment
     pnls = [t.get("pnl", 0.0) for t in all_trades]
     total_trades = len(pnls)
     expected_value = float(np.mean(pnls)) if total_trades > 0 else 0.0
 
+    rho_1 = lag1_autocorr(pnls)
+    n_eff = effective_sample_size(total_trades, rho_1)
     pnl_std = float(np.std(pnls, ddof=1)) if total_trades > 1 else 0.0
-    se = pnl_std / np.sqrt(total_trades) if total_trades > 1 else 0.0
-    t_crit = t_critical_95(total_trades - 1)
+    se = (pnl_std / np.sqrt(n_eff)) if n_eff > 1 else 0.0
+    df = max(1, int(round(n_eff)) - 1)
+    t_crit = t_critical_95(df)
     ci95_lower = expected_value - t_crit * se
     ci95_upper = expected_value + t_crit * se
     ci95_positive = bool(ci95_lower > 0.0)
-    sample_sufficient = bool(total_trades >= 15 and len(folds) >= 3)
+    sample_sufficient = bool(n_eff >= 15 and len(folds) >= 3)
 
     # Win rate & Profit factor
     wins = [p for p in pnls if p > 0]
@@ -561,7 +663,6 @@ def walk_forward(engine: QuantBacktestEngine, candles: List[Dict[str, Any]],
 
     if len(all_equity) > 2:
         eq = np.array(all_equity)
-        # Avoid zero-division in returns
         denom = eq[:-1]
         denom[denom <= 0] = 1.0
         eq_returns = np.diff(eq) / denom
@@ -609,7 +710,7 @@ def walk_forward(engine: QuantBacktestEngine, candles: List[Dict[str, Any]],
 
     regimes_tested = sorted(list(set(f["regime"] for f in folds)))
 
-    return {
+    report = {
         "folds": len(folds),
         "oos_return_pct": round(float(np.mean(returns)), 4),
         "oos_max_drawdown": round(max(dds), 6),
@@ -631,4 +732,13 @@ def walk_forward(engine: QuantBacktestEngine, candles: List[Dict[str, Any]],
         "regimes_tested": regimes_tested,
         "liquidity_ok": liquidity_ok,
         "liquidity_reason": liquidity_reason,
+        "is_proxy": True,
+        "evaluation_status": "indicative_proxy",
+        "proxy_warning": "OHLCV simulation relies on intra-candle path reconstruction, heuristic fills, and fixed funding; indicative only.",
+        "autocorr_rho1": round(rho_1, 4),
+        "n_eff": round(n_eff, 2),
+        "historical_folds": folds,
     }
+    if candidate_evaluation is not None:
+        report["exact_candidate_evaluation"] = candidate_evaluation
+    return report

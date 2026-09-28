@@ -87,3 +87,38 @@ def test_walk_forward_deployed_params():
     assert report["worst_period"] is not None
     assert "regimes_tested" in report
     assert "turnover" in report
+    assert report["is_proxy"] is True
+    assert report["evaluation_status"] == "indicative_proxy"
+    assert "historical_folds" in report
+    assert "exact_candidate_evaluation" in report
+    assert report["exact_candidate_evaluation"]["levels"] == 10
+
+
+def test_autocorr_effective_sample_size():
+    from engine.backtest import lag1_autocorr, effective_sample_size
+    # Perfectly alternating series has negative autocorrelation -> no artificial inflation
+    alt = [1.0, -1.0, 1.0, -1.0, 1.0, -1.0]
+    rho_alt = lag1_autocorr(alt)
+    assert rho_alt < 0
+    assert effective_sample_size(len(alt), rho_alt) == float(len(alt))
+
+    # Strongly clustered series has high positive autocorrelation -> N_eff < N
+    clustered = [1.0, 1.1, 1.05, 0.95, 1.0, 0.9, -1.0, -1.1, -1.05, -0.95, -1.0, -0.9]
+    rho_clust = lag1_autocorr(clustered)
+    assert rho_clust > 0.5
+    neff = effective_sample_size(len(clustered), rho_clust)
+    assert neff < len(clustered) / 2
+    assert neff >= 2.0
+
+
+def test_simulation_marked_as_proxy():
+    sim = GridSimulator()
+    candles = [
+        {"open": 100.0, "high": 105.0, "low": 95.0, "close": 102.0, "volume": 1000.0},
+        {"open": 102.0, "high": 108.0, "low": 98.0, "close": 100.0, "volume": 1000.0},
+    ]
+    res = sim.simulate(candles, lower=90.0, upper=110.0, levels=10, investment=50.0)
+    assert res["is_proxy"] is True
+    assert res["evaluation_status"] == "indicative_proxy"
+    assert "proxy_warning" in res
+

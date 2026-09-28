@@ -170,8 +170,8 @@ func evaluateBacktestGate(traded BacktestJobSummary, neighbors []BacktestJobSumm
 		}
 	}
 	// Task 4: Lower bound of 95% Confidence Interval for Net EV after costs MUST be strictly > 0
-	if (!traded.CI95Positive || traded.CI95Lower <= 0.0) && (traded.CI95Lower != 0 || traded.CI95Upper != 0 || traded.OOSPct <= backtestMinOOSPct) {
-		verdict.Reason = fmt.Sprintf("backtest gate: Net EV 95%% CI lower bound (%.4f) <= 0 on traded TF %s — чистый EV не доказан выше нуля после расходов",
+	if !traded.CI95Positive || traded.CI95Lower <= 0.0 {
+		verdict.Reason = fmt.Sprintf("backtest gate: нет подтверждения — 95%% ДИ чистого EV (нижняя граница %.4f) <= 0 или не рассчитан на traded TF %s",
 			traded.CI95Lower, traded.Interval)
 		return verdict
 	}
@@ -194,9 +194,13 @@ func evaluateBacktestGate(traded BacktestJobSummary, neighbors []BacktestJobSumm
 		return verdict
 	}
 	// Task 4: Liquidity check
-	if !traded.LiquidityOK && traded.LiquidityReason != "" {
-		verdict.Reason = fmt.Sprintf("backtest gate: liquidity check failed (%s) on traded TF %s",
-			traded.LiquidityReason, traded.Interval)
+	if !traded.LiquidityOK {
+		liqReason := traded.LiquidityReason
+		if liqReason == "" {
+			liqReason = "проверка не проведена или не подтверждена"
+		}
+		verdict.Reason = fmt.Sprintf("backtest gate: нет подтверждения — ликвидность (%s) на traded TF %s",
+			liqReason, traded.Interval)
 		return verdict
 	}
 	// Neighbor fragility checks
@@ -289,25 +293,21 @@ func parseBacktestResult(resultBytes []byte) (BacktestJobSummary, bool) {
 		Turnover:         result.Turnover,
 		WorstPeriod:      result.WorstPeriod,
 		RegimesTested:    result.RegimesTested,
-		LiquidityOK:      true,
+		LiquidityOK:      false,
 		LiquidityReason:  result.LiquidityReason,
 	}
 	if result.LiquidityOK != nil {
 		summary.LiquidityOK = *result.LiquidityOK
 	}
-	if !summary.SampleSufficient && summary.RoundTrips >= backtestMinRoundTrips && summary.Folds >= backtestMinFolds {
-		summary.SampleSufficient = true
-	}
-	if !summary.CI95Positive && summary.CI95Lower == 0 && summary.CI95Upper == 0 && summary.OOSPct > backtestMinOOSPct {
-		summary.CI95Positive = true
-		summary.CI95Lower = summary.OOSPct / 100.0
-	}
 	return summary, true
 }
 
 func matchesDeployParams(jobParamsBytes []byte, p *BacktestDeployParams) bool {
-	if p == nil || len(jobParamsBytes) == 0 {
+	if p == nil {
 		return true
+	}
+	if len(jobParamsBytes) == 0 {
+		return false
 	}
 	var jobParams struct {
 		LowerPrice float64 `json:"lower_price"`
