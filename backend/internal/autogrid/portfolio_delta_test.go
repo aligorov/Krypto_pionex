@@ -2,6 +2,7 @@ package autogrid
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"strings"
 	"testing"
@@ -290,5 +291,80 @@ func TestMarginReserveBlocker(t *testing.T) {
 		decimal.NewFromInt(200), true)
 	if code != "MARGIN_RESERVE" {
 		t.Errorf("stale snapshot: code = %q, want MARGIN_RESERVE (present ⇒ enforced)", code)
+	}
+}
+
+// v2.0.145 capital-adaptive slot: the slot SCALES DOWN to what fits under
+// the 30% margin reserve instead of refusing — the $253-account freeze
+// (52 silent MARGIN_RESERVE rejections) must not recur.
+func TestCapitalEffectiveBudgetScalesDown(t *testing.T) {
+	dbURL := integrationDatabaseURL(t)
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, dbURL)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	t.Cleanup(pool.Close)
+	accountService := accounts.NewService(pool)
+	riskEngine := risk.NewEngine(pool)
+	service := NewService(pool, riskEngine)
+	worker := NewWorker(pool, service, accountService, riskEngine,
+		llm.NewService(pool, slog.New(slog.DiscardHandler)),
+		slog.New(slog.DiscardHandler))
+
+	acct := fmt.Sprintf("itest-cap-%d", time.Now().UnixNano())
+	account, err := accountService.Create(ctx, accounts.CreateInput{
+		Name: acct, APIKey: "itest-key", APISecret: "itest-secret",
+		HasFuturesPermission: true, HasBotPermission: true,
+	})
+	if err != nil {
+		t.Fatalf("create account: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(ctx, `DELETE FROM grid_bots WHERE account_id = $1`, account.ID)
+		_, _ = pool.Exec(ctx, `DELETE FROM account_equity_snapshots WHERE account_id = $1`, account.ID)
+		_, _ = pool.Exec(ctx, `DELETE FROM pionex_accounts WHERE id = $1`, account.ID)
+	})
+
+	// equity $253 (the prod freeze scenario), empty fleet, tranche ON:
+	// room = 0.70×253 = 177; slot = floor(177/2) = $88.
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO account_equity_snapshots (account_id, equity_usdt, captured_at)
+		VALUES ($1, 253, NOW())
+	`, account.ID); err != nil {
+		t.Fatalf("seed equity: %v", err)
+	}
+	slot, scaled := worker.capitalEffectiveBudget(ctx, account.ID, decimal.NewFromInt(100), true)
+	if !scaled || !slot.Equal(decimal.NewFromInt(88)) {
+		t.Fatalf("want scaled $88 slot, got %s (scaled=%v)", slot, scaled)
+	}
+
+	// No snapshot → fail open to the settings budget.
+	openAcct := fmt.Sprintf("itest-cap-open-%d", time.Now().UnixNano())
+	acct2, err := accountService.Create(ctx, accounts.CreateInput{
+		Name: openAcct, APIKey: "itest-key", APISecret: "itest-secret",
+		HasFuturesPermission: true, HasBotPermission: true,
+	})
+	if err != nil {
+		t.Fatalf("create open account: %v", err)
+	}
+	t.Cleanup(func() { _, _ = pool.Exec(ctx, `DELETE FROM pionex_accounts WHERE id = $1`, acct2.ID) })
+	slot2, scaled2 := worker.capitalEffectiveBudget(ctx, acct2.ID, decimal.NewFromInt(100), false)
+	if scaled2 || !slot2.Equal(decimal.NewFromInt(100)) {
+		t.Fatalf("missing snapshot must fail open to $100, got %s (scaled=%v)", slot2, scaled2)
+	}
+
+	// Equity so low that even a $10-class slot does not fit → zero (hard
+	// reject + alarm). $12 equity → room 8.4 → floor 8 < 10. ($25 equity
+	// legitimately yields a $17 slot — scaling, not deficiency.)
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO account_equity_snapshots (account_id, equity_usdt, captured_at)
+		VALUES ($1, 12, NOW())
+	`, acct2.ID); err != nil {
+		t.Fatalf("seed low equity: %v", err)
+	}
+	slot3, _ := worker.capitalEffectiveBudget(ctx, acct2.ID, decimal.NewFromInt(100), false)
+	if !slot3.IsZero() {
+		t.Fatalf("equity $12 must yield zero slot, got %s", slot3)
 	}
 }

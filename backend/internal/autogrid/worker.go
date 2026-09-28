@@ -165,6 +165,9 @@ type Worker struct {
 	stormTriggers map[string]time.Time
 	stormUntil    time.Time
 	stormLoggedAt time.Time
+	// lastCapitalAlarmAt throttles the v2.0.145 capital-deficiency telegram
+	// to one per hour (single manage goroutine → plain field).
+	lastCapitalAlarmAt time.Time
 	// fleetStormSet pins the v2.0.111 storm sensor to the RUNNING fleet
 	// (v2.0.144: pre-warmed candidate symbols must not arm market-wide
 	// storms). Managed under stormMu; empty set = legacy count-everything.
@@ -2021,6 +2024,66 @@ func (worker *Worker) revalidateCandidateTrend(
 	return true, freshTrend
 }
 
+// capitalEffectiveBudget derives the slot this account can actually place
+// RIGHT NOW under the v2.0.140 margin reserve, scaling DOWN instead of
+// refusing (v2.0.145): the fleet must stay autonomous at whatever capital
+// the operator left on the account. room = 0.70×equity − Σ committed;
+// slot = min(settingsBudget, floor(room / divisor)) with the tranche
+// doubling as the divisor. Returns zero when even the exchange-minimum
+// class slot ($10) does not fit — that case still rejects, and loudly.
+// Missing equity snapshot (bootstrap) or read errors fail OPEN to the
+// settings budget: the hard-blocker semantics live on in manual/invest_in.
+func (worker *Worker) capitalEffectiveBudget(ctx context.Context, accountID string, settingsBudget decimal.Decimal, trancheOn bool) (decimal.Decimal, bool) {
+	var equityStr *string
+	if err := worker.db.QueryRow(ctx, `
+		SELECT equity_usdt::TEXT FROM account_equity_snapshots
+		WHERE account_id = $1 ORDER BY captured_at DESC LIMIT 1
+	`, accountID).Scan(&equityStr); err != nil {
+		return settingsBudget, false // no snapshot yet / transient read — fail open (deploy-time parity with the v2.0.140 gate)
+	}
+	equity, err := decimal.NewFromString(*equityStr)
+	if err != nil || !equity.IsPositive() {
+		return settingsBudget, false
+	}
+	var committed decimal.Decimal
+	if err := worker.db.QueryRow(ctx, `
+		SELECT COALESCE(SUM(quote_investment), 0) FROM grid_bots
+		WHERE account_id = $1
+		  AND status IN ('PENDING_SUBMISSION', 'SUBMISSION_UNKNOWN', 'RUNNING', 'STOP_REQUESTED', 'STOPPING')
+	`, accountID).Scan(&committed); err != nil {
+		return settingsBudget, false
+	}
+	room := equity.Mul(decimal.NewFromFloat(0.70)).Sub(committed)
+	divisor := decimal.NewFromInt(1)
+	if trancheOn {
+		divisor = decimal.NewFromInt(2)
+	}
+	// floor to whole dollars — a $88.33 slot is operator noise
+	fit := room.Div(divisor).Floor()
+	if fit.GreaterThan(settingsBudget) || !fit.IsPositive() {
+		return settingsBudget, false
+	}
+	if fit.LessThan(decimal.NewFromInt(10)) {
+		return decimal.Zero, true // not even an exchange-minimum-class slot fits
+	}
+	return fit, true
+}
+
+// capitalDeficiencyAlarm announces a hard capital shortfall at most once an
+// hour (telegram + log) — the v2.0.140 freeze was 52 SILENT rejections
+// long before anyone noticed. Single manage goroutine → plain field.
+func (worker *Worker) capitalDeficiencyAlarm(ctx context.Context, settings Settings, slotBudget decimal.Decimal) {
+	if time.Since(worker.lastCapitalAlarmAt) < time.Hour {
+		return
+	}
+	worker.lastCapitalAlarmAt = time.Now()
+	worker.logger.Warn("capital deficiency: no slot fits the margin reserve",
+		"component", "autogrid_worker", "settings_budget", settings.BudgetUSDT.StringFixed(2))
+	_ = QueueTelegramEvent(ctx, worker.db, "CAPITAL_DEFICIENCY", map[string]any{
+		"message": "⚠️ <b>Дефицит капитала:</b> даже минимальный слот не влезает в 30%-резерв маржи — новые боты не открываются. Долейте USDT на фьючерс-кошелёк или уменьшите бюджет слота.",
+	})
+}
+
 // marginReserveBlocker enforces the v2.0.140 free-margin reserve: projected
 // committed isolated margin (Σ active REAL quote_investment + this deploy's
 // full slot, including its planned tranche-2 doubling when tranches are on)
@@ -2484,17 +2547,47 @@ func (worker *Worker) deployReal(
 			regime = val
 		}
 
+		// v2.0.145 capital-adaptive slot: the fleet must place bots
+		// AUTONOMOUSLY at whatever capital the account actually holds —
+		// a hard MARGIN_RESERVE reject froze every deploy for hours on a
+		// $253 account (52 silent rejections, prod 2026-09-28) because a
+		// $100 slot with its tranche doubling ($200) overflowed the 30%
+		// reserve line ($177). Instead of refusing, the slot SCALES DOWN to
+		// what fits under the reserve; only a slot below the exchange
+		// minimum rejects. Capital deficiency now ANNOUNCES itself (hourly
+		// telegram) instead of starving the fleet quietly.
+		slotBudget, capitalScaled := worker.capitalEffectiveBudget(ctx, *settings.AccountID, settings.BudgetUSDT, settings.TrancheDeployEnabled)
+		if !slotBudget.IsPositive() {
+			worker.capitalDeficiencyAlarm(ctx, settings, slotBudget)
+			reason := fmt.Sprintf("резерв маржи: свободно под новый слот $0 при equity ниже минимума — даже минимальный слот не влезает в 30%%-резерв, нужен долив капитала",
+			)
+			deployErrors = append(deployErrors, fmt.Sprintf("%s: %s", candidate.Symbol, reason))
+			worker.rejectCandidate(ctx, candidate, reason, nil)
+			worker.journalEntryDecision(ctx, EntryChainInput{
+				Path: EntryPathScannerReal, Settings: settings, Symbol: candidate.Symbol,
+				Direction: entryDirectionFromTrend(strings.ToLower(strings.TrimSpace(candidate.RecommendedTrend))), Fleet: "REAL", RefID: candidate.ID,
+			}, entryOutcomeReject, "MARGIN_RESERVE", reason, nil)
+			continue
+		}
+		if capitalScaled {
+			worker.logger.Warn("capital-adaptive slot scaled down for margin reserve",
+				"component", "autogrid_worker", "symbol", candidate.Symbol,
+				"settings_budget", settings.BudgetUSDT.StringFixed(2), "effective_budget", slotBudget.StringFixed(2))
+		}
+		slotSettings := settings
+		slotSettings.BudgetUSDT = slotBudget
+
 		// v2.0.13 tranches: REAL commits HALF the budget at create; the
 		// manage loop tops up via the native invest_in endpoint after a
 		// confirmed adverse excursion or the 24h time-box (paper mirror).
 		// Sizing the grid level count against the full slot budget ($200)
 		// enables 30-40 levels (step ~0.55%) with $5/level order capacity,
 		// doubling grid crossing captures vs halving levels to 20.
-		investAmount := settings.BudgetUSDT
+		investAmount := slotBudget
 		if settings.TrancheDeployEnabled {
-			investAmount = settings.BudgetUSDT.Div(decimal.NewFromInt(2))
+			investAmount = slotBudget.Div(decimal.NewFromInt(2))
 		}
-		geometryBudget := settings.BudgetUSDT
+		geometryBudget := slotBudget
 		mesh := ComputeAdaptiveMesh(
 			candidate.LowerPrice, candidate.UpperPrice, candidate.CurrentPrice,
 			atrPct, regime, geometryBudget, settings.Leverage,
@@ -2714,7 +2807,7 @@ func (worker *Worker) deployReal(
 		// fleetCandidateDelta/projectedFleetDelta helpers — the paper gate
 		// above runs the identical math, so paper/REAL parity holds in this
 		// lane by construction.
-		candidateDelta := fleetCandidateDelta(trend, settings.BudgetUSDT, botLev)
+		candidateDelta := fleetCandidateDelta(trend, slotBudget, botLev)
 		if settings.FleetMaxNetDeltaUSDT.IsPositive() && !candidateDelta.IsZero() {
 			fleetDelta, neutralPark, err := worker.calculateFleetNetDelta(ctx, settings.ID, false)
 			if err != nil {
@@ -2733,7 +2826,7 @@ func (worker *Worker) deployReal(
 
 		// Order Book Cushion Check (Quant & Vision v3.0) — feeds L2 depth into OFIEngine
 		if settings.OrderbookProfilerEnabled {
-			botNotional := settings.BudgetUSDT.Mul(decimal.NewFromInt(int64(botLev))).InexactFloat64()
+			botNotional := slotBudget.Mul(decimal.NewFromInt(int64(botLev))).InexactFloat64()
 			minCushion := settings.MinDepthCushionRatio.InexactFloat64()
 			ok, profile, depthReason := worker.checkOrderBookCushion(ctx, candidate.Symbol, candidate.CurrentPrice, botNotional, minCushion, true, settings.MaxSpreadPct)
 			if !ok {
@@ -2761,7 +2854,7 @@ func (worker *Worker) deployReal(
 
 		if err := worker.risk.ValidateNewGrid(
 			ctx, *settings.AccountID, candidate.Symbol,
-			botLev, settings.BudgetUSDT,
+			botLev, slotBudget,
 		); err != nil {
 			deployErrors = append(deployErrors, fmt.Sprintf("%s: risk gate: %v", candidate.Symbol, err))
 			// v2.0.138 (audit): the refusal must reach the candidate row too —
@@ -2775,21 +2868,11 @@ func (worker *Worker) deployReal(
 			}, entryOutcomeReject, "RISK_ENGINE", "risk engine: "+err.Error(), nil)
 			continue
 		}
-		// v2.0.140 margin reserve: insufficient free margin used to surface
-		// only as an exchange rejection AFTER the create fee conversation
-		// started. The reserve is derived from our own equity snapshots
-		// (wallet + Σ isolated investments) — the account API cannot see
-		// isolated grid margin. The full slot (tranche doubling included)
-		// must leave ≥30% of the recorded equity free.
-		if code, reserveReason := marginReserveBlocker(ctx, worker.db, *settings.AccountID, settings.BudgetUSDT, settings.TrancheDeployEnabled); code != "" {
-			deployErrors = append(deployErrors, fmt.Sprintf("%s: %s", candidate.Symbol, reserveReason))
-			worker.rejectCandidate(ctx, candidate, reserveReason, nil)
-			worker.journalEntryDecision(ctx, EntryChainInput{
-				Path: EntryPathScannerReal, Settings: settings, Symbol: candidate.Symbol,
-				Direction: entryDirectionFromTrend(trend), Fleet: "REAL", RefID: candidate.ID,
-			}, entryOutcomeReject, code, reserveReason, nil)
-			continue
-		}
+		// v2.0.145: the v2.0.140 margin-reserve reject moved UP into the
+		// capital-adaptive slotBudget at the top of this iteration — the
+		// reserve now SCALES the slot instead of refusing it (manual deploy
+		// and invest_in keep the hard blocker: their commitments are fixed
+		// by the operator).
 		base, quote, err := SplitPionexPerp(candidate.Symbol)
 		if err != nil {
 			deployErrors = append(deployErrors, err.Error())
@@ -2815,14 +2898,14 @@ func (worker *Worker) deployReal(
 		if mesh.UpperPrice.GreaterThan(mesh.LowerPrice) && candidate.CurrentPrice.IsPositive() {
 			botTargetSpan, _ = mesh.UpperPrice.Sub(mesh.LowerPrice).Div(candidate.CurrentPrice).Mul(decimal.NewFromInt(100)).Float64()
 		}
-		botTarget, botMaxLoss, stress := computeBotTargetsWithStress(settings, candidate, botLev, botTargetSpan, stressGeometry{
+		botTarget, botMaxLoss, stress := computeBotTargetsWithStress(slotSettings, candidate, botLev, botTargetSpan, stressGeometry{
 			direction: trend, entry: candidate.CurrentPrice,
 			lower: lowerPrice, upper: upperPrice, stop: antiHuntStop,
 			gridNum: mesh.GridNum,
 			// Full-slot budget, not the tranche-halved investAmount (paper
 			// twin's comment): tranche-1 stress is the same number, and the
 			// post-top-up stop then covers the doubled inventory too.
-			invest: settings.BudgetUSDT,
+			invest: slotBudget,
 		})
 		// v2.0.139 stress-inventory gate (paper parity): the floor keeps the
 		// STORED stop honest, but a geometry whose full-traverse loss
@@ -2831,7 +2914,7 @@ func (worker *Worker) deployReal(
 		// is not budget-sized: refuse BEFORE a grid row or a create fee is
 		// ever submitted. FIXED-mode targets are exempt (operator's stop).
 		if settings.PnLTargetMode != "FIXED" {
-			stressCeiling := tranche2MaxLossCap(settings.BudgetUSDT, botLev)
+			stressCeiling := tranche2MaxLossCap(slotBudget, botLev)
 			if stress.loss.GreaterThan(stressCeiling) {
 				deployErrors = append(deployErrors, fmt.Sprintf(
 					"%s: stress inventory $%s exceeds loss ceiling $%s",
@@ -2943,7 +3026,7 @@ func (worker *Worker) deployReal(
 		}
 		trancheMarkers := map[string]any{
 			"trancheDeployed": trancheFlag(settings.TrancheDeployEnabled),
-			"trancheBase":     settings.BudgetUSDT.String(),
+			"trancheBase":     slotBudget.String(),
 			"trancheEntry":    candidate.CurrentPrice.String(),
 			"atrPctEntry":     atrPct,
 		}
@@ -3017,12 +3100,12 @@ func (worker *Worker) deployReal(
 		_ = worker.db.QueryRow(ctx, `SELECT COALESCE(bot_number, 0) FROM grid_bots WHERE id = $1`, botID).Scan(&botNum)
 
 		_ = LogBotEvent(ctx, worker.db, botID, botNum, "REAL", candidate.Symbol, "CREATED", &candidate.CurrentPrice, nil, map[string]any{
-			"leverage": botLev, "gridNum": mesh.GridNum, "lowerPrice": lowerPrice, "upperPrice": upperPrice, "budget": settings.BudgetUSDT,
+			"leverage": botLev, "gridNum": mesh.GridNum, "lowerPrice": lowerPrice, "upperPrice": upperPrice, "budget": slotBudget, "capitalScaled": capitalScaled,
 		})
 		_ = QueueTelegramEvent(ctx, worker.db, "BOT_CREATED", map[string]any{
 			"bot_number": botNum, "symbol": candidate.Symbol, "direction": strings.ToUpper(trend),
 			"leverage": botLev, "lower_price": lowerPrice, "upper_price": upperPrice,
-			"grid_num": mesh.GridNum, "quote_investment": settings.BudgetUSDT, "source": "REAL",
+			"grid_num": mesh.GridNum, "quote_investment": slotBudget, "source": "REAL",
 		})
 		// Rate limit protection: 1.2s delay between bot creations
 		time.Sleep(1200 * time.Millisecond)
