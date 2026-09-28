@@ -331,6 +331,7 @@ export interface AutoGridSettings {
   ofiHarvestEnabled?: boolean;
   ouRotationEnabled?: boolean;
   minRiskReward?: string;
+  marginReservePct?: string;
   lastError: string | null;
   lastStartedAt: string | null;
   lastStoppedAt: string | null;

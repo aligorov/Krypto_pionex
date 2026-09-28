@@ -511,6 +511,7 @@ function SettingsSummary({ settings }: { settings: AutoGridSettings }) {
   const rows: Array<[string, string]> = [
     ['Режим', settings.executionMode === 'REAL' ? 'REAL (нативные гриды)' : 'PAPER (симуляция)'],
     ['Бюджет на бота', `${settings.budgetUsdt} USDT`],
+    ['Резерв маржи', `${Number(settings.marginReservePct ?? '0').toFixed(0)}% (${Number(settings.marginReservePct ?? '0') === 0 ? 'выключен — 100% капитала в работе' : `буфер ${settings.marginReservePct}%`})`],
     ['Максимум ботов', String(settings.maxActiveBots)],
     ['Плечо', `${settings.leverage}x (${settings.adaptiveLeverageEnabled ? '🛡️ Адаптивное по ATR — защита от сквизов' : '⚡ Фиксированное на все пары'})`],
     ['Режим целей PnL', settings.pnlTargetMode === 'DYNAMIC'
@@ -667,6 +668,7 @@ function SettingsForm({
           ofiHarvestEnabled: !!form.ofiHarvestEnabled,
           ouRotationEnabled: !!form.ouRotationEnabled,
           minRiskReward: dec(form.minRiskReward ?? '1.80'),
+          marginReservePct: dec(form.marginReservePct ?? '0'),
         }),
       });
       await onSaved();
@@ -707,6 +709,10 @@ function SettingsForm({
         <label>
           Бюджет на бота, USDT
           <input {...field('budgetUsdt')} inputMode="decimal" />
+        </label>
+        <label>
+          Резерв маржи, % (0 = выключен, 100% в работе)
+          <input {...field('marginReservePct')} inputMode="decimal" placeholder="0" />
         </label>
 
         <label>

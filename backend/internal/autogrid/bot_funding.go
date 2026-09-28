@@ -50,11 +50,18 @@ func loadBotFundingReserve(ctx context.Context, db *pgxpool.Pool, accountID stri
 	return equity, committed, spendable, nil
 }
 
-func fitBotFundingBudget(equity, committed, budget decimal.Decimal, trancheOn bool) (decimal.Decimal, bool) {
+func fitBotFundingBudget(equity, committed, budget decimal.Decimal, trancheOn bool, reservePct decimal.Decimal) (decimal.Decimal, bool) {
 	if !equity.IsPositive() || !budget.IsPositive() || committed.IsNegative() {
 		return decimal.Zero, true
 	}
-	room := equity.Mul(decimal.NewFromFloat(0.70)).Sub(committed).Floor()
+	if reservePct.IsNegative() {
+		reservePct = decimal.Zero
+	}
+	if reservePct.GreaterThan(decimal.NewFromInt(95)) {
+		reservePct = decimal.NewFromInt(95)
+	}
+	factor := decimal.NewFromInt(1).Sub(reservePct.Div(decimal.NewFromInt(100)))
+	room := equity.Mul(factor).Sub(committed).Floor()
 	// Budget is already the FULL slot. deployReal halves it at creation
 	// when tranches are enabled; dividing it again reserves the slot twice.
 	fit := decimal.Min(budget, room)

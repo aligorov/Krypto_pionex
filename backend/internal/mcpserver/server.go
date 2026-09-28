@@ -556,6 +556,7 @@ type AutoGridSettingsUpdateInput struct {
 	OFIHarvestEnabled         *bool  `json:"ofiHarvestEnabled,omitempty"`
 	OURotationEnabled         *bool  `json:"ouRotationEnabled,omitempty"`
 	MinRiskReward             string `json:"minRiskReward,omitempty"`
+	MarginReservePct          string `json:"marginReservePct,omitempty"`
 }
 
 type AutoGridBotIDInput struct {
@@ -715,6 +716,13 @@ func registerAutoGridTools(
 				return nil, DataOutput{}, fmt.Errorf("invalid minRiskReward %q: %w", input.MinRiskReward, err)
 			}
 			update.MinRiskReward = &d
+		}
+		if input.MarginReservePct != "" {
+			d, err := decimal.NewFromString(input.MarginReservePct)
+			if err != nil {
+				return nil, DataOutput{}, fmt.Errorf("invalid marginReservePct %q: %w", input.MarginReservePct, err)
+			}
+			update.MarginReservePct = &d
 		}
 		decimalFields := []struct {
 			raw  string

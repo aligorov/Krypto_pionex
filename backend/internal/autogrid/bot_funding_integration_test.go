@@ -31,22 +31,22 @@ func TestBotFundingSourceAndReservations(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if v, _ := env.worker.capitalEffectiveBudget(ctx, env.account.ID, decimal.NewFromInt(100), true); !v.IsZero() {
+	if v, _ := env.worker.capitalEffectiveBudget(ctx, env.account.ID, decimal.NewFromInt(100), true, decimal.NewFromInt(30)); !v.IsZero() {
 		t.Fatal("legacy Futures wallet must not authorize Spot spending")
 	}
 	env.seedSnapshot(t, decimal.NewFromInt(253), time.Now())
 	botID := env.seedRealBot(t, "PFD-FUNDING_USDT_PERP", "NEUTRAL", "RUNNING", `{"trancheDeployed":1,"trancheBase":"100"}`, "", decimal.NewFromInt(50), 2)
-	if v, _ := env.worker.capitalEffectiveBudget(ctx, env.account.ID, decimal.NewFromInt(100), true); !v.Equal(decimal.NewFromInt(77)) {
+	if v, _ := env.worker.capitalEffectiveBudget(ctx, env.account.ID, decimal.NewFromInt(100), true, decimal.NewFromInt(30)); !v.Equal(decimal.NewFromInt(77)) {
 		t.Fatalf("unpaid tranche not reserved: %s", v)
 	}
-	if code, reason := marginReserveBlocker(ctx, env.pool, env.account.ID, decimal.NewFromInt(50), false, botID); code != "" {
+	if code, reason := marginReserveBlocker(ctx, env.pool, env.account.ID, decimal.NewFromInt(50), false, decimal.NewFromInt(30), botID); code != "" {
 		t.Fatalf("reserved top-up charged twice: %s", reason)
 	}
 	_, err = env.pool.Exec(ctx, `UPDATE account_equity_snapshots SET available_usdt=0 WHERE account_id=$1 AND source='bot_spot_aggregate'`, env.account.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if v, _ := env.worker.capitalEffectiveBudget(ctx, env.account.ID, decimal.NewFromInt(100), true); !v.IsZero() {
+	if v, _ := env.worker.capitalEffectiveBudget(ctx, env.account.ID, decimal.NewFromInt(100), true, decimal.NewFromInt(30)); !v.IsZero() {
 		t.Fatalf("locked equity is not spendable: %s", v)
 	}
 }

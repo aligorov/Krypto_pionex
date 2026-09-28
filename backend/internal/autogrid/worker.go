@@ -2124,13 +2124,13 @@ func (worker *Worker) revalidateCandidateTrend(
 
 // capitalEffectiveBudget uses only fresh Spot-funded bot equity. Missing,
 // stale or unreadable funding must never restore the full configured budget.
-func (worker *Worker) capitalEffectiveBudget(ctx context.Context, accountID string, settingsBudget decimal.Decimal, trancheOn bool) (decimal.Decimal, bool) {
+func (worker *Worker) capitalEffectiveBudget(ctx context.Context, accountID string, settingsBudget decimal.Decimal, trancheOn bool, reservePct decimal.Decimal) (decimal.Decimal, bool) {
 	equity, committed, spendable, err := loadBotFundingReserve(ctx, worker.db, accountID)
 	if err != nil {
 		worker.logger.Warn("bot funding unavailable", "component", "autogrid_worker", "error", err)
 		return decimal.Zero, true
 	}
-	slot, _ := fitBotFundingBudget(equity, committed, decimal.Min(settingsBudget, spendable.Floor()), trancheOn)
+	slot, _ := fitBotFundingBudget(equity, committed, decimal.Min(settingsBudget, spendable.Floor()), trancheOn, reservePct)
 	return slot, !slot.Equal(settingsBudget)
 }
 
@@ -2145,7 +2145,7 @@ func (worker *Worker) capitalDeficiencyAlarm(ctx context.Context, settings Setti
 	worker.logger.Warn("capital deficiency: no slot fits the margin reserve",
 		"component", "autogrid_worker", "settings_budget", settings.BudgetUSDT.StringFixed(2))
 	_ = QueueTelegramEvent(ctx, worker.db, "CAPITAL_DEFICIENCY", map[string]any{
-		"message": "⚠️ <b>Дефицит капитала:</b> даже минимальный слот не влезает в 30%-резерв маржи — новые боты не открываются. Проверьте доступные USDT на Spot для финансирования ботов и свежесть снимка капитала.",
+		"message": fmt.Sprintf("⚠️ <b>Дефицит капитала:</b> даже минимальный слот не влезает в %s%%-резерв маржи — новые боты не открываются. Проверьте доступные USDT на Spot для финансирования ботов и свежесть снимка капитала.", settings.MarginReservePct.StringFixed(0)),
 	})
 }
 
@@ -2158,6 +2158,7 @@ func marginReserveBlocker(
 	accountID string,
 	addCommitment decimal.Decimal,
 	trancheOn bool,
+	reservePct decimal.Decimal,
 	topUpBotID ...string,
 ) (code, reason string) {
 	equity, activeCommitted, spendable, err := loadBotFundingReserve(ctx, db, accountID)
@@ -2188,11 +2189,18 @@ func marginReserveBlocker(
 		slots = decimal.NewFromInt(2)
 	}
 	projected := activeCommitted.Add(addCommitment.Mul(slots))
-	ceiling := equity.Mul(decimal.NewFromFloat(0.70))
+	if reservePct.IsNegative() {
+		reservePct = decimal.Zero
+	}
+	if reservePct.GreaterThan(decimal.NewFromInt(95)) {
+		reservePct = decimal.NewFromInt(95)
+	}
+	factor := decimal.NewFromInt(1).Sub(reservePct.Div(decimal.NewFromInt(100)))
+	ceiling := equity.Mul(factor)
 	if projected.GreaterThan(ceiling) || addCommitment.Mul(slots).GreaterThan(spendable) {
 		return "MARGIN_RESERVE", fmt.Sprintf(
-			"резерв маржи: projected $%s при equity $%s оставляет <30%% свободных — вход отложен",
-			projected.StringFixed(2), equity.StringFixed(2))
+			"резерв маржи: projected $%s при equity $%s оставляет <%s%% свободных — вход отложен",
+			projected.StringFixed(2), equity.StringFixed(2), reservePct.StringFixed(0))
 	}
 	return "", ""
 }
@@ -2586,10 +2594,10 @@ func (worker *Worker) deployReal(
 		// what fits under the reserve; only a slot below the exchange
 		// minimum rejects. Capital deficiency now ANNOUNCES itself (hourly
 		// telegram) instead of starving the fleet quietly.
-		slotBudget, capitalScaled := worker.capitalEffectiveBudget(ctx, *settings.AccountID, settings.BudgetUSDT, settings.TrancheDeployEnabled)
+		slotBudget, capitalScaled := worker.capitalEffectiveBudget(ctx, *settings.AccountID, settings.BudgetUSDT, settings.TrancheDeployEnabled, settings.MarginReservePct)
 		if !slotBudget.IsPositive() {
 			worker.capitalDeficiencyAlarm(ctx, settings, slotBudget)
-			reason := fmt.Sprintf("резерв маржи: свободно под новый слот $0 — капитал Spot для ботов недоступен или минимальный слот не влезает в 30%%-резерв")
+			reason := fmt.Sprintf("резерв маржи: свободно под новый слот $0 — капитал Spot для ботов недоступен или минимальный слот не влезает в %s%%-резерв", settings.MarginReservePct.StringFixed(0))
 			deployErrors = append(deployErrors, fmt.Sprintf("%s: %s", candidate.Symbol, reason))
 			worker.rejectCandidate(ctx, candidate, reason, nil)
 			worker.journalEntryDecision(ctx, EntryChainInput{

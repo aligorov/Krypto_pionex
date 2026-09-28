@@ -21,10 +21,15 @@ func TestFitBotFundingBudget(t *testing.T) {
 		{"below tranche minimum", 12, 0, 100, 0, true},
 		{"minimum tranche slot", 15, 0, 100, 10, true},
 		{"below single minimum", 6, 0, 100, 0, false},
-		{"single minimum", 8, 0, 100, 5, false},
+		{"below single minimum", 8, 0, 100, 5, false},
+		{"zero reserve full capacity", 100, 0, 100, 100, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			v, scaled := fitBotFundingBudget(decimal.NewFromInt(tc.equity), decimal.NewFromInt(tc.committed), decimal.NewFromInt(tc.budget), tc.tranche)
+			reserve := decimal.NewFromInt(30)
+			if tc.name == "zero reserve full capacity" {
+				reserve = decimal.Zero
+			}
+			v, scaled := fitBotFundingBudget(decimal.NewFromInt(tc.equity), decimal.NewFromInt(tc.committed), decimal.NewFromInt(tc.budget), tc.tranche, reserve)
 			if !v.Equal(decimal.NewFromInt(tc.want)) || scaled != (tc.want != tc.budget) {
 				t.Fatalf("got %s scaled=%v; want %d", v, scaled, tc.want)
 			}

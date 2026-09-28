@@ -227,7 +227,7 @@ func TestMarginReserveBlocker(t *testing.T) {
 
 	// Tranche doubling: 600 + 2×200 = 1000 > 700 → blocked.
 	code, reason := marginReserveBlocker(ctx, env.pool, env.account.ID,
-		decimal.NewFromInt(200), true)
+		decimal.NewFromInt(200), true, decimal.NewFromInt(30))
 	if code != "MARGIN_RESERVE" {
 		t.Errorf("add 200 trancheOn: code = %q, want MARGIN_RESERVE", code)
 	}
@@ -237,7 +237,7 @@ func TestMarginReserveBlocker(t *testing.T) {
 
 	// 600 + 2×80 = 760 > 700 → still blocked.
 	code, _ = marginReserveBlocker(ctx, env.pool, env.account.ID,
-		decimal.NewFromInt(80), true)
+		decimal.NewFromInt(80), true, decimal.NewFromInt(30))
 	if code != "MARGIN_RESERVE" {
 		t.Errorf("add 80 trancheOn: code = %q, want MARGIN_RESERVE", code)
 	}
@@ -245,14 +245,14 @@ func TestMarginReserveBlocker(t *testing.T) {
 	// Exactly on the line: 600 + 2×50 = 700 is NOT > 700 → allowed (the
 	// 30% floor is a floor, not a moat).
 	code, _ = marginReserveBlocker(ctx, env.pool, env.account.ID,
-		decimal.NewFromInt(50), true)
+		decimal.NewFromInt(50), true, decimal.NewFromInt(30))
 	if code != "" {
 		t.Errorf("add 50 trancheOn: code = %q, want allowed (700 is not > 700)", code)
 	}
 
 	// 600 + 2×40 = 680 → allowed.
 	code, _ = marginReserveBlocker(ctx, env.pool, env.account.ID,
-		decimal.NewFromInt(40), true)
+		decimal.NewFromInt(40), true, decimal.NewFromInt(30))
 	if code != "" {
 		t.Errorf("add 40 trancheOn: code = %q, want allowed", code)
 	}
@@ -260,19 +260,19 @@ func TestMarginReserveBlocker(t *testing.T) {
 	// Without tranches the slot commits single: 600 + 101 = 701 > 700 →
 	// blocked; 600 + 90 = 690 → allowed.
 	code, _ = marginReserveBlocker(ctx, env.pool, env.account.ID,
-		decimal.NewFromInt(101), false)
+		decimal.NewFromInt(101), false, decimal.NewFromInt(30))
 	if code != "MARGIN_RESERVE" {
 		t.Errorf("add 101 trancheOff: code = %q, want MARGIN_RESERVE", code)
 	}
 	code, _ = marginReserveBlocker(ctx, env.pool, env.account.ID,
-		decimal.NewFromInt(90), false)
+		decimal.NewFromInt(90), false, decimal.NewFromInt(30))
 	if code != "" {
 		t.Errorf("add 90 trancheOff: code = %q, want allowed", code)
 	}
 
 	// Missing funding evidence must defer entry; capture runs independently.
 	code, _ = marginReserveBlocker(ctx, env.pool, "00000000-0000-0000-0000-000000000000",
-		decimal.NewFromInt(999999), true)
+		decimal.NewFromInt(999999), true, decimal.NewFromInt(30))
 	if code != "MARGIN_RESERVE" {
 		t.Errorf("missing snapshot: code = %q, want fail-closed", code)
 	}
@@ -284,7 +284,7 @@ func TestMarginReserveBlocker(t *testing.T) {
 	}
 	env.seedSnapshot(t, decimal.NewFromInt(1000), time.Now().Add(-48*time.Hour))
 	code, _ = marginReserveBlocker(ctx, env.pool, env.account.ID,
-		decimal.NewFromInt(200), true)
+		decimal.NewFromInt(200), true, decimal.NewFromInt(30))
 	if code != "MARGIN_RESERVE" {
 		t.Errorf("stale snapshot: code = %q, want MARGIN_RESERVE (present ⇒ enforced)", code)
 	}
@@ -330,7 +330,7 @@ func TestCapitalEffectiveBudgetScalesDown(t *testing.T) {
 	`, account.ID); err != nil {
 		t.Fatalf("seed equity: %v", err)
 	}
-	slot, scaled := worker.capitalEffectiveBudget(ctx, account.ID, decimal.NewFromInt(100), true)
+	slot, scaled := worker.capitalEffectiveBudget(ctx, account.ID, decimal.NewFromInt(100), true, decimal.NewFromInt(30))
 	if scaled || !slot.Equal(decimal.NewFromInt(100)) {
 		t.Fatalf("want full $100 slot, got %s (scaled=%v)", slot, scaled)
 	}
@@ -345,7 +345,7 @@ func TestCapitalEffectiveBudgetScalesDown(t *testing.T) {
 		t.Fatalf("create open account: %v", err)
 	}
 	t.Cleanup(func() { _, _ = pool.Exec(ctx, `DELETE FROM pionex_accounts WHERE id = $1`, acct2.ID) })
-	slot2, scaled2 := worker.capitalEffectiveBudget(ctx, acct2.ID, decimal.NewFromInt(100), false)
+	slot2, scaled2 := worker.capitalEffectiveBudget(ctx, acct2.ID, decimal.NewFromInt(100), false, decimal.NewFromInt(30))
 	if !scaled2 || !slot2.IsZero() {
 		t.Fatalf("missing snapshot must fail closed to $0, got %s (scaled=%v)", slot2, scaled2)
 	}
@@ -357,7 +357,7 @@ func TestCapitalEffectiveBudgetScalesDown(t *testing.T) {
 	`, acct2.ID); err != nil {
 		t.Fatalf("seed low equity: %v", err)
 	}
-	slot3, _ := worker.capitalEffectiveBudget(ctx, acct2.ID, decimal.NewFromInt(100), false)
+	slot3, _ := worker.capitalEffectiveBudget(ctx, acct2.ID, decimal.NewFromInt(100), false, decimal.NewFromInt(30))
 	if !slot3.IsZero() {
 		t.Fatalf("equity $6 must yield zero slot, got %s", slot3)
 	}

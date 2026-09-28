@@ -92,6 +92,7 @@ type Settings struct {
 	OFIHarvestEnabled        bool            `json:"ofiHarvestEnabled"`
 	OURotationEnabled        bool            `json:"ouRotationEnabled"`
 	MinRiskReward            decimal.Decimal `json:"minRiskReward"`
+	MarginReservePct         decimal.Decimal `json:"marginReservePct"`
 	CreatedAt                time.Time       `json:"createdAt"`
 	UpdatedAt                time.Time       `json:"updatedAt"`
 }
@@ -152,6 +153,7 @@ type UpdateSettingsInput struct {
 	OFIHarvestEnabled        *bool            `json:"ofiHarvestEnabled"`
 	OURotationEnabled        *bool            `json:"ouRotationEnabled"`
 	MinRiskReward            *decimal.Decimal `json:"minRiskReward"`
+	MarginReservePct         *decimal.Decimal `json:"marginReservePct"`
 }
 
 type ScanRun struct {
@@ -441,7 +443,8 @@ func (s *Service) GetSettings(ctx context.Context) (*Settings, error) {
 		       COALESCE(smart_exit_enabled, true),
 		       COALESCE(ofi_harvest_enabled, true),
 		       COALESCE(ou_rotation_enabled, true),
-		       COALESCE(min_risk_reward, 1.8)
+		       COALESCE(min_risk_reward, 1.8),
+		       COALESCE(margin_reserve_pct, 0.00)
 		FROM autogrid_settings WHERE scope_key = $1
 	`, DefaultScope).Scan(settingsScanTargets(&item)...)
 	if err != nil {
@@ -585,6 +588,10 @@ func (s *Service) UpdateSettings(
 	if input.MinRiskReward != nil && input.MinRiskReward.IsPositive() {
 		minRR = *input.MinRiskReward
 	}
+	marginReserve := current.MarginReservePct
+	if input.MarginReservePct != nil {
+		marginReserve = *input.MarginReservePct
+	}
 	accountID := input.AccountID
 	if accountID != nil && strings.TrimSpace(*accountID) == "" {
 		accountID = nil
@@ -613,6 +620,7 @@ func (s *Service) UpdateSettings(
 		    min_depth_cushion_ratio = $46,
 		    smart_exit_enabled = $47, ofi_harvest_enabled = $48,
 		    ou_rotation_enabled = $49, min_risk_reward = $50,
+		    margin_reserve_pct = $51,
 		    last_error = NULL, updated_at = NOW()
 		WHERE scope_key = $1
 	`, DefaultScope, accountID, input.ExecutionMode, input.BudgetUSDT,
@@ -629,7 +637,7 @@ func (s *Service) UpdateSettings(
 		trancheDeploy, input.StopForecastMode, input.RadarAutoCloseMode,
 		dgtRedeploy, wickShield, wickGrace, fleetMaxDelta, universeCap,
 		maxSpread, gaussDensity, obProfiler, knifePause, minDepthCushion,
-		smartExit, ofiHarvest, ouRotation, minRR)
+		smartExit, ofiHarvest, ouRotation, minRR, marginReserve)
 	if err != nil {
 		return nil, fmt.Errorf("update AutoGrid settings: %w", err)
 	}
@@ -1824,6 +1832,7 @@ func settingsScanTargets(item *Settings) []any {
 		&item.UniverseScanCap, &item.MaxSpreadPct, &item.GaussianDensityEnabled,
 		&item.OrderbookProfilerEnabled, &item.KnifePauseEnabled, &item.MinDepthCushionRatio,
 		&item.SmartExitEnabled, &item.OFIHarvestEnabled, &item.OURotationEnabled, &item.MinRiskReward,
+		&item.MarginReservePct,
 	}
 }
 
@@ -2268,11 +2277,11 @@ func (s *Service) AdjustBot(
 			if err := s.risk.ValidateGridTopUp(ctx, *accountID, botSymbol, botLeverage, input.QuoteInvestment); err != nil {
 				return "", fmt.Errorf("invest_in rejected by risk engine: %w", err)
 			}
-			// v2.0.140 margin reserve: a top-up IS the doubling — the pour
-			// adds its full amount to the committed isolated margin, so
-			// trancheOn is false by construction (no second slot is
-			// scheduled behind it). Fresh Spot funding is required.
-			if code, reserveReason := marginReserveBlocker(ctx, s.db, *accountID, input.QuoteInvestment, false, botID); code != "" {
+			reservePct := decimal.Zero
+			if curSettings, err := s.GetSettings(ctx); err == nil && curSettings != nil {
+				reservePct = curSettings.MarginReservePct
+			}
+			if code, reserveReason := marginReserveBlocker(ctx, s.db, *accountID, input.QuoteInvestment, false, reservePct, botID); code != "" {
 				investIn := EntryChainInput{
 					Path: EntryPathInvestIn, Settings: Settings{ID: settingsID},
 					Symbol: botSymbol, Direction: botDirection, Fleet: "REAL", RefID: botID,
@@ -2872,7 +2881,7 @@ func (s *Service) DeployManualBot(
 	// spend the last free USDT the autopilot's own reserve keeps. Manual
 	// bots carry no tranche contract, so the slot commits single (the
 	// envelope gate below relies on the same property).
-	if code, reserveReason := marginReserveBlocker(ctx, s.db, *accountID, investment, false); code != "" {
+	if code, reserveReason := marginReserveBlocker(ctx, s.db, *accountID, investment, false, settings.MarginReservePct); code != "" {
 		journalEntryDecisionSvc(ctx, s.db, manualEntryIn, entryOutcomeReject, code, reserveReason, nil)
 		return nil, "", errors.New(reserveReason)
 	}
