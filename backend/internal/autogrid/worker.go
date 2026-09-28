@@ -165,6 +165,10 @@ type Worker struct {
 	stormTriggers map[string]time.Time
 	stormUntil    time.Time
 	stormLoggedAt time.Time
+	// fleetStormSet pins the v2.0.111 storm sensor to the RUNNING fleet
+	// (v2.0.144: pre-warmed candidate symbols must not arm market-wide
+	// storms). Managed under stormMu; empty set = legacy count-everything.
+	fleetStormSet map[string]struct{}
 	// runningRawLogged dedups the v2.0.101 raw-payload witness for RUNNING
 	// grids to one line per (bot, adjustments) pair.
 	runningRawLogged map[string]bool
@@ -5144,11 +5148,16 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 	// marks and the fleet's deploy-time ATRs, so the next sharp WS move is
 	// measured against what supervision last saw.
 	atrBySymbol := make(map[string]float64, len(bots))
+	fleetSymbols := make([]string, 0, len(bots))
 	for _, bot := range bots {
 		if bot.atrEntry > 0 && bot.atrEntry > atrBySymbol[bot.symbol] {
 			atrBySymbol[bot.symbol] = bot.atrEntry
 		}
+		fleetSymbols = append(fleetSymbols, bot.symbol)
 	}
+	// v2.0.144: pin the storm sensor to the fleet BEFORE the baselines
+	// refresh — see setFleetStormSymbols for the pre-warm regression.
+	worker.setFleetStormSymbols(fleetSymbols)
 	if priceErr == nil && len(priceBySymbol) > 0 {
 		worker.rememberRealtimeBaselines(priceBySymbol, atrBySymbol)
 	}

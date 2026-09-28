@@ -68,8 +68,15 @@ func (worker *Worker) onRealtimeMark(update pionex.MarkUpdate) {
 	if !shouldTriggerRealtimePass(baseline.price, update.MarkPrice, baseline.atrPct) {
 		return
 	}
-	// v2.0.111: every sharp move also feeds the fleet storm detector.
-	worker.noteStormTrigger(update.Symbol)
+	// v2.0.111: every sharp move also feeds the fleet storm detector — but
+	// v2.0.144 restricts the SENSOR to the RUNNING fleet: pre-warmed
+	// candidate symbols share this lane and their routine sharp moves
+	// armed market-wide storms that froze deploys for hours (the baselines
+	// span the whole PERP universe "for free", which silently widened the
+	// 3-of-N arm probability by an order of magnitude).
+	if worker.fleetStormSymbol(update.Symbol) {
+		worker.noteStormTrigger(update.Symbol)
+	}
 
 	select {
 	case worker.realtimeSignal <- update.Symbol:

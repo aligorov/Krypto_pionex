@@ -432,6 +432,39 @@ func (worker *Worker) trancheStressAllowed(ctx context.Context, botID string) bo
 
 // ── C. storm mode ─────────────────────────────────────────────────────────
 
+// setFleetStormSymbols pins the storm sensor to the RUNNING fleet. The
+// baseline map feeding the realtime trigger spans the whole PERP universe
+// and the WS lane serves up to 60 pre-warmed candidate symbols — counting
+// sharp moves on those made the 3-of-N storm arm chronically on live
+// markets (prod 2026-09-28: continuous re-arms 02:32Z→04:05Z+, deploys
+// frozen for hours). A storm is "the FLEET is being hit", not "the market
+// is volatile" — the latter is the macro/cascade/vol gates' job.
+// Called from the manage goroutine once per pass.
+func (worker *Worker) setFleetStormSymbols(symbols []string) {
+	next := make(map[string]struct{}, len(symbols))
+	for _, sym := range symbols {
+		if sym != "" {
+			next[sym] = struct{}{}
+		}
+	}
+	worker.stormMu.Lock()
+	worker.fleetStormSet = next
+	worker.stormMu.Unlock()
+}
+
+// fleetStormSymbol reports whether the symbol counts toward the storm. An
+// EMPTY set (unit workers, boot before the first manage pass) keeps the
+// legacy behavior of counting every trigger — fail-toward-protection.
+func (worker *Worker) fleetStormSymbol(symbol string) bool {
+	worker.stormMu.RLock()
+	defer worker.stormMu.RUnlock()
+	if len(worker.fleetStormSet) == 0 {
+		return true
+	}
+	_, ok := worker.fleetStormSet[symbol]
+	return ok
+}
+
 // noteStormTrigger records one realtime sharp-move trigger and arms/extends
 // the storm when enough fleet symbols trip together. Called from the WS
 // callback goroutine — everything here is mutex-guarded.

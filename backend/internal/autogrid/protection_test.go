@@ -61,3 +61,45 @@ func TestMaybeLogStormStateNoDeadlock(t *testing.T) {
 		t.Fatalf("maybeLogStormState deadlocked (Lock→RLock nest regression)")
 	}
 }
+
+// v2.0.144: the storm sensor is pinned to the RUNNING fleet — pre-warmed
+// candidate symbols (which share the WS lane) must NOT arm market-wide
+// storms. Legacy behavior (count everything) survives an empty set only.
+func TestStormSensorFleetPinned(t *testing.T) {
+	w := &Worker{}
+	w.setFleetStormSymbols([]string{"FLEET_A_USDT_PERP", "FLEET_B_USDT_PERP"})
+
+	// Two fleet hits + one pre-warm hit: only two DISTINCT fleet symbols —
+	// below stormMinSymbols, no storm.
+	if w.fleetStormSymbol("PREWARM_X_USDT_PERP") {
+		t.Fatal("pre-warm symbol must not count toward the storm")
+	}
+	w.noteStormTrigger("FLEET_A_USDT_PERP")
+	w.noteStormTrigger("FLEET_B_USDT_PERP")
+	// noteStormTrigger itself doesn't filter (unit callers); the onRealtimeMark
+	// gate does. Simulate the gate: only fleet symbols reach it.
+	w.noteStormTrigger("FLEET_A_USDT_PERP") // re-trip within window
+	if w.stormActive() {
+		t.Fatal("two distinct fleet symbols must not arm the storm (need 3)")
+	}
+	w.noteStormTrigger("FLEET_B_USDT_PERP")
+	// Still 2 distinct. Third fleet symbol:
+	w.setFleetStormSymbols([]string{"FLEET_A_USDT_PERP", "FLEET_B_USDT_PERP", "FLEET_C_USDT_PERP"})
+	w.noteStormTrigger("FLEET_C_USDT_PERP")
+	if !w.stormActive() {
+		t.Fatal("three distinct fleet symbols must arm the storm")
+	}
+}
+
+func TestStormSensorEmptySetCountsEverything(t *testing.T) {
+	w := &Worker{}
+	w.noteStormTrigger("A_USDT_PERP")
+	w.noteStormTrigger("B_USDT_PERP")
+	w.noteStormTrigger("C_USDT_PERP")
+	if !w.stormActive() {
+		t.Fatal("empty fleet set = legacy count-everything behavior (boot window)")
+	}
+	if !w.fleetStormSymbol("ANYTHING_USDT_PERP") {
+		t.Fatal("empty set must pass every symbol")
+	}
+}
