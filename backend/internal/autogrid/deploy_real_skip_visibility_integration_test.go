@@ -278,6 +278,12 @@ func newRealDeployHarness(t *testing.T, maxActiveBots int, symbols ...string) *r
 	`); err != nil {
 		t.Fatalf("disable backtest gate flag: %v", err)
 	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), `
+			UPDATE feature_flags SET enabled = true, updated_at = NOW()
+			WHERE name = 'backtest_gate'
+		`)
+	})
 	reloaded, err := service.GetSettings(ctx)
 	if err != nil {
 		t.Fatalf("reload settings: %v", err)

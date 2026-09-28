@@ -1834,7 +1834,7 @@ func (worker *Worker) deployPaper(
 		riskRewardDec := decimal.NewFromFloat(adaptiveRes.RiskRewardRatio)
 		adaptiveStrat := adaptiveRes.AdaptiveStrategy
 
-		if settings.PnLTargetMode != "FIXED" {
+		if settings.PnLTargetMode == "DYNAMIC" {
 			botTargetVal := decimal.NewFromFloat(adaptiveRes.TargetUSDT).Round(2)
 			target = &botTargetVal
 			botMaxLossVal := decimal.NewFromFloat(adaptiveRes.MaxLossUSDT).Round(2)
