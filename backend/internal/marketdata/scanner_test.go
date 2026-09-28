@@ -177,16 +177,29 @@ func TestScannerMajorSymbolNoPrefixFalsePositives(t *testing.T) {
 func TestWinRateProfitFactorClamped(t *testing.T) {
 	// Two winning candles and one epsilon-loser: PF would be ~1e9 unclamped.
 	values := []float64{0.01, 0.02, -1e-12}
-	_, pf := winRateAndProfitFactor(values)
+	_, pf, pfValid, _ := winRateAndProfitFactor(values)
+	if !pfValid {
+		t.Fatalf("epsilon-loser has negative return so pfValid must be true")
+	}
 	if pf > 99 || pf < 0 {
 		t.Fatalf("profit factor must clamp to [0,99], got %v", pf)
 	}
 	if pf != 99 {
 		t.Fatalf("epsilon-loser should saturate PF at 99, got %v", pf)
 	}
+	// Zero losing steps case: cannot return fake 99 or mark valid
+	_, zeroLossPf, zeroLossPfValid, _ := winRateAndProfitFactor([]float64{0.01, 0.02, 0.03})
+	if zeroLossPfValid || zeroLossPf != 0.0 {
+		t.Fatalf("zero losing steps must report pfValid=false and pf=0, got valid=%v pf=%v", zeroLossPfValid, zeroLossPf)
+	}
+	// Zero downside for Sortino:
+	sortino, sortinoValid := ratio([]float64{0.01, 0.02, 0.03}, true, 365)
+	if sortinoValid || sortino != 0.0 {
+		t.Fatalf("zero downside returns must report sortinoValid=false and sortino=0 (not 4.0), got valid=%v sortino=%v", sortinoValid, sortino)
+	}
 	// Normal case unaffected.
-	_, pf = winRateAndProfitFactor([]float64{0.02, -0.01, 0.03, -0.02})
-	if pf < 1.66 || pf > 1.67 {
+	_, pf, pfValid, _ = winRateAndProfitFactor([]float64{0.02, -0.01, 0.03, -0.02})
+	if !pfValid || pf < 1.66 || pf > 1.67 {
 		t.Fatalf("normal PF must be 0.05/0.03 ≈ 1.667, got %v", pf)
 	}
 }

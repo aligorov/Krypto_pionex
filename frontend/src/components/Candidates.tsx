@@ -429,7 +429,14 @@ function CandidateRow({
       </td>
       <td>{candidate.recommendedLeverage}x</td>
       <td>
-        {Number(candidate.expectedValuePct).toFixed(3)}% / {Number(candidate.sharpe).toFixed(2)}
+        {Number(candidate.expectedValuePct).toFixed(3)}% /{' '}
+        {assumptions['sharpeDisplay'] ? (
+          <span title={String(assumptions['proxyWarning'] || '')} style={{ fontSize: assumptions['sharpeDisplay'] === 'недостаточно данных' ? '0.75rem' : 'inherit', color: assumptions['sharpeDisplay'] === 'недостаточно данных' ? '#94a3b8' : 'inherit' }}>
+            {String(assumptions['sharpeDisplay'])}
+          </span>
+        ) : (
+          Number(candidate.sharpe).toFixed(2)
+        )}
       </td>
       <td>
         {storedAI ? (

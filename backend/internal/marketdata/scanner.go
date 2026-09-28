@@ -395,10 +395,10 @@ func scoreCandidate(
 	}
 
 	evPct := mean(modelReturns) * 100
-	sharpe := ratio(modelReturns, false, periodsPerDay*365)
-	sortino := ratio(modelReturns, true, periodsPerDay*365)
+	sharpe, sharpeValid := ratio(modelReturns, false, periodsPerDay*365)
+	sortino, sortinoValid := ratio(modelReturns, true, periodsPerDay*365)
 	maxDrawdown := maxDrawdown(modelReturns) * 100
-	winRate, profitFactor := winRateAndProfitFactor(modelReturns)
+	winRate, profitFactor, pfValid, wrValid := winRateAndProfitFactor(modelReturns)
 	turnover := float64(crossings) * 2 / float64(len(modelReturns))
 
 	pricePrec := symbol.GetPricePrecision()
@@ -494,13 +494,13 @@ func scoreCandidate(
 	if evPct < minEV {
 		reasons = append(reasons, "model EV below limit")
 	}
-	if sharpe < config.MinSharpe {
+	if sharpeValid && sharpe < config.MinSharpe {
 		reasons = append(reasons, "model Sharpe below limit")
 	}
 	if maxDrawdown > config.MaxDrawdownPct {
 		reasons = append(reasons, "model max drawdown above limit")
 	}
-	if profitFactor < config.MinProfitFactor {
+	if pfValid && profitFactor < config.MinProfitFactor {
 		reasons = append(reasons, "model profit factor below limit")
 	}
 	// v2.0.89-A fee-gate (P1, best-practice research; floor 2.5× since
@@ -684,7 +684,7 @@ func scoreCandidate(
 
 	score := scannerScore(
 		volatilityPct, evPct, sharpe, maxDrawdown, profitFactor,
-		regime.Choppiness, regime.IsSqueeze, config,
+		regime.Choppiness, sharpeValid, pfValid, regime.IsSqueeze, config,
 	)
 
 	// Entry Fit: directional grids require entry within viable channel structure,
@@ -774,6 +774,18 @@ func scoreCandidate(
 		LowerPrice: lower, UpperPrice: upper, GridNum: gridNum,
 		RecommendedLeverage: leverage, RecommendedTrend: recommendedTrend,
 		ModelAssumptions: map[string]any{
+			"isProxy":             true,
+			"proxyReference":      true,
+			"proxyEvaluation":     "indicative_reference_only",
+			"proxyWarning":        "свечной прокси является справочной оценкой и не служит доказательством качества входа",
+			"sharpeValid":         sharpeValid,
+			"sharpeDisplay":       formatProxyDisplay(sharpe, sharpeValid),
+			"sortinoValid":        sortinoValid,
+			"sortinoDisplay":      formatProxyDisplay(sortino, sortinoValid),
+			"profitFactorValid":   pfValid,
+			"profitFactorDisplay": formatProxyDisplay(profitFactor, pfValid),
+			"winRateValid":        wrValid,
+			"winRateDisplay":      formatWinRateDisplay(winRate, wrValid),
 			"model":               "neutral_grid_capture_proxy_v3_multitier",
 			"interval":            config.Interval,
 			"lookbackCandles":     len(sorted),
@@ -935,7 +947,7 @@ func sampleStdDev(values []float64) float64 {
 	return math.Sqrt(sum / float64(len(values)-1))
 }
 
-func ratio(values []float64, downsideOnly bool, annualPeriods float64) float64 {
+func ratio(values []float64, downsideOnly bool, annualPeriods float64) (float64, bool) {
 	average := mean(values)
 	sample := values
 	if downsideOnly {
@@ -945,18 +957,22 @@ func ratio(values []float64, downsideOnly bool, annualPeriods float64) float64 {
 				sample = append(sample, value)
 			}
 		}
+		if len(sample) < 2 {
+			// Zero or fewer than 2 negative observations: downside deviation cannot be reliably measured.
+			// Return 0.0 with valid=false rather than synthetic 4.0.
+			return 0.0, false
+		}
+	} else if len(values) < 2 {
+		return 0.0, false
 	}
 	deviation := sampleStdDev(sample)
 	if deviation == 0 {
-		if average > 0 {
-			return 4.0
-		}
-		return 0
+		return 0.0, false
 	}
 	// Scale by daily equivalent factor rather than 35,040 intraday periods
-	// to prevent synthetic zero-drawdown toy paths from saturating at 99.
+	// to prevent synthetic zero-drawdown toy paths from saturating.
 	scale := math.Sqrt(math.Min(annualPeriods, 365.0))
-	return clamp(average/deviation*scale, -10, 10)
+	return clamp(average/deviation*scale, -10, 10), true
 }
 
 func maxDrawdown(returns []float64) float64 {
@@ -976,36 +992,50 @@ func maxDrawdown(returns []float64) float64 {
 	return drawdown
 }
 
-func winRateAndProfitFactor(values []float64) (float64, float64) {
-	wins, positive, negative := 0, 0.0, 0.0
+func winRateAndProfitFactor(values []float64) (float64, float64, bool, bool) {
+	if len(values) == 0 {
+		return 0.0, 0.0, false, false
+	}
+	wins, losses := 0, 0
+	positive, negative := 0.0, 0.0
 	for _, value := range values {
 		if value > 0 {
 			wins++
 			positive += value
 		} else if value < 0 {
+			losses++
 			negative += -value
 		}
 	}
 	winRate := float64(wins) / float64(len(values)) * 100
-	if negative == 0 {
-		if positive > 0 {
-			return winRate, 99
-		}
-		return winRate, 0
+	if losses == 0 {
+		// Zero losing steps in proxy: cannot compute a statistically valid profit factor or win rate.
+		// Return 0.0 with valid=false rather than fake 99 or claiming 100% verified win rate.
+		return winRate, 0.0, false, false
 	}
 	// v2.0.29: profit factor is persisted into autogrid_candidates.profit_factor
-	// NUMERIC(12,6) (max 999999.999999). When the negative-return sum shrinks to
-	// a single marginal candle's epsilon, positive/negative explodes past any
-	// fixed precision (prod COHRX 2026-08-21 12:40Z: scan persist died with
-	// SQLSTATE 22003 and every scheduled scan failed while the razor window
-	// lasted). Cap at 99 like the zero-negative branch above: PF >= 99 already
-	// means "no meaningful losing candles" and every consumer (MinProfitFactor
-	// gate ~1.05, scannerScore clamp at 2) saturates far below it.
-	return winRate, clamp(positive/negative, 0, 99)
+	// NUMERIC(12,6) (max 999999.999999). Cap at 99 for DB boundary.
+	profitFactor := clamp(positive/negative, 0, 99)
+	return winRate, profitFactor, true, true
+}
+
+func formatProxyDisplay(val float64, valid bool) string {
+	if !valid {
+		return "недостаточно данных"
+	}
+	return fmt.Sprintf("%.2f", val)
+}
+
+func formatWinRateDisplay(val float64, valid bool) string {
+	if !valid {
+		return "недостаточно данных"
+	}
+	return fmt.Sprintf("%.1f%%", val)
 }
 
 func scannerScore(
 	volatility, ev, sharpe, drawdown, profitFactor, choppiness float64,
+	sharpeValid, pfValid bool,
 	isSqueeze bool,
 	config ScanConfig,
 ) float64 {
@@ -1019,11 +1049,21 @@ func scannerScore(
 		squeezePenalty = 0.8
 	}
 
+	sharpeFactor := 0.5
+	if sharpeValid {
+		sharpeFactor = clamp(sharpe/math.Max(config.MinSharpe, 0.25), 0, 2)
+	}
+
+	pfFactor := 0.5
+	if pfValid {
+		pfFactor = clamp(profitFactor/math.Max(config.MinProfitFactor, 1), 0, 2)
+	}
+
 	score := clamp(volatilityFit, 0, 1)*0.15 +
 		clamp(ev/math.Max(config.MinExpectedValuePct+0.25, 0.25), 0, 2)*0.20 +
-		clamp(sharpe/math.Max(config.MinSharpe, 0.25), 0, 2)*0.20 +
+		sharpeFactor*0.20 +
 		clamp(1-drawdown/math.Max(config.MaxDrawdownPct, 1), 0, 1)*0.15 +
-		clamp(profitFactor/math.Max(config.MinProfitFactor, 1), 0, 2)*0.15 +
+		pfFactor*0.15 +
 		chopFit*0.15
 
 	return clamp((score/1.4)*squeezePenalty, 0, 1)

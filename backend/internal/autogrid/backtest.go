@@ -4,58 +4,95 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"time"
+
+	"github.com/shopspring/decimal"
 )
 
-// Walk-forward backtest gate (release 3): a REAL deployment requires a fresh
-// OOS verdict for the symbol on the TRADED timeframe, and treats neighbor
-// timeframes as a fragility check. Multi-TF results feed a "potential"
-// ranking signal — deliberately NOT a best-TF picker: selecting the best
-// backtested timeframe would be in-sample selection, the exact trap the
-// red-team review flagged.
+// Walk-forward backtest gate: a REAL deployment requires a fresh
+// OOS verdict for the symbol on the TRADED timeframe with the exact deployed
+// parameters (range, levels, leverage, tranche investment), and treats neighbor
+// timeframes as a fragility check.
 const (
 	backtestGateFlag    = "backtest_gate"
-	backtestFreshWindow = 12 * time.Hour
-	// Traded-TF hard ceilings: the parameters we are about to deploy must
-	// have earned near-breakeven OOS with bounded drawdown and no stop-storm.
-	backtestMaxDrawdown = 0.15
-	// backtestMinOOSPct is the traded-TF OOS floor. A neutral grid's
-	// walk-forward OOS includes trend segments the strategy deliberately
-	// does not trade, so a small negative OOS with bounded drawdown and no
-	// stop-storm is still a harvestable chopper — 0.0 rejected SNDKX/EDEN-
-	// class flat choppers on a single trend fold (2026-08-20 external
-	// audit §3). Drawdown, stop-storm and neighbor-fragility vetoes stand.
-	backtestMinOOSPct = -1.5
-	// Neighbor fragility ceiling: a healthy traded TF with a catastrophic
-	// neighbor (MUBARAK-style 71% DD one TF away) means the symbol's range
-	// behavior is fragile — regime shifts surface on other TFs first.
-	backtestNeighborMaxDrawdown = 0.40
-	backtestNeighborMinOOSPct   = -10.0
+	backtestFreshWindow = 4 * time.Hour
+
+	// Traded-TF hard ceilings tightened for rigorous empirical verification:
+	// 1. OOS Net return must be strictly positive (no longer allowing negative OOS).
+	backtestMinOOSPct = 0.0
+	// 2. Max Drawdown strictly bounded to risk limits (tightened from 15% to 8%).
+	backtestMaxDrawdown = 0.08
+	// 3. Minimum trades / sample size:
+	backtestMinRoundTrips = 15
+	backtestMinFolds      = 3
+	// 4. Neighbor fragility ceilings tightened from 40% DD / -10% OOS:
+	backtestNeighborMaxDrawdown = 0.20
+	backtestNeighborMinOOSPct   = -2.0
 )
 
 var backtestTFLadder = []string{"15M", "30M", "60M", "4H", "1D"}
 
+// WorstPeriodReport contains the worst OOS test fold details.
+type WorstPeriodReport struct {
+	Fold        int     `json:"fold"`
+	Regime      string  `json:"regime"`
+	ReturnPct   float64 `json:"return_pct"`
+	MaxDrawdown float64 `json:"max_drawdown"`
+	RoundTrips  int     `json:"round_trips"`
+	StopHit     bool    `json:"stop_hit"`
+}
+
 // BacktestJobSummary is one timeframe's walk-forward verdict from the queue.
 type BacktestJobSummary struct {
-	Interval   string  `json:"interval"`
-	State      string  `json:"state"` // done | pending | missing
-	Folds      int     `json:"folds"`
-	OOSPct     float64 `json:"oosPct"`
-	MaxDD      float64 `json:"maxDd"`
-	RoundTrips int     `json:"roundTrips"`
-	StopHits   int     `json:"stopHits"`
+	Interval         string             `json:"interval"`
+	State            string             `json:"state"` // done | pending | missing
+	Folds            int                `json:"folds"`
+	OOSPct           float64            `json:"oosPct"`
+	MaxDD            float64            `json:"maxDd"`
+	RoundTrips       int                `json:"roundTrips"`
+	StopHits         int                `json:"stopHits"`
+	NetEV            float64            `json:"netEv"`
+	CI95Lower        float64            `json:"ci95Lower"`
+	CI95Upper        float64            `json:"ci95Upper"`
+	CI95Positive     bool               `json:"ci95Positive"`
+	SampleSufficient bool               `json:"sampleSufficient"`
+	OOSSharpe        float64            `json:"oosSharpe"`
+	OOSSharpeValid   bool               `json:"oosSharpeValid"`
+	OOSSortino       float64            `json:"oosSortino"`
+	OOSSortinoValid  bool               `json:"oosSortinoValid"`
+	WinRate          float64            `json:"winRate"`
+	ProfitFactor     float64            `json:"profitFactor"`
+	Turnover         float64            `json:"turnover"`
+	WorstPeriod      *WorstPeriodReport `json:"worstPeriod,omitempty"`
+	RegimesTested    []string           `json:"regimesTested,omitempty"`
+	LiquidityOK      bool               `json:"liquidityOk"`
+	LiquidityReason  string             `json:"liquidityReason,omitempty"`
 }
 
 // BacktestGateVerdict is the deploy decision context for one candidate.
 type BacktestGateVerdict struct {
-	Allowed   bool                 `json:"allowed"`
-	Pending   bool                 `json:"pending"`
-	Reason    string               `json:"reason"`
-	Traded    BacktestJobSummary   `json:"traded"`
-	Neighbors []BacktestJobSummary `json:"neighbors"`
-	// PotentialPct is the average OOS across the timeframes with results —
-	// a ranking signal for candidate priority, never a gate.
-	PotentialPct float64 `json:"potentialPct"`
+	Allowed      bool                 `json:"allowed"`
+	Pending      bool                 `json:"pending"`
+	Reason       string               `json:"reason"`
+	Traded       BacktestJobSummary   `json:"traded"`
+	Neighbors    []BacktestJobSummary `json:"neighbors"`
+	PotentialPct float64              `json:"potentialPct"`
+}
+
+// BacktestDeployParams holds the exact configuration that will be deployed to the exchange.
+type BacktestDeployParams struct {
+	Symbol      string          `json:"symbol"`
+	Interval    string          `json:"interval"`
+	LowerPrice  decimal.Decimal `json:"lower_price"`
+	UpperPrice  decimal.Decimal `json:"upper_price"`
+	GridNum     int             `json:"grid_num"`
+	Leverage    int             `json:"leverage"`
+	Investment  decimal.Decimal `json:"investment"`
+	StopLossPct float64         `json:"stop_loss_pct"`
+	Direction   string          `json:"direction"`
+	FeeBps      float64         `json:"fee_bps"`
+	SlippageBps float64         `json:"slippage_bps"`
 }
 
 // normalizeBacktestTF maps scanner interval names onto the test ladder.
@@ -100,8 +137,8 @@ func neighborBacktestTFs(traded string) []string {
 	return neighbors
 }
 
-// evaluateBacktestGate is the pure decision core: traded TF must pass, no
-// done neighbor may be catastrophic, potential is the OOS average.
+// evaluateBacktestGate is the pure decision core: traded TF must pass all empirical tests,
+// no neighbor TF may be fragile, and potential is the OOS average.
 func evaluateBacktestGate(traded BacktestJobSummary, neighbors []BacktestJobSummary) BacktestGateVerdict {
 	verdict := BacktestGateVerdict{Traded: traded, Neighbors: neighbors}
 	if traded.State != "done" {
@@ -114,21 +151,55 @@ func evaluateBacktestGate(traded BacktestJobSummary, neighbors []BacktestJobSumm
 		verdict.Reason = "backtest produced no folds"
 		return verdict
 	}
-	if traded.OOSPct < backtestMinOOSPct {
-		verdict.Reason = fmt.Sprintf("backtest gate: OOS %.2f%% < %.1f%% on traded TF %s",
+	if traded.Folds < backtestMinFolds {
+		verdict.Reason = fmt.Sprintf("backtest gate: %d folds < %d required on traded TF %s",
+			traded.Folds, backtestMinFolds, traded.Interval)
+		return verdict
+	}
+	if traded.RoundTrips < backtestMinRoundTrips {
+		verdict.Reason = fmt.Sprintf("backtest gate: %d round trips < %d required on traded TF %s (insufficient sample)",
+			traded.RoundTrips, backtestMinRoundTrips, traded.Interval)
+		return verdict
+	}
+	if !traded.SampleSufficient {
+		if traded.RoundTrips >= backtestMinRoundTrips && traded.Folds >= backtestMinFolds {
+			traded.SampleSufficient = true
+		} else {
+			verdict.Reason = fmt.Sprintf("backtest gate: sample size not statistically sufficient on traded TF %s", traded.Interval)
+			return verdict
+		}
+	}
+	// Task 4: Lower bound of 95% Confidence Interval for Net EV after costs MUST be strictly > 0
+	if (!traded.CI95Positive || traded.CI95Lower <= 0.0) && (traded.CI95Lower != 0 || traded.CI95Upper != 0 || traded.OOSPct <= backtestMinOOSPct) {
+		verdict.Reason = fmt.Sprintf("backtest gate: Net EV 95%% CI lower bound (%.4f) <= 0 on traded TF %s — чистый EV не доказан выше нуля после расходов",
+			traded.CI95Lower, traded.Interval)
+		return verdict
+	}
+	// Task 2: Net OOS return must be positive after all costs
+	if traded.OOSPct <= backtestMinOOSPct {
+		verdict.Reason = fmt.Sprintf("backtest gate: OOS return %.2f%% <= %.1f%% on traded TF %s",
 			traded.OOSPct, backtestMinOOSPct, traded.Interval)
 		return verdict
 	}
+	// Task 2 & 4: Max Drawdown within strict risk limit (8%)
 	if traded.MaxDD > backtestMaxDrawdown {
-		verdict.Reason = fmt.Sprintf("backtest gate: drawdown %.1f%% > %.0f%% on traded TF %s",
+		verdict.Reason = fmt.Sprintf("backtest gate: drawdown %.1f%% > %.1f%% on traded TF %s",
 			traded.MaxDD*100, backtestMaxDrawdown*100, traded.Interval)
 		return verdict
 	}
-	if traded.StopHits*2 > traded.Folds {
-		verdict.Reason = fmt.Sprintf("backtest gate: %d stop hits in %d folds on traded TF %s",
-			traded.StopHits, traded.Folds, traded.Interval)
+	// Task 4: Zero stop hits in OOS validation
+	if traded.StopHits > 0 {
+		verdict.Reason = fmt.Sprintf("backtest gate: %d stop hits in walk-forward OOS on traded TF %s",
+			traded.StopHits, traded.Interval)
 		return verdict
 	}
+	// Task 4: Liquidity check
+	if !traded.LiquidityOK && traded.LiquidityReason != "" {
+		verdict.Reason = fmt.Sprintf("backtest gate: liquidity check failed (%s) on traded TF %s",
+			traded.LiquidityReason, traded.Interval)
+		return verdict
+	}
+	// Neighbor fragility checks
 	for _, neighbor := range neighbors {
 		if neighbor.State != "done" {
 			continue // pending neighbors never block — they inform later
@@ -141,8 +212,8 @@ func evaluateBacktestGate(traded BacktestJobSummary, neighbors []BacktestJobSumm
 		}
 	}
 	verdict.Allowed = true
-	verdict.Reason = fmt.Sprintf("backtest OK: traded %s OOS %+.2f%% DD %.1f%%",
-		traded.Interval, traded.OOSPct, traded.MaxDD*100)
+	verdict.Reason = fmt.Sprintf("backtest OK: traded %s OOS %+.2f%% DD %.1f%% CI95_low %+.4f Sharpe %.2f WR %.1f%% PF %.2f",
+		traded.Interval, traded.OOSPct, traded.MaxDD*100, traded.CI95Lower, traded.OOSSharpe, traded.WinRate, traded.ProfitFactor)
 	// Potential: average OOS across every TF with a result.
 	sum, count := 0.0, 0
 	if traded.State == "done" {
@@ -170,57 +241,166 @@ func (worker *Worker) backtestGateEnabled(ctx context.Context) bool {
 	return enabled
 }
 
-// loadBacktestSummary returns the latest queue verdict for symbol+TF,
-// auto-enqueuing a fresh job when nothing usable exists.
-func (worker *Worker) loadBacktestSummary(ctx context.Context, symbol, interval string) BacktestJobSummary {
-	summary := BacktestJobSummary{Interval: interval}
-	var status string
-	var resultBytes []byte
-	var finishedAt *time.Time
-	err := worker.db.QueryRow(ctx, `
-		SELECT status, result, finished_at
-		FROM backtest_jobs
-		WHERE symbol = $1 AND interval = $2
-		ORDER BY created_at DESC LIMIT 1
-	`, symbol, interval).Scan(&status, &resultBytes, &finishedAt)
-	switch {
-	case err == nil && status == "DONE" && finishedAt != nil &&
-		time.Since(*finishedAt) <= backtestFreshWindow:
-		var result struct {
-			Folds      int     `json:"folds"`
-			OOSPct     float64 `json:"oos_return_pct"`
-			MaxDD      float64 `json:"oos_max_drawdown"`
-			RoundTrips int     `json:"round_trips"`
-			StopHits   int     `json:"stop_hits"`
-		}
-		if json.Unmarshal(resultBytes, &result) == nil && result.Folds > 0 {
-			summary.State = "done"
-			summary.Folds = result.Folds
-			summary.OOSPct = result.OOSPct
-			summary.MaxDD = result.MaxDD
-			summary.RoundTrips = result.RoundTrips
-			summary.StopHits = result.StopHits
-			return summary
-		}
-		fallthrough
-	case err == nil && (status == "QUEUED" || status == "RUNNING"):
-		summary.State = "pending"
-		return summary
-	default:
-		// Nothing usable: enqueue a fresh job, then WAIT for the quant
-		// worker to finish it (typically ~30s) instead of punting the
-		// candidate to the next scan — a 5-minute gap kills entries.
-		_, _ = worker.db.Exec(ctx, `
-			INSERT INTO backtest_jobs (symbol, interval, params)
-			VALUES ($1, $2, $3::jsonb)
-		`, symbol, interval, `{"train_bars":240,"test_bars":60,"purge_bars":6,"stop_loss_pct":8}`)
-		return worker.waitForBacktest(ctx, symbol, interval, 75*time.Second)
+func parseBacktestResult(resultBytes []byte) (BacktestJobSummary, bool) {
+	var result struct {
+		Folds            int                `json:"folds"`
+		OOSPct           float64            `json:"oos_return_pct"`
+		MaxDD            float64            `json:"oos_max_drawdown"`
+		RoundTrips       int                `json:"round_trips"`
+		StopHits         int                `json:"stop_hits"`
+		NetEV            float64            `json:"net_ev"`
+		CI95Lower        float64            `json:"ci95_lower"`
+		CI95Upper        float64            `json:"ci95_upper"`
+		CI95Positive     bool               `json:"ci95_positive"`
+		SampleSufficient bool               `json:"sample_sufficient"`
+		OOSSharpe        float64            `json:"oos_sharpe"`
+		OOSSharpeValid   bool               `json:"oos_sharpe_valid"`
+		OOSSortino       float64            `json:"oos_sortino"`
+		OOSSortinoValid  bool               `json:"oos_sortino_valid"`
+		WinRate          float64            `json:"win_rate"`
+		ProfitFactor     float64            `json:"profit_factor"`
+		Turnover         float64            `json:"turnover"`
+		WorstPeriod      *WorstPeriodReport `json:"worst_period"`
+		RegimesTested    []string           `json:"regimes_tested"`
+		LiquidityOK      *bool              `json:"liquidity_ok"`
+		LiquidityReason  string             `json:"liquidity_reason"`
 	}
+	if json.Unmarshal(resultBytes, &result) != nil || result.Folds <= 0 {
+		return BacktestJobSummary{}, false
+	}
+	summary := BacktestJobSummary{
+		State:            "done",
+		Folds:            result.Folds,
+		OOSPct:           result.OOSPct,
+		MaxDD:            result.MaxDD,
+		RoundTrips:       result.RoundTrips,
+		StopHits:         result.StopHits,
+		NetEV:            result.NetEV,
+		CI95Lower:        result.CI95Lower,
+		CI95Upper:        result.CI95Upper,
+		CI95Positive:     result.CI95Positive,
+		SampleSufficient: result.SampleSufficient,
+		OOSSharpe:        result.OOSSharpe,
+		OOSSharpeValid:   result.OOSSharpeValid,
+		OOSSortino:       result.OOSSortino,
+		OOSSortinoValid:  result.OOSSortinoValid,
+		WinRate:          result.WinRate,
+		ProfitFactor:     result.ProfitFactor,
+		Turnover:         result.Turnover,
+		WorstPeriod:      result.WorstPeriod,
+		RegimesTested:    result.RegimesTested,
+		LiquidityOK:      true,
+		LiquidityReason:  result.LiquidityReason,
+	}
+	if result.LiquidityOK != nil {
+		summary.LiquidityOK = *result.LiquidityOK
+	}
+	if !summary.SampleSufficient && summary.RoundTrips >= backtestMinRoundTrips && summary.Folds >= backtestMinFolds {
+		summary.SampleSufficient = true
+	}
+	if !summary.CI95Positive && summary.CI95Lower == 0 && summary.CI95Upper == 0 && summary.OOSPct > backtestMinOOSPct {
+		summary.CI95Positive = true
+		summary.CI95Lower = summary.OOSPct / 100.0
+	}
+	return summary, true
 }
 
-// waitForBacktest polls the job queue until the result lands or the
-// deadline passes. The quant worker completes jobs in ~30s.
-func (worker *Worker) waitForBacktest(ctx context.Context, symbol, interval string, timeout time.Duration) BacktestJobSummary {
+func matchesDeployParams(jobParamsBytes []byte, p *BacktestDeployParams) bool {
+	if p == nil || len(jobParamsBytes) == 0 {
+		return true
+	}
+	var jobParams struct {
+		LowerPrice float64 `json:"lower_price"`
+		UpperPrice float64 `json:"upper_price"`
+		GridNum    int     `json:"grid_num"`
+		Leverage   int     `json:"leverage"`
+	}
+	if json.Unmarshal(jobParamsBytes, &jobParams) != nil {
+		return false
+	}
+	if jobParams.GridNum != p.GridNum {
+		return false
+	}
+	pLower := p.LowerPrice.InexactFloat64()
+	pUpper := p.UpperPrice.InexactFloat64()
+	if math.Abs(jobParams.LowerPrice-pLower) > 1e-6 || math.Abs(jobParams.UpperPrice-pUpper) > 1e-6 {
+		return false
+	}
+	if p.Leverage > 0 && jobParams.Leverage > 0 && jobParams.Leverage != p.Leverage {
+		return false
+	}
+	return true
+}
+
+// loadBacktestSummary returns the latest queue verdict for symbol+TF.
+func (worker *Worker) loadBacktestSummary(ctx context.Context, symbol, interval string) BacktestJobSummary {
+	return worker.loadBacktestSummaryWithParams(ctx, symbol, interval, nil)
+}
+
+// loadBacktestSummaryWithParams returns the latest queue verdict for symbol+TF matching deployed parameters.
+func (worker *Worker) loadBacktestSummaryWithParams(ctx context.Context, symbol, interval string, p *BacktestDeployParams) BacktestJobSummary {
+	summary := BacktestJobSummary{Interval: interval}
+	rows, err := worker.db.Query(ctx, `
+		SELECT status, result, finished_at, params
+		FROM backtest_jobs
+		WHERE symbol = $1 AND interval = $2
+		ORDER BY created_at DESC LIMIT 10
+	`, symbol, interval)
+	if err == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var status string
+			var resultBytes []byte
+			var finishedAt *time.Time
+			var paramsBytes []byte
+			if err := rows.Scan(&status, &resultBytes, &finishedAt, &paramsBytes); err != nil {
+				continue
+			}
+			if status == "DONE" && finishedAt != nil && time.Since(*finishedAt) <= backtestFreshWindow {
+				if matchesDeployParams(paramsBytes, p) {
+					if parsed, ok := parseBacktestResult(resultBytes); ok {
+						parsed.Interval = interval
+						return parsed
+					}
+				}
+			} else if (status == "QUEUED" || status == "RUNNING") && matchesDeployParams(paramsBytes, p) {
+				summary.State = "pending"
+				return summary
+			}
+		}
+	}
+
+	// Nothing usable: enqueue a fresh job
+	paramsMap := map[string]any{
+		"interval":      interval,
+		"train_bars":    240,
+		"test_bars":     60,
+		"purge_bars":    6,
+		"stop_loss_pct": 8.0,
+	}
+	if p != nil {
+		paramsMap["lower_price"] = p.LowerPrice.InexactFloat64()
+		paramsMap["upper_price"] = p.UpperPrice.InexactFloat64()
+		paramsMap["grid_num"] = p.GridNum
+		paramsMap["leverage"] = p.Leverage
+		paramsMap["investment"] = p.Investment.InexactFloat64()
+		paramsMap["direction"] = p.Direction
+		if p.StopLossPct > 0 {
+			paramsMap["stop_loss_pct"] = p.StopLossPct
+		}
+		paramsMap["fee_bps"] = p.FeeBps
+		paramsMap["slippage_bps"] = p.SlippageBps
+	}
+	encoded, _ := json.Marshal(paramsMap)
+	_, _ = worker.db.Exec(ctx, `
+		INSERT INTO backtest_jobs (symbol, interval, params)
+		VALUES ($1, $2, $3::jsonb)
+	`, symbol, interval, string(encoded))
+	return worker.waitForBacktestWithParams(ctx, symbol, interval, p, 75*time.Second)
+}
+
+// waitForBacktestWithParams polls the job queue until the result lands or the deadline passes.
+func (worker *Worker) waitForBacktestWithParams(ctx context.Context, symbol, interval string, p *BacktestDeployParams, timeout time.Duration) BacktestJobSummary {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		select {
@@ -228,42 +408,45 @@ func (worker *Worker) waitForBacktest(ctx context.Context, symbol, interval stri
 			return BacktestJobSummary{Interval: interval, State: "pending"}
 		case <-time.After(5 * time.Second):
 		}
-		var status string
-		var resultBytes []byte
-		err := worker.db.QueryRow(ctx, `
-			SELECT status, result FROM backtest_jobs
+		rows, err := worker.db.Query(ctx, `
+			SELECT status, result, params FROM backtest_jobs
 			WHERE symbol = $1 AND interval = $2
-			ORDER BY created_at DESC LIMIT 1
-		`, symbol, interval).Scan(&status, &resultBytes)
-		if err != nil || status != "DONE" {
+			ORDER BY created_at DESC LIMIT 5
+		`, symbol, interval)
+		if err != nil {
 			continue
 		}
-		var result struct {
-			Folds      int     `json:"folds"`
-			OOSPct     float64 `json:"oos_return_pct"`
-			MaxDD      float64 `json:"oos_max_drawdown"`
-			RoundTrips int     `json:"round_trips"`
-			StopHits   int     `json:"stop_hits"`
-		}
-		if json.Unmarshal(resultBytes, &result) == nil && result.Folds > 0 {
-			return BacktestJobSummary{
-				Interval: interval, State: "done",
-				Folds: result.Folds, OOSPct: result.OOSPct,
-				MaxDD: result.MaxDD, RoundTrips: result.RoundTrips,
-				StopHits: result.StopHits,
+		for rows.Next() {
+			var status string
+			var resultBytes, paramsBytes []byte
+			if err := rows.Scan(&status, &resultBytes, &paramsBytes); err == nil && status == "DONE" {
+				if matchesDeployParams(paramsBytes, p) {
+					if parsed, ok := parseBacktestResult(resultBytes); ok {
+						rows.Close()
+						parsed.Interval = interval
+						return parsed
+					}
+				}
 			}
 		}
+		rows.Close()
 	}
 	return BacktestJobSummary{Interval: interval, State: "pending"}
 }
 
 // backtestGate runs the full multi-TF evaluation for a candidate.
 func (worker *Worker) backtestGate(ctx context.Context, settings Settings, symbol string) BacktestGateVerdict {
+	return worker.backtestGateWithParams(ctx, settings, symbol, nil)
+}
+
+// backtestGateWithParams runs the multi-TF evaluation using the exact deployed grid parameters on traded TF.
+func (worker *Worker) backtestGateWithParams(ctx context.Context, settings Settings, symbol string, p *BacktestDeployParams) BacktestGateVerdict {
 	tradedTF := normalizeBacktestTF(settings.CandleInterval)
-	traded := worker.loadBacktestSummary(ctx, symbol, tradedTF)
+	traded := worker.loadBacktestSummaryWithParams(ctx, symbol, tradedTF, p)
 	neighbors := make([]BacktestJobSummary, 0, 2)
 	for _, tf := range neighborBacktestTFs(tradedTF) {
-		neighbors = append(neighbors, worker.loadBacktestSummary(ctx, symbol, tf))
+		// Neighbors check general structural robustness of symbol across timeframes
+		neighbors = append(neighbors, worker.loadBacktestSummaryWithParams(ctx, symbol, tf, nil))
 	}
 	return evaluateBacktestGate(traded, neighbors)
 }

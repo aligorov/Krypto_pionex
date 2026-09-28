@@ -72,20 +72,31 @@ def run_job(conn, job):
     limits = int(params.get("limits", 500))
     candles = fetch_klines(symbol, interval, limits)
 
+    maker_fee = float(params.get("fee_bps", 2.0)) / 10000.0 if "fee_bps" in params else 0.0002
+    slippage = float(params.get("slippage_bps", 5.0)) / 10000.0 if "slippage_bps" in params else 0.0005
+    funding_rate_8h = float(params.get("funding_rate_8h", 0.0001))
+
     engine = QuantBacktestEngine(
-        maker_fee=0.0002,
+        maker_fee=maker_fee,
         taker_fee=0.0005,
-        # v2.0.93: 0.0002 -> 0.0005 — close-cost alignment with the Go paper
-        # model (taker + slippage on the exit leg); the thinner slip made OOS
-        # stops look cheaper than the fleet's own close accounting.
-        slippage=0.0005,
-        # Conservative baseline funding (1 bp / 8h on held notional): the
-        # live paper loop feeds real cross-exchange rates, but the deploy
-        # gate must price SOME funding drag — ignoring it overstated OOS
-        # returns by ~40-60 bps per 14d window (2026-08-31 fee audit).
-        funding_rate_8h=0.0001,
+        slippage=slippage,
+        funding_rate_8h=funding_rate_8h,
     )
     interval_hours = {"5M": 5 / 60, "15M": 0.25, "30M": 0.5, "60M": 1.0, "1H": 1.0, "4H": 4.0, "1D": 24.0}
+    bar_hours = interval_hours.get(str(interval).upper(), 1.0)
+
+    deployed_params = None
+    if "lower_price" in params and "upper_price" in params and "grid_num" in params:
+        deployed_params = {
+            "lower": float(params["lower_price"]),
+            "upper": float(params["upper_price"]),
+            "levels": int(params["grid_num"]),
+            "leverage": float(params.get("leverage", 1.0)),
+            "investment": float(params.get("investment", 100.0)),
+            "direction": str(params.get("direction", "neutral")).lower(),
+            "stop_loss_pct": float(params.get("stop_loss_pct", 8.0)) if params.get("stop_loss_pct") is not None else None,
+        }
+
     report = walk_forward(
         engine,
         candles,
@@ -94,7 +105,8 @@ def run_job(conn, job):
         purge_bars=int(params.get("purge_bars", 6)),
         investment=float(params.get("investment", 100.0)),
         stop_loss_pct=float(params.get("stop_loss_pct", 8.0)),
-        bar_hours=interval_hours.get(str(interval).upper(), 1.0),
+        bar_hours=bar_hours,
+        deployed_params=deployed_params,
     )
     report["symbol"] = symbol
     report["interval"] = interval

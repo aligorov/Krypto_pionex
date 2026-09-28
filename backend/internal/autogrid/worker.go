@@ -2421,32 +2421,6 @@ func (worker *Worker) deployReal(
 				fmt.Sprintf("smart direction (%s) против демотированного тренда сканера (no_trend после 24h ±3%% против направления)", smartTrend), nil)
 			continue
 		}
-		// Walk-forward backtest gate: the traded TF must have earned a fresh
-		// non-negative OOS verdict with bounded drawdown, and no neighbor TF
-		// may be catastrophic. Missing jobs are auto-enqueued; the candidate
-		// is reconsidered on the next scan once results arrive.
-		if backtestGateOn {
-			verdict := worker.backtestGate(ctx, settings, candidate.Symbol)
-			if verdict.Pending {
-				worker.logger.Info("backtest gate: awaiting walk-forward results",
-					"component", "autogrid_worker", "symbol", candidate.Symbol)
-				continue
-			}
-			if !verdict.Allowed {
-				worker.rejectCandidate(ctx, candidate, verdict.Reason, map[string]any{
-					"backtestGate": map[string]any{
-						"allowed": verdict.Allowed, "reason": verdict.Reason,
-						"traded": verdict.Traded, "neighbors": verdict.Neighbors,
-					},
-				})
-				worker.logger.Info("backtest gate rejected candidate",
-					"component", "autogrid_worker", "symbol", candidate.Symbol, "reason", verdict.Reason)
-				continue
-			}
-			worker.logger.Info("backtest gate passed",
-				"component", "autogrid_worker", "symbol", candidate.Symbol,
-				"reason", verdict.Reason, "potential_pct", verdict.PotentialPct)
-		}
 		var exists bool
 		if err := worker.db.QueryRow(ctx, `
 			SELECT EXISTS (
@@ -2989,6 +2963,90 @@ func (worker *Worker) deployReal(
 			data.LossStopType = "profit_amount"
 			data.LossStop = &neg
 		}
+
+		// Walk-forward backtest gate: the traded TF must pass empirical walk-forward
+		// backtesting with the exact parameters (range, levels, leverage, investment,
+		// stop loss, direction) that will be deployed to Pionex.
+		if backtestGateOn {
+			stopLossPct := 8.0
+			if candidate.CurrentPrice.IsPositive() && antiHuntStop.IsPositive() {
+				if trend == "short" {
+					if antiHuntStop.GreaterThan(candidate.CurrentPrice) {
+						pct, _ := antiHuntStop.Sub(candidate.CurrentPrice).Div(candidate.CurrentPrice).Mul(decimal.NewFromInt(100)).Float64()
+						if pct > 0 {
+							stopLossPct = pct
+						}
+					}
+				} else {
+					if candidate.CurrentPrice.GreaterThan(antiHuntStop) {
+						pct, _ := candidate.CurrentPrice.Sub(antiHuntStop).Div(candidate.CurrentPrice).Mul(decimal.NewFromInt(100)).Float64()
+						if pct > 0 {
+							stopLossPct = pct
+						}
+					}
+				}
+			}
+			deployParams := BacktestDeployParams{
+				Symbol:      candidate.Symbol,
+				Interval:    settings.CandleInterval,
+				LowerPrice:  lowerPrice,
+				UpperPrice:  upperPrice,
+				GridNum:     mesh.GridNum,
+				Leverage:    botLev,
+				Investment:  investAmount,
+				Direction:   trend,
+				StopLossPct: stopLossPct,
+				FeeBps:      decimalFloat(settings.FeeBps),
+				SlippageBps: decimalFloat(settings.SlippageBps),
+			}
+			verdict := worker.backtestGateWithParams(ctx, settings, candidate.Symbol, &deployParams)
+			if verdict.Pending {
+				worker.logger.Info("backtest gate: awaiting walk-forward results for exact deploy params",
+					"component", "autogrid_worker", "symbol", candidate.Symbol,
+					"lower", deployParams.LowerPrice.String(), "upper", deployParams.UpperPrice.String(),
+					"levels", deployParams.GridNum, "leverage", deployParams.Leverage)
+				continue
+			}
+			if !verdict.Allowed {
+				worker.rejectCandidate(ctx, candidate, verdict.Reason, map[string]any{
+					"backtestGate": map[string]any{
+						"allowed": verdict.Allowed, "reason": verdict.Reason,
+						"traded": verdict.Traded, "neighbors": verdict.Neighbors,
+						"params": deployParams,
+					},
+				})
+				worker.journalEntryDecision(ctx, EntryChainInput{
+					Path: EntryPathScannerReal, Settings: settings, Symbol: candidate.Symbol,
+					Direction: entryDirectionFromTrend(trend), Fleet: "REAL", RefID: candidate.ID,
+				}, entryOutcomeReject, "BACKTEST_GATE", verdict.Reason, map[string]any{
+					"traded": verdict.Traded,
+				})
+				worker.logger.Info("backtest gate rejected candidate",
+					"component", "autogrid_worker", "symbol", candidate.Symbol, "reason", verdict.Reason)
+				continue
+			}
+			worker.logger.Info("backtest gate passed with exact deploy params",
+				"component", "autogrid_worker", "symbol", candidate.Symbol,
+				"reason", verdict.Reason, "potential_pct", verdict.PotentialPct)
+			if candidate.ModelAssumptions == nil {
+				candidate.ModelAssumptions = make(map[string]any)
+			}
+			candidate.ModelAssumptions["walkForwardProof"] = map[string]any{
+				"passed":           true,
+				"netEV":            verdict.Traded.NetEV,
+				"ci95Lower":        verdict.Traded.CI95Lower,
+				"ci95Upper":        verdict.Traded.CI95Upper,
+				"oosSharpe":        verdict.Traded.OOSSharpe,
+				"oosSortino":       verdict.Traded.OOSSortino,
+				"winRate":          verdict.Traded.WinRate,
+				"profitFactor":     verdict.Traded.ProfitFactor,
+				"maxDrawdown":      verdict.Traded.MaxDD,
+				"regimesTested":    verdict.Traded.RegimesTested,
+				"worstPeriod":      verdict.Traded.WorstPeriod,
+				"sampleSufficient": verdict.Traded.SampleSufficient,
+			}
+		}
+
 		params := pionex.NativeFuturesGridCreateParams{
 			Base: futuresBase, Quote: quote, BUOrderData: data,
 		}
