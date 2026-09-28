@@ -569,6 +569,16 @@ func (worker *Worker) scanAndDeploy(
 	}
 	scanConfig := worker.service.scannerConfig(*settings)
 	scanConfig.CascadeShortMode = cascadeShort
+	// v2.0.147: while the beta gate reads BTC TREND_DOWN, the scanner lifts
+	// the SHORT anti-FOMO floors for pair-confirmed downtrends (counterfactual
+	// 2026-09-28: those cuts fell 2.4:1 in the short's favor while NEUTRAL
+	// bled). The loop re-reads the same cached regime at deploy time — the
+	// fresher read wins and any disagreement resolves conservatively (a
+	// scan-time down / deploy-time up split re-cuts the candidate at the
+	// beta block; the reverse only admits floor-passing shorts).
+	if _, betaDownScan := betaGateTrend(worker.marketBetaRegime(ctx)); betaDownScan {
+		scanConfig.BetaDownShortMode = true
+	}
 	candidates, err := worker.scanner.ScanMarkets(ctx, scanConfig)
 	if err != nil {
 		worker.service.FailScan(ctx, scanID, err)
@@ -1168,9 +1178,16 @@ func (worker *Worker) deployPaper(
 			continue
 		}
 		if !isEntryTimingFavorable(candidate) {
-			worker.rejectCandidate(ctx, candidate,
-				"вход-тайминг: текущая позиция в канале вне благоприятной зоны для этого направления", nil)
-			continue
+			if !betaDownShortExempt(candidate, betaDown) {
+				worker.rejectCandidate(ctx, candidate,
+					"вход-тайминг: текущая позиция в канале вне благоприятной зоны для этого направления", nil)
+				continue
+			}
+			// v2.0.147 attribution marker: this short entered ONLY because the
+			// beta-down exemption lifted entry-timing — persisted into
+			// model_assumptions so the 14-day follow-up can partition realized
+			// outcomes by entry cohort and validate or roll back on evidence.
+			candidate.ModelAssumptions["betaDownExempt"] = true
 		}
 		// LLM audit gate (FIX-F): same rule, same text as the REAL branch.
 		if llmBrainEnabledPaper && candidate.ModelAssumptions["llmAuditId"] == nil {
@@ -2237,7 +2254,12 @@ func (worker *Worker) deployReal(
 	}
 	deployErrors := make([]string, 0)
 	backtestGateOn := worker.backtestGateEnabled(ctx)
-
+	// v2.0.147 beta-down SHORT exemption: one pass-level read of the SAME
+	// 5-min cached regime the beta block below enforces — entry-timing must
+	// not cut a pair-confirmed downtrend short just because the channel
+	// position reads "unfavorable" (in a trend regime the extreme IS the
+	// continuation; counterfactual 2026-09-28: those cuts fell 4.3:1).
+	betaDownEntry, _ := betaGateTrend(worker.marketBetaRegime(ctx))
 	// When the LLM brain is enabled, an UNAUDITED candidate is not
 	// deployable — regardless of why the audit is missing (beyond the
 	// per-scan audit cap, transport failure, timeout). This is the hard
@@ -2271,9 +2293,15 @@ func (worker *Worker) deployReal(
 			continue
 		}
 		if !isEntryTimingFavorable(candidate) {
-			worker.rejectCandidate(ctx, candidate,
-				"вход-тайминг: текущая позиция в канале вне благоприятной зоны для этого направления", nil)
-			continue
+			if !betaDownShortExempt(candidate, betaDownEntry) {
+				worker.rejectCandidate(ctx, candidate,
+					"вход-тайминг: текущая позиция в канале вне благоприятной зоны для этого направления", nil)
+				continue
+			}
+			// v2.0.147 attribution marker — paper-mirror comment: entry-timing
+			// lifted by the beta-down exemption; partitions the 14-day
+			// follow-up by entry cohort.
+			candidate.ModelAssumptions["betaDownExempt"] = true
 		}
 		if llmBrainEnabled && candidate.ModelAssumptions["llmAuditId"] == nil {
 			worker.logger.Warn("skip real deploy: no completed LLM audit for candidate",
@@ -6512,6 +6540,24 @@ func betaGateTrend(regime string, adx, emaSlopePct float64) (down, up bool) {
 		return false, emaSlopePct > 0.3
 	}
 	return false, false
+}
+
+// betaDownShortExempt (v2.0.147): while the beta gate reads BTC TREND_DOWN,
+// a SHORT candidate whose own tape confirms the downtrend passes the
+// entry-timing gate even outside the "favorable" channel zone. The mirror
+// of the scanner's antiFomoShortFloorsLifted: strong trend (>22 ADX or
+// >0.5 slope, the band the anti-FOMO floors already widen on) AND a
+// falling EMA — slope sign is the direction proof, a rising pair is a
+// divergence and keeps the gate armed. NEUTRAL/LONG are never exempt;
+// R1+Vision and every later gate stay armed for the exempted short too.
+func betaDownShortExempt(candidate Candidate, betaDown bool) bool {
+	if !betaDown || candidate.RecommendedTrend != "short" {
+		return false
+	}
+	adx, _ := candidate.ModelAssumptions["adx"].(float64)
+	slope, _ := candidate.ModelAssumptions["emaSlopePct"].(float64)
+	strongTrend := adx > 22.0 || math.Abs(slope) > 0.5
+	return strongTrend && slope < 0
 }
 
 // marketBetaRegime caches BTC's regime for 5 minutes; the deploy paths ask

@@ -75,6 +75,19 @@ type ScanConfig struct {
 	// the continuation entries this scan exists to deploy. All other
 	// vetoes (volatility caps, LONG floors, Hurst, backtest) stay armed.
 	CascadeShortMode bool
+	// BetaDownShortMode (v2.0.147) marks a scan taken while the beta gate
+	// itself reads BTC TREND_DOWN: short-side anti-FOMO floors lift for
+	// pairs whose OWN tape confirms the downtrend (strong trend + falling
+	// EMA — the same strongTrend band semantics the floors already widen
+	// on). Counterfactual 2026-09-28 (5 167 rejected SHORT candidates, 30h):
+	// Anti-FOMO-cut shorts fell a median −0.32% (win/loss 2.4:1) and
+	// entry-timing-cut shorts −1.09% (4.3:1) while 67 NEUTRAL bots bled
+	// −$19.62 — range logic ("don't enter at the channel extreme") applied
+	// to a trend regime where the extreme IS the continuation. R1+Vision
+	// stays armed everywhere (its 16 cuts went +0.66% AGAINST the short —
+	// that gate is correct). LONG/NEUTRAL floors and every other veto stay
+	// armed.
+	BetaDownShortMode bool
 	// NotionalPerBot (v2.0.75) is budget×leverage the fleet commits per bot.
 	// Grid density scales with it (GridLevelsForRange): 0 = unknown, the
 	// level count then follows the bare 0.25% step floor.
@@ -568,10 +581,12 @@ func scoreCandidate(
 			reasons = append(reasons, fmt.Sprintf("Anti-FOMO: положение в канале (%.1f%%) > %.0f%% - вход в LONG выше предела заблокирован", regime.RangePositionPct, posCap))
 		}
 	} else if recommendedTrend == "short" {
-		if config.CascadeShortMode {
+		if antiFomoShortFloorsLifted(config.CascadeShortMode, config.BetaDownShortMode, regime.ADX, regime.EMASlopePct) {
 			// v2.0.21 cascade window: skip the RSI/position floors for
 			// shorts (see ScanConfig.CascadeShortMode) — the oversold
 			// reading IS the signal during a forced unwind.
+			// v2.0.147: same lift during a beta-down regime when the pair's
+			// own tape confirms the downtrend (see ScanConfig.BetaDownShortMode).
 		} else {
 			rsiFloor, posFloor := 30.0, 25.0
 			if strongTrend {
@@ -1047,6 +1062,25 @@ func neutralSqueezeRisk(regime RegimeResult) bool {
 // v2.0.39): entering after the move is a chase — 1W/3L in the ledger.
 func matureTrendLongDemoted(trend string, adx float64) bool {
 	return trend == "long" && adx >= 28.0
+}
+
+// antiFomoShortFloorsLifted decides whether the SHORT RSI/position floors
+// stand down for this scan: the v2.0.21 cascade window lifts them
+// unconditionally (forced-unwind pass), and the v2.0.147 beta-down regime
+// lifts them only when the pair's own tape confirms the downtrend — strong
+// trend (the same >22 ADX / >0.5 slope band the floors already widen on)
+// AND a falling EMA. Slope sign is the direction proof: a beta-down scan
+// seeing a rising pair is a divergence, not a confirmation, and keeps the
+// floors armed.
+func antiFomoShortFloorsLifted(cascadeMode, betaDownShortMode bool, adx, emaSlopePct float64) bool {
+	if cascadeMode {
+		return true
+	}
+	if !betaDownShortMode {
+		return false
+	}
+	strongTrend := adx > 22.0 || math.Abs(emaSlopePct) > 0.5
+	return strongTrend && emaSlopePct < 0
 }
 
 // isASCIISymbol reports whether the exchange symbol is pure printable
