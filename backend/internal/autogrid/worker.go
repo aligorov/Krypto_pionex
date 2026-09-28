@@ -407,7 +407,8 @@ func (worker *Worker) sweepRestartGhosts(ctx context.Context) {
 		SET status = 'EXPIRED', lease_owner = NULL, lease_expiry = NULL
 		WHERE (status = 'QUEUED' AND created_at < NOW() - INTERVAL '15 minutes')
 		   OR (status = 'EXECUTING' AND lease_expiry IS NOT NULL AND lease_expiry < NOW())
-	`)
+		   OR (status = 'EXECUTING' AND lease_owner IS DISTINCT FROM $1)
+	`, worker.owner)
 	if err == nil && tag.RowsAffected() > 0 {
 		worker.logger.Warn("expired stale control commands",
 			"component", "autogrid_worker", "count", tag.RowsAffected())
@@ -3218,6 +3219,9 @@ func (worker *Worker) deployReal(
 			"trancheBase":     slotBudget.String(),
 			"trancheEntry":    candidate.CurrentPrice.String(),
 			"atrPctEntry":     atrPct,
+			// v2.0.155: the symbol's deploy-time precision rides model_state
+			// so the manage loop rounds the trailing-SL candidate to it.
+			"pricePrecision": pricePrecision,
 		}
 		// v2.0.139 telemetry: the stress-floor marker rides model_state
 		// exactly when the floor lifted the cap (paper twin: the bot row's
@@ -3785,41 +3789,46 @@ func (worker *Worker) settleTerminalFinal(
 }
 
 type managedBot struct {
-	id, accountID, remoteID, localStatus, symbol, direction string
-	lower, upper                                            decimal.Decimal
-	rowNum, adjustments, leverage                           int
-	pnlTarget, maxLoss                                      *decimal.Decimal
-	antiHuntStop                                            *decimal.Decimal
-	investment                                              decimal.Decimal
-	botNumber                                               int
-	peak                                                    decimal.Decimal
-	createdAt                                               time.Time
-	closedReason                                            string
-	trancheDeployed                                         int
-	trancheBase                                             *string
-	trancheEntry                                            *string
-	atrEntry                                                float64
-	trancheFailAt                                           *string
-	trancheIntentAt                                         *string
-	fundingPaid                                             decimal.Decimal
-	lastFundingReconcileAt                                  *time.Time
-	shiftFloatingOffset                                     decimal.Decimal
-	shiftPosition                                           decimal.Decimal
-	supervisionFloor                                        decimal.Decimal
-	rebasePool                                              decimal.Decimal
-	lastEntryMark                                           *decimal.Decimal
-	lastSignedPos                                           *decimal.Decimal
-	wickShieldTriggeredAt                                   *string
-	wickShieldExtreme                                       *decimal.Decimal
-	wickShieldLastClearedAt                                 *string
-	rebasePos                                               decimal.Decimal
-	peakFloor                                               *decimal.Decimal
-	shiftRealizedBase                                       decimal.Decimal
-	lastRemoteGridProfit                                    decimal.Decimal
-	lastAdjustmentsCount                                    int
+	id, accountID, remoteID, localStatus, symbol, direction   string
+	lower, upper                                              decimal.Decimal
+	rowNum, adjustments, leverage                             int
+	pnlTarget, maxLoss                                        *decimal.Decimal
+	antiHuntStop                                              *decimal.Decimal
+	investment                                                decimal.Decimal
+	botNumber                                                 int
+	peak                                                      decimal.Decimal
+	createdAt                                                 time.Time
+	closedReason                                              string
+	trancheDeployed                                           int
+	trancheBase                                               *string
+	trancheEntry                                              *string
+	atrEntry                                                  float64
+	trancheFailAt                                             *string
+	trancheIntentAt                                           *string
+	fundingPaid                                               decimal.Decimal
+	lastFundingReconcileAt                                    *time.Time
+	shiftFloatingOffset                                       decimal.Decimal
+	shiftPosition                                             decimal.Decimal
+	supervisionFloor                                          decimal.Decimal
+	rebasePool                                                decimal.Decimal
+	lastEntryMark                                             *decimal.Decimal
+	lastSignedPos                                             *decimal.Decimal
+	wickShieldTriggeredAt                                     *string
+	wickShieldExtreme                                         *decimal.Decimal
+	wickShieldLastClearedAt                                   *string
+	rebasePos                                                 decimal.Decimal
+	peakFloor                                                 *decimal.Decimal
+	shiftRealizedBase                                         decimal.Decimal
+	lastRemoteGridProfit                                      decimal.Decimal
+	lastAdjustmentsCount                                      int
 	targetPrice, stopLossPrice, stopLossHigh, trailingSLPrice *decimal.Decimal
 	adaptiveStrategy                                          string
 	riskRewardRatio                                           *decimal.Decimal
+	// pricePrecision carries the deploy-time symbol precision (model_state)
+	// for the trailing-SL rounding; trailingSLFailAt is the 1h backoff
+	// marker for a failed native SL update (v2.0.155).
+	pricePrecision   int
+	trailingSLFailAt *string
 }
 
 // managedBot is the per-pass supervision row for REAL bots (v2.0.149:
@@ -3977,7 +3986,9 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 		       COALESCE(NULLIF(model_state->>'lastRemoteGridProfit','')::NUMERIC, 0),
 		       COALESCE(NULLIF(model_state->>'lastAdjustmentsCount','')::INT, 0),
 		       target_price, stop_loss_price, stop_loss_high, trailing_sl_price,
-		       COALESCE(adaptive_strategy, ''), risk_reward_ratio
+		       COALESCE(adaptive_strategy, ''), risk_reward_ratio,
+		       COALESCE(NULLIF(model_state->>'pricePrecision','')::INT, 0),
+		       NULLIF(model_state->>'trailingSLFailAt','')
 		FROM grid_bots
 		WHERE autogrid_settings_id = $1 AND bu_order_id IS NOT NULL
 		  AND status IN ('RUNNING', 'STOP_REQUESTED', 'STOPPING')
@@ -4006,6 +4017,7 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 			&item.shiftRealizedBase, &item.lastRemoteGridProfit, &item.lastAdjustmentsCount,
 			&item.targetPrice, &item.stopLossPrice, &item.stopLossHigh, &item.trailingSLPrice,
 			&item.adaptiveStrategy, &item.riskRewardRatio,
+			&item.pricePrecision, &item.trailingSLFailAt,
 		); err != nil {
 			rows.Close()
 			return clampInterval(settings.ManageIntervalSeconds), err
@@ -4249,8 +4261,20 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 				// accepted only as a LOSS signal (see blindFloatingEstimate)
 				// so the books are never flattered nor invented against.
 				if est := blindFloatingEstimate(remote.BUOrderData.TotalProfit, realized); est.IsNegative() {
-					unrealized = est
-					blindFloatingFromExchange = true
+					// v2.0.155 (review SEC-001): a floating loss beyond the
+					// bot's whole notional (investment × leverage) is not a
+					// market move — it is a glitch or a poisoned response.
+					// Reject the signal with an Error page rather than close
+					// the fleet on it; the exchange's own LossStop keeps
+					// guarding the position either way.
+					if !blindEstimatePlausible(est, bot.investment, bot.leverage) {
+						worker.logger.Error("blind floating estimate beyond notional — signal rejected",
+							"component", "autogrid_worker", "bot_number", bot.botNumber,
+							"symbol", bot.symbol, "estimate", est.StringFixed(2))
+					} else {
+						unrealized = est
+						blindFloatingFromExchange = true
+					}
 				}
 			}
 
@@ -4474,9 +4498,20 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 		if bot.lastSignedPos != nil && !bot.lastSignedPos.IsZero() {
 			signedPosParam = bot.lastSignedPos
 		}
+		// v2.0.155: the floor-basis peak ratchets BEFORE the persist ships it.
+		// Since v2.0.119 the persist wrote the SCANNED value while the
+		// per-pass max lived only in the loop copy — peakFloorUsdt in the DB
+		// never grew, and TRAILING_TAKE_PROFIT/BREAKEVEN_LOCK compared the
+		// current total against a stale peak, keeping both exits dead
+		// cross-pass for every REAL bot.
+		peakFloorNow := realized.Add(supervisionFloor)
+		if bot.peakFloor != nil && bot.peakFloor.GreaterThan(peakFloorNow) {
+			peakFloorNow = *bot.peakFloor
+		}
+		bot.peakFloor = &peakFloorNow
 		var peakFloorParam *decimal.Decimal
-		if bot.peakFloor != nil && bot.peakFloor.IsPositive() {
-			peakFloorParam = bot.peakFloor
+		if peakFloorNow.IsPositive() {
+			peakFloorParam = &peakFloorNow
 		}
 		var shiftRealizedBaseParam *decimal.Decimal
 		if !bot.shiftRealizedBase.IsZero() {
@@ -4794,17 +4829,12 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 		if current := realized.Add(unrealized); current.GreaterThan(peakNow) {
 			peakNow = current
 		}
-		// v2.0.119: the trailing/breakeven engine must compare like with
-		// like. decideBotAction reads the total on the supervisionFloor
-		// basis, so its peak must be floored on the same basis — a raw-basis
-		// peak above the floor-basis total armed BREAKEVEN_LOCK on the very
-		// first floor dip (the v2.0.113 review's mixed-basis P2). The raw
-		// peak_pnl_usdt column stays untouched for display continuity.
-		peakFloorNow := realized.Add(supervisionFloor)
-		if bot.peakFloor != nil && bot.peakFloor.GreaterThan(peakFloorNow) {
-			peakFloorNow = *bot.peakFloor
-		}
-		bot.peakFloor = &peakFloorNow
+		// v2.0.119: the trailing/breakeven engine compares like with like —
+		// the peak rides the supervisionFloor basis (the raw peak_pnl_usdt
+		// column stays untouched for display continuity). v2.0.155: the
+		// ratchet now happens before the persist above; this is the same
+		// value, kept for the decision input below.
+		peakFloorNow = *bot.peakFloor
 		closeDecidedAt := time.Now()
 		var ofiRegime *string
 		var microBias *float64
@@ -4818,6 +4848,14 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 		ouHalfLife := 0.0
 		if ouReading.ok && ouReading.halfLifeHours > 0 {
 			ouHalfLife = ouReading.halfLifeHours
+		}
+		// v2.0.155: storm state (OU rotation deferral) and the trailing-SL
+		// precision — the grid's own accepted precision backs up a missing
+		// deploy-time marker.
+		stormNow := worker.stormActive()
+		trailPrecision := bot.pricePrecision
+		if trailPrecision <= 0 {
+			trailPrecision = paperTrailPrecision(bot.lower)
 		}
 
 		decision := decideBotAction(botActionInput{
@@ -4846,6 +4884,8 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 			SmartExitEnabled:  settings.SmartExitEnabled,
 			OFIHarvestEnabled: settings.OFIHarvestEnabled,
 			OURotationEnabled: settings.OURotationEnabled,
+			PricePrecision:    trailPrecision,
+			StormActive:       &stormNow,
 		})
 		// v2.0.93 FIX-E (paper-canonical order): the tranche-2 pour runs AFTER
 		// the stop decision, not before it. The old order poured on the very
@@ -5381,6 +5421,15 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 			if decision.TrailingSLPrice == nil || !decision.TrailingSLPrice.IsPositive() {
 				break
 			}
+			// v2.0.155: a failing updateTriggerProfitLoss must not machine-gun
+			// the exchange every manage pass — one retry per hour, the same
+			// backoff shape as the tranche-2 pour marker.
+			if bot.trailingSLFailAt != nil {
+				if failedAt, pErr := time.Parse(time.RFC3339, strings.TrimSpace(*bot.trailingSLFailAt)); pErr == nil &&
+					time.Since(failedAt) < time.Hour {
+					break
+				}
+			}
 			newSLStr := decision.TrailingSLPrice.String()
 			worker.logger.Info("advancing trailing stop-loss natively on Pionex bot card",
 				"component", "autogrid_worker", "bot_id", bot.id, "symbol", bot.symbol,
@@ -5401,10 +5450,22 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 				worker.logger.Error("failed to update native trailing stop-loss on Pionex",
 					"component", "autogrid_worker", "bot_id", bot.id, "remote_id", bot.remoteID,
 					"error", updateErr)
+				if _, mErr := worker.db.Exec(ctx, `
+					UPDATE grid_bots
+					SET model_state = jsonb_set(COALESCE(model_state, '{}'::jsonb), '{trailingSLFailAt}',
+						to_jsonb(to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'))),
+					    updated_at = NOW()
+					WHERE id = $1
+				`, bot.id); mErr != nil {
+					worker.logger.Warn("persist trailingSLFailAt backoff marker",
+						"component", "autogrid_worker", "bot_id", bot.id, "error", mErr)
+				}
 			} else {
 				_, _ = worker.db.Exec(ctx, `
 					UPDATE grid_bots
-					SET trailing_sl_price = $1, stop_loss_price = $1, updated_at = NOW()
+					SET trailing_sl_price = $1, stop_loss_price = $1,
+					    model_state = COALESCE(model_state, '{}'::jsonb) - 'trailingSLFailAt',
+					    updated_at = NOW()
 					WHERE id = $2
 				`, decision.TrailingSLPrice, bot.id)
 				_ = LogBotEvent(ctx, worker.db, bot.id, bot.botNumber, "REAL", bot.symbol, "TRAILING_SL_ADVANCED", &price, nil, map[string]any{
@@ -6113,6 +6174,8 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 		}
 	}
 
+	// v2.0.155 REAL-parity: the storm deferral rides the paper OU rotation too.
+	stormNow := worker.stormActive()
 	for _, bot := range bots {
 		price, ok := priceBySymbol[bot.symbol]
 		if !ok || price.IsZero() {
@@ -6272,7 +6335,10 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 		// break matrix so a stale range cannot hide behind a HOLD.
 		{
 			ageVerdict := gridAgeVerdictFor(worker.ouReadingForSymbol(ctx, bot.symbol, settings), time.Since(bot.openedAt))
-			if ageVerdict.rotate {
+			// v2.0.155 (review I-1): the paper pre-block rotation defers inside a
+			// fleet storm exactly like the REAL one — rotating INTO the
+			// acceleration crystallizes the bottom tick (v2.0.111 doctrine).
+			if ageVerdict.rotate && !stormNow {
 				_, err := worker.db.Exec(ctx, `
 					UPDATE paper_grid_bots
 					SET status = 'COMPLETED', closed_reason = $2,
@@ -6359,6 +6425,11 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 			SmartExitEnabled:  settings.SmartExitEnabled,
 			OFIHarvestEnabled: settings.OFIHarvestEnabled,
 			OURotationEnabled: settings.OURotationEnabled,
+			// v2.0.155 REAL-parity: the storm deferral and the trailing
+			// precision ride the paper arm too (the OU rotation and the
+			// trailing candidate must not diverge between the fleets).
+			PricePrecision: paperTrailPrecision(bot.lower),
+			StormActive:    &stormNow,
 		})
 
 		if decision.Action == ActionHold || decision.Action == ActionAdjustUp || decision.Action == ActionAdjustDown {

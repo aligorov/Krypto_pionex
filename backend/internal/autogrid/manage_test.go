@@ -803,6 +803,10 @@ func TestDecideBotActionTrailingSLAdvance(t *testing.T) {
 	input.PnLTarget = mustDecimal("20.0")
 	input.RealizedPNL = mustDecimal("12.0") // >= 50% of 20.0
 	input.CurrentPrice = mustDecimal("100.0")
+	// v2.0.155: the trail advances only a bot that carries a native card
+	// stop (ADAPTIVE_ATR deploy); a NONE-mode bot must not gain one.
+	cardSL := mustDecimal("80.0")
+	input.StopLossPrice = &cardSL
 
 	decision := decideBotAction(input)
 	if decision.Action != ActionUpdateTrailingSL || decision.Reason != "TRAILING_SL_ADVANCE" {

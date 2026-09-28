@@ -50,6 +50,19 @@ func blindFloatingEstimate(remoteTotal, realized decimal.Decimal) decimal.Decima
 	return decimal.Zero
 }
 
+// blindEstimatePlausible bounds the blind loss signal at the bot's whole
+// notional (v2.0.155, review SEC-001): a floating loss beyond investment ×
+// leverage is not a market move — it is a glitch or a poisoned response,
+// and the blind lane must reject it (the exchange's own LossStop keeps
+// guarding the position regardless).
+func blindEstimatePlausible(est, investment decimal.Decimal, leverage int) bool {
+	if leverage < 1 {
+		leverage = 1
+	}
+	bound := investment.Mul(decimal.NewFromInt(int64(leverage)))
+	return !est.LessThan(bound.Neg())
+}
+
 // blindStopsEvaluate runs the price-independent exits for one bot whose
 // price is missing this pass. Only CLOSE_STOP_LOSS / CLOSE_TAKE_PROFIT can
 // fire: decideBotAction holds the anti-hunt and range-break branches on a
@@ -179,7 +192,12 @@ func (worker *Worker) markPriceFeedBlind(detail string) {
 		"component", "autogrid_worker", "detail", detail,
 		"blind_since", worker.priceFeedBlindSince.Format(time.RFC3339))
 	if worker.db != nil {
-		_ = QueueTelegramEvent(context.Background(), worker.db, "EMERGENCY", map[string]any{
+		// v2.0.155 (review SEC-004): the EMERGENCY page is best-effort
+		// telemetry — a bounded context keeps a black-holed Postgres
+		// connection from parking the supervision goroutine forever.
+		tgCtx, tgCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer tgCancel()
+		_ = QueueTelegramEvent(tgCtx, worker.db, "EMERGENCY", map[string]any{
 			"message": "🚨 Прайс-фид слеп >10 мин: ценовые выходы (anti-hunt/range-break) разоружены, PnL-стопы переведены на биржевой тотал — проверь indexes/WS/tickers",
 		})
 	}

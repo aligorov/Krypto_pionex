@@ -109,9 +109,17 @@ func (worker *Worker) radarBreakFlip(ctx context.Context, settings Settings, b r
 	// applyExchangeFinal can measure EXIT_SLIPPAGE for break-flip closes
 	// too (the NEAR #1401 overshoot was caught by exactly this figure).
 	// b.total is already on the floor basis (realized + supervisionFloor,
-	// realRadarInputs).
-	active, intentErr := worker.recordCloseIntent(ctx, b.botID, breakReason, total)
-	if intentErr != nil || !active {
+	// realRadarInputs). v2.0.155 (SEC-003): the FIRST-WRITER variant — only
+	// the writer that flips RUNNING stamps the baseline, atomically; a
+	// concurrent operator close must not get a second page or a DGT
+	// re-deploy queued behind it.
+	active, intentErr := worker.recordCloseIntentFirstWriter(ctx, b.botID, breakReason, total)
+	if intentErr != nil {
+		worker.logger.Error("radar break-flip: close intent persist failed",
+			"component", "autogrid_worker", "bot_id", b.botID, "error", intentErr)
+		return false
+	}
+	if !active {
 		return false
 	}
 	worker.logger.Warn("radar break-flip: escape lane closes the grid for DGT re-deploy",
@@ -254,20 +262,14 @@ func (worker *Worker) radarMicrostructureEmergencyExit(ctx context.Context, sett
 	if b.botSource == "REAL" {
 		now := time.Now().UTC()
 		nowStr := now.Format(time.RFC3339)
-		// Single-fire contract preserved from the direct UPDATE this
-		// replaced: only a RUNNING bot pages the emergency lane; an
-		// already-requested bot keeps its original intent baseline.
-		var runningStatus string
-		if err := worker.db.QueryRow(ctx, `
-			SELECT status FROM grid_bots WHERE id = $1
-		`, b.botID).Scan(&runningStatus); err != nil || runningStatus != "RUNNING" {
-			worker.armEmergencyExitDebounce(b.botID, 2*time.Second)
-			return false
-		}
-		// v2.0.149 (exit audit F2): same durable intent writer as a sighted
-		// stop — stopIntentTotal makes the emergency closes visible to the
-		// EXIT_SLIPPAGE telemetry (b.total is the radar floor basis).
-		active, intentErr := worker.recordCloseIntent(ctx, b.botID, adverseReason, b.total)
+		// v2.0.149 (exit audit F2) + v2.0.155 (SEC-003): the FIRST-WRITER
+		// intent — atomically flips only a RUNNING bot and stamps the
+		// stopIntentTotal baseline (b.total, the radar floor basis) so the
+		// emergency closes join the EXIT_SLIPPAGE telemetry. The old
+		// SELECT-then-UPDATE pair had a TOCTOU window that double-paged and
+		// re-queued DGT behind a concurrent operator close; the single
+		// statement removes the window outright.
+		active, intentErr := worker.recordCloseIntentFirstWriter(ctx, b.botID, adverseReason, b.total)
 		if intentErr != nil || !active {
 			worker.armEmergencyExitDebounce(b.botID, 2*time.Second)
 			return false

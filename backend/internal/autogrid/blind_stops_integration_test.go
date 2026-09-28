@@ -46,6 +46,18 @@ func newBlindExchangeMock(t *testing.T) *blindExchangeMock {
 				"totalProfit": "-18.5",
 				"riskStatus":  "NORMAL",
 			},
+			// BLIND-C: a POISONED exchange total (v2.0.155 SEC-001) — the
+			// implied floating loss (−5001.5) is far beyond the bot's whole
+			// notional ($100 at 1x): the signal must be rejected, no stop,
+			// no mask, the bot stays RUNNING.
+			"BLIND-C": {
+				"top": "320", "bottom": "300", "row": 20,
+				"gridType": "arithmetic", "trend": "no_trend", "leverage": 1,
+				"position": "0.5", "positionOpenPrice": "300",
+				"profitReduce": "1.5", "profitWithdrawn": "0",
+				"totalProfit": "-5000",
+				"riskStatus":  "NORMAL",
+			},
 			// BLIND-B: positive exchange total → the estimate is rejected
 			// (fail-closed: never flatter the books) → unrealized stays 0,
 			// the bot stays RUNNING, nothing is masked as a loss.
@@ -224,6 +236,7 @@ func TestBlindStopsIntegration(t *testing.T) {
 	for _, spec := range []struct{ buID, lower, upper string }{
 		{"BLIND-A", "100", "120"},
 		{"BLIND-B", "200", "240"},
+		{"BLIND-C", "300", "320"},
 	} {
 		var botID string
 		err = pool.QueryRow(ctx, `
@@ -308,6 +321,22 @@ func TestBlindStopsIntegration(t *testing.T) {
 	}
 	if got := decimal.RequireFromString(bUnrealized); !got.IsZero() {
 		t.Fatalf("BLIND-B unrealized = %s, want 0 (positive estimate rejected)", bUnrealized)
+	}
+
+	// BLIND-C: the poisoned total is rejected outright — no stop, no mask.
+	var cStatus, cIntent, cUnrealized, cMarker string
+	if err := pool.QueryRow(ctx, `
+		SELECT status, COALESCE(model_state->>'stopIntentTotal',''),
+		       unrealized_pnl_usdt::TEXT, COALESCE(model_state->>'priceFeedBlindFloating','')
+		FROM grid_bots WHERE id = $1
+	`, botIDs["BLIND-C"]).Scan(&cStatus, &cIntent, &cUnrealized, &cMarker); err != nil {
+		t.Fatalf("load BLIND-C: %v", err)
+	}
+	if cStatus != "RUNNING" || cIntent != "" || cMarker != "" {
+		t.Fatalf("BLIND-C must stay untouched RUNNING (poisoned signal rejected), got %s/%q/%q", cStatus, cIntent, cMarker)
+	}
+	if got := decimal.RequireFromString(cUnrealized); !got.IsZero() {
+		t.Fatalf("BLIND-C unrealized = %s, want 0 (beyond-notional estimate rejected)", cUnrealized)
 	}
 
 	// The blindness episode is tracked on the worker.

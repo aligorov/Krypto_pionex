@@ -51,6 +51,14 @@ type botActionInput struct {
 	SmartExitEnabled  bool
 	OFIHarvestEnabled bool
 	OURotationEnabled bool
+	// PricePrecision is the symbol's quote precision (deploy-time scanner
+	// reading, model_state.carried): the trailing-SL candidate rounds to it —
+	// a fixed Round(4) zeroed sub-cent perps and missed quote precision on
+	// BTC-class symbols (v2.0.155). 0 = fall back to 4.
+	PricePrecision int
+	// StormActive defers the OU rotation inside a fleet-wide acceleration
+	// (v2.0.111 doctrine, worker-parity; nil = storm unknown, rotate).
+	StormActive *bool
 }
 
 type manageDecision struct {
@@ -134,11 +142,22 @@ func decideBotAction(input botActionInput) manageDecision {
 		}
 	}
 
-	// 1.8 Trailing Stop Loss Advance: if bot is in significant profit (>= 50% of target), advance native SL
-	if input.PnLTarget.GreaterThan(decimal.Zero) && total.GreaterThanOrEqual(input.PnLTarget.Mul(decimal.NewFromFloat(0.50))) && input.CurrentPrice.GreaterThan(decimal.Zero) {
+	// 1.8 Trailing Stop Loss Advance: if bot is in significant profit (>= 50% of target), advance native SL.
+	// v2.0.155: only a bot that CARRIES a native card stop (StopLossPrice
+	// set — deployed under ADAPTIVE_ATR) may have it trailed; a NONE-mode bot
+	// must not gain a card stop through the update endpoint. The candidate
+	// rounds to the symbol's price precision — a fixed Round(4) zeroed
+	// sub-cent perps (the PEPE failure class) and could miss quote precision
+	// on BTC-class symbols.
+	if input.PnLTarget.GreaterThan(decimal.Zero) && total.GreaterThanOrEqual(input.PnLTarget.Mul(decimal.NewFromFloat(0.50))) && input.CurrentPrice.GreaterThan(decimal.Zero) &&
+		input.StopLossPrice != nil {
+		trailPrec := int32(4)
+		if input.PricePrecision > 0 {
+			trailPrec = int32(input.PricePrecision)
+		}
 		var candidateSL decimal.Decimal
 		if input.Direction == "LONG" {
-			candidateSL = input.CurrentPrice.Mul(decimal.NewFromFloat(0.985)).Round(4)
+			candidateSL = input.CurrentPrice.Mul(decimal.NewFromFloat(0.985)).Round(trailPrec)
 			if (input.TrailingSLPrice == nil || candidateSL.GreaterThan(*input.TrailingSLPrice)) &&
 				(input.StopLossPrice == nil || candidateSL.GreaterThan(*input.StopLossPrice)) {
 				return manageDecision{
@@ -148,7 +167,7 @@ func decideBotAction(input botActionInput) manageDecision {
 				}
 			}
 		} else if input.Direction == "SHORT" {
-			candidateSL = input.CurrentPrice.Mul(decimal.NewFromFloat(1.015)).Round(4)
+			candidateSL = input.CurrentPrice.Mul(decimal.NewFromFloat(1.015)).Round(trailPrec)
 			if (input.TrailingSLPrice == nil || candidateSL.LessThan(*input.TrailingSLPrice)) &&
 				(input.StopLossPrice == nil || candidateSL.LessThan(*input.StopLossPrice)) {
 				return manageDecision{
@@ -160,10 +179,21 @@ func decideBotAction(input botActionInput) manageDecision {
 		}
 	}
 
-	// 1.9 Ornstein-Uhlenbeck Half-Life Rotation: prevents capital lock-in during prolonged flat consolidation
-	if input.OURotationEnabled && input.OUHalfLifeHours > 0 && input.AgeHours > 2.0*input.OUHalfLifeHours {
-		if total.Abs().LessThan(input.Budget.Mul(decimal.NewFromFloat(0.01))) {
-			return manageDecision{Action: ActionCloseOURotation, Reason: "OU_HALFLIFE_ROTATION"}
+	// 1.9 Ornstein-Uhlenbeck Half-Life Rotation: prevents capital lock-in during prolonged flat consolidation.
+	// v2.0.155 parity with the worker's GRID_AGED_HALF_LIFE: the v2.0.89
+	// 4-hour floor (no rotation before it, whatever the fast OU fit says) and
+	// the v2.0.111 storm deferral — rotating INTO a fleet-wide acceleration
+	// crystallizes the bottom tick (ICP #1381 −$4.34).
+	if input.OURotationEnabled && input.OUHalfLifeHours > 0 {
+		maxAgeHours := 2.0 * input.OUHalfLifeHours
+		if maxAgeHours < 4.0 {
+			maxAgeHours = 4.0
+		}
+		stormDefer := input.StormActive != nil && *input.StormActive
+		if input.AgeHours > maxAgeHours && !stormDefer {
+			if total.Abs().LessThan(input.Budget.Mul(decimal.NewFromFloat(0.01))) {
+				return manageDecision{Action: ActionCloseOURotation, Reason: "OU_HALFLIFE_ROTATION"}
+			}
 		}
 	}
 
@@ -611,4 +641,18 @@ func fundingAccrual(
 	}
 	next := anchor.Add(time.Duration(boundaries) * fundingInterval)
 	return &delta, &next
+}
+
+// paperTrailPrecision derives the trailing-SL rounding scale for the paper
+// arm from the grid's own lower bound (v2.0.155 review I-2): paper rows
+// carry no deploy-time precision marker, and the exchange-accepted lower
+// price is the best witness of the symbol's tick scale. Capped at 8 like
+// the deploy heuristic.
+func paperTrailPrecision(lower decimal.Decimal) int {
+	if exp := lower.Exponent(); exp < 0 {
+		if prec := int(-exp); prec > 0 && prec <= 8 {
+			return prec
+		}
+	}
+	return 4
 }
