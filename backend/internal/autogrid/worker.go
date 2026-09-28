@@ -112,6 +112,17 @@ type Worker struct {
 	// dataAlarmAt dedups data-health alarms to one per feed per 24h
 	// (same single-goroutine argument as trancheTBRegime).
 	dataAlarmAt map[string]time.Time
+	// priceFeedBlindSince / priceFeedBlindLastAlarm track the v2.0.149
+	// price-feed blindness episode (exit audit F1): non-nil Since while any
+	// supervised bot has no price, EMERGENCY page after 10 minutes repeated
+	// at most hourly (same single-goroutine argument as trancheTBRegime —
+	// the manage loop is the only writer). priceFeedBlindLastPass carries
+	// "the previous pass ended blind" across passes so a partial outage
+	// (healthy map, missing symbol) cannot close the episode early (review
+	// P2-1: episode churn kept the 10-minute page forever unreachable).
+	priceFeedBlindSince     *time.Time
+	priceFeedBlindLastAlarm time.Time
+	priceFeedBlindLastPass  bool
 	// radarPriceTrail is the in-memory symbol→(ts,price) pair behind the
 	// v2.0.85 band-2 velocity trigger: two consecutive radar passes measure
 	// the speed toward the adverse edge (same single-goroutine argument as
@@ -2875,6 +2886,21 @@ func (worker *Worker) deployReal(
 			// post-top-up stop then covers the doubled inventory too.
 			invest: slotBudget,
 		})
+		// v2.0.149 (exit audit F3): FIXED mode with a zero target/loss
+		// resolves to nil,nil — such a bot carries NO stop anywhere (the
+		// local exits read 0 = off and no exchange LossStop is sent at
+		// create). The settings plane already rejects the combination
+		// (validateSettings), but a raw SQL settings edit must not be
+		// able to buy an unprotected grid: refuse the deploy outright.
+		if botTarget == nil || botMaxLoss == nil {
+			deployErrors = append(deployErrors, fmt.Sprintf(
+				"%s: no target/loss resolved (FIXED без стопа?) — deploy refused",
+				candidate.Symbol))
+			worker.rejectCandidate(ctx, candidate,
+				"деплой без таргета/стопа отказан: FIXED-режим с нулевым MaxLossUSDT/PnLTargetUSDT оставляет бота вообще без защиты (аудит выхода F3)",
+				map[string]any{"stopUnarmedRefusal": true})
+			continue
+		}
 		// v2.0.139 stress-inventory gate (paper parity): the floor keeps the
 		// STORED stop honest, but a geometry whose full-traverse loss
 		// overflows the tranche-2 effective-stop ceiling (DynamicLossMaxPct ×
@@ -3631,6 +3657,44 @@ func (worker *Worker) settleTerminalFinal(
 	}
 }
 
+type managedBot struct {
+	id, accountID, remoteID, localStatus, symbol, direction string
+	lower, upper                                            decimal.Decimal
+	rowNum, adjustments, leverage                           int
+	pnlTarget, maxLoss                                      *decimal.Decimal
+	antiHuntStop                                            *decimal.Decimal
+	investment                                              decimal.Decimal
+	botNumber                                               int
+	peak                                                    decimal.Decimal
+	createdAt                                               time.Time
+	closedReason                                            string
+	trancheDeployed                                         int
+	trancheBase                                             *string
+	trancheEntry                                            *string
+	atrEntry                                                float64
+	trancheFailAt                                           *string
+	trancheIntentAt                                         *string
+	fundingPaid                                             decimal.Decimal
+	lastFundingReconcileAt                                  *time.Time
+	shiftFloatingOffset                                     decimal.Decimal
+	shiftPosition                                           decimal.Decimal
+	supervisionFloor                                        decimal.Decimal
+	rebasePool                                              decimal.Decimal
+	lastEntryMark                                           *decimal.Decimal
+	lastSignedPos                                           *decimal.Decimal
+	wickShieldTriggeredAt                                   *string
+	wickShieldExtreme                                       *decimal.Decimal
+	wickShieldLastClearedAt                                 *string
+	rebasePos                                               decimal.Decimal
+	peakFloor                                               *decimal.Decimal
+	shiftRealizedBase                                       decimal.Decimal
+	lastRemoteGridProfit                                    decimal.Decimal
+	lastAdjustmentsCount                                    int
+}
+
+// managedBot is the per-pass supervision row for REAL bots (v2.0.149:
+// hoisted to package level so the blind-stop helper can share it).
+
 func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 	settings, err := worker.service.GetSettings(ctx)
 	if err != nil {
@@ -3751,6 +3815,10 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 	if priceErr != nil {
 		worker.logger.Warn("fetch tickers for management", "component", "autogrid_worker", "error", priceErr)
 	}
+	// v2.0.149 (exit audit F1): a failed or empty price map is a blindness
+	// episode, not a WARN — the PnL stops degrade to the exchange-total
+	// basis and the price exits disarm until the feed recovers.
+	worker.notePriceFeedMapHealth(priceErr != nil || len(priceBySymbol) == 0)
 	rows, err := worker.db.Query(ctx, `
 		SELECT id, account_id, bu_order_id, status, symbol, direction,
 		       lower_price, upper_price, grid_num, adjustments_count,
@@ -3785,40 +3853,6 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 	`, settings.ID)
 	if err != nil {
 		return clampInterval(settings.ManageIntervalSeconds), err
-	}
-	type managedBot struct {
-		id, accountID, remoteID, localStatus, symbol, direction string
-		lower, upper                                            decimal.Decimal
-		rowNum, adjustments, leverage                           int
-		pnlTarget, maxLoss                                      *decimal.Decimal
-		antiHuntStop                                            *decimal.Decimal
-		investment                                              decimal.Decimal
-		botNumber                                               int
-		peak                                                    decimal.Decimal
-		createdAt                                               time.Time
-		closedReason                                            string
-		trancheDeployed                                         int
-		trancheBase                                             *string
-		trancheEntry                                            *string
-		atrEntry                                                float64
-		trancheFailAt                                           *string
-		trancheIntentAt                                         *string
-		fundingPaid                                             decimal.Decimal
-		lastFundingReconcileAt                                  *time.Time
-		shiftFloatingOffset                                     decimal.Decimal
-		shiftPosition                                           decimal.Decimal
-		supervisionFloor                                        decimal.Decimal
-		rebasePool                                              decimal.Decimal
-		lastEntryMark                                           *decimal.Decimal
-		lastSignedPos                                           *decimal.Decimal
-		wickShieldTriggeredAt                                   *string
-		wickShieldExtreme                                       *decimal.Decimal
-		wickShieldLastClearedAt                                 *string
-		rebasePos                                               decimal.Decimal
-		peakFloor                                               *decimal.Decimal
-		shiftRealizedBase                                       decimal.Decimal
-		lastRemoteGridProfit                                    decimal.Decimal
-		lastAdjustmentsCount                                    int
 	}
 	bots := make([]managedBot, 0)
 	for rows.Next() {
@@ -4027,6 +4061,11 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 		unrealized := decimal.Zero
 		supervisionFloor := decimal.Zero
 		currentEntry := remote.BUOrderData.PositionOpenPrice
+		// v2.0.149 (exit audit F1): set when the floating leg had to be
+		// taken from the exchange total because the local price is dead —
+		// the marker lands in model_state and is stripped on the first
+		// healthy pass.
+		blindFloatingFromExchange := false
 
 		isZeroPos := remote.BUOrderData.Position.IsZero()
 		var signedPos decimal.Decimal
@@ -4069,6 +4108,16 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 			// Raw unrealized matches the exchange app's Floating PnL using the payload's PositionOpenPrice
 			if currentEntry.GreaterThan(decimal.Zero) && price.GreaterThan(decimal.Zero) {
 				unrealized = signedPos.Mul(price.Sub(currentEntry))
+			} else if !price.GreaterThan(decimal.Zero) {
+				// v2.0.149 (exit audit F1): a dead price must not zero-mask
+				// the floating leg. TotalProfit is the exchange's own
+				// grid+floating total and needs no local price; it is
+				// accepted only as a LOSS signal (see blindFloatingEstimate)
+				// so the books are never flattered nor invented against.
+				if est := blindFloatingEstimate(remote.BUOrderData.TotalProfit, realized); est.IsNegative() {
+					unrealized = est
+					blindFloatingFromExchange = true
+				}
 			}
 
 			// Point Д.1 & Д.5: Rebase detection across passes.
@@ -4346,7 +4395,7 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 					WHEN $8::BOOLEAN THEN
 						COALESCE(model_state, '{}'::jsonb) - 'shiftFloatingOffset' - 'shiftPosition' - 'rebasePool' - 'rebasePos' - 'payloadEntryMark' - 'payloadSignedPos'
 					ELSE
-						(COALESCE(model_state, '{}'::jsonb) - 'rebasePool' - 'rebasePos' - 'payloadEntryMark' - 'payloadSignedPos' - 'peakFloorUsdt' - 'shiftRealizedBase' - 'lastRemoteGridProfit' - 'lastAdjustmentsCount' - 'ofiRegime' - 'ofiScore' - 'microPriceBiasBps')
+						(COALESCE(model_state, '{}'::jsonb) - 'rebasePool' - 'rebasePos' - 'payloadEntryMark' - 'payloadSignedPos' - 'peakFloorUsdt' - 'shiftRealizedBase' - 'lastRemoteGridProfit' - 'lastAdjustmentsCount' - 'ofiRegime' - 'ofiScore' - 'microPriceBiasBps' - 'priceFeedBlindFloating')
 						|| jsonb_strip_nulls(jsonb_build_object(
 							'payloadEntryMark', $9::NUMERIC,
 							'rebasePool', $10::NUMERIC,
@@ -4370,6 +4419,20 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 			worker.logger.Error("persist remote grid truth and PnL",
 				"component", "autogrid_worker", "bot_id", bot.id, "error", err)
 		}
+		if blindFloatingFromExchange {
+			// v2.0.149 (exit audit F1): post-mortem marker — this pass's
+			// unrealized came from the exchange total while the local price
+			// was dead; the healthy strip above clears it on recovery.
+			if _, err := worker.db.Exec(ctx, `
+				UPDATE grid_bots
+				SET model_state = COALESCE(model_state, '{}'::jsonb) || jsonb_build_object('priceFeedBlindFloating', true),
+				    updated_at = NOW()
+				WHERE id = $1
+			`, bot.id); err != nil {
+				worker.logger.Warn("persist priceFeedBlindFloating marker",
+					"component", "autogrid_worker", "bot_id", bot.id, "error", err)
+			}
+		}
 
 		if bot.localStatus != "RUNNING" {
 			var reconciliation string
@@ -4388,6 +4451,15 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 			continue
 		}
 		if price.IsZero() {
+			// v2.0.149 (exit audit F1): a dead price disarms only the
+			// price-dependent exits. The PnL exits — max-loss, take-profit,
+			// trailing — keep firing on the floor basis (unrealized from the
+			// exchange total where it honestly signals a loss): the
+			// 2026-09-25..27 overshoot class (SUI/DOT/ORDI/NEAR, 4/4 stops
+			// past the cap) grew exactly from this branch being a silent
+			// continue.
+			worker.notePriceFeedBotBlind(bot.symbol, bot.botNumber)
+			worker.blindStopsEvaluate(ctx, client, settings, bot, realized, supervisionFloor)
 			continue
 		}
 		// v2.0.89 part B — OU half-life age rotation (REAL arm, paper-parity):

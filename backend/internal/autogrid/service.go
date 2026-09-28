@@ -1801,9 +1801,18 @@ func (s *Service) RequestBotClose(ctx context.Context, settingsID, botID, reason
 	// v2.0.78 CRIT-3: a stop request on a row without a buOrderId creates a
 	// STOP_REQUESTED zombie (no remote id → no supervision, no adoption) that
 	// blocks the symbol; NULL-bu rows stay with the adoption reconciler.
+	// v2.0.149 (exit audit F2): the operator close stamps the same
+	// stopIntentTotal baseline the manage closes carry (realized + floor),
+	// server-side on the first request, so EXIT_SLIPPAGE covers manual
+	// closes too; a second writer never rewrites the baseline.
 	tag, err := s.db.Exec(ctx, `
 		UPDATE grid_bots
-		SET status = 'STOP_REQUESTED', closed_reason = $3, updated_at = NOW()
+		SET status = 'STOP_REQUESTED', closed_reason = $3,
+		    model_state = CASE WHEN model_state->>'stopIntentTotal' IS NOT NULL THEN model_state
+		        ELSE COALESCE(model_state, '{}'::jsonb) || jsonb_build_object(
+		            'stopIntentTotal', COALESCE(realized_pnl_usdt, 0) + COALESCE(supervision_floor_pnl_usdt, unrealized_pnl_usdt, 0),
+		            'stopIntentAt', NOW()) END,
+		    updated_at = NOW()
 		WHERE id = $1 AND autogrid_settings_id = $2
 		  AND bu_order_id IS NOT NULL
 		  AND status IN ('PENDING_SUBMISSION', 'SUBMISSION_UNKNOWN', 'RUNNING')

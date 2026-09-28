@@ -104,12 +104,14 @@ func (worker *Worker) radarBreakFlip(ctx context.Context, settings Settings, b r
 		return false
 	}
 
-	tag, err := worker.db.Exec(ctx, `
-		UPDATE grid_bots
-		SET status = 'STOP_REQUESTED', closed_reason = $2, updated_at = NOW()
-		WHERE id = $1 AND status = 'RUNNING'
-	`, b.botID, breakReason)
-	if err != nil || tag.RowsAffected() == 0 {
+	// v2.0.149 (exit audit F2): the escape lane rides the same durable
+	// intent writer as a sighted stop — stopIntentTotal lands on the row so
+	// applyExchangeFinal can measure EXIT_SLIPPAGE for break-flip closes
+	// too (the NEAR #1401 overshoot was caught by exactly this figure).
+	// b.total is already on the floor basis (realized + supervisionFloor,
+	// realRadarInputs).
+	active, intentErr := worker.recordCloseIntent(ctx, b.botID, breakReason, total)
+	if intentErr != nil || !active {
 		return false
 	}
 	worker.logger.Warn("radar break-flip: escape lane closes the grid for DGT re-deploy",
@@ -157,15 +159,15 @@ func (worker *Worker) radarBreakFlip(ctx context.Context, settings Settings, b r
 // It bypasses the 90s radar score throttle, up to 2-hour recenter cooldowns, and 3-snapshot dwell gates.
 //
 // In SHADOW mode (settings.StopForecastMode != "ACTIVE"):
-// - Strictly observational: emits STOP_FORECAST_SHADOW events and Telegram advisory,
-//   arms 2m shadow debounce, and never touches bot state or trading execution.
+//   - Strictly observational: emits STOP_FORECAST_SHADOW events and Telegram advisory,
+//     arms 2m shadow debounce, and never touches bot state or trading execution.
 //
 // In ACTIVE mode (settings.StopForecastMode == "ACTIVE"):
-// - REAL NEUTRAL bots with DGT re-deploy enabled: executes radarBreakFlip (closes grid & queues center-aligned re-deploy).
-// - Directional bots (LONG / SHORT), REAL bots without DgtRedeploy, and PAPER bots:
-//   executes an immediate direct emergency protective stop (EMERGENCY_OFI_DUMP or EMERGENCY_OFI_PUMP).
-//   On DB write failure: arms 2s transient backoff.
-//   On successful DB write: arms 30s debounce and records requested_at timestamp.
+//   - REAL NEUTRAL bots with DGT re-deploy enabled: executes radarBreakFlip (closes grid & queues center-aligned re-deploy).
+//   - Directional bots (LONG / SHORT), REAL bots without DgtRedeploy, and PAPER bots:
+//     executes an immediate direct emergency protective stop (EMERGENCY_OFI_DUMP or EMERGENCY_OFI_PUMP).
+//     On DB write failure: arms 2s transient backoff.
+//     On successful DB write: arms 30s debounce and records requested_at timestamp.
 func (worker *Worker) radarMicrostructureEmergencyExit(ctx context.Context, settings Settings, b radarInput) bool {
 	if !b.ofiActionable {
 		return false
@@ -252,12 +254,21 @@ func (worker *Worker) radarMicrostructureEmergencyExit(ctx context.Context, sett
 	if b.botSource == "REAL" {
 		now := time.Now().UTC()
 		nowStr := now.Format(time.RFC3339)
-		tag, err := worker.db.Exec(ctx, `
-			UPDATE grid_bots
-			SET status = 'STOP_REQUESTED', closed_reason = $2, updated_at = NOW()
-			WHERE id = $1 AND status = 'RUNNING'
-		`, b.botID, adverseReason)
-		if err != nil || tag.RowsAffected() == 0 {
+		// Single-fire contract preserved from the direct UPDATE this
+		// replaced: only a RUNNING bot pages the emergency lane; an
+		// already-requested bot keeps its original intent baseline.
+		var runningStatus string
+		if err := worker.db.QueryRow(ctx, `
+			SELECT status FROM grid_bots WHERE id = $1
+		`, b.botID).Scan(&runningStatus); err != nil || runningStatus != "RUNNING" {
+			worker.armEmergencyExitDebounce(b.botID, 2*time.Second)
+			return false
+		}
+		// v2.0.149 (exit audit F2): same durable intent writer as a sighted
+		// stop — stopIntentTotal makes the emergency closes visible to the
+		// EXIT_SLIPPAGE telemetry (b.total is the radar floor basis).
+		active, intentErr := worker.recordCloseIntent(ctx, b.botID, adverseReason, b.total)
+		if intentErr != nil || !active {
 			worker.armEmergencyExitDebounce(b.botID, 2*time.Second)
 			return false
 		}
