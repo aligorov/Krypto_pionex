@@ -62,6 +62,12 @@ type CreateInput struct {
 	TrailingSLPrice  *decimal.Decimal
 	AdaptiveStrategy *string
 	RiskRewardRatio  *decimal.Decimal
+	// LiqPriceUp/LiqPriceDown carry the deploy-time liquidation estimates
+	// from futuresGrid/checkParams (v2.0.161 liquidation guard) so the
+	// supervision loop and analytics see the wall the geometry was built
+	// against. nil = the exchange returned no estimate.
+	LiqPriceUp   *decimal.Decimal
+	LiqPriceDown *decimal.Decimal
 }
 
 func NewLifecycleManager(db *pgxpool.Pool, pionexClient *pionex.Client) *LifecycleManager {
@@ -137,11 +143,12 @@ func (manager *LifecycleManager) CreateGridBot(
 				request_fingerprint, execution_mode, reconciliation_state,
 				pnl_target_usdt, max_loss_usdt, anti_hunt_stop_price, struct_context,
 				model_state, target_price, stop_loss_price, stop_loss_high,
-				trailing_sl_price, adaptive_strategy, risk_reward_ratio
+				trailing_sl_price, adaptive_strategy, risk_reward_ratio,
+				liq_price_up, liq_price_down
 			) VALUES (
 				$1, $2, $3, 'PENDING_SUBMISSION', $4, $5, $6, $7, $8, $9,
 				$10, $11, $12, $13, $14, 'REAL', 'PENDING', $15, $16, $17, $18,
-				$19::JSONB, $20, $21, $22, $23, $24, $25
+				$19::JSONB, $20, $21, $22, $23, $24, $25, $26, $27
 			)
 			ON CONFLICT (request_fingerprint) DO NOTHING
 			RETURNING id
@@ -168,6 +175,8 @@ func (manager *LifecycleManager) CreateGridBot(
 			input.TrailingSLPrice,
 			input.AdaptiveStrategy,
 			input.RiskRewardRatio,
+			input.LiqPriceUp,
+			input.LiqPriceDown,
 		).Scan(&gridID)
 		if errors.Is(insertErr, pgx.ErrNoRows) {
 			loadErr := tx.QueryRow(ctx, `

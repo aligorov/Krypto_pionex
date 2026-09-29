@@ -1215,6 +1215,7 @@ func (worker *Worker) dgtRedeployReal(ctx context.Context, settings Settings, sp
 	params := pionex.NativeFuturesGridCreateParams{
 		Base: futuresBase, Quote: quote, BUOrderData: data,
 	}
+	var liqEstUp, liqEstDown *decimal.Decimal
 	if check, checkErr := client.CheckFuturesGridParams(ctx, params); checkErr != nil {
 		worker.noteDgtSkip(ctx, spec, "REAL", "checkParams: "+checkErr.Error())
 		return false
@@ -1223,6 +1224,24 @@ func (worker *Worker) dgtRedeployReal(ctx context.Context, settings Settings, sp
 		worker.noteDgtSkip(ctx, spec, "REAL",
 			fmt.Sprintf("бюджет %s ниже минимума биржи %s", investAmount.String(), check.GetMinInvestment().String()))
 		return false
+	} else if check != nil {
+		// v2.0.161 review P2: the re-centered grid is the same real-money
+		// exposure class as a fresh deploy — the liquidation guard mirrors
+		// here, with the re-deploy's own stop ladder and break price.
+		if check.EstimateLiquidationUp.GreaterThan(decimal.Zero) {
+			v := check.EstimateLiquidationUp
+			liqEstUp = &v
+		}
+		if check.EstimateLiquidationDown.GreaterThan(decimal.Zero) {
+			v := check.EstimateLiquidationDown
+			liqEstDown = &v
+		}
+		stopLowDec := derefZero(stopLossPriceDec)
+		if reason := liquidationGuardReason(trendForExchange(spec.direction), spec.breakPrice,
+			derefZero(liqEstDown), derefZero(liqEstUp), stopLowDec, stopLossHighDec, botLev); reason != "" {
+			worker.noteDgtSkip(ctx, spec, "REAL", reason)
+			return false
+		}
 	}
 
 	manager := grid.NewLifecycleManager(worker.db, client)
@@ -1253,6 +1272,8 @@ func (worker *Worker) dgtRedeployReal(ctx context.Context, settings Settings, sp
 		TrailingSLPrice:  stopLossPriceDec,
 		AdaptiveStrategy: &adaptiveStrat,
 		RiskRewardRatio:  &riskRewardDec,
+		LiqPriceUp:       liqEstUp,
+		LiqPriceDown:     liqEstDown,
 	})
 	if createErr != nil {
 		if errors.Is(createErr, grid.ErrDuplicateActiveBot) {

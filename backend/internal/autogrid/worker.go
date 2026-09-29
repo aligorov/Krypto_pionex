@@ -1190,16 +1190,18 @@ func (worker *Worker) deployPaper(
 			continue
 		}
 		if !isEntryTimingFavorable(candidate) {
-			if !betaDownShortExempt(candidate, betaDown) {
+			v := directionalTrendExempt(candidate, betaDown)
+			if !v.Exempt {
 				worker.rejectCandidate(ctx, candidate,
 					"вход-тайминг: текущая позиция в канале вне благоприятной зоны для этого направления", nil)
 				continue
 			}
-			// v2.0.147 attribution marker: this short entered ONLY because the
-			// beta-down exemption lifted entry-timing — persisted into
-			// model_assumptions so the 14-day follow-up can partition realized
-			// outcomes by entry cohort and validate or roll back on evidence.
-			candidate.ModelAssumptions["betaDownExempt"] = true
+			// v2.0.147/v2.0.161 attribution marker: this directional entry
+			// happened ONLY because the confirmed-trend exemption lifted
+			// entry-timing — persisted into model_assumptions so the 14-day
+			// follow-up can partition realized outcomes by entry cohort
+			// (betaDownExempt = prod-proven; dirTrend* = v2.0.161 wider class).
+			candidate.ModelAssumptions[v.Cohort] = true
 		}
 		// LLM audit gate (FIX-F): same rule, same text as the REAL branch.
 		if llmBrainEnabledPaper && candidate.ModelAssumptions["llmAuditId"] == nil {
@@ -1488,12 +1490,14 @@ func (worker *Worker) deployPaper(
 			forecastPct = harGeo.forecastPct
 		}
 		if blocked, ratio := worker.volExpansionBlocked(ctx, candidate.Symbol, forecastPct); blocked {
-			if betaDownShortExempt(candidate, betaDown) {
-				// v2.0.148: the RV gate is direction-blind by design, but for a
-				// pair-confirmed downtrend short the "expansion" IS the move the
-				// short is paid to ride (counterfactual 2026-09-28: the cut
-				// cohort fell a median −1.09%/2h, 4.3:1). Stamp the cohort.
-				candidate.ModelAssumptions["betaDownExempt"] = true
+			if v := directionalTrendExempt(candidate, betaDown); v.Exempt {
+				// v2.0.148/v2.0.161: the RV gate is direction-blind by design,
+				// but for a pair with its own CONFIRMED trend the "expansion"
+				// IS the move the directional grid is paid to ride
+				// (counterfactual 2026-09-28: the cut short cohort fell a
+				// median −1.09%/2h, 4.3:1). Stamp the cohort; every later
+				// gate stays armed.
+				candidate.ModelAssumptions[v.Cohort] = true
 			} else {
 				worker.logger.Info("entry gate: volatility expansion, skip",
 					"component", "autogrid_worker", "symbol", candidate.Symbol,
@@ -2393,15 +2397,16 @@ func (worker *Worker) deployReal(
 			continue
 		}
 		if !isEntryTimingFavorable(candidate) {
-			if !betaDownShortExempt(candidate, betaDownEntry) {
+			v := directionalTrendExempt(candidate, betaDownEntry)
+			if !v.Exempt {
 				worker.rejectCandidate(ctx, candidate,
 					"вход-тайминг: текущая позиция в канале вне благоприятной зоны для этого направления", nil)
 				continue
 			}
-			// v2.0.147 attribution marker — paper-mirror comment: entry-timing
-			// lifted by the beta-down exemption; partitions the 14-day
-			// follow-up by entry cohort.
-			candidate.ModelAssumptions["betaDownExempt"] = true
+			// v2.0.147/v2.0.161 attribution marker — paper-mirror comment:
+			// entry-timing lifted by the confirmed-trend exemption;
+			// partitions the 14-day follow-up by entry cohort.
+			candidate.ModelAssumptions[v.Cohort] = true
 		}
 		if llmBrainEnabled && candidate.ModelAssumptions["llmAuditId"] == nil {
 			worker.logger.Warn("skip real deploy: no completed LLM audit for candidate",
@@ -2420,7 +2425,7 @@ func (worker *Worker) deployReal(
 			worker.rejectCandidate(ctx, candidate, "entry gate: "+flushWhyReal, nil)
 			continue
 		}
-		if ok, reason := worker.revalidateCandidateTrend(ctx, &candidate, settings, cascadeShort, betaDownShortExempt(candidate, betaDownEntry)); !ok {
+		if ok, reason := worker.revalidateCandidateTrend(ctx, &candidate, settings, cascadeShort, directionalTrendExempt(candidate, betaDownEntry).Exempt); !ok {
 			worker.logger.Info("skip real deploy after fresh trend revalidation",
 				"component", "autogrid_worker", "symbol", candidate.Symbol, "reason", reason)
 			worker.rejectCandidate(ctx, candidate, "ре-валидация тренда: "+reason, nil)
@@ -2654,11 +2659,12 @@ func (worker *Worker) deployReal(
 			forecastPct = harGeo.forecastPct
 		}
 		if blocked, ratio := worker.volExpansionBlocked(ctx, candidate.Symbol, forecastPct); blocked {
-			if betaDownShortExempt(candidate, betaDownEntry) {
-				// v2.0.148 (REAL mirror): expansion-down is the confirmed
-				// short's payload, not its hazard — RV gate stands down for
-				// the beta-down cohort, every later gate stays armed.
-				candidate.ModelAssumptions["betaDownExempt"] = true
+			if v := directionalTrendExempt(candidate, betaDownEntry); v.Exempt {
+				// v2.0.148 (REAL mirror)/v2.0.161: expansion is the confirmed
+				// trend's payload, not its hazard — the RV gate stands down
+				// for the confirmed own-direction cohort (short always; long
+				// unless BTC itself is falling), every later gate stays armed.
+				candidate.ModelAssumptions[v.Cohort] = true
 			} else {
 				worker.logger.Info("entry gate: volatility expansion, skip real deploy",
 					"component", "autogrid_worker", "symbol", candidate.Symbol,
@@ -3253,6 +3259,33 @@ func (worker *Worker) deployReal(
 			))
 			continue
 		}
+		// v2.0.161 liquidation guard: the exchange's own estimates must sit
+		// at least liqGuardMinPct beyond the stored stops — a stop closer to
+		// the estimated liquidation has no room for wicks/funding drift
+		// before the exchange force-closes (prod: ORDI −$10.45, NEAR −$10.41
+		// were exactly this geometry). Missing estimates skip the guard,
+		// mirroring the checkParams fail-open contract above.
+		var liqEstUp, liqEstDown *decimal.Decimal
+		if check != nil {
+			if check.EstimateLiquidationUp.GreaterThan(decimal.Zero) {
+				v := check.EstimateLiquidationUp
+				liqEstUp = &v
+			}
+			if check.EstimateLiquidationDown.GreaterThan(decimal.Zero) {
+				v := check.EstimateLiquidationDown
+				liqEstDown = &v
+			}
+		}
+		if reason := liquidationGuardReason(trend, candidate.CurrentPrice,
+			derefZero(liqEstDown), derefZero(liqEstUp), slPrice, slHighPrice, botLev); reason != "" {
+			deployErrors = append(deployErrors, fmt.Sprintf("%s: %s", candidate.Symbol, reason))
+			worker.logger.Info("entry gate: liquidation guard refused deploy",
+				"component", "autogrid_worker", "symbol", candidate.Symbol,
+				"leverage", botLev, "liq_up", derefZero(liqEstUp).StringFixed(4),
+				"liq_down", derefZero(liqEstDown).StringFixed(4))
+			worker.rejectCandidate(ctx, candidate, reason, map[string]any{"liqGuardBlocked": true})
+			continue
+		}
 		trancheMarkers := map[string]any{
 			"trancheDeployed": trancheFlag(settings.TrancheDeployEnabled),
 			"trancheBase":     slotBudget.String(),
@@ -3267,6 +3300,14 @@ func (worker *Worker) deployReal(
 		// entryFeatures field).
 		if stress.floored {
 			trancheMarkers["stressLossFloor"] = true
+		}
+		// v2.0.161 review P2: the exemption cohort markers must persist on
+		// the REAL fleet (model_state via TrancheState) or the 14-day
+		// outcome partition for validate-or-rollback exists on paper only.
+		for _, cohort := range []string{"betaDownExempt", "dirTrendShort", "dirTrendLong"} {
+			if on, _ := candidate.ModelAssumptions[cohort].(bool); on {
+				trancheMarkers[cohort] = true
+			}
 		}
 		var storedSL *decimal.Decimal
 		var storedSLHigh *decimal.Decimal
@@ -3302,6 +3343,8 @@ func (worker *Worker) deployReal(
 			TrailingSLPrice:  storedSL,
 			AdaptiveStrategy: &adaptiveStrat,
 			RiskRewardRatio:  &riskRewardDec,
+			LiqPriceUp:       liqEstUp,
+			LiqPriceDown:     liqEstDown,
 		})
 		if createErr != nil {
 			if errors.Is(createErr, grid.ErrDuplicateActiveBot) {
@@ -5043,6 +5086,25 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 			PricePrecision:    trailPrecision,
 			StormActive:       &stormNow,
 		})
+		// v2.0.161 liquidation proximity guard: the running liquidation price
+		// is the hard wall behind every stop — when price is within
+		// liqProximityClosePct of it, no stop ladder can be trusted to
+		// execute first. Persist the live reading and close through the
+		// standard stop path (arms cooldown deliberately). Only preempts a
+		// HOLD: an already-firing TP/stop decision keeps priority.
+		if runningLiq := remote.BUOrderData.LiquidationPrice; runningLiq.GreaterThan(decimal.Zero) {
+			_, _ = worker.db.Exec(ctx, `
+				UPDATE grid_bots
+				SET liq_price = $2::NUMERIC, updated_at = NOW()
+				WHERE id = $1 AND (liq_price IS NULL OR liq_price <> $2::NUMERIC)
+			`, bot.id, runningLiq)
+			if decision.Action == ActionHold && liquidationProximityBreached(price, runningLiq) {
+				decision = manageDecision{Action: ActionCloseStopLoss, Reason: "LIQ_PROXIMITY"}
+				worker.logger.Warn("liquidation proximity guard: closing bot",
+					"component", "autogrid_worker", "symbol", bot.symbol,
+					"price", price.StringFixed(6), "liq_price", runningLiq.StringFixed(6))
+			}
+		}
 		// v2.0.93 FIX-E (paper-canonical order): the tranche-2 pour runs AFTER
 		// the stop decision, not before it. The old order poured on the very
 		// tick that then closed or shifted the bot — real margin into a stop
