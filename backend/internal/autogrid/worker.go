@@ -1510,6 +1510,9 @@ func (worker *Worker) deployPaper(
 		if harGeo != nil {
 			harGeo.applyToMesh(candidate.CurrentPrice, &mesh)
 		}
+		// v2.0.163 wide-grid doctrine (paper mirror): ≥8% span after every
+		// geometry source; levels keep, steps widen with the span.
+		mesh.LowerPrice, mesh.UpperPrice = EnsureDeploySpan(mesh.LowerPrice, mesh.UpperPrice, candidate.CurrentPrice)
 
 		trend := strings.ToLower(strings.TrimSpace(candidate.RecommendedTrend))
 		if trend == "no_trend" || trend == "" {
@@ -1748,6 +1751,17 @@ func (worker *Worker) deployPaper(
 					"component", "autogrid_worker", "symbol", candidate.Symbol,
 					"old_lower", mesh.LowerPrice.String(), "bid_wall", profile.BidWallPrice.String())
 				mesh.LowerPrice = profile.BidWallPrice
+			}
+			// v2.0.163 review P1-1 (paper mirror): re-apply the 8% floor
+			// after the anchor and gate the FINAL step.
+			mesh.LowerPrice, mesh.UpperPrice = EnsureDeploySpan(mesh.LowerPrice, mesh.UpperPrice, candidate.CurrentPrice)
+			if spanPct := mesh.UpperPrice.Sub(mesh.LowerPrice).Div(candidate.CurrentPrice).Mul(decimal.NewFromInt(100)).InexactFloat64(); mesh.GridNum > 0 {
+				if stepPct := spanPct / float64(mesh.GridNum); stepPct > 0 {
+					if reason, violated := marketdata.FeeGateRejection(stepPct, decimalFloat(settings.FeeBps), decimalFloat(settings.SlippageBps)); violated {
+						worker.rejectCandidate(ctx, candidate, "fee-gate (финальная геометрия после анкера): "+reason, nil)
+						continue
+					}
+				}
 			}
 		}
 
@@ -2697,6 +2711,18 @@ func (worker *Worker) deployReal(
 				"leverage_cap", harGeo.geo.Leverage)
 		}
 
+		// v2.0.163 wide-grid doctrine: after every geometry source has
+		// spoken, the span must still cover a normal move — ≥8% of price.
+		// The level count keeps: wider bounds with the same levels widen
+		// every step (bigger harvest per crossing, same fee share).
+		if nl, nu := EnsureDeploySpan(mesh.LowerPrice, mesh.UpperPrice, candidate.CurrentPrice); !nl.Equal(mesh.LowerPrice) || !nu.Equal(mesh.UpperPrice) {
+			worker.logger.Info("v2.0.163 wide-grid: span widened to 8% floor",
+				"component", "autogrid_worker", "symbol", candidate.Symbol,
+				"was_lower", mesh.LowerPrice.StringFixed(6), "was_upper", mesh.UpperPrice.StringFixed(6),
+				"new_lower", nl.StringFixed(6), "new_upper", nu.StringFixed(6), "grid_num", mesh.GridNum)
+			mesh.LowerPrice, mesh.UpperPrice = nl, nu
+		}
+
 		pricePrecision := 6
 		if p, ok := candidate.ModelAssumptions["pricePrecision"].(float64); ok && p > 0 {
 			pricePrecision = int(p)
@@ -2924,6 +2950,23 @@ func (worker *Worker) deployReal(
 					"component", "autogrid_worker", "symbol", candidate.Symbol,
 					"old_lower", lowerPrice.String(), "bid_wall", profile.BidWallPrice.String())
 				lowerPrice = profile.BidWallPrice.Round(int32(pricePrecision))
+			}
+			// v2.0.163 review P1-1: the wall anchor narrows the span AFTER
+			// the doctrine widening — re-apply the 8% floor and gate the
+			// FINAL geometry so no deploy ships a sub-floor step.
+			if nl, nu := EnsureDeploySpan(lowerPrice, upperPrice, candidate.CurrentPrice); !nl.Equal(lowerPrice) || !nu.Equal(upperPrice) {
+				worker.logger.Info("v2.0.163 wide-grid: re-widened after bid-wall anchor",
+					"component", "autogrid_worker", "symbol", candidate.Symbol,
+					"new_lower", nl.StringFixed(6), "new_upper", nu.StringFixed(6))
+				lowerPrice, upperPrice = nl, nu
+			}
+			if spanPct := upperPrice.Sub(lowerPrice).Div(candidate.CurrentPrice).Mul(decimal.NewFromInt(100)).InexactFloat64(); mesh.GridNum > 0 {
+				if stepPct := spanPct / float64(mesh.GridNum); stepPct > 0 {
+					if reason, violated := marketdata.FeeGateRejection(stepPct, decimalFloat(settings.FeeBps), decimalFloat(settings.SlippageBps)); violated {
+						worker.rejectCandidate(ctx, candidate, "fee-gate (финальная геометрия после анкера): "+reason, nil)
+						continue
+					}
+				}
 			}
 		}
 

@@ -114,24 +114,23 @@ func TestManualDeployFeeGateParity(t *testing.T) {
 		t.Fatalf("refused deploys must leave no paper rows, got %d (%v)", refusedRows, err)
 	}
 
-	// Pass side (v2.0.94 floor 0.35% at 5/2 bps): 4%/10 levels = 0.40% — the
-	// PAPER deploy goes through and persists the operator's row untouched.
-	if err := deploy("CANFG4_USDT_PERP", "PAPER", 98, 102, 10); err != nil {
-		t.Fatalf("4%%/10-levels deploy must clear the fee-gate, got %v", err)
+	// Pass side (v2.0.163 floor 0.504% at 5/2 bps): 4%/7 levels = 0.571% —
+	// the PAPER deploy goes through and persists the operator's row untouched.
+	if err := deploy("CANFG4_USDT_PERP", "PAPER", 98, 102, 7); err != nil {
+		t.Fatalf("4%%/7-levels deploy must clear the fee-gate, got %v", err)
 	}
 	var persistedRow int
 	if err := pool.QueryRow(ctx, `
 		SELECT grid_num FROM paper_grid_bots WHERE symbol = 'CANFG4_USDT_PERP' AND status = 'RUNNING'
-	`).Scan(&persistedRow); err != nil || persistedRow != 10 {
-		t.Fatalf("fee-gate-passing deploy must persist row 10, got %d (%v)", persistedRow, err)
+	`).Scan(&persistedRow); err != nil || persistedRow != 7 {
+		t.Fatalf("fee-gate-passing deploy must persist row 7, got %d (%v)", persistedRow, err)
 	}
 
-	// Boundary documentation (5/2 bps, v2.0.94): an explicit 5-row grid on a
-	// 2% span steps 0.40% — ABOVE the 0.35% bar — and is legal; the density
-	// doctrine itself can no longer produce a viable derived row this narrow
-	// (floor(2/0.35)=5 → clamp 6 → 0.33% refused), so only an explicit wide-
-	// stepped row clears.
-	if err := deploy("CANFG5_USDT_PERP", "PAPER", 99, 101, 5); err != nil {
-		t.Fatalf("2%%/5-levels (0.40%% step) must clear the 0.35%% bar at 5/2 bps, got %v", err)
+	// Boundary documentation (5/2 bps, v2.0.163): an explicit 3-row grid on
+	// a 2% span steps 0.67% — ABOVE the 0.504% bar — and is legal; the
+	// density doctrine itself can no longer produce a viable derived row
+	// this narrow, so only an explicit wide-stepped row clears.
+	if err := deploy("CANFG5_USDT_PERP", "PAPER", 99, 101, 3); err != nil {
+		t.Fatalf("2%%/3-levels (0.67%% step) must clear the 0.504%% bar at 5/2 bps, got %v", err)
 	}
 }

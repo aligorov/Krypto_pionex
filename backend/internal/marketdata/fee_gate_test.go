@@ -40,29 +40,31 @@ func TestFeeGateSpanOverLevels(t *testing.T) {
 		}
 	}
 
-	passStep := GridStepPctForSpan(4.0, 11)
-	if passStep < 0.3636 || passStep > 0.3637 {
-		t.Fatalf("4%%/11 levels must step 0.36%%, got %.4f", passStep)
+	passStep := GridStepPctForSpan(4.0, 7)
+	if passStep < 0.5714 || passStep > 0.5715 {
+		t.Fatalf("4%%/7 levels must step 0.57%%, got %.4f", passStep)
 	}
 	if _, violated := FeeGateRejection(passStep, 5, 2); violated {
-		t.Fatal("4% span over 11 levels (0.36% step) must clear the fee-gate")
+		t.Fatal("4% span over 7 levels (0.57% step) must clear the fee-gate")
 	}
 	// Legacy validator follows the same doctrine now (was 1.5× friction).
 	// v2.0.95: the EXACT boundary must pass — 2.5×0.14 is
 	// 0.35000000000000003 in double and the epsilon absorbs the last bit
 	// (prod 09-12: ACE/APT rejected with a displayed 0.35% step).
-	if ValidateMinGridStep(0.20, 5, 2) || ValidateMinGridStep(0.3499, 5, 2) {
+	if ValidateMinGridStep(0.20, 5, 2) || ValidateMinGridStep(0.503, 5, 2) {
 		t.Fatal("ValidateMinGridStep must refuse sub-floor steps at 5/2 bps")
 	}
-	if !ValidateMinGridStep(0.35, 5, 2) || !ValidateMinGridStep(0.3636, 5, 2) {
-		t.Fatal("ValidateMinGridStep must accept the exact 0.35% boundary and above-floor steps")
+	if !ValidateMinGridStep(0.505, 5, 2) || !ValidateMinGridStep(0.5714, 5, 2) {
+		t.Fatal("ValidateMinGridStep must accept above-floor steps at the 3.6x doctrine")
 	}
-	// Same epsilon contract in the gate itself: 4.9% over 14 levels = 0.35%
-	// exactly (the ACE prod case) must clear at 5/2 bps.
-	aceStep := GridStepPctForSpan(4.9, 14)
+	// Same epsilon contract in the gate itself (v2.0.163 doctrine): a span
+	// whose step lands exactly on the 3.6x floor must clear, not die on the
+	// last double bit (the ACE prod case class).
+	boundarySpan := 9 * (StepFloorRoundTripMultiple * RoundTripCostPct(5, 2))
+	aceStep := GridStepPctForSpan(boundarySpan, 9)
 	reason, violated = FeeGateRejection(aceStep, 5, 2)
 	if violated {
-		t.Fatalf("the exact-boundary 0.35%% step (ACE case, got %.17f) must clear the fee-gate, got %q", aceStep, reason)
+		t.Fatalf("the exact-boundary %.4f%% step (ACE case class, got %.17f) must clear the fee-gate, got %q", aceStep, aceStep, reason)
 	}
 }
 

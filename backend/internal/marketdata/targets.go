@@ -427,7 +427,12 @@ const (
 	// floor's center) averaged +$0.93 with 1 loser and 0 stops. External
 	// consensus (Bitsgap/QuickNode/Quantpedia) is step ≥ 2–3× round-trip; the
 	// old 2× floor is a survival minimum, not a profitable one.
-	StepFloorRoundTripMultiple = 2.5
+	// v2.0.163 (operator doctrine, "шаг в 10× комиссии"): 2.5 → 3.6 — at the
+	// 5/2 bps fleet costs that is a 0.5% floor ≈ 10× the 5 bps taker fee per
+	// fill; paired with the 8% span floor it puts every new grid in the
+	// 0.5%-step band the survivor consensus calls golden (~2% on futures is
+	// the upper bound, not the floor).
+	StepFloorRoundTripMultiple = 3.6
 	// MinGridLevelNotionalUSDT is the smallest acceptable per-level order
 	// notional (budget×leverage/levels).
 	MinGridLevelNotionalUSDT = 8.0
@@ -479,21 +484,21 @@ func FeeGateStepFloorPct(feeBps, slippageBps float64) float64 {
 }
 
 // DefaultGridStepFloorPct is the DOCUMENTED FALLBACK of FeeGateStepFloorPct:
-// 2.5× the round-trip cost at the fleet-default 5/2 bps = 0.35%. It stays as
+// 3.6× the round-trip cost at the fleet-default 5/2 bps = 0.504%. It stays as
 // the contract for pure paths that genuinely have no live settings (and as
 // the degenerate-input floor inside FeeGateStepFloorPct); every real path
 // (scanner, mesh, AI Kit clamp, manual deploy, DGT re-center) passes its own
 // feeBps/slippageBps through so the density floor and the fee-gate can never
 // disagree again.
 func DefaultGridStepFloorPct() float64 {
-	return StepFloorRoundTripMultiple * RoundTripCostPct(5, 2) // 0.35% at fleet defaults
+	return StepFloorRoundTripMultiple * RoundTripCostPct(5, 2) // 0.504% at fleet defaults
 }
 
 // RoundTripCostPct returns the friction of ONE grid level round trip in
 // percent of price: two legs (buy + sell), each paying feeBps + slippageBps.
 // At the fleet defaults (5 bps fee / 2 bps slippage) that is
 // 2 × 7 / 100 = 0.14% — the level step must clear
-// StepFloorRoundTripMultiple × THAT (2.5× = 0.35% since v2.0.94).
+// StepFloorRoundTripMultiple × THAT (3.6× = 0.504% since v2.0.163).
 func RoundTripCostPct(feeBps, slippageBps float64) float64 {
 	return 2.0 * (feeBps + slippageBps) / 100.0 // bps → %, × 2 legs
 }

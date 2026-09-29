@@ -15,18 +15,16 @@ func TestComputeAdaptiveMeshDensityFromMargin(t *testing.T) {
 	budget := decimal.NewFromFloat(100)
 
 	// v2.0.75 margin-density doctrine: $100×2x = $200 notional on a 4% span
-	// → 11 levels × $18.20 (step ≈0.364%). v2.0.94: the density floor is
-	// harmonized with the fee-gate (2.5× round-trip at 5/2 bps = 0.35%) —
-	// the 2× floor admitted the band where every stop-out of the weekly
-	// mining lived (≤0.31% steps, avg +$0.24/bot vs +$0.93 in the band the
-	// new floor selects).
+	// → 7 levels × $28.60 (step ≈0.571%). v2.0.163: the density floor is the
+	// fee-gate (3.6× round-trip at 5/2 bps = 0.504% ≈ 10× the 5 bps fee) —
+	// the wide-step doctrine the survivor consensus calls for.
 	res := ComputeAdaptiveMesh(lower, upper, price, 0.50, "RANGE", budget, 2, 5, 2)
-	if res.GridNum != 11 {
-		t.Errorf("expected 11 levels for $200 notional on a 4%% span, got %d", res.GridNum)
+	if res.GridNum != 7 {
+		t.Errorf("expected 7 levels for $200 notional on a 4%% span, got %d", res.GridNum)
 	}
 	step, _ := res.GridStepPct.Float64()
-	if step < 0.35 || step > 0.38 {
-		t.Errorf("expected ~0.364%% step, got %.4f%%", step)
+	if step < 0.57 || step > 0.58 {
+		t.Errorf("expected ~0.571%% step, got %.4f%%", step)
 	}
 	if perLevel := 200.0 / float64(res.GridNum); perLevel < marketdata.MinGridLevelNotionalUSDT {
 		t.Errorf("every level must carry ≥ $8, got %.2f", perLevel)
@@ -63,18 +61,18 @@ func TestComputeAdaptiveMeshFloorFollowsFees(t *testing.T) {
 	budget := decimal.NewFromFloat(100)
 
 	defaults := ComputeAdaptiveMesh(lower, upper, price, 0.50, "RANGE", budget, 2, 5, 2)
-	if defaults.GridNum != 25 {
-		// $200 notional on a 12% span: the $8-per-level cap binds
-		// (8×12/200 = 0.48% step) → floor(12/0.48) = 25 levels.
-		t.Fatalf("5/2 bps on a 12%% span at $200 notional = 25 levels, got %d", defaults.GridNum)
+	if defaults.GridNum != 23 {
+		// $200 notional on a 12% span: the 3.6× fee floor binds
+		// (0.504% step) → floor(12/0.504) = 23 levels ($8-step is 0.48%).
+		t.Fatalf("5/2 bps on a 12%% span at $200 notional = 23 levels, got %d", defaults.GridNum)
 	}
 	pricy := ComputeAdaptiveMesh(lower, upper, price, 0.50, "RANGE", budget, 2, 20, 10)
-	if pricy.GridNum != 8 {
-		t.Fatalf("20/10 bps bar 1.50%% → 8 levels on a 12%% span, got %d", pricy.GridNum)
+	if pricy.GridNum != 6 {
+		t.Fatalf("20/10 bps bar 2.16%% → 6 levels on a 12%% span, got %d", pricy.GridNum)
 	}
 	step, _ := pricy.GridStepPct.Float64()
-	if step < 1.50 {
-		t.Fatalf("pricy-fee step must clear the 1.50%% fee-gate bar, got %.4f%%", step)
+	if step < 2.0 {
+		t.Fatalf("pricy-fee step must clear toward the 2.16%% fee-gate bar, got %.4f%%", step)
 	}
 	if pricy.GridNum >= defaults.GridNum {
 		t.Fatalf("pricier fees must thin the grid: %d vs %d", pricy.GridNum, defaults.GridNum)
@@ -159,11 +157,11 @@ func TestClampAntiHuntStopIntoBounds(t *testing.T) {
 // the span (fee-gate floor at the actual fees + the $8/level notional cap),
 // floor = the doctrine's 6 levels.
 func TestClampAIGridCount(t *testing.T) {
-	// A 4% span at $200 notional, 5/2 bps: doctrine count = 11 (v2.0.94
-	// 2.5× floor). A spot AI count of 150 clamps down to 11 (born viable
+	// A 4% span at $200 notional, 5/2 bps: doctrine count = 7 (v2.0.163
+	// 3.6× floor). A spot AI count of 150 clamps down to 7 (born viable
 	// instead of born rejected).
-	if got := clampAIGridCount(4, 200, 5, 2, 150); got != 11 {
-		t.Fatalf("spot AI 150 over a 4%% span must clamp to the doctrine ceiling 11, got %d", got)
+	if got := clampAIGridCount(4, 200, 5, 2, 150); got != 7 {
+		t.Fatalf("spot AI 150 over a 4%% span must clamp to the doctrine ceiling 7, got %d", got)
 	}
 	// Pricier fees shrink the ceiling in lockstep (FIX-A parity): 20/10 bps
 	// → floor 1.50% → the 4% span clamps to the 6-level grid floor.

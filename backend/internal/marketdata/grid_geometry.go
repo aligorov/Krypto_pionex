@@ -51,8 +51,16 @@ func ComputeGridGeometry(forecastVolPct float64, harR2 float64, feeBps float64, 
 
 	// Grid range = 2.5 × daily volatility.
 	rangePct := dailyVolPct * 2.5
-	if rangePct < 3.0 {
-		rangePct = 3.0 // structural floor: below 3% a range grid barely spreads
+	structRangeFloor := 3.0
+	// v2.0.163: the 6-level minimum must never force sub-floor steps — when
+	// the fee-gate step floor rises (3.6× round trip), the structural range
+	// floor rises with it (GridLevelsMin × stepFloor), or a 3% range at 6
+	// levels silently ships 0.5% steps the fee-gate then rejects.
+	if feeFloor := GridLevelsMin * FeeGateStepFloorPct(feeBps, 0); feeFloor > structRangeFloor {
+		structRangeFloor = feeFloor
+	}
+	if rangePct < structRangeFloor {
+		rangePct = structRangeFloor // structural floor: below 3% a range grid barely spreads
 	}
 	if rangePct > 25.0 {
 		rangePct = 25.0 // ceiling: beyond this a grid stops being a grid

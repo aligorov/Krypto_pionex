@@ -18,6 +18,37 @@ type AdaptiveMeshResult struct {
 	UpperPrice   decimal.Decimal `json:"upperPrice"`
 }
 
+// minDeploySpanPct is the v2.0.163 wide-grid doctrine: a futures grid
+// narrower than 8% of price dies to the first ordinary crypto move (prod
+// 29.09: bots born and stopped within hours, spans of 3-5%). A wide span
+// with the SAME level count widens the step proportionally — the harvest
+// per crossing grows while the fee share of it stays fixed.
+const minDeploySpanPct = 8.0
+
+// EnsureDeploySpan widens the grid bounds to at least minDeploySpanPct of
+// the current price, centered on the price and never shrinking an existing
+// wider side. The level count is deliberately left to the caller — with the
+// bounds widened and the levels kept, every step widens with the span.
+func EnsureDeploySpan(lower, upper, price decimal.Decimal) (decimal.Decimal, decimal.Decimal) {
+	if !price.GreaterThan(decimal.Zero) || !upper.GreaterThan(lower) {
+		return lower, upper
+	}
+	spanPct := upper.Sub(lower).Div(price).Mul(decimal.NewFromInt(100))
+	if spanPct.GreaterThanOrEqual(decimal.NewFromFloat(minDeploySpanPct)) {
+		return lower, upper
+	}
+	half := price.Mul(decimal.NewFromFloat(minDeploySpanPct / 200.0))
+	newLower := price.Sub(half)
+	if lower.LessThan(newLower) {
+		newLower = lower
+	}
+	newUpper := price.Add(half)
+	if upper.GreaterThan(newUpper) {
+		newUpper = upper
+	}
+	return newLower, newUpper
+}
+
 // ComputeAdaptiveMesh sizes the grid level count under the margin-density
 // doctrine (v2.0.75): step = max(fee-gate floor at the ACTUAL costs, the step
 // at which every level still carries ≥ $8 of the budget×leverage notional),

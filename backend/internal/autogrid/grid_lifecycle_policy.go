@@ -453,9 +453,11 @@ func (worker *Worker) dgtFreshGeometry(
 	if atrPct <= 0 {
 		atrPct = 2.0
 	}
+	// v2.0.163: the stub floor joins the wide-grid doctrine (8%, was 4%) —
+	// a re-centered grid narrower than a normal move just re-dies.
 	spanPct := 6.0 * atrPct
-	if spanPct < 4.0 {
-		spanPct = 4.0
+	if spanPct < minDeploySpanPct {
+		spanPct = minDeploySpanPct
 	}
 	if spanPct > 25.0 {
 		spanPct = 25.0
@@ -473,6 +475,8 @@ func (worker *Worker) dgtFreshGeometry(
 	if harGeo != nil {
 		harGeo.applyToMesh(spec.breakPrice, &mesh)
 	}
+	// v2.0.163: HAR may still shrink the span below the doctrine floor.
+	mesh.LowerPrice, mesh.UpperPrice = EnsureDeploySpan(mesh.LowerPrice, mesh.UpperPrice, spec.breakPrice)
 	return mesh, harGeo, atrPct
 }
 
