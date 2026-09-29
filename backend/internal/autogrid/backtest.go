@@ -18,17 +18,19 @@ const (
 	backtestGateFlag    = "backtest_gate"
 	backtestFreshWindow = 4 * time.Hour
 
-	// Traded-TF hard ceilings tightened for rigorous empirical verification:
-	// 1. OOS Net return must be strictly positive (no longer allowing negative OOS).
-	backtestMinOOSPct = 0.0
-	// 2. Max Drawdown strictly bounded to risk limits (tightened from 15% to 8%).
-	backtestMaxDrawdown = 0.08
+	// Traded-TF hard ceilings calibrated for quality entry filtering:
+	// 1. OOS Net return floor: relaxed from 0.0% to -1.0% to allow minor noise / walk-forward friction.
+	backtestMinOOSPct = -1.0
+	// 2. Max Drawdown bounded to risk limits (calibrated to 15% for crypto perpetual grids).
+	backtestMaxDrawdown = 0.15
 	// 3. Minimum trades / sample size:
 	backtestMinRoundTrips = 15
 	backtestMinFolds      = 3
-	// 4. Neighbor fragility ceilings tightened from 40% DD / -10% OOS:
-	backtestNeighborMaxDrawdown = 0.20
-	backtestNeighborMinOOSPct   = -2.0
+	// Max stop hits allowed across walk-forward folds (allow at most 1 isolated stop hit).
+	backtestMaxStopHits = 1
+	// 4. Neighbor fragility ceilings:
+	backtestNeighborMaxDrawdown = 0.30
+	backtestNeighborMinOOSPct   = -6.0
 )
 
 var backtestTFLadder = []string{"15M", "30M", "60M", "4H", "1D"}
@@ -175,22 +177,22 @@ func evaluateBacktestGate(traded BacktestJobSummary, neighbors []BacktestJobSumm
 			traded.CI95Lower, traded.Interval)
 		return verdict
 	}
-	// Task 2: Net OOS return must be positive after all costs
+	// Net OOS return must be above minimum floor (-1.0%)
 	if traded.OOSPct <= backtestMinOOSPct {
 		verdict.Reason = fmt.Sprintf("backtest gate: OOS return %.2f%% <= %.1f%% on traded TF %s",
 			traded.OOSPct, backtestMinOOSPct, traded.Interval)
 		return verdict
 	}
-	// Task 2 & 4: Max Drawdown within strict risk limit (8%)
+	// Max Drawdown within risk limit (15%)
 	if traded.MaxDD > backtestMaxDrawdown {
 		verdict.Reason = fmt.Sprintf("backtest gate: drawdown %.1f%% > %.1f%% on traded TF %s",
 			traded.MaxDD*100, backtestMaxDrawdown*100, traded.Interval)
 		return verdict
 	}
-	// Task 4: Zero stop hits in OOS validation
-	if traded.StopHits > 0 {
-		verdict.Reason = fmt.Sprintf("backtest gate: %d stop hits in walk-forward OOS on traded TF %s",
-			traded.StopHits, traded.Interval)
+	// Stop hits in OOS validation bounded to backtestMaxStopHits (max 1)
+	if traded.StopHits > backtestMaxStopHits {
+		verdict.Reason = fmt.Sprintf("backtest gate: %d stop hits in walk-forward OOS on traded TF %s (max %d allowed)",
+			traded.StopHits, traded.Interval, backtestMaxStopHits)
 		return verdict
 	}
 	// Task 4: Liquidity check

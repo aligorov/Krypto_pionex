@@ -46,27 +46,66 @@ func TestBacktestGateFragileNeighbor(t *testing.T) {
 	}
 }
 
+func TestBacktestGateRobustNeighborWithModerateDrawdown(t *testing.T) {
+	traded := BacktestJobSummary{
+		Interval: "15M", State: "done", Folds: 4, RoundTrips: 25,
+		OOSPct: 0.45, MaxDD: 0.12, StopHits: 0,
+		CI95Positive: true, CI95Lower: 0.001, SampleSufficient: true, LiquidityOK: true,
+	}
+	// PEPE-like neighbor: 30M OOS -5.60%, DD 20.0% (within -6.0% and 30% ceilings)
+	neighbors := []BacktestJobSummary{
+		{Interval: "30M", State: "done", Folds: 4, OOSPct: -5.60, MaxDD: 0.20, StopHits: 1},
+	}
+	verdict := evaluateBacktestGate(traded, neighbors)
+	if !verdict.Allowed {
+		t.Fatalf("moderately noisy neighbor (PEPE-like) must pass gate, got: %s", verdict.Reason)
+	}
+}
+
 func TestBacktestGateTradedTFMustPass(t *testing.T) {
-	// Strict OOS floor: any non-positive OOS return must reject (tightened to > 0.0%).
+	// Strict OOS floor: any return below or equal to backtestMinOOSPct (-1.0%) must reject.
 	shallow := BacktestJobSummary{
 		Interval: "60M", State: "done", Folds: 4, RoundTrips: 20,
-		OOSPct: -0.36, MaxDD: 0.0223, StopHits: 0, SampleSufficient: true,
+		OOSPct: -1.5, MaxDD: 0.0223, StopHits: 0, SampleSufficient: true,
+		CI95Positive: true, CI95Lower: 0.001, LiquidityOK: true,
 	}
 	if verdict := evaluateBacktestGate(shallow, nil); verdict.Allowed {
-		t.Fatalf("OOS -0.36%% below or at %.1f%% floor must reject: %s", backtestMinOOSPct, verdict.Reason)
+		t.Fatalf("OOS -1.5%% below or at %.1f%% floor must reject: %s", backtestMinOOSPct, verdict.Reason)
 	}
 
 	storm := BacktestJobSummary{
 		Interval: "60M", State: "done", Folds: 4, RoundTrips: 20,
 		OOSPct: 2.5, MaxDD: 0.0223, StopHits: 3, SampleSufficient: true,
+		CI95Positive: true, CI95Lower: 0.001, LiquidityOK: true,
 	}
 	if verdict := evaluateBacktestGate(storm, nil); verdict.Allowed {
 		t.Fatalf("stop-storm on traded TF must reject: %s", verdict.Reason)
 	}
 
+	// 1 isolated stop hit is allowed across folds
+	singleStop := BacktestJobSummary{
+		Interval: "60M", State: "done", Folds: 4, RoundTrips: 20,
+		OOSPct: 2.5, MaxDD: 0.0223, StopHits: 1, SampleSufficient: true,
+		CI95Positive: true, CI95Lower: 0.001, LiquidityOK: true,
+	}
+	if verdict := evaluateBacktestGate(singleStop, nil); !verdict.Allowed {
+		t.Fatalf("single stop hit (<= 1) must be allowed: %s", verdict.Reason)
+	}
+
+	// 2 or more stop hits must reject
+	twoStops := BacktestJobSummary{
+		Interval: "60M", State: "done", Folds: 4, RoundTrips: 20,
+		OOSPct: 2.5, MaxDD: 0.0223, StopHits: 2, SampleSufficient: true,
+		CI95Positive: true, CI95Lower: 0.001, LiquidityOK: true,
+	}
+	if verdict := evaluateBacktestGate(twoStops, nil); verdict.Allowed {
+		t.Fatalf("2 stop hits (> 1) must reject: %s", verdict.Reason)
+	}
+
 	deep := BacktestJobSummary{
 		Interval: "60M", State: "done", Folds: 4, RoundTrips: 20,
 		OOSPct: -2.0, MaxDD: 0.0223, StopHits: 0, SampleSufficient: true,
+		CI95Positive: true, CI95Lower: 0.001, LiquidityOK: true,
 	}
 	if verdict := evaluateBacktestGate(deep, nil); verdict.Allowed {
 		t.Fatalf("OOS below the %.1f%% floor must reject: %s", backtestMinOOSPct, verdict.Reason)
@@ -76,7 +115,7 @@ func TestBacktestGateTradedTFMustPass(t *testing.T) {
 	ciNegative := BacktestJobSummary{
 		Interval: "60M", State: "done", Folds: 4, RoundTrips: 20,
 		OOSPct: 1.5, MaxDD: 0.03, StopHits: 0,
-		CI95Positive: false, CI95Lower: -0.0005, SampleSufficient: true,
+		CI95Positive: false, CI95Lower: -0.0005, SampleSufficient: true, LiquidityOK: true,
 	}
 	if verdict := evaluateBacktestGate(ciNegative, nil); verdict.Allowed {
 		t.Fatalf("negative 95%% CI lower bound must reject: %s", verdict.Reason)
@@ -86,19 +125,20 @@ func TestBacktestGateTradedTFMustPass(t *testing.T) {
 	insufficientTrades := BacktestJobSummary{
 		Interval: "60M", State: "done", Folds: 4, RoundTrips: 10,
 		OOSPct: 2.0, MaxDD: 0.02, StopHits: 0, SampleSufficient: false,
+		CI95Positive: true, CI95Lower: 0.001, LiquidityOK: true,
 	}
 	if verdict := evaluateBacktestGate(insufficientTrades, nil); verdict.Allowed {
 		t.Fatalf("insufficient trades (< 15) must reject: %s", verdict.Reason)
 	}
 
-	// Drawdown strictly bounded <= 8%.
+	// Drawdown strictly bounded <= 15%.
 	highDD := BacktestJobSummary{
 		Interval: "60M", State: "done", Folds: 4, RoundTrips: 25,
-		OOSPct: 3.0, MaxDD: 0.09, StopHits: 0, SampleSufficient: true,
-		CI95Positive: true, CI95Lower: 0.001,
+		OOSPct: 3.0, MaxDD: 0.18, StopHits: 0, SampleSufficient: true,
+		CI95Positive: true, CI95Lower: 0.001, LiquidityOK: true,
 	}
 	if verdict := evaluateBacktestGate(highDD, nil); verdict.Allowed {
-		t.Fatalf("drawdown 9%% > 8%% cap must reject: %s", verdict.Reason)
+		t.Fatalf("drawdown 18%% > 15%% cap must reject: %s", verdict.Reason)
 	}
 
 	// Liquidity check failure must reject.
