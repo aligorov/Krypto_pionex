@@ -35,8 +35,10 @@ func TestGateSettledProfitUnlockIdentity(t *testing.T) {
 	if got := gateSettledProfit(pos, pionex.FinalProfitUnlockIdentity, "GRID_AGED_HALF_LIFE", ""); got == nil || !got.Equal(pos) {
 		t.Fatalf("positive non-loss identity must pass: %v", got)
 	}
-	if got := gateSettledProfit(pos, pionex.FinalProfitUnlockIdentity, "STOP_LOSS", ""); got != nil {
-		t.Fatalf("positive identity on loss-class must refuse: %v", got)
+	// CRWVX #1440 shape: stop loss exit with positive net profit from accumulated grid earnings.
+	// Unlock identity is ground truth cash returned to wallet, must NOT be rejected.
+	if got := gateSettledProfit(pos, pionex.FinalProfitUnlockIdentity, "STOP_LOSS", ""); got == nil || !got.Equal(pos) {
+		t.Fatalf("positive identity on loss-class must be accepted: %v", got)
 	}
 }
 

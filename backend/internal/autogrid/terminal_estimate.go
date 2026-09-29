@@ -55,21 +55,24 @@ func gateSettledProfit(
 	source pionex.FinalProfitSource,
 	storedReason, exchangeReason string,
 ) *decimal.Decimal {
-	// v2.0.103: unlock_identity joins the gate's jurisdiction. Without it
-	// every caller's «gated != nil means accepted» contract inverted for
-	// the identity leg — the re-check sweep computed the exchange truth and
-	// then confirmed the estimate instead of applying it (prod 09-25 night:
-	// every reopened row froze back at telemetry_net_close).
 	switch source {
-	case pionex.FinalProfitExited, pionex.FinalProfitTotalAlias, pionex.FinalProfitUnlockIdentity:
+	case pionex.FinalProfitUnlockIdentity:
+		// unlock_identity is the post-settlement cash reality:
+		// unlockUsdtAmount − quote_investment. True by construction, bounded by
+		// isolated margin (checked in terminal_recheck). Always accepted, including
+		// positive totals on stop exits (e.g. CRWVX #1440 where grid profit exceeded stop loss).
+		return &total
+
+	case pionex.FinalProfitExited, pionex.FinalProfitTotalAlias:
+		if !total.IsPositive() {
+			return &total
+		}
+		if lossClassClose(storedReason) || lossClassClose(exchangeReason) {
+			return nil
+		}
+		return &total
+
 	default:
 		return nil
 	}
-	if !total.IsPositive() {
-		return &total
-	}
-	if lossClassClose(storedReason) || lossClassClose(exchangeReason) {
-		return nil
-	}
-	return &total
 }

@@ -72,7 +72,7 @@ func terminalTelemetryEstimate(
 ) (final, closeCost decimal.Decimal) {
 	closeCost = pionex.CloseCostUSDT(inventoryNotional)
 	final = telemetryTotal.Sub(closeCost)
-	if exchangeStopClass(closedReason) && maxLoss.IsPositive() {
+	if exchangeStopClass(closedReason) && maxLoss.IsPositive() && inventoryNotional.IsPositive() {
 		floor := maxLoss.Neg().Sub(closeCost)
 		if final.GreaterThan(floor) {
 			final = floor

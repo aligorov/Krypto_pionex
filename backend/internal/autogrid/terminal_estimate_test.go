@@ -85,6 +85,14 @@ func TestTerminalTelemetryEstimate(t *testing.T) {
 	if !final.Equal(estDec(t, "-5.483188571")) {
 		t.Fatalf("non-stop close must estimate at mark − cost, got %s", final)
 	}
+
+	// Zero inventory with positive telemetry (CRWVX shape): position already
+	// closed at telemetry tick — must NOT floor to -max_loss.
+	final, closeCost = terminalTelemetryEstimate(
+		estDec(t, "0.008118"), decimal.Zero, estDec(t, "4"), "STOP_LOSS_NATIVE")
+	if !closeCost.IsZero() || !final.Equal(estDec(t, "0.008118")) {
+		t.Fatalf("zero inventory stop must keep realized total, got %s (cost %s)", final, closeCost)
+	}
 }
 
 // TestTerminalRefusalErrorClassification pins the transport-vs-refusal split
