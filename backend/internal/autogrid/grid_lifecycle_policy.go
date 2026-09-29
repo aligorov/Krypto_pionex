@@ -1170,6 +1170,10 @@ func (worker *Worker) dgtRedeployReal(ctx context.Context, settings Settings, sp
 		QuoteInvestment: investAmount.Round(2),
 	}
 	if isNeutral {
+		// v2.0.160 harvest doctrine: the replacement card TP is a harvest
+		// amount — 2% of the committed investment ceiling, never the
+		// full-range traversal fantasy of the raw dynamic target.
+		botTarget = applyNeutralHarvestTP(settings.PnLTargetMode, investAmount, botTarget)
 		if botTarget != nil && botTarget.GreaterThan(decimal.Zero) {
 			data.ProfitStopType = "profit_amount"
 			data.ProfitStop = botTarget

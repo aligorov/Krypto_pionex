@@ -2907,6 +2907,12 @@ func (s *Service) DeployManualBot(
 		},
 	}
 	botTarget, botMaxLoss := s.computeManualTargets(ctx, targetSettings, input.Symbol, leverage)
+	// v2.0.160 harvest doctrine: a neutral manual bot gets the same harvest
+	// ceiling on its card — 2% of the committed investment — instead of a
+	// traversal-sized dynamic amount that never fires. FIXED mode untouched.
+	if strings.EqualFold(trend, "no_trend") || strings.EqualFold(trend, "neutral") || trend == "" {
+		botTarget = applyNeutralHarvestTP(targetSettings.PnLTargetMode, investment, botTarget)
+	}
 	if botTarget != nil && botTarget.GreaterThan(decimal.Zero) {
 		params.BUOrderData.ProfitStopType = "profit_amount"
 		params.BUOrderData.ProfitStop = botTarget

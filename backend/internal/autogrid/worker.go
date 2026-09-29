@@ -3083,6 +3083,15 @@ func (worker *Worker) deployReal(
 		normTrendReal := strings.ToLower(strings.TrimSpace(trend))
 		isNeutralReal := normTrendReal == "no_trend" || normTrendReal == "neutral" || normTrendReal == ""
 
+		// v2.0.160 harvest doctrine: a neutral card TP is a HARVEST amount —
+		// cap the dynamic (tranche-halved) target at 2% of the committed
+		// investment so the exchange card actually fires instead of waiting
+		// for a full-range traversal that never happens. The stored
+		// pnl_target_usdt below inherits the same capped value.
+		if isNeutralReal {
+			botTarget = applyNeutralHarvestTP(settings.PnLTargetMode, investAmount, botTarget)
+		}
+
 		// Configure native Pionex take-profit directly on the bot card:
 		// Neutral futures grids hold bidirectional inventory (short above, long below).
 		// Setting a price-based profitStop causes an instant premature trigger as soon as short
@@ -4834,63 +4843,121 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 			}
 		}
 
-		// Self-heal / active repair for neutral bots created with erroneous price-based take-profit on Pionex card (v2.0.158)
+		// Self-heal / active repair for neutral bots' exchange take-profit card.
+		// v2.0.158: a price-based profitStop triggers instantly on a neutral
+		// grid (market_price <= upper_price is immediately true) — replace it
+		// with profit_amount.
+		// v2.0.160: also shrink an oversized profit_amount card (pre-160
+		// dynamic targets: $15–44 on $50–100 slots) down to the harvest
+		// ceiling and mirror the capped amount into pnl_target_usdt so the
+		// local exit ladder and the exchange card agree. FIXED mode keeps the
+		// v2.0.158 behavior only (the operator's explicit amount is law).
 		if bot.localStatus == "RUNNING" && client != nil {
 			isNeutralBot := strings.EqualFold(bot.direction, "NEUTRAL") || strings.EqualFold(remote.BUOrderData.Trend, "no_trend")
-			if isNeutralBot && strings.EqualFold(remote.BUOrderData.ProfitStopType, "price") {
-				profitValStr := ""
-				var newTakeProfit *decimal.Decimal
-				if botTarget.GreaterThan(decimal.Zero) {
-					profitValStr = botTarget.StringFixed(2)
-					newTakeProfit = &botTarget
-				} else if bot.pnlTarget != nil && bot.pnlTarget.GreaterThan(decimal.Zero) {
-					profitValStr = bot.pnlTarget.StringFixed(2)
-					newTakeProfit = bot.pnlTarget
+			if isNeutralBot {
+				cardType := strings.ToLower(strings.TrimSpace(remote.BUOrderData.ProfitStopType))
+				harvestCap := NeutralHarvestTPCap(bot.investment)
+				fixedMode := settings.PnLTargetMode == "FIXED"
+				needsRepair := false
+				repairReason := ""
+				switch cardType {
+				case "price":
+					needsRepair = true
+					repairReason = "price_legacy"
+				case "profit_amount":
+					// Skip when the exchange already holds a larger (post-top-up)
+					// commitment than the local column: the cap would be computed
+					// from a stale half-investment and the only-lower mirror would
+					// then pin it there forever. The resync above persists first;
+					// the next pass caps from the true figure.
+					staleInvestment := remoteInvestmentReported &&
+						remoteInvestment.GreaterThan(bot.investment.Add(decimal.NewFromInt(1)))
+					if !fixedMode && !staleInvestment && remote.BUOrderData.ProfitStop.GreaterThan(harvestCap) {
+						needsRepair = true
+						repairReason = "harvest_cap"
+					}
 				}
+				if needsRepair {
+					cardWas := remote.BUOrderData.ProfitStop
+					effective := harvestCap
+					// FIXED mode keeps the operator's stored amount verbatim
+					// (fallback to the cap only when nothing is stored);
+					// DYNAMIC keeps a stored amount below the cap untouched.
+					if botTarget.GreaterThan(decimal.Zero) && (fixedMode || botTarget.LessThan(harvestCap)) {
+						effective = botTarget
+					}
+					profitValStr := effective.StringFixed(2)
+					newTakeProfit := effective
 
-				worker.logger.Warn("repairing neutral bot on Pionex: replacing premature price-based take-profit with profit_amount",
-					"component", "autogrid_worker", "bot_id", bot.id, "symbol", bot.symbol,
-					"remote_id", bot.remoteID, "target_amount", profitValStr)
-
-				req := pionex.FuturesGridUpdateTriggerProfitLossRequest{
-					BUOrderID: bot.remoteID,
-					List: []pionex.FuturesGridTriggerProfitLossItem{
-						{
-							Type:                "stop_profit",
-							StopType:            "profit_amount",
-							Value:               profitValStr,
-							ProfitStopSellModel: "TO_USDT",
-						},
-					},
-				}
-				_, uErr := client.UpdateFuturesGridTriggerProfitLoss(ctx, req)
-				if uErr != nil {
-					worker.logger.Error("failed to repair neutral bot take-profit on Pionex",
-						"component", "autogrid_worker", "bot_id", bot.id, "remote_id", bot.remoteID, "error", uErr)
-				} else {
-					worker.logger.Info("successfully repaired neutral bot take-profit on Pionex card",
+					worker.logger.Warn("repairing neutral bot take-profit on Pionex card",
 						"component", "autogrid_worker", "bot_id", bot.id, "symbol", bot.symbol,
-						"remote_id", bot.remoteID, "target_amount", profitValStr)
-					remote.BUOrderData.ProfitStopType = "profit_amount"
+						"remote_id", bot.remoteID, "target_amount", profitValStr,
+						"reason", repairReason, "card_was", cardWas.StringFixed(2),
+						"harvest_cap", harvestCap.StringFixed(2))
+
+					req := pionex.FuturesGridUpdateTriggerProfitLossRequest{
+						BUOrderID: bot.remoteID,
+						List: []pionex.FuturesGridTriggerProfitLossItem{
+							{
+								Type:                "stop_profit",
+								StopType:            "profit_amount",
+								Value:               profitValStr,
+								ProfitStopSellModel: "TO_USDT",
+							},
+						},
+					}
+					_, uErr := client.UpdateFuturesGridTriggerProfitLoss(ctx, req)
+					if uErr != nil {
+						worker.logger.Error("failed to repair neutral bot take-profit on Pionex",
+							"component", "autogrid_worker", "bot_id", bot.id, "remote_id", bot.remoteID, "error", uErr)
+					} else {
+						worker.logger.Info("successfully repaired neutral bot take-profit on Pionex card",
+							"component", "autogrid_worker", "bot_id", bot.id, "symbol", bot.symbol,
+							"remote_id", bot.remoteID, "target_amount", profitValStr, "reason", repairReason)
+						remote.BUOrderData.ProfitStopType = "profit_amount"
+						remote.BUOrderData.ProfitStop = effective
+						_, _ = worker.db.Exec(ctx, `
+							UPDATE grid_bots
+							SET take_profit = $1, target_price = NULL, updated_at = NOW()
+							WHERE id = $2
+						`, newTakeProfit, bot.id)
+						// Mirror the ceiling into the stored dynamic target so the
+						// local exit ladder cannot wait on the pre-160 fantasy
+						// amount the card just abandoned. Only ever lowered;
+						// FIXED mode keeps the operator's number.
+						if !fixedMode {
+							_, _ = worker.db.Exec(ctx, `
+								UPDATE grid_bots
+								SET pnl_target_usdt = $2::NUMERIC, updated_at = NOW()
+								WHERE id = $1
+								  AND pnl_target_usdt IS NOT NULL
+								  AND pnl_target_usdt > $2::NUMERIC
+							`, bot.id, effective)
+							// Same-tick decision safety (the tranche-2 precedent):
+							// decideBotAction below reads the local copies, so
+							// refresh them or this tick can wait one pass on the
+							// abandoned target.
+							bot.pnlTarget = &effective
+							botTarget = effective
+						}
+						_ = LogBotEvent(ctx, worker.db, bot.id, bot.botNumber, "REAL", bot.symbol,
+							"REPAIR_TAKE_PROFIT", &price, nil, map[string]any{
+								"action":       "switched_to_profit_amount",
+								"target_usdt":  profitValStr,
+								"reason":       repairReason,
+								"card_was":     cardWas.StringFixed(2),
+								"harvest_cap":  harvestCap.StringFixed(2),
+							})
+					}
+				} else if bot.targetPrice != nil {
+					// Clean up DB target_price artifact for neutral bots so UI displays pnlTargetUsdt cleanly
 					_, _ = worker.db.Exec(ctx, `
 						UPDATE grid_bots
-						SET take_profit = $1, target_price = NULL, updated_at = NOW()
-						WHERE id = $2
-					`, newTakeProfit, bot.id)
-					_ = LogBotEvent(ctx, worker.db, bot.id, bot.botNumber, "REAL", bot.symbol,
-						"REPAIR_TAKE_PROFIT", &price, nil, map[string]any{
-							"action":      "switched_to_profit_amount",
-							"target_usdt": profitValStr,
-						})
+						SET target_price = NULL, updated_at = NOW()
+						WHERE id = $1
+					`, bot.id)
+					bot.targetPrice = nil
 				}
-			} else if isNeutralBot && bot.targetPrice != nil {
-				// Clean up DB target_price artifact for neutral bots so UI displays pnlTargetUsdt cleanly
-				_, _ = worker.db.Exec(ctx, `
-					UPDATE grid_bots
-					SET target_price = NULL, updated_at = NOW()
-					WHERE id = $1
-				`, bot.id)
-				bot.targetPrice = nil
 			}
 		}
 
