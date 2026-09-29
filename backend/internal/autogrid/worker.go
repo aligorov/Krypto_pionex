@@ -7124,11 +7124,25 @@ func betaDownShortExempt(candidate Candidate, betaDown bool) bool {
 	return strongTrend && slope < 0
 }
 
-// marketBetaRegime caches BTC's regime for 5 minutes; the deploy paths ask
-// for it once per candidate loop.
+// marketBetaRegime caches BTC's regime for 2 minutes; the deploy paths ask
+// for it once per candidate loop. Checks both 15M for fast intraday dump detection
+// and 60M for macro market trend.
 func (worker *Worker) marketBetaRegime(ctx context.Context) (string, float64, float64) {
-	if time.Since(worker.betaRegime.checkedAt) < 5*time.Minute {
+	if time.Since(worker.betaRegime.checkedAt) < 2*time.Minute {
 		return worker.betaRegime.regime, worker.betaRegime.adx, worker.betaRegime.emaSlope
+	}
+	// Fast 15M check: if BTC is actively flushing on 15M, trigger early beta down
+	if candles15M, err15 := worker.publicClient.GetKlines(ctx, "BTC_USDT_PERP", "15M", 30); err15 == nil && len(candles15M) >= 30 {
+		res15 := marketdata.DetectRegime(candles15M)
+		if res15.Regime == "TREND_DOWN" && res15.ADX >= 22.0 && res15.EMASlopePct < -0.4 {
+			worker.betaRegime = betaRegimeCache{
+				checkedAt: time.Now(),
+				regime:    res15.Regime,
+				adx:       res15.ADX,
+				emaSlope:  res15.EMASlopePct,
+			}
+			return res15.Regime, res15.ADX, res15.EMASlopePct
+		}
 	}
 	candles, err := worker.publicClient.GetKlines(ctx, "BTC_USDT_PERP", "60M", 60)
 	if err != nil || len(candles) < 30 {

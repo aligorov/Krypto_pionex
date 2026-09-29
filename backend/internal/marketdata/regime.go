@@ -105,18 +105,14 @@ func DetectRegime(candles []pionex.KlineCandle) RegimeResult {
 	}
 
 	// Oscillation overrides:
-	// Only override to RANGE if ADX is not in a strong trending state (< 32.0)
-	// and Choppiness is not in extreme trending territory (> 38.2).
-	isStrongTrend := result.ADX > 32.0 || result.Choppiness < 38.2
-	if !isStrongTrend {
-		if result.Choppiness >= chopRangeThreshold || midlineCrossings(candles) >= 3 {
-			result.Regime = "RANGE"
-		}
+	// If price is frequently crossing the midline (>= 3 times in 36 candles),
+	// it is oscillating back and forth across the channel -> RANGE.
+	if midlineCrossings(candles) >= 3 || result.Choppiness >= chopRangeThreshold {
+		result.Regime = "RANGE"
 	}
 
-	// A strong ADX or low Choppiness reading is required to commit a directional grid;
-	// weak trend signals keep the neutral grid which is the most robust shape.
-	if result.Regime != "RANGE" && (result.ADX < adxTrendThreshold || result.Choppiness > 45.0) {
+	// A confirmed trend requires ADX >= 22 and Choppiness below choppy consolidation (<= 52.0).
+	if result.Regime != "RANGE" && (result.ADX < adxTrendThreshold || result.Choppiness > 52.0) {
 		result.Regime = "RANGE"
 	}
 	result.ParkinsonVolatility = parkinsonVolatility(candles, 96.0)
@@ -504,13 +500,15 @@ func supportResistanceRange(
 		windowLow = math.Min(windowLow, low)
 		windowHigh = math.Max(windowHigh, high)
 	}
-	halfBand := math.Max(volatilityPct, 2.0) / 200
+	// Dynamic half-band: guarantee at least 1.75% half-span (3.5% total span) even in low volatility,
+	// scaled up with volatility so grids have healthy breathing room and don't escape on minor noise.
+	halfBand := math.Max(math.Min(volatilityPct, 12.0)*0.5, 1.75) / 100
 	volLower := price * (1 - halfBand)
 	volUpper := price * (1 + halfBand)
 
 	// Add an ATR buffer so the grid bounds have room to absorb local wicks
 	atrPct := atrPercent(candles, 14)
-	atrBuffer := price * (math.Max(atrPct, 0.5) / 100) * 0.5
+	atrBuffer := price * (math.Max(atrPct, 0.6) / 100) * 0.75
 
 	structLower := windowLow - atrBuffer
 	structUpper := windowHigh + atrBuffer
@@ -521,12 +519,13 @@ func supportResistanceRange(
 	// Anchor the bounds on real traded volume where the profile agrees:
 	// wick-inflated extremes get pulled back to the band where liquidity
 	// actually changed hands. The result must still bracket the price and
-	// keep a sane minimum span — otherwise the structural bounds stand.
+	// keep a sane minimum span (3.5%) and safe distance from price (>= 1.2%) —
+	// otherwise the structural/volatility bounds stand.
 	if vpLower, vpUpper, ok := volumeProfileBounds(candles, 0.7); ok {
 		tighterLower := math.Max(lower, vpLower-atrBuffer)
 		tighterUpper := math.Min(upper, vpUpper+atrBuffer)
-		if tighterLower < price && price < tighterUpper &&
-			tighterUpper-tighterLower >= price*0.02 {
+		if tighterLower < price*0.988 && price*1.012 < tighterUpper &&
+			tighterUpper-tighterLower >= price*0.035 {
 			lower, upper = tighterLower, tighterUpper
 		}
 	}
