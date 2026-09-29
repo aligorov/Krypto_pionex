@@ -1829,7 +1829,13 @@ func (worker *Worker) deployPaper(
 			SlippageBps:    settings.SlippageBps.InexactFloat64(),
 		})
 
-		targetPriceDec := adaptiveRes.TargetPrice
+		normTrend := strings.ToLower(strings.TrimSpace(trend))
+		isNeutralPaper := normTrend == "no_trend" || normTrend == "neutral" || normTrend == ""
+		var targetPriceDec *decimal.Decimal
+		if !isNeutralPaper {
+			tp := adaptiveRes.TargetPrice
+			targetPriceDec = &tp
+		}
 		var stopLossPriceDec decimal.Decimal
 		var stopLossHighDec *decimal.Decimal
 		if settings.StopLossMode == "ADAPTIVE_ATR" {
@@ -3059,12 +3065,51 @@ func (worker *Worker) deployReal(
 			PricePrecision: pricePrecision,
 		})
 
-		// Configure native Pionex price-based take-profit directly on the bot card
-		targetPrice := adaptiveRes.TargetPrice.Round(int32(pricePrecision))
-		data.ProfitStopType = "price"
-		data.ProfitStop = &targetPrice
-		profitDelay := 15
-		data.ProfitStopDelay = &profitDelay
+		// Sized net true USDT targets: respect PnLTargetMode (DYNAMIC vs FIXED) and TrancheDeployEnabled
+		if settings.PnLTargetMode == "DYNAMIC" {
+			botTargetVal := decimal.NewFromFloat(adaptiveRes.TargetUSDT).Round(2)
+			botMaxLossVal := decimal.NewFromFloat(adaptiveRes.MaxLossUSDT).Round(2)
+			if stress.loss.GreaterThan(botMaxLossVal) {
+				botMaxLossVal = stress.loss.Round(2)
+			}
+			if settings.TrancheDeployEnabled {
+				botTargetVal = botTargetVal.Div(decimal.NewFromInt(2)).Round(2)
+				botMaxLossVal = botMaxLossVal.Div(decimal.NewFromInt(2)).Round(2)
+			}
+			botTarget = &botTargetVal
+			botMaxLoss = &botMaxLossVal
+		}
+
+		normTrendReal := strings.ToLower(strings.TrimSpace(trend))
+		isNeutralReal := normTrendReal == "no_trend" || normTrendReal == "neutral" || normTrendReal == ""
+
+		// Configure native Pionex take-profit directly on the bot card:
+		// Neutral futures grids hold bidirectional inventory (short above, long below).
+		// Setting a price-based profitStop causes an instant premature trigger as soon as short
+		// orders fill because market_price <= upper_price is immediately true. Neutral grids MUST
+		// use profit_amount take-profit (USDT target).
+		// Directional grids (LONG / SHORT) hold one-way directional inventory, where price-based
+		// profitStop works natively on the Pionex card.
+		var targetPriceDec *decimal.Decimal
+		if isNeutralReal {
+			if botTarget != nil && botTarget.GreaterThan(decimal.Zero) {
+				data.ProfitStopType = "profit_amount"
+				data.ProfitStop = botTarget
+				data.ProfitStopDelay = nil
+			} else {
+				data.ProfitStopType = ""
+				data.ProfitStop = nil
+				data.ProfitStopDelay = nil
+			}
+			targetPriceDec = nil
+		} else {
+			targetPrice := adaptiveRes.TargetPrice.Round(int32(pricePrecision))
+			data.ProfitStopType = "price"
+			data.ProfitStop = &targetPrice
+			profitDelay := 15
+			data.ProfitStopDelay = &profitDelay
+			targetPriceDec = &targetPrice
+		}
 
 		// Configure native Pionex price-based stop-loss: strictly respect settings.StopLossMode
 		var slPrice decimal.Decimal
@@ -3085,21 +3130,6 @@ func (worker *Worker) deployReal(
 			data.LossStop = nil
 			data.LossStopHigh = nil
 			data.LossStopDelay = nil
-		}
-
-		// Sized net true USDT targets: respect PnLTargetMode (DYNAMIC vs FIXED) and TrancheDeployEnabled
-		if settings.PnLTargetMode == "DYNAMIC" {
-			botTargetVal := decimal.NewFromFloat(adaptiveRes.TargetUSDT).Round(2)
-			botMaxLossVal := decimal.NewFromFloat(adaptiveRes.MaxLossUSDT).Round(2)
-			if stress.loss.GreaterThan(botMaxLossVal) {
-				botMaxLossVal = stress.loss.Round(2)
-			}
-			if settings.TrancheDeployEnabled {
-				botTargetVal = botTargetVal.Div(decimal.NewFromInt(2)).Round(2)
-				botMaxLossVal = botMaxLossVal.Div(decimal.NewFromInt(2)).Round(2)
-			}
-			botTarget = &botTargetVal
-			botMaxLoss = &botMaxLossVal
 		}
 
 		// Walk-forward backtest gate: the traded TF must pass empirical walk-forward
@@ -3229,7 +3259,6 @@ func (worker *Worker) deployReal(
 		if stress.floored {
 			trancheMarkers["stressLossFloor"] = true
 		}
-		targetPriceDec := targetPrice
 		var storedSL *decimal.Decimal
 		var storedSLHigh *decimal.Decimal
 		if settings.StopLossMode == "ADAPTIVE_ATR" {
@@ -3258,7 +3287,7 @@ func (worker *Worker) deployReal(
 			// its failure silently stripped the bot of its tranche contract.
 			// Markers match the paper model_state contract.
 			TrancheState:     trancheMarkers,
-			TargetPrice:      &targetPriceDec,
+			TargetPrice:      targetPriceDec,
 			StopLossPrice:    storedSL,
 			StopLossHigh:     storedSLHigh,
 			TrailingSLPrice:  storedSL,
@@ -4802,6 +4831,66 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 							"effective_max_loss": botMaxLoss.StringFixed(2),
 						})
 				}
+			}
+		}
+
+		// Self-heal / active repair for neutral bots created with erroneous price-based take-profit on Pionex card (v2.0.158)
+		if bot.localStatus == "RUNNING" && client != nil {
+			isNeutralBot := strings.EqualFold(bot.direction, "NEUTRAL") || strings.EqualFold(remote.BUOrderData.Trend, "no_trend")
+			if isNeutralBot && strings.EqualFold(remote.BUOrderData.ProfitStopType, "price") {
+				profitValStr := ""
+				var newTakeProfit *decimal.Decimal
+				if botTarget.GreaterThan(decimal.Zero) {
+					profitValStr = botTarget.StringFixed(2)
+					newTakeProfit = &botTarget
+				} else if bot.pnlTarget != nil && bot.pnlTarget.GreaterThan(decimal.Zero) {
+					profitValStr = bot.pnlTarget.StringFixed(2)
+					newTakeProfit = bot.pnlTarget
+				}
+
+				worker.logger.Warn("repairing neutral bot on Pionex: replacing premature price-based take-profit with profit_amount",
+					"component", "autogrid_worker", "bot_id", bot.id, "symbol", bot.symbol,
+					"remote_id", bot.remoteID, "target_amount", profitValStr)
+
+				req := pionex.FuturesGridUpdateTriggerProfitLossRequest{
+					BUOrderID: bot.remoteID,
+					List: []pionex.FuturesGridTriggerProfitLossItem{
+						{
+							Type:                "stop_profit",
+							StopType:            "profit_amount",
+							Value:               profitValStr,
+							ProfitStopSellModel: "TO_USDT",
+						},
+					},
+				}
+				_, uErr := client.UpdateFuturesGridTriggerProfitLoss(ctx, req)
+				if uErr != nil {
+					worker.logger.Error("failed to repair neutral bot take-profit on Pionex",
+						"component", "autogrid_worker", "bot_id", bot.id, "remote_id", bot.remoteID, "error", uErr)
+				} else {
+					worker.logger.Info("successfully repaired neutral bot take-profit on Pionex card",
+						"component", "autogrid_worker", "bot_id", bot.id, "symbol", bot.symbol,
+						"remote_id", bot.remoteID, "target_amount", profitValStr)
+					remote.BUOrderData.ProfitStopType = "profit_amount"
+					_, _ = worker.db.Exec(ctx, `
+						UPDATE grid_bots
+						SET take_profit = $1, target_price = NULL, updated_at = NOW()
+						WHERE id = $2
+					`, newTakeProfit, bot.id)
+					_ = LogBotEvent(ctx, worker.db, bot.id, bot.botNumber, "REAL", bot.symbol,
+						"REPAIR_TAKE_PROFIT", &price, nil, map[string]any{
+							"action":      "switched_to_profit_amount",
+							"target_usdt": profitValStr,
+						})
+				}
+			} else if isNeutralBot && bot.targetPrice != nil {
+				// Clean up DB target_price artifact for neutral bots so UI displays pnlTargetUsdt cleanly
+				_, _ = worker.db.Exec(ctx, `
+					UPDATE grid_bots
+					SET target_price = NULL, updated_at = NOW()
+					WHERE id = $1
+				`, bot.id)
+				bot.targetPrice = nil
 			}
 		}
 

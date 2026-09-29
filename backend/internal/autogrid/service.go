@@ -255,6 +255,7 @@ type ClosedBot struct {
 	EstimatedFinalUSDT *decimal.Decimal `json:"estimatedFinalUsdt,omitempty"`
 	ClosedReason       *string          `json:"closedReason"`
 	Status             string           `json:"status"`
+	PnLTargetUSDT      *decimal.Decimal `json:"pnlTargetUsdt,omitempty"`
 	TargetPrice        *decimal.Decimal `json:"targetPrice,omitempty"`
 	StopLossPrice      *decimal.Decimal `json:"stopLossPrice,omitempty"`
 	AdaptiveStrategy   *string          `json:"adaptiveStrategy,omitempty"`
@@ -1121,7 +1122,10 @@ func (s *Service) CompleteScan(
 				SlippageBps:    slippageBps,
 			})
 
-			targetPriceDec = &adaptiveRes.TargetPrice
+			normTrend := strings.ToLower(strings.TrimSpace(item.RecommendedTrend))
+			if normTrend != "no_trend" && normTrend != "neutral" && normTrend != "" {
+				targetPriceDec = &adaptiveRes.TargetPrice
+			}
 			stopLossPriceDec = &adaptiveRes.StopLossPrice
 			stopLossHighDec = adaptiveRes.StopLossHigh
 			strat := adaptiveRes.AdaptiveStrategy
@@ -1860,7 +1864,7 @@ func (s *Service) listClosedBots(ctx context.Context, settingsID string) ([]Clos
 	// → NULL estimate → the UI marks the final unknown.
 	rows, err := s.db.Query(ctx, `
 		SELECT g.id, COALESCE(g.bot_number, 0), g.symbol, g.direction, g.quote_investment,
-		       g.realized_pnl_usdt, g.closed_reason, g.status,
+		       g.realized_pnl_usdt, g.closed_reason, g.status, g.pnl_target_usdt,
 		       g.target_price, g.stop_loss_price, g.adaptive_strategy, g.risk_reward_ratio,
 		       COALESCE(g.closed_at, g.updated_at),
 		       est.total_pnl
@@ -1886,7 +1890,7 @@ func (s *Service) listClosedBots(ctx context.Context, settingsID string) ([]Clos
 		item.Source = "REAL"
 		if err := rows.Scan(
 			&item.ID, &item.BotNumber, &item.Symbol, &item.Direction, &item.QuoteInvestment,
-			&item.RealizedPNLUSDT, &item.ClosedReason, &item.Status,
+			&item.RealizedPNLUSDT, &item.ClosedReason, &item.Status, &item.PnLTargetUSDT,
 			&item.TargetPrice, &item.StopLossPrice, &item.AdaptiveStrategy, &item.RiskRewardRatio,
 			&item.ClosedAt,
 			&item.EstimatedFinalUSDT,
@@ -1903,7 +1907,7 @@ func (s *Service) listClosedBots(ctx context.Context, settingsID string) ([]Clos
 	rows, err = s.db.Query(ctx, `
 		SELECT id, COALESCE(bot_number, 0), symbol, direction, quote_investment,
 		       COALESCE(realized_pnl_usdt, 0) + COALESCE(unrealized_pnl_usdt, 0), closed_reason, status,
-		       target_price, stop_loss_price, adaptive_strategy, risk_reward_ratio,
+		       pnl_target_usdt, target_price, stop_loss_price, adaptive_strategy, risk_reward_ratio,
 		       COALESCE(closed_at, updated_at)
 		FROM paper_grid_bots
 		WHERE settings_id = $1
@@ -1920,7 +1924,7 @@ func (s *Service) listClosedBots(ctx context.Context, settingsID string) ([]Clos
 		item.Source = "PAPER"
 		if err := rows.Scan(
 			&item.ID, &item.BotNumber, &item.Symbol, &item.Direction, &item.QuoteInvestment,
-			&item.RealizedPNLUSDT, &item.ClosedReason, &item.Status,
+			&item.RealizedPNLUSDT, &item.ClosedReason, &item.Status, &item.PnLTargetUSDT,
 			&item.TargetPrice, &item.StopLossPrice, &item.AdaptiveStrategy, &item.RiskRewardRatio,
 			&item.ClosedAt,
 		); err != nil {

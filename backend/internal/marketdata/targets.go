@@ -3,6 +3,7 @@ package marketdata
 import (
 	"fmt"
 	"math"
+	"strings"
 
 	"github.com/shopspring/decimal"
 )
@@ -200,21 +201,26 @@ func ComputeIndividualTargetPrices(input AdaptiveBotTargetInput) AdaptiveBotTarg
 		lev = 1
 	}
 
-	strategy := StrategyVolatilityExpansion
-	direction := input.Direction
-	if direction == "" {
+	normDir := strings.ToUpper(strings.TrimSpace(input.Direction))
+	var direction string
+	switch normDir {
+	case "SHORT":
+		direction = "SHORT"
+	case "NEUTRAL", "NO_TREND":
+		direction = "NEUTRAL"
+	default:
 		direction = "LONG"
 	}
 
-	// Strategy selection based on market microstructure & order flow
-	if input.OrderBookDepth != nil && (input.OrderBookDepth.HasBidWall || input.OrderBookDepth.HasAskWall) {
+	strategy := StrategyVolatilityExpansion
+	if direction == "NEUTRAL" {
+		strategy = StrategyMeanReversionOU
+	} else if input.OrderBookDepth != nil && (input.OrderBookDepth.HasBidWall || input.OrderBookDepth.HasAskWall) {
 		if input.OrderBookDepth.ImbalanceRatio > 0.58 || input.OrderBookDepth.ImbalanceRatio < 0.42 {
 			strategy = StrategyOFIWallDefense
 		}
 	} else if input.SRAnalysis != nil && (input.SRAnalysis.ResistStrength > 0.6 || input.SRAnalysis.SupportStrength > 0.6) {
 		strategy = StrategySRMomentumRunner
-	} else if direction == "NEUTRAL" {
-		strategy = StrategyMeanReversionOU
 	}
 
 	var tp, sl decimal.Decimal

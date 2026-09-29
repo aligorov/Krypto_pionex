@@ -432,6 +432,7 @@ export interface AutoGridClosedBot {
   estimatedFinalUsdt?: string | null;
   closedReason: string | null;
   status: string;
+  pnlTargetUsdt?: string;
   targetPrice?: string;
   stopLossPrice?: string;
   adaptiveStrategy?: string;

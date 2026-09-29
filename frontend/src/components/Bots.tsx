@@ -600,9 +600,13 @@ function ClosedBotRow({
       <td>
         <div style={{ display: 'flex', flexDirection: 'column', gap: '2px' }}>
           {strategyBadge(bot.adaptiveStrategy)}
-          {(bot.targetPrice || bot.stopLossPrice) && (
+          {(bot.targetPrice || bot.pnlTargetUsdt || bot.stopLossPrice) && (
             <div style={{ fontSize: '0.70rem', color: '#94a3b8' }}>
-              {bot.targetPrice && <span style={{ color: '#34d399', marginRight: 4 }}>TP: {bot.targetPrice}</span>}
+              {(bot.targetPrice || bot.pnlTargetUsdt) && (
+                <span style={{ color: '#34d399', marginRight: 4 }}>
+                  TP: {bot.targetPrice ? bot.targetPrice : `${bot.pnlTargetUsdt}$`}
+                </span>
+              )}
               {bot.stopLossPrice && <span style={{ color: '#f87171' }}>SL: {bot.stopLossPrice}</span>}
             </div>
           )}

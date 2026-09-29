@@ -360,5 +360,27 @@ func TestComputeIndividualTargetPrices(t *testing.T) {
 	if resPrec.MaxLossUSDT > 25.0 || resPrec.MaxLossUSDT < 10.0 {
 		t.Fatalf("MaxLossUSDT %f must be clamped in [$10..$25], got %f", resPrec.MaxLossUSDT, resPrec.MaxLossUSDT)
 	}
+
+	// Test 5: "no_trend" (worker.go convention) maps to NEUTRAL & MeanReversionOU
+	resNoTrend := ComputeIndividualTargetPrices(AdaptiveBotTargetInput{
+		Symbol:        "DOGE_USDT",
+		Direction:     "no_trend",
+		CurrentPrice:  decimal.NewFromFloat(0.0934),
+		LowerPrice:    decimal.NewFromFloat(0.0900),
+		UpperPrice:    decimal.NewFromFloat(0.0980),
+		Budget:        50.0,
+		Leverage:      4,
+		ATR:           0.002,
+		MinRiskReward: 1.8,
+	})
+	if resNoTrend.AdaptiveStrategy != StrategyMeanReversionOU {
+		t.Fatalf("expected strategy %s for no_trend, got %s", StrategyMeanReversionOU, resNoTrend.AdaptiveStrategy)
+	}
+	if resNoTrend.StopLossHigh == nil {
+		t.Fatalf("no_trend (neutral) grid must return StopLossHigh")
+	}
+	if resNoTrend.TargetPrice.GreaterThan(decimal.NewFromFloat(0.0980)) {
+		t.Fatalf("no_trend target price %s must NOT overshoot UpperPrice 0.0980", resNoTrend.TargetPrice)
+	}
 }
 

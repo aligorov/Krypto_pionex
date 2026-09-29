@@ -840,9 +840,19 @@ func (worker *Worker) dgtRedeployPaper(ctx context.Context, settings Settings, s
 		SlippageBps:   settings.SlippageBps.InexactFloat64(),
 	})
 
-	targetPriceDec := adaptiveRes.TargetPrice
-	stopLossPriceDec := adaptiveRes.StopLossPrice
-	stopLossHighDec := adaptiveRes.StopLossHigh
+	isNeutralPaper := trendForExchange(spec.direction) == "no_trend"
+	var targetPriceDec *decimal.Decimal
+	if !isNeutralPaper {
+		tp := adaptiveRes.TargetPrice
+		targetPriceDec = &tp
+	}
+	var stopLossPriceDec *decimal.Decimal
+	var stopLossHighDec *decimal.Decimal
+	if settings.StopLossMode == "ADAPTIVE_ATR" {
+		sl := adaptiveRes.StopLossPrice
+		stopLossPriceDec = &sl
+		stopLossHighDec = adaptiveRes.StopLossHigh
+	}
 	riskRewardDec := decimal.NewFromFloat(adaptiveRes.RiskRewardRatio)
 	adaptiveStrat := adaptiveRes.AdaptiveStrategy
 
@@ -1092,9 +1102,22 @@ func (worker *Worker) dgtRedeployReal(ctx context.Context, settings Settings, sp
 		SlippageBps:   settings.SlippageBps.InexactFloat64(),
 	})
 
-	targetPriceDec := adaptiveRes.TargetPrice
-	stopLossPriceDec := adaptiveRes.StopLossPrice
-	stopLossHighDec := adaptiveRes.StopLossHigh
+	isNeutral := trendForExchange(spec.direction) == "no_trend"
+	var targetPriceDec *decimal.Decimal
+	if !isNeutral {
+		tp := adaptiveRes.TargetPrice.Round(int32(pricePrecision))
+		targetPriceDec = &tp
+	}
+	var stopLossPriceDec *decimal.Decimal
+	var stopLossHighDec *decimal.Decimal
+	if settings.StopLossMode == "ADAPTIVE_ATR" {
+		sl := ClampAntiHuntStopIntoBounds(spec.direction, lowerPrice, upperPrice, adaptiveRes.StopLossPrice).Round(int32(pricePrecision))
+		stopLossPriceDec = &sl
+		if adaptiveRes.StopLossHigh != nil {
+			slH := adaptiveRes.StopLossHigh.Round(int32(pricePrecision))
+			stopLossHighDec = &slH
+		}
+	}
 	riskRewardDec := decimal.NewFromFloat(adaptiveRes.RiskRewardRatio)
 	adaptiveStrat := adaptiveRes.AdaptiveStrategy
 
@@ -1146,18 +1169,40 @@ func (worker *Worker) dgtRedeployReal(ctx context.Context, settings Settings, sp
 		Leverage:        botLev,
 		QuoteInvestment: investAmount.Round(2),
 	}
-	data.ProfitStopType = "price"
-	data.ProfitStop = &adaptiveRes.TargetPrice
-	profitDelay := 15
-	data.ProfitStopDelay = &profitDelay
-
-	data.LossStopType = "price"
-	data.LossStop = &adaptiveRes.StopLossPrice
-	if adaptiveRes.StopLossHigh != nil {
-		data.LossStopHigh = adaptiveRes.StopLossHigh
+	if isNeutral {
+		if botTarget != nil && botTarget.GreaterThan(decimal.Zero) {
+			data.ProfitStopType = "profit_amount"
+			data.ProfitStop = botTarget
+			data.ProfitStopDelay = nil
+		} else {
+			data.ProfitStopType = ""
+			data.ProfitStop = nil
+			data.ProfitStopDelay = nil
+		}
+	} else {
+		tp := adaptiveRes.TargetPrice.Round(int32(pricePrecision))
+		data.ProfitStopType = "price"
+		data.ProfitStop = &tp
+		profitDelay := 15
+		data.ProfitStopDelay = &profitDelay
 	}
-	lossDelay := 15
-	data.LossStopDelay = &lossDelay
+
+	if settings.StopLossMode == "ADAPTIVE_ATR" {
+		slPrice := ClampAntiHuntStopIntoBounds(spec.direction, lowerPrice, upperPrice, adaptiveRes.StopLossPrice).Round(int32(pricePrecision))
+		data.LossStopType = "price"
+		data.LossStop = &slPrice
+		if adaptiveRes.StopLossHigh != nil {
+			h := adaptiveRes.StopLossHigh.Round(int32(pricePrecision))
+			data.LossStopHigh = &h
+		}
+		lossDelay := 15
+		data.LossStopDelay = &lossDelay
+	} else {
+		data.LossStopType = ""
+		data.LossStop = nil
+		data.LossStopHigh = nil
+		data.LossStopDelay = nil
+	}
 
 	futuresBase := base
 	if !strings.HasSuffix(futuresBase, ".PERP") && !strings.HasSuffix(futuresBase, "_PERP") {
@@ -1198,10 +1243,10 @@ func (worker *Worker) dgtRedeployReal(ctx context.Context, settings Settings, sp
 			"trancheEntry":    spec.breakPrice.String(),
 			"atrPctEntry":     atrPct,
 		},
-		TargetPrice:      &targetPriceDec,
-		StopLossPrice:    &stopLossPriceDec,
+		TargetPrice:      targetPriceDec,
+		StopLossPrice:    stopLossPriceDec,
 		StopLossHigh:     stopLossHighDec,
-		TrailingSLPrice:  &stopLossPriceDec,
+		TrailingSLPrice:  stopLossPriceDec,
 		AdaptiveStrategy: &adaptiveStrat,
 		RiskRewardRatio:  &riskRewardDec,
 	})
