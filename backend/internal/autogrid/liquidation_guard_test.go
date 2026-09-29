@@ -103,14 +103,16 @@ func TestDirectionalTrendExempt(t *testing.T) {
 	if v := directionalTrendExempt(mk("long", 25, 1.2), false); !v.Exempt || v.Cohort != "dirTrendLong" {
 		t.Fatalf("own-trend long not exempt: %+v", v)
 	}
-	// v2.0.161 review P1: the long cohort restores NORMAL anti-FOMO caps —
-	// RSI > 70 or channel position > 75% voids the exemption even though
-	// the scanner widened its own caps in this exact strong-trend band.
+	// v2.0.162 (operator override): the long cohort may enter breakouts up
+	// to 90% of the channel; the overheating RSI cap stays.
 	if v := directionalTrendExempt(mkWithRSI("long", 25, 1.2, 75, 50), false); v.Exempt {
-		t.Fatalf("overheated long (RSI 75) must not exempt: %+v", v)
+		t.Fatalf("overheated long (RSI 75 > cap 70) must not exempt: %+v", v)
 	}
-	if v := directionalTrendExempt(mkWithRSI("long", 25, 1.2, 65, 80), false); v.Exempt {
-		t.Fatalf("late-channel long (80%%) must not exempt: %+v", v)
+	if v := directionalTrendExempt(mkWithRSI("long", 25, 1.2, 65, 80), false); !v.Exempt || v.Cohort != "dirTrendLong" {
+		t.Fatalf("breakout long (pos 80%% ≤ 90%%) must exempt: %+v", v)
+	}
+	if v := directionalTrendExempt(mkWithRSI("long", 25, 1.2, 65, 95), false); v.Exempt {
+		t.Fatalf("exhausted channel (pos 95%%) must not exempt: %+v", v)
 	}
 	if v := directionalTrendExempt(mkWithRSI("long", 25, 1.2, 65, 50), false); !v.Exempt || v.Cohort != "dirTrendLong" {
 		t.Fatalf("sane long must exempt: %+v", v)

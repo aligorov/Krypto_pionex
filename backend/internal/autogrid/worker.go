@@ -1673,6 +1673,10 @@ func (worker *Worker) deployPaper(
 		// v2.0.62 (R1) + Quant Vision v3.0: directional entry requires
 		// either the matching confluence verdict OR confirmed candlestick price action
 		// (Pin Bar, Engulfing, or SFP liquidity sweep). Cascade-shorts exempt.
+		// v2.0.162 (unlock plan step 3): a confirmed own-trend impulse is
+		// exempt too — a decisive trend prints reversal candles rarely (a
+		// green/red series has no hammer), so the pattern requirement
+		// converted every clean impulse entry into a NEUTRAL fallback.
 		if (trend == "long" || trend == "short") && !(cascadeShort && trend == "short") {
 			verdict := candidateConfluenceVerdict(candidate.ModelAssumptions)
 			want := "SUPPORT_SHORT"
@@ -1680,15 +1684,25 @@ func (worker *Worker) deployPaper(
 				want = "SUPPORT_LONG"
 			}
 			if verdict != want {
-				paConfirmed, paReason := worker.directionalConfirmedByPriceAction(ctx, candidate.Symbol, trend)
-				if !paConfirmed {
-					worker.rejectCandidate(ctx, candidate,
-						fmt.Sprintf("R1 + Vision: направленный вход (%s) без подтверждения — confluence %s (нужно %s) и нет свечного паттерна (%s)",
-							strings.ToUpper(trend), verdict, want, paReason), nil)
-					continue
+				if v := directionalTrendExempt(candidate, betaDown); v.Exempt {
+					// v2.0.162 review P1: stamp the cohort — an R1-only
+					// exemption must stay visible in the 14-day outcome
+					// partition or the promised evidence-based rollback
+					// cannot see this entry class.
+					candidate.ModelAssumptions[v.Cohort] = true
+					worker.logger.Info("paper directional entry approved via confirmed trend (R1 exempt)",
+						"component", "autogrid_worker", "symbol", candidate.Symbol, "trend", trend, "cohort", v.Cohort)
+				} else {
+					paConfirmed, paReason := worker.directionalConfirmedByPriceAction(ctx, candidate.Symbol, trend)
+					if !paConfirmed {
+						worker.rejectCandidate(ctx, candidate,
+							fmt.Sprintf("R1 + Vision: направленный вход (%s) без подтверждения — confluence %s (нужно %s) и нет свечного паттерна (%s)",
+								strings.ToUpper(trend), verdict, want, paReason), nil)
+						continue
+					}
+					worker.logger.Info("paper directional entry approved via Price Action",
+						"component", "autogrid_worker", "symbol", candidate.Symbol, "trend", trend, "pattern", paReason)
 				}
-				worker.logger.Info("paper directional entry approved via Price Action",
-					"component", "autogrid_worker", "symbol", candidate.Symbol, "trend", trend, "pattern", paReason)
 			}
 		}
 
@@ -2766,6 +2780,8 @@ func (worker *Worker) deployReal(
 		// v2.0.62 (R1, REAL mirror) + Quant Vision v3.0: directional entry requires
 		// either the matching confluence verdict OR confirmed candlestick price action
 		// (Pin Bar, Engulfing, or SFP liquidity sweep). Cascade-shorts exempt.
+		// v2.0.162 (unlock plan step 3, REAL mirror): confirmed own-trend
+		// impulses are exempt from the pattern requirement (see paper twin).
 		if (trend == "long" || trend == "short") && !(cascadeShort && trend == "short") {
 			verdict := candidateConfluenceVerdict(candidate.ModelAssumptions)
 			want := "SUPPORT_SHORT"
@@ -2773,15 +2789,23 @@ func (worker *Worker) deployReal(
 				want = "SUPPORT_LONG"
 			}
 			if verdict != want {
-				paConfirmed, paReason := worker.directionalConfirmedByPriceAction(ctx, candidate.Symbol, trend)
-				if !paConfirmed {
-					worker.rejectCandidate(ctx, candidate,
-						fmt.Sprintf("R1 + Vision: направленный вход (%s) без подтверждения — confluence %s (нужно %s) и нет свечного паттерна (%s)",
-							strings.ToUpper(trend), verdict, want, paReason), nil)
-					continue
+				if v := directionalTrendExempt(candidate, betaDownEntry); v.Exempt {
+					// v2.0.162 review P1 (REAL mirror): stamp the cohort for
+					// the 14-day outcome partition.
+					candidate.ModelAssumptions[v.Cohort] = true
+					worker.logger.Info("real directional entry approved via confirmed trend (R1 exempt)",
+						"component", "autogrid_worker", "symbol", candidate.Symbol, "trend", trend, "cohort", v.Cohort)
+				} else {
+					paConfirmed, paReason := worker.directionalConfirmedByPriceAction(ctx, candidate.Symbol, trend)
+					if !paConfirmed {
+						worker.rejectCandidate(ctx, candidate,
+							fmt.Sprintf("R1 + Vision: направленный вход (%s) без подтверждения — confluence %s (нужно %s) и нет свечного паттерна (%s)",
+								strings.ToUpper(trend), verdict, want, paReason), nil)
+						continue
+					}
+					worker.logger.Info("real directional entry approved via Price Action",
+						"component", "autogrid_worker", "symbol", candidate.Symbol, "trend", trend, "pattern", paReason)
 				}
-				worker.logger.Info("real directional entry approved via Price Action",
-					"component", "autogrid_worker", "symbol", candidate.Symbol, "trend", trend, "pattern", paReason)
 			}
 		}
 		// v2.0.21 beta gate (REAL mirror).

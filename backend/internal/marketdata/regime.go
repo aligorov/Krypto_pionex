@@ -115,6 +115,23 @@ func DetectRegime(candles []pionex.KlineCandle) RegimeResult {
 	if result.Regime != "RANGE" && (result.ADX < adxTrendThreshold || result.Choppiness > 52.0) {
 		result.Regime = "RANGE"
 	}
+	// v2.0.162 stacked-EMA preservation (unlock plan step 1, symmetric): the
+	// ADX/choppiness flatteners above must not turn a decisively stacked,
+	// sloping tape back into RANGE — a low-ADX grind is still distribution.
+	// The pair keeps its TREND_* class when the EMAs are stacked AND the
+	// fast slope is decisive (the same ±0.5% confirmed-trend band the
+	// directional engine keys on), UNLESS the tape genuinely oscillates
+	// across the midline (the crossings veto above keeps its meaning: a
+	// range leg phasing downward is a range, not a trend) or the macro
+	// window clearly contradicts (the ±3% guards keep their meaning).
+	if midlineCrossings(candles) < 3 {
+		if windowReturnPct <= 3.0 && result.EMAFast < result.EMASlow && result.EMASlopePct <= -0.5 {
+			result.Regime = "TREND_DOWN"
+		}
+		if windowReturnPct >= -3.0 && result.EMAFast > result.EMASlow && result.EMASlopePct >= 0.5 {
+			result.Regime = "TREND_UP"
+		}
+	}
 	result.ParkinsonVolatility = parkinsonVolatility(candles, 96.0)
 	return result
 }

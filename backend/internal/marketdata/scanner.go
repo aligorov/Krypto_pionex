@@ -451,13 +451,13 @@ func scoreCandidate(
 	} else if change24hPct <= -3.0 && recommendedTrend == "long" {
 		recommendedTrend = "no_trend"
 	}
-	// Mature-trend LONG demotion (v2.0.39, closed-ledger audit): longs
-	// entering ADX ≥28 tapes went 1W/3L (GRAM 28.8/LIT 31.4/RGTIX 34.4 =
-	// −$18.9; the lone winner DOGE entered at ADX 13.8) — by the time ADX
-	// reads 28 the move is aged and the entry is a chase.
-	if matureTrendLongDemoted(recommendedTrend, regime.ADX) {
-		recommendedTrend = "no_trend"
-	}
+	// v2.0.162 (unlock plan): the mature-trend LONG demotion (v2.0.39,
+	// ADX≥28 → no_trend) is REMOVED by operator directive — it confined
+	// LONG to the 22–28 ADX window and fed strong rallies into the neutral
+	// generator instead. The original 1W/3L evidence was a 4-trade sample
+	// from the pre-directional-era exit machinery; the walk-forward
+	// backtest gate and the 161/162 exemption cohorts (14-day outcome
+	// partition) now carry the validation load.
 	if rangeFraction < 0.005 {
 		recommendedTrend = "no_trend"
 	}
@@ -1098,27 +1098,24 @@ func neutralSqueezeRisk(regime RegimeResult) bool {
 	return regime.IsSqueeze && !(regime.ADX < 20.0 && regime.Choppiness > 55.0)
 }
 
-// matureTrendLongDemoted drops LONG when the trend is aged (ADX ≥28,
-// v2.0.39): entering after the move is a chase — 1W/3L in the ledger.
-func matureTrendLongDemoted(trend string, adx float64) bool {
-	return trend == "long" && adx >= 28.0
-}
+// neutralSqueezeRisk is documented above; the mature-trend LONG demotion
+// helper (v2.0.39) was removed in v2.0.162 by operator directive — see the
+// call-site comment in scoreCandidate.
 
 // antiFomoShortFloorsLifted decides whether the SHORT RSI/position floors
 // stand down for this scan: the v2.0.21 cascade window lifts them
-// unconditionally (forced-unwind pass), and the v2.0.147 beta-down regime
-// lifts them only when the pair's own tape confirms the downtrend — strong
-// trend (the same >22 ADX / >0.5 slope band the floors already widen on)
-// AND a falling EMA. Slope sign is the direction proof: a beta-down scan
-// seeing a rising pair is a divergence, not a confirmation, and keeps the
-// floors armed.
+// unconditionally (forced-unwind pass). v2.0.147 lifted them for the
+// beta-down regime when the pair's own tape confirmed the downtrend;
+// v2.0.162 (unlock plan step 5) widens that lift to ANY confirmed own
+// downtrend — strong trend (the same >22 ADX / >0.5 slope band the floors
+// already widen on) AND a falling EMA. Slope sign is the direction proof:
+// an impulse breakdown sits at the channel bottom by construction, and
+// the oversold reading IS the signal, not a trap, while the trend carries.
 func antiFomoShortFloorsLifted(cascadeMode, betaDownShortMode bool, adx, emaSlopePct float64) bool {
 	if cascadeMode {
 		return true
 	}
-	if !betaDownShortMode {
-		return false
-	}
+	_ = betaDownShortMode // subsumed by the own-tape confirmation below
 	strongTrend := adx > 22.0 || math.Abs(emaSlopePct) > 0.5
 	return strongTrend && emaSlopePct < 0
 }

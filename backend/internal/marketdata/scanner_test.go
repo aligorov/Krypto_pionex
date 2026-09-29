@@ -215,13 +215,10 @@ func TestLedgerAuditedEntryZones(t *testing.T) {
 	if neutralSemiTrendBlocked("long", 28) || neutralSemiTrendBlocked("short", 28) {
 		t.Fatal("semi-trend veto is NEUTRAL-only")
 	}
-	// Mature-trend LONG demotion at ADX ≥28 (GRAM 28.8/LIT 31.4/RGTIX 34.4).
-	if !matureTrendLongDemoted("long", 28.8) || matureTrendLongDemoted("long", 13.8) {
-		t.Fatal("long demotion must fire at ADX ≥28 and spare fresh trends")
-	}
-	if matureTrendLongDemoted("no_trend", 34) {
-		t.Fatal("demotion is LONG-only")
-	}
+	// v2.0.162: the mature-trend LONG demotion (ADX ≥28 → no_trend) is
+	// REMOVED by operator directive — aged strong trends now feed the LONG
+	// grid; the walk-forward gate and the 14-day cohort partition carry
+	// the validation load.
 }
 
 func TestNeutralSqueezeRisk(t *testing.T) {

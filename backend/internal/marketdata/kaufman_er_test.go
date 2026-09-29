@@ -85,9 +85,10 @@ func TestScoreCandidateKaufmanERGate(t *testing.T) {
 	// the ER gate alone.
 	config.FeeBps, config.SlippageBps = 0, 0
 
-	// Trending tape: +2% per candle compounds to ~4.9× over 80 candles; the
-	// mature-trend LONG demotion (ADX ≥ 28) drops it to no_trend and the ER
-	// veto finishes the job.
+	// Trending tape: +2% per candle compounds to ~4.9× over 80 candles.
+	// v2.0.162: the mature-trend LONG demotion is gone, so this tape is a
+	// LONG candidate now and dies at the Anti-FOMO caps (RSI/position
+	// extremes) instead of falling through to the neutral ER veto.
 	trendTicker := pionex.TickerInfo{
 		Symbol: "TST_USDT", Open: decimal.NewFromInt(100),
 		Close: decimal.NewFromFloat(100 * math.Pow(1.02, 79)),
@@ -101,8 +102,8 @@ func TestScoreCandidateKaufmanERGate(t *testing.T) {
 	if candidate.Decision != "REJECTED" {
 		t.Fatalf("trending tape must be rejected, got %s (%s)", candidate.Decision, candidate.RejectionReason)
 	}
-	if !strings.Contains(candidate.RejectionReason, "Kaufman ER") {
-		t.Fatalf("trending tape must carry the Kaufman ER veto, got %q", candidate.RejectionReason)
+	if !strings.Contains(candidate.RejectionReason, "Anti-FOMO") {
+		t.Fatalf("trending tape must die at the directional Anti-FOMO caps, got %q", candidate.RejectionReason)
 	}
 	er, ok := candidate.ModelAssumptions["kaufmanER"].(float64)
 	if !ok || er <= 0.8 {

@@ -63,16 +63,17 @@ func directionalTrendExempt(candidate Candidate, btcTrendDown bool) dirTrendVerd
 		if !strongTrend || slope <= 0 {
 			return dirTrendVerdict{}
 		}
-		// v2.0.161 review P1: the scanner widens anti-FOMO to RSI 78 /
-		// channel 88% exactly in this strong-trend band, so the exempt
-		// cohort must restore the NORMAL caps itself — no long enters this
-		// class above RSI 70 or 75% of the channel (the beta-down short
-		// cohort keeps its prod-proven floors untouched).
+		// v2.0.162 (operator override, unlock plan): the exempt long cohort
+		// may enter on breakouts up to 90% of the channel — impulse entries
+		// live in the upper channel by construction (the 161-review 75% cap
+		// would have re-blocked exactly the breakout class the operator is
+		// unlocking). The RSI ≤ 70 overheating cap STAYS — that is the actual
+		// FOMO trap; channel height is not.
 		rsi, _ := candidate.ModelAssumptions["rsi"].(float64)
 		if rsi > 70.0 {
 			return dirTrendVerdict{}
 		}
-		if pos, ok := candidate.ModelAssumptions["rangePositionPct"].(float64); ok && pos > 75.0 {
+		if pos, ok := candidate.ModelAssumptions["rangePositionPct"].(float64); ok && pos > 90.0 {
 			return dirTrendVerdict{}
 		}
 		return dirTrendVerdict{Exempt: true, Cohort: "dirTrendLong"}
