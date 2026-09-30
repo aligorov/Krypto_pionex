@@ -343,7 +343,10 @@ func (worker *Worker) checkKnifePause(
 	// path below. A socket-wide 1008 rate-limit reset used to mark every
 	// book DESYNC and freeze 100% of entries on "awaiting fresh snapshot"
 	// while the REST trade tape was clean. Real flow vetoes (dump/pump
-	// pressure — IsActionable) still hard-veto.
+	// pressure — IsActionable) still hard-veto. Review P2: if BOTH lanes
+	// are dead (desync soft-veto AND the REST fetch fails), the entry is
+	// refused — knife protection must never silently drop to zero.
+	desyncDeferred := false
 	if worker.ofiEngine != nil {
 		analysis := worker.ofiEngine.Analyze(symbol)
 		if allowed, ofiReason := analysis.CanEnter(trend); !allowed {
@@ -352,6 +355,7 @@ func (worker *Worker) checkKnifePause(
 					analysis, string(analysis.Readiness()), "VETO", ofiReason, "")
 				return true, marketdata.TakerFlowMetrics{}, ofiReason
 			}
+			desyncDeferred = true
 			logOFIDecision(ctx, worker.db, defaultSettingsID(ctx, worker.db), symbol, ofiKindEntryVeto,
 				analysis, string(analysis.Readiness()), "DEFER_REST", ofiReason,
 				"desync-class veto falls through to the REST taker-flow check (v2.0.164)")
@@ -365,10 +369,16 @@ func (worker *Worker) checkKnifePause(
 	}
 
 	if worker.publicClient == nil {
+		if desyncDeferred {
+			return true, marketdata.TakerFlowMetrics{}, "order book desync + no public client — обе ленты мертвы, вход заблокирован (v2.0.164)"
+		}
 		return false, marketdata.TakerFlowMetrics{}, "no public client"
 	}
 	trades, err := worker.publicClient.GetTrades(ctx, symbol, 60)
 	if err != nil || len(trades) == 0 {
+		if desyncDeferred {
+			return true, marketdata.TakerFlowMetrics{}, "order book desync + REST trades недоступны — обе ленты мертвы, вход заблокирован (v2.0.164)"
+		}
 		return false, marketdata.TakerFlowMetrics{}, "trades fetch failed (fail-open)"
 	}
 	metrics = marketdata.AnalyzeTakerFlow(trades)

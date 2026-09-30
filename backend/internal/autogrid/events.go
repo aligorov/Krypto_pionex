@@ -1,6 +1,8 @@
 package autogrid
 
 import (
+	"log/slog"
+
 	"context"
 	"encoding/json"
 	"fmt"
@@ -288,11 +290,33 @@ func recordCandidateOutcome(ctx context.Context, db *pgxpool.Pool, candidateID *
 	if candidateID == nil || strings.TrimSpace(*candidateID) == "" {
 		return
 	}
-	_, _ = db.Exec(ctx, `
+	if _, err := db.Exec(ctx, `
 		UPDATE autogrid_candidates
 		SET outcome_pnl_usdt = $2, outcome_closed_reason = $3, outcome_at = NOW()
 		WHERE id = $1 AND outcome_at IS NULL
-	`, *candidateID, total, reason)
+	`, *candidateID, total, reason); err != nil {
+		_ = err // paper-path best-effort as before; the REAL path logs via recordRealBotOutcome
+	}
+}
+
+// recordRealBotOutcome is the REAL-fleet settle hook (v2.0.165): every
+// terminal path that finalizes a native grid bot calls this with the bot id
+// and the exchange-truth total — the candidate link rides the grid_bots row
+// (migration 0059), so no call site needs to track the candidate itself.
+// First outcome wins, mirroring recordCandidateOutcome.
+func recordRealBotOutcome(ctx context.Context, db *pgxpool.Pool, logger *slog.Logger, botID string, total decimal.Decimal, reason string) {
+	if strings.TrimSpace(botID) == "" || db == nil {
+		return
+	}
+	if _, err := db.Exec(ctx, `
+		UPDATE autogrid_candidates c
+		SET outcome_pnl_usdt = $2, outcome_closed_reason = $3, outcome_at = NOW()
+		FROM grid_bots g
+		WHERE g.id = $1 AND g.candidate_id = c.id AND c.outcome_at IS NULL
+	`, botID, total, reason); err != nil && logger != nil {
+		logger.Error("recordRealBotOutcome failed",
+			"component", "autogrid_worker", "bot_id", botID, "error", err)
+	}
 }
 
 // entryFeaturesJSON snapshots the candidate's full feature set into the

@@ -3446,6 +3446,8 @@ func (worker *Worker) deployReal(
 			RiskRewardRatio:  &riskRewardDec,
 			LiqPriceUp:       liqEstUp,
 			LiqPriceDown:     liqEstDown,
+			// v2.0.165: the candidate link the outcome cohorts need.
+			CandidateID:      &candidate.ID,
 		})
 		if createErr != nil {
 			if errors.Is(createErr, grid.ErrDuplicateActiveBot) {
@@ -4302,6 +4304,12 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 					worker.logger.Error("persist already-closed grid state",
 						"component", "autogrid_worker", "bot_id", bot.id, "error", err)
 				}
+				// v2.0.165: outcome cohort row for the already-closed settle path.
+				outcomeTotal := decimal.Zero
+				if d, ok := finalRealizedArg.(decimal.Decimal); ok {
+					outcomeTotal = d
+				}
+				recordRealBotOutcome(ctx, worker.db, worker.logger, bot.id, outcomeTotal, closedReason)
 				worker.logger.Info("Pionex grid not found or already closed on exchange, marked STOPPED",
 					"component", "autogrid_worker", "symbol", bot.symbol, "bot_id", bot.id,
 					"final_pnl_persisted", finalRealizedArg != nil,
@@ -5897,6 +5905,12 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 				worker.logger.Error("backfill closed grid final PnL",
 					"component", "autogrid_worker", "bot_id", item.id, "error", err)
 			}
+			// v2.0.165: outcome cohort row for the 30d back-sweep settle.
+			sweepTotal := decimal.Zero
+			if d, ok := decision.final.(decimal.Decimal); ok {
+				sweepTotal = d
+			}
+			recordRealBotOutcome(ctx, worker.db, worker.logger, item.id, sweepTotal, item.closedReason)
 		}
 	}
 

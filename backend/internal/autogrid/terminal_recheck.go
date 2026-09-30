@@ -237,6 +237,9 @@ func (worker *Worker) applyExchangeFinal(ctx context.Context, item pendingTermin
 		"component", "autogrid_worker", "bot_number", item.botNumber, "symbol", item.symbol,
 		"estimate_was", item.currentRealized, "exchange_final", settled.StringFixed(4),
 		"final_profit_source", string(source))
+	// v2.0.165: the exchange-truth settle is the authoritative REAL outcome
+	// point — write the candidate outcome cohort row (first-wins).
+	recordRealBotOutcome(ctx, worker.db, worker.logger, item.id, settled, "TERMINAL_FINAL")
 	_ = QueueTelegramEvent(ctx, worker.db, "TERMINAL_FINAL_CORRECTED", map[string]any{
 		"bot_number": item.botNumber, "symbol": item.symbol,
 		"estimate_was": item.currentRealized, "exchange_final": settled.StringFixed(4),

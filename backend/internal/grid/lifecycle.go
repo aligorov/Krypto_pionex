@@ -68,6 +68,11 @@ type CreateInput struct {
 	// against. nil = the exchange returned no estimate.
 	LiqPriceUp   *decimal.Decimal
 	LiqPriceDown *decimal.Decimal
+	// CandidateID links the bot to its autogrid_candidates row (v2.0.165
+	// outcome analytics — migration 0059); the paper table always had it,
+	// the REAL table did not, and outcome cohorts went dark on the REAL
+	// switch. nil keeps NULL (manual deploys).
+	CandidateID *string
 }
 
 func NewLifecycleManager(db *pgxpool.Pool, pionexClient *pionex.Client) *LifecycleManager {
@@ -144,11 +149,11 @@ func (manager *LifecycleManager) CreateGridBot(
 				pnl_target_usdt, max_loss_usdt, anti_hunt_stop_price, struct_context,
 				model_state, target_price, stop_loss_price, stop_loss_high,
 				trailing_sl_price, adaptive_strategy, risk_reward_ratio,
-				liq_price_up, liq_price_down
+				liq_price_up, liq_price_down, candidate_id
 			) VALUES (
 				$1, $2, $3, 'PENDING_SUBMISSION', $4, $5, $6, $7, $8, $9,
 				$10, $11, $12, $13, $14, 'REAL', 'PENDING', $15, $16, $17, $18,
-				$19::JSONB, $20, $21, $22, $23, $24, $25, $26, $27
+				$19::JSONB, $20, $21, $22, $23, $24, $25, $26, $27, $28
 			)
 			ON CONFLICT (request_fingerprint) DO NOTHING
 			RETURNING id
@@ -177,6 +182,7 @@ func (manager *LifecycleManager) CreateGridBot(
 			input.RiskRewardRatio,
 			input.LiqPriceUp,
 			input.LiqPriceDown,
+			input.CandidateID,
 		).Scan(&gridID)
 		if errors.Is(insertErr, pgx.ErrNoRows) {
 			loadErr := tx.QueryRow(ctx, `

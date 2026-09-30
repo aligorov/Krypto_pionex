@@ -53,6 +53,10 @@ const (
 	stormSymbolWindow = 5 * time.Minute
 	stormMinSymbols   = 3
 	stormDuration     = 5 * time.Minute
+	// stormNotifyEvery decouples the Telegram cadence from the (shortened)
+	// storm window — review P2: chained 5-min storms must not re-page every
+	// 2.5 minutes; keep the old 15-minute spacing.
+	stormNotifyEvery = 15 * time.Minute
 )
 
 // ── A. break-flip ─────────────────────────────────────────────────────────
@@ -545,7 +549,7 @@ func (worker *Worker) maybeLogStormState(ctx context.Context) {
 			symbols++
 		}
 	}
-	shouldNotify := active && now.Sub(worker.stormLoggedAt) > stormDuration/2
+	shouldNotify := active && now.Sub(worker.stormLoggedAt) > stormNotifyEvery
 	if shouldNotify {
 		worker.stormLoggedAt = now
 	}
