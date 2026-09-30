@@ -41,10 +41,42 @@ type dirTrendVerdict struct {
 	Cohort string // "betaDownExempt" | "dirTrendShort" | "dirTrendLong"
 }
 
+// bullishMicroBounce reports an active upward micro-bounce on the pair:
+// stochastic in bullish territory (>50) and rising over its signal, or a
+// fresh MACD-up cross (v2.0.166). Shorting into it is counter-trend entry
+// regardless of which exemption cohort asked.
+func bullishMicroBounce(candidate Candidate) bool {
+	confMap, ok := candidate.ModelAssumptions["confluence"].(map[string]any)
+	if !ok {
+		return false
+	}
+	stochK, _ := confMap["stochK"].(float64)
+	stochD, _ := confMap["stochD"].(float64)
+	if stochK > 50.0 && stochK > stochD {
+		return true
+	}
+	macdUp, _ := confMap["macdCrossedUp"].(bool)
+	return macdUp
+}
+
 // directionalTrendExempt is the single stand-down oracle for the RV and
 // entry-timing gates. betaDownShortExempt keeps priority (its cohort is
 // prod-proven); the wider own-trend class follows the same thresholds.
-func directionalTrendExempt(candidate Candidate, btcTrendDown bool) dirTrendVerdict {
+//
+// v2.0.166 symmetry and bounce protection:
+//   - SHORT: own strong downtrend AND BTC not in TREND_UP (market beta veto),
+//     not oversold (RSI >= 30, pos >= 15%), and no active bullish micro-bounce
+//     (StochK > 50 & rising, or MACD crossed up).
+//   - LONG: own strong uptrend AND BTC not in TREND_DOWN, not overheated
+//     (RSI <= 70, pos <= 90%).
+func directionalTrendExempt(candidate Candidate, btcTrendDown, btcTrendUp bool) dirTrendVerdict {
+	// v2.0.166 review P1-2: the active-bounce veto (stoch >50 & rising, or a
+	// fresh MACD-up cross) applies to the PROVEN cohort too — the ETC
+	// incident shape is exactly a beta-down tape with a pair-local green V;
+	// a cohort marker may not buy a counter-bounce entry.
+	if bullishMicroBounce(candidate) {
+		return dirTrendVerdict{}
+	}
 	if betaDownShortExempt(candidate, btcTrendDown) {
 		return dirTrendVerdict{Exempt: true, Cohort: "betaDownExempt"}
 	}
@@ -53,9 +85,21 @@ func directionalTrendExempt(candidate Candidate, btcTrendDown bool) dirTrendVerd
 	strongTrend := adx > dirTrendMinADX || math.Abs(slope) > dirTrendMinSlopePct
 	switch strings.ToLower(strings.TrimSpace(candidate.RecommendedTrend)) {
 	case "short":
-		if strongTrend && slope < 0 {
-			return dirTrendVerdict{Exempt: true, Cohort: "dirTrendShort"}
+		if btcTrendUp {
+			return dirTrendVerdict{}
 		}
+		if !strongTrend || slope >= 0 {
+			return dirTrendVerdict{}
+		}
+		if rsi, ok := candidate.ModelAssumptions["rsi"].(float64); ok && rsi < 30.0 {
+			return dirTrendVerdict{}
+		}
+		if pos, ok := candidate.ModelAssumptions["rangePositionPct"].(float64); ok && pos < 15.0 {
+			return dirTrendVerdict{}
+		}
+		// Micro-momentum guard lives in bullishMicroBounce (applied at the
+		// top of this function for every cohort).
+		return dirTrendVerdict{Exempt: true, Cohort: "dirTrendShort"}
 	case "long":
 		if btcTrendDown {
 			return dirTrendVerdict{}

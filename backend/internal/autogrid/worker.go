@@ -1190,7 +1190,7 @@ func (worker *Worker) deployPaper(
 			continue
 		}
 		if !isEntryTimingFavorable(candidate) {
-			v := directionalTrendExempt(candidate, betaDown)
+			v := directionalTrendExempt(candidate, betaDown, betaUp)
 			if !v.Exempt {
 				worker.rejectCandidate(ctx, candidate,
 					"вход-тайминг: текущая позиция в канале вне благоприятной зоны для этого направления", nil)
@@ -1490,7 +1490,7 @@ func (worker *Worker) deployPaper(
 			forecastPct = harGeo.forecastPct
 		}
 		if blocked, ratio := worker.volExpansionBlocked(ctx, candidate.Symbol, forecastPct); blocked {
-			if v := directionalTrendExempt(candidate, betaDown); v.Exempt {
+			if v := directionalTrendExempt(candidate, betaDown, betaUp); v.Exempt {
 				// v2.0.148/v2.0.161: the RV gate is direction-blind by design,
 				// but for a pair with its own CONFIRMED trend the "expansion"
 				// IS the move the directional grid is paid to ride
@@ -1687,7 +1687,7 @@ func (worker *Worker) deployPaper(
 				want = "SUPPORT_LONG"
 			}
 			if verdict != want {
-				if v := directionalTrendExempt(candidate, betaDown); v.Exempt {
+				if v := directionalTrendExempt(candidate, betaDown, betaUp); v.Exempt {
 					// v2.0.162 review P1: stamp the cohort — an R1-only
 					// exemption must stay visible in the 14-day outcome
 					// partition or the promised evidence-based rollback
@@ -2412,7 +2412,7 @@ func (worker *Worker) deployReal(
 	// not cut a pair-confirmed downtrend short just because the channel
 	// position reads "unfavorable" (in a trend regime the extreme IS the
 	// continuation; counterfactual 2026-09-28: those cuts fell 4.3:1).
-	betaDownEntry, _ := betaGateTrend(worker.marketBetaRegime(ctx))
+	betaDownEntry, betaUpEntry := betaGateTrend(worker.marketBetaRegime(ctx))
 	// When the LLM brain is enabled, an UNAUDITED candidate is not
 	// deployable — regardless of why the audit is missing (beyond the
 	// per-scan audit cap, transport failure, timeout). This is the hard
@@ -2446,7 +2446,7 @@ func (worker *Worker) deployReal(
 			continue
 		}
 		if !isEntryTimingFavorable(candidate) {
-			v := directionalTrendExempt(candidate, betaDownEntry)
+			v := directionalTrendExempt(candidate, betaDownEntry, betaUpEntry)
 			if !v.Exempt {
 				worker.rejectCandidate(ctx, candidate,
 					"вход-тайминг: текущая позиция в канале вне благоприятной зоны для этого направления", nil)
@@ -2474,7 +2474,7 @@ func (worker *Worker) deployReal(
 			worker.rejectCandidate(ctx, candidate, "entry gate: "+flushWhyReal, nil)
 			continue
 		}
-		if ok, reason := worker.revalidateCandidateTrend(ctx, &candidate, settings, cascadeShort, directionalTrendExempt(candidate, betaDownEntry).Exempt); !ok {
+		if ok, reason := worker.revalidateCandidateTrend(ctx, &candidate, settings, cascadeShort, directionalTrendExempt(candidate, betaDownEntry, betaUpEntry).Exempt); !ok {
 			worker.logger.Info("skip real deploy after fresh trend revalidation",
 				"component", "autogrid_worker", "symbol", candidate.Symbol, "reason", reason)
 			worker.rejectCandidate(ctx, candidate, "ре-валидация тренда: "+reason, nil)
@@ -2708,7 +2708,7 @@ func (worker *Worker) deployReal(
 			forecastPct = harGeo.forecastPct
 		}
 		if blocked, ratio := worker.volExpansionBlocked(ctx, candidate.Symbol, forecastPct); blocked {
-			if v := directionalTrendExempt(candidate, betaDownEntry); v.Exempt {
+			if v := directionalTrendExempt(candidate, betaDownEntry, betaUpEntry); v.Exempt {
 				// v2.0.148 (REAL mirror)/v2.0.161: expansion is the confirmed
 				// trend's payload, not its hazard — the RV gate stands down
 				// for the confirmed own-direction cohort (short always; long
@@ -2836,7 +2836,7 @@ func (worker *Worker) deployReal(
 				want = "SUPPORT_LONG"
 			}
 			if verdict != want {
-				if v := directionalTrendExempt(candidate, betaDownEntry); v.Exempt {
+				if v := directionalTrendExempt(candidate, betaDownEntry, betaUpEntry); v.Exempt {
 					// v2.0.162 review P1 (REAL mirror): stamp the cohort for
 					// the 14-day outcome partition.
 					candidate.ModelAssumptions[v.Cohort] = true
@@ -7375,10 +7375,19 @@ func (worker *Worker) marketBetaRegime(ctx context.Context) (string, float64, fl
 	if time.Since(worker.betaRegime.checkedAt) < 2*time.Minute {
 		return worker.betaRegime.regime, worker.betaRegime.adx, worker.betaRegime.emaSlope
 	}
-	// Fast 15M check: if BTC is actively flushing on 15M, trigger early beta down
+	// Fast 15M check: if BTC is actively flushing or pumping on 15M, trigger early beta regime
 	if candles15M, err15 := worker.publicClient.GetKlines(ctx, "BTC_USDT_PERP", "15M", 30); err15 == nil && len(candles15M) >= 30 {
 		res15 := marketdata.DetectRegime(candles15M)
 		if res15.Regime == "TREND_DOWN" && res15.ADX >= 22.0 && res15.EMASlopePct < -0.4 {
+			worker.betaRegime = betaRegimeCache{
+				checkedAt: time.Now(),
+				regime:    res15.Regime,
+				adx:       res15.ADX,
+				emaSlope:  res15.EMASlopePct,
+			}
+			return res15.Regime, res15.ADX, res15.EMASlopePct
+		}
+		if res15.Regime == "TREND_UP" && res15.ADX >= 22.0 && res15.EMASlopePct > 0.4 {
 			worker.betaRegime = betaRegimeCache{
 				checkedAt: time.Now(),
 				regime:    res15.Regime,

@@ -88,49 +88,62 @@ func TestDirectionalTrendExempt(t *testing.T) {
 		}
 	}
 	// Proven cohort keeps priority: BTC down + confirmed own downtrend short.
-	if v := directionalTrendExempt(mk("short", 25, -1.2), true); !v.Exempt || v.Cohort != "betaDownExempt" {
+	if v := directionalTrendExempt(mk("short", 25, -1.2), true, false); !v.Exempt || v.Cohort != "betaDownExempt" {
 		t.Fatalf("beta-down cohort lost: %+v", v)
 	}
 	// v2.0.161: confirmed own downtrend short WITHOUT BTC down — exempt now.
-	if v := directionalTrendExempt(mk("short", 25, -1.2), false); !v.Exempt || v.Cohort != "dirTrendShort" {
+	if v := directionalTrendExempt(mk("short", 25, -1.2), false, false); !v.Exempt || v.Cohort != "dirTrendShort" {
 		t.Fatalf("own-trend short not exempt: %+v", v)
 	}
 	// Slope-only confirmation (ADX below threshold but steep).
-	if v := directionalTrendExempt(mk("short", 15, -0.8), false); !v.Exempt || v.Cohort != "dirTrendShort" {
+	if v := directionalTrendExempt(mk("short", 15, -0.8), false, false); !v.Exempt || v.Cohort != "dirTrendShort" {
 		t.Fatalf("steep-slope short not exempt: %+v", v)
 	}
 	// Confirmed own uptrend long, BTC flat/up — exempt (RSI/channel defaults sane).
-	if v := directionalTrendExempt(mk("long", 25, 1.2), false); !v.Exempt || v.Cohort != "dirTrendLong" {
+	if v := directionalTrendExempt(mk("long", 25, 1.2), false, false); !v.Exempt || v.Cohort != "dirTrendLong" {
 		t.Fatalf("own-trend long not exempt: %+v", v)
 	}
 	// v2.0.162 (operator override): the long cohort may enter breakouts up
 	// to 90% of the channel; the overheating RSI cap stays.
-	if v := directionalTrendExempt(mkWithRSI("long", 25, 1.2, 75, 50), false); v.Exempt {
+	if v := directionalTrendExempt(mkWithRSI("long", 25, 1.2, 75, 50), false, false); v.Exempt {
 		t.Fatalf("overheated long (RSI 75 > cap 70) must not exempt: %+v", v)
 	}
-	if v := directionalTrendExempt(mkWithRSI("long", 25, 1.2, 65, 80), false); !v.Exempt || v.Cohort != "dirTrendLong" {
+	if v := directionalTrendExempt(mkWithRSI("long", 25, 1.2, 65, 80), false, false); !v.Exempt || v.Cohort != "dirTrendLong" {
 		t.Fatalf("breakout long (pos 80%% ≤ 90%%) must exempt: %+v", v)
 	}
-	if v := directionalTrendExempt(mkWithRSI("long", 25, 1.2, 65, 95), false); v.Exempt {
+	if v := directionalTrendExempt(mkWithRSI("long", 25, 1.2, 65, 95), false, false); v.Exempt {
 		t.Fatalf("exhausted channel (pos 95%%) must not exempt: %+v", v)
 	}
-	if v := directionalTrendExempt(mkWithRSI("long", 25, 1.2, 65, 50), false); !v.Exempt || v.Cohort != "dirTrendLong" {
+	if v := directionalTrendExempt(mkWithRSI("long", 25, 1.2, 65, 50), false, false); !v.Exempt || v.Cohort != "dirTrendLong" {
 		t.Fatalf("sane long must exempt: %+v", v)
 	}
 	// Long in a confirmed uptrend but BTC falling — beta-gate wins, no exempt.
-	if v := directionalTrendExempt(mk("long", 25, 1.2), true); v.Exempt {
+	if v := directionalTrendExempt(mk("long", 25, 1.2), true, false); v.Exempt {
 		t.Fatalf("long exempt must not bypass the BTC beta veto: %+v", v)
 	}
+	// v2.0.166: Short in a confirmed downtrend but BTC rising — beta-gate wins, no exempt.
+	if v := directionalTrendExempt(mk("short", 25, -1.2), false, true); v.Exempt {
+		t.Fatalf("short exempt must not bypass the BTC rising beta veto: %+v", v)
+	}
+	// v2.0.166: Short with bullish stochastic bounce — no exempt.
+	stochBounceCand := mk("short", 25, -1.2)
+	stochBounceCand.ModelAssumptions["confluence"] = map[string]any{
+		"stochK": 55.0,
+		"stochD": 42.0,
+	}
+	if v := directionalTrendExempt(stochBounceCand, false, false); v.Exempt {
+		t.Fatalf("short exempt must not bypass active stochastic bounce: %+v", v)
+	}
 	// Weak trend — no exemption (the dead zone stays armed).
-	if v := directionalTrendExempt(mk("short", 18, -0.3), false); v.Exempt {
+	if v := directionalTrendExempt(mk("short", 18, -0.3), false, false); v.Exempt {
 		t.Fatalf("weak trend must not exempt: %+v", v)
 	}
 	// Direction against the slope — never.
-	if v := directionalTrendExempt(mk("short", 30, 1.5), false); v.Exempt {
+	if v := directionalTrendExempt(mk("short", 30, 1.5), false, false); v.Exempt {
 		t.Fatalf("short against an uptrend must not exempt: %+v", v)
 	}
 	// Neutral never.
-	if v := directionalTrendExempt(mk("no_trend", 30, -1.5), true); v.Exempt {
+	if v := directionalTrendExempt(mk("no_trend", 30, -1.5), true, false); v.Exempt {
 		t.Fatalf("neutral must never exempt: %+v", v)
 	}
 }

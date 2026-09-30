@@ -87,17 +87,18 @@ func DetectRegime(candles []pionex.KlineCandle) RegimeResult {
 
 	switch {
 	case result.EMAFast > result.EMASlow && result.EMASlopePct > 0.15:
-		if windowReturnPct < -3.0 {
+		if windowReturnPct < -3.0 || endClose < result.EMAFast {
 			// Mirror of the short-side macro guard: the macro window is down,
 			// so a local up-pullback is a relief rally in a downtrend, not an
-			// uptrend. Without this the engine longs into obvious shorts.
+			// uptrend. Also if current price broke below EMAFast, it's not a clean uptrend.
 			result.Regime = "RANGE"
 		} else {
 			result.Regime = "TREND_UP"
 		}
 	case result.EMAFast < result.EMASlow && result.EMASlopePct < -0.15:
-		if windowReturnPct > 3.0 {
-			// Macro window is up, local pullback is a range/consolidation or dip, not macro downtrend
+		if windowReturnPct > 3.0 || endClose > result.EMAFast {
+			// Macro window is up, local pullback is a range/consolidation or dip, not macro downtrend.
+			// Also if current price broke above EMAFast, it's a relief bounce, not a clean downtrend.
 			result.Regime = "RANGE"
 		} else {
 			result.Regime = "TREND_DOWN"
@@ -125,10 +126,10 @@ func DetectRegime(candles []pionex.KlineCandle) RegimeResult {
 	// range leg phasing downward is a range, not a trend) or the macro
 	// window clearly contradicts (the ±3% guards keep their meaning).
 	if midlineCrossings(candles) < 3 {
-		if windowReturnPct <= 3.0 && result.EMAFast < result.EMASlow && result.EMASlopePct <= -0.5 {
+		if windowReturnPct <= 3.0 && result.EMAFast < result.EMASlow && result.EMASlopePct <= -0.5 && endClose <= result.EMAFast {
 			result.Regime = "TREND_DOWN"
 		}
-		if windowReturnPct >= -3.0 && result.EMAFast > result.EMASlow && result.EMASlopePct >= 0.5 {
+		if windowReturnPct >= -3.0 && result.EMAFast > result.EMASlow && result.EMASlopePct >= 0.5 && endClose >= result.EMAFast {
 			result.Regime = "TREND_UP"
 		}
 	}
