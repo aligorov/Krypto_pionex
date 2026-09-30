@@ -69,10 +69,11 @@ func TestDecideBotActionBlindPrice(t *testing.T) {
 		t.Fatalf("blind take-profit: got %s/%s, want CLOSE_TAKE_PROFIT/TAKE_PROFIT", d.Action, d.Reason)
 	}
 
-	// Armed peak (>= 50% of target) decaying back under the +0.2% budget
-	// floor must lock breakeven without any price.
+	// Armed peak (>= 75% of target, v2.0.164) decaying back under the
+	// +0.2% budget floor must lock breakeven without any price.
 	breakeven := base
-	breakeven.PeakPNL = decimal.NewFromInt(5)
+	breakeven.Direction = "LONG"
+	breakeven.PeakPNL = decimal.NewFromInt(10)
 	breakeven.UnrealizedPNL = decimal.NewFromFloat(0.1)
 	if d := decideBotAction(breakeven); d.Action != ActionCloseTakeProfit || d.Reason != "BREAKEVEN_LOCK" {
 		t.Fatalf("blind breakeven lock: got %s/%s, want CLOSE_TAKE_PROFIT/BREAKEVEN_LOCK", d.Action, d.Reason)

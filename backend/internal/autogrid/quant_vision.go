@@ -337,14 +337,25 @@ func (worker *Worker) checkKnifePause(
 	// If the real-time order flow engine is already tracking the symbol and detects
 	// adverse flow (e.g. dump pressure or confirmed dump for LONG/NEUTRAL), veto immediately.
 	// This guarantees that REST failures or delays cannot bypass an active, streaming OFI veto!
+	// v2.0.164 (prod 30.09 postmortem): a DATA-HEALTH veto (book desync /
+	// recovering / warming after a socket reset) is NO LONGER a hard entry
+	// block — it logs DEFER_REST and falls through to the REST taker-flow
+	// path below. A socket-wide 1008 rate-limit reset used to mark every
+	// book DESYNC and freeze 100% of entries on "awaiting fresh snapshot"
+	// while the REST trade tape was clean. Real flow vetoes (dump/pump
+	// pressure — IsActionable) still hard-veto.
 	if worker.ofiEngine != nil {
 		analysis := worker.ofiEngine.Analyze(symbol)
 		if allowed, ofiReason := analysis.CanEnter(trend); !allowed {
+			if analysis.IsActionable() {
+				logOFIDecision(ctx, worker.db, defaultSettingsID(ctx, worker.db), symbol, ofiKindEntryVeto,
+					analysis, string(analysis.Readiness()), "VETO", ofiReason, "")
+				return true, marketdata.TakerFlowMetrics{}, ofiReason
+			}
 			logOFIDecision(ctx, worker.db, defaultSettingsID(ctx, worker.db), symbol, ofiKindEntryVeto,
-				analysis, string(analysis.Readiness()), "VETO", ofiReason, "")
-			return true, marketdata.TakerFlowMetrics{}, ofiReason
-		}
-		if analysis.IsActionable() {
+				analysis, string(analysis.Readiness()), "DEFER_REST", ofiReason,
+				"desync-class veto falls through to the REST taker-flow check (v2.0.164)")
+		} else if analysis.IsActionable() {
 			// Allow with a live directional flow observed — the rare,
 			// analysis-worthy accepts (plain NEUTRAL allows would flood the
 			// journal with every scan).
@@ -364,15 +375,21 @@ func (worker *Worker) checkKnifePause(
 
 	// v2.0.123 dynamic microstructure: feed trades into OFI engine as a
 	// chronologically sorted batch, roll micro-windows, and finalize for analysis.
+	// v2.0.164: same soft/hard split as the fast path — a desync-class veto
+	// after the batch falls through to the raw taker-flow checks below.
 	if worker.ofiEngine != nil {
 		worker.ofiEngine.IngestTradeBatch(symbol, trades)
 		analysis := worker.ofiEngine.Analyze(symbol)
 		if allowed, ofiReason := analysis.CanEnter(trend); !allowed {
+			if analysis.IsActionable() {
+				logOFIDecision(ctx, worker.db, defaultSettingsID(ctx, worker.db), symbol, ofiKindEntryVeto,
+					analysis, string(analysis.Readiness()), "VETO", ofiReason, "")
+				return true, metrics, ofiReason
+			}
 			logOFIDecision(ctx, worker.db, defaultSettingsID(ctx, worker.db), symbol, ofiKindEntryVeto,
-				analysis, string(analysis.Readiness()), "VETO", ofiReason, "")
-			return true, metrics, ofiReason
-		}
-		if analysis.IsActionable() {
+				analysis, string(analysis.Readiness()), "DEFER_REST", ofiReason,
+				"desync-class veto falls through to the raw taker-flow check (v2.0.164)")
+		} else if analysis.IsActionable() {
 			logOFIDecision(ctx, worker.db, defaultSettingsID(ctx, worker.db), symbol, ofiKindEntryVeto,
 				analysis, string(analysis.Readiness()), "ALLOW", "", "")
 		}

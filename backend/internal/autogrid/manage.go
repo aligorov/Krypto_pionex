@@ -197,16 +197,26 @@ func decideBotAction(input botActionInput) manageDecision {
 		}
 	}
 
-	// 2. Trailing Take-Profit & Early Profit Lock
-	if input.PnLTarget.GreaterThan(decimal.Zero) {
-		// Early Profit Locking: arm trailing once peak profit reaches 50% of
-		// target. v2.0.56: the arm is a pure fraction of the target with NO
-		// dollar cap — the retired min(0.35×target, $3.50) form cut all 5/5
-		// trailing exits of the 24h checkpoint at 0.68–0.79×peak ($3.1–6.6
-		// banked against an $18 target): the fixed $3.50 cap armed the trail
-		// far too early and never let σ-scaled targets mature their peaks.
-		// Checkpoint convergence for v2.0.56: capture 0.76×peak, goal ≥0.85.
-		targetArmThreshold := input.PnLTarget.Mul(decimal.NewFromFloat(0.5))
+	// 2. Trailing Take-Profit & Early Profit Lock — DIRECTIONAL ONLY.
+	// v2.0.164 (prod 29-30.09 postmortem + debate evidence): a NEUTRAL grid
+	// is a mean-reversion harvester whose profit is capped by construction —
+	// the exchange profit_amount card IS its take-profit. A local PnL trail
+	// on a $1 card target armed at 50% ($0.50) and closed on a 20% peak
+	// pullback, converting every $1 harvest into $0.40-0.80 micro-exits
+	// while always beating the card. Industry anchors arm at the TP itself
+	// (3Commas) with a step-anchored callback; for MR grids the evidence
+	// reads "fixed TP, no trail". So NEUTRAL bots keep only the card (and
+	// the stop ladder); LONG/SHORT keep the trail — trend profit needs it —
+	// with the arm raised 50%→75% of target (v2.0.56 history below).
+	if input.PnLTarget.GreaterThan(decimal.Zero) && input.Direction != "NEUTRAL" {
+		// Early Profit Locking: arm trailing once peak profit reaches the
+		// arm fraction of target. v2.0.56: the arm is a pure fraction of the
+		// target with NO dollar cap — the retired min(0.35×target, $3.50)
+		// form cut all 5/5 trailing exits of the 24h checkpoint at
+		// 0.68–0.79×peak. v2.0.164: 0.5→0.75 — a half-armed trail surrenders
+		// the upper half of trend runs; 75% matches the 3Commas-style
+		// "arm near the target" doctrine.
+		targetArmThreshold := input.PnLTarget.Mul(decimal.NewFromFloat(0.75))
 
 		if input.PeakPNL.GreaterThanOrEqual(targetArmThreshold) {
 			// Breakeven Lock: if an armed peak decays back near zero, lock profit (+0.2% budget)
@@ -220,14 +230,13 @@ func decideBotAction(input botActionInput) manageDecision {
 			// arm level — since v2.0.19 made targets leverage-consistent
 			// ($36 on 4x), 0.30×target ($10.80) exceeded every plausible
 			// peak, inverting the "guarantee" into an instant exit on the
-			// arming tick: the trailing branch was dead code and every win
-			// banked at ~$3.50 (2026-08-30 ledger: 7/7 wins at the arm).
-			// v2.0.52: cap raised to 85% of arm — winners on the 08-31
-			// tape kept surrendering the last 15% above the floor.
-			// v2.0.56: with the arm at 50% of target the 0.85×arm cap
-			// (0.425×target) sits above the 0.30×target guarantee, so the
-			// plain 20% trail governs; the cap stays as a guard against
-			// future arm retuning reintroducing the arming-tick inversion.
+			// arming tick. v2.0.52: cap raised to 85% of arm. v2.0.56: with
+			// the arm at 50% of target the 0.85×arm cap (0.425×target) sat
+			// above the 0.30×target guarantee, so the plain 20% trail
+			// governed; the cap stays as a guard against arm retuning
+			// reintroducing the arming-tick inversion. v2.0.164 arm=0.75:
+			// 0.85×arm = 0.64×target — again above the 0.30 guarantee, the
+			// plain trail governs and the guard stands.
 			pullbackTolerance := input.PeakPNL.Mul(decimal.NewFromFloat(0.20))
 			trailingFloor := input.PeakPNL.Sub(pullbackTolerance)
 			guaranteedFloorCap := targetArmThreshold.Mul(decimal.NewFromFloat(0.85))

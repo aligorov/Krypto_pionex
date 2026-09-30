@@ -44,9 +44,15 @@ const (
 
 	// Storm mode: ≥3 fleet symbols tripping within the window arms a
 	// rolling storm; each new trip refreshes it.
+	// v2.0.164 (operator directive, prod 30.09): 30 → 5 minutes. In a
+	// trending tape the trips kept refreshing the window, chaining 30-min
+	// freezes that starved the fleet of entries for hours; 5 min still
+	// covers the sharp-move spike the gate exists for (the symbol window is
+	// 5 min too), while letting the RV/macro/anti-FOMO gates carry the
+	// steady-state protection.
 	stormSymbolWindow = 5 * time.Minute
 	stormMinSymbols   = 3
-	stormDuration     = 30 * time.Minute
+	stormDuration     = 5 * time.Minute
 )
 
 // ── A. break-flip ─────────────────────────────────────────────────────────

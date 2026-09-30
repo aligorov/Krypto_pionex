@@ -1753,8 +1753,29 @@ func (worker *Worker) deployPaper(
 				mesh.LowerPrice = profile.BidWallPrice
 			}
 			// v2.0.163 review P1-1 (paper mirror): re-apply the 8% floor
-			// after the anchor and gate the FINAL step.
-			mesh.LowerPrice, mesh.UpperPrice = EnsureDeploySpan(mesh.LowerPrice, mesh.UpperPrice, candidate.CurrentPrice)
+			// after the anchor and gate the FINAL step. v2.0.164: round the
+			// re-widened bounds to price precision (REAL-parity — the
+			// unrounded twin fed the parity checkParams probe wrong shapes).
+			paperPrec := 6
+			if p, ok := candidate.ModelAssumptions["pricePrecision"].(float64); ok && p > 0 {
+				paperPrec = int(p)
+			} else if pInt, ok := candidate.ModelAssumptions["pricePrecision"].(int); ok && pInt > 0 {
+				paperPrec = pInt
+			} else if candidate.CurrentPrice.GreaterThan(decimal.Zero) {
+				if exp := candidate.CurrentPrice.Exponent(); exp < 0 {
+					paperPrec = int(-exp)
+				}
+			}
+			if paperPrec > 8 {
+				paperPrec = 8
+			}
+			if nl, nu := EnsureDeploySpan(mesh.LowerPrice, mesh.UpperPrice, candidate.CurrentPrice); !nl.Equal(mesh.LowerPrice) || !nu.Equal(mesh.UpperPrice) {
+				nl = nl.Round(int32(paperPrec))
+				nu = nu.Round(int32(paperPrec))
+				if nu.GreaterThan(nl) {
+					mesh.LowerPrice, mesh.UpperPrice = nl, nu
+				}
+			}
 			if spanPct := mesh.UpperPrice.Sub(mesh.LowerPrice).Div(candidate.CurrentPrice).Mul(decimal.NewFromInt(100)).InexactFloat64(); mesh.GridNum > 0 {
 				if stepPct := spanPct / float64(mesh.GridNum); stepPct > 0 {
 					if reason, violated := marketdata.FeeGateRejection(stepPct, decimalFloat(settings.FeeBps), decimalFloat(settings.SlippageBps)); violated {
@@ -2954,11 +2975,24 @@ func (worker *Worker) deployReal(
 			// v2.0.163 review P1-1: the wall anchor narrows the span AFTER
 			// the doctrine widening — re-apply the 8% floor and gate the
 			// FINAL geometry so no deploy ships a sub-floor step.
+			// v2.0.164 (prod 29-30.09 postmortem): the re-widened bounds
+			// MUST be rounded to the symbol's price precision — this was
+			// the one unrounded mutation reaching CreateFuturesGridBot and
+			// the exchange refused five accepted candidates with
+			// "top not match quote precision" (XLM/ALABX/ARB/SOXLX/UNI).
 			if nl, nu := EnsureDeploySpan(lowerPrice, upperPrice, candidate.CurrentPrice); !nl.Equal(lowerPrice) || !nu.Equal(upperPrice) {
-				worker.logger.Info("v2.0.163 wide-grid: re-widened after bid-wall anchor",
-					"component", "autogrid_worker", "symbol", candidate.Symbol,
-					"new_lower", nl.StringFixed(6), "new_upper", nu.StringFixed(6))
-				lowerPrice, upperPrice = nl, nu
+				nl = nl.Round(int32(pricePrecision))
+				nu = nu.Round(int32(pricePrecision))
+				if nu.GreaterThan(nl) {
+					worker.logger.Info("v2.0.163 wide-grid: re-widened after bid-wall anchor",
+						"component", "autogrid_worker", "symbol", candidate.Symbol,
+						"new_lower", nl.StringFixed(6), "new_upper", nu.StringFixed(6))
+					lowerPrice, upperPrice = nl, nu
+				} else {
+					worker.logger.Warn("v2.0.164 wide-grid: re-widen collapsed after rounding — keeping anchored bounds",
+						"component", "autogrid_worker", "symbol", candidate.Symbol,
+						"lower", lowerPrice.StringFixed(6), "upper", upperPrice.StringFixed(6))
+				}
 			}
 			if spanPct := upperPrice.Sub(lowerPrice).Div(candidate.CurrentPrice).Mul(decimal.NewFromInt(100)).InexactFloat64(); mesh.GridNum > 0 {
 				if stepPct := spanPct / float64(mesh.GridNum); stepPct > 0 {

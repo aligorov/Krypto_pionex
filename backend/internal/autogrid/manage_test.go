@@ -44,7 +44,9 @@ func TestDecideBotActionTakeProfit(t *testing.T) {
 
 func TestDecideBotActionTrailingTakeProfit(t *testing.T) {
 	input := baseActionInput() // Target is 12
-	// Bot previously hit 10 USDT (83% of target, well past the 0.5×12=6 arm),
+	// v2.0.164: trailing is DIRECTIONAL-only; arm = 0.75×12 = 9.
+	input.Direction = "LONG"
+	// Bot previously hit 10 USDT (83% of target, past the 0.75×12=9 arm),
 	// but now pulled back to 7.5 USDT (< 8.0 trailing floor = 0.8×peak)
 	input.PeakPNL = mustDecimal("10")
 	input.RealizedPNL = mustDecimal("7.5")
@@ -57,9 +59,10 @@ func TestDecideBotActionTrailingTakeProfit(t *testing.T) {
 func TestDecideBotActionBreakevenLock(t *testing.T) {
 	input := baseActionInput() // Target is 12, Budget is 200
 	input.Budget = mustDecimal("200")
-	// Bot previously hit 6.5 USDT (54% of target, just above the 50% arm),
-	// but now dropped to 0.1 USDT (<= 0.4 USDT breakeven floor)
-	input.PeakPNL = mustDecimal("6.5")
+	input.Direction = "LONG"
+	// v2.0.164 arm 0.75×12 = 9: bot previously hit 9.5 USDT, but now
+	// dropped to 0.1 USDT (<= 0.4 USDT breakeven floor)
+	input.PeakPNL = mustDecimal("9.5")
 	input.RealizedPNL = mustDecimal("0.1")
 	decision := decideBotAction(input)
 	if decision.Action != ActionCloseTakeProfit || decision.Reason != "BREAKEVEN_LOCK" {
@@ -597,108 +600,119 @@ func TestNeutralUpTrendStop(t *testing.T) {
 	}
 }
 
-// v2.0.30→v2.0.56 evolution: trailing arms at 50% of target with no dollar
-// cap (v2.0.56), floor = max(0.8·peak, min(0.30×target, 0.85×arm)) — the
-// CRWVX dead zone stays closed while σ-scaled peaks are allowed to mature.
-func TestDecideBotActionTrailingArmsAtHalfTarget(t *testing.T) {
-	input := baseActionInput() // Target 12, Budget 200
-	// v2.0.56 arm: 0.5×12 = 6 — the old min(0.35×12, $3.50) = $3.50 cap is
-	// gone. Peak 6 sits exactly on the arm.
-	input.PeakPNL = mustDecimal("6")
-	// Floor = max(0.8×6=4.8, 0.30×12=3.6) = 4.8 → 4.5 trails out.
-	input.RealizedPNL = mustDecimal("4.5")
+// v2.0.30→v2.0.64 evolution: trailing arms at 75% of target (v2.0.164, was
+// 50% since v2.0.56) with no dollar cap, floor = max(0.8·peak,
+// min(0.30×target, 0.85×arm)) — the CRWVX dead zone stays closed while
+// σ-scaled peaks mature their upper half too. DIRECTIONAL only (v2.0.164):
+// NEUTRAL bots take profit on the exchange profit_amount card, never a
+// local PnL trail.
+func TestDecideBotActionTrailingArmsAtThreeQuartersTarget(t *testing.T) {
+	input := baseActionInput() // Target 12, Budget 200, Direction NEUTRAL
+	input.Direction = "LONG"
+	// v2.0.164 arm: 0.75×12 = 9. Peak 9.5 is armed.
+	input.PeakPNL = mustDecimal("9.5")
+	// Floor = max(0.8×9.5=7.6, 0.30×12=3.6) = 7.6 → 7.5 trails out.
+	input.RealizedPNL = mustDecimal("7.5")
 	decision := decideBotAction(input)
 	if decision.Action != ActionCloseTakeProfit || decision.Reason != "TRAILING_TAKE_PROFIT" {
 		t.Fatalf("armed peak with pullback below floor must trail out, got %+v", decision)
 	}
 	// And while ABOVE the floor it keeps running (no premature exit).
-	input.RealizedPNL = mustDecimal("4.95")
+	input.RealizedPNL = mustDecimal("7.65")
 	decision = decideBotAction(input)
 	if decision.Action != ActionHold {
 		t.Fatalf("above the trailing floor must hold, got %+v", decision)
 	}
-	// Below the arm nothing trails at all: a peak of 3.6 on a $10 target used
-	// to arm at the retired $3.50 dollar floor and exit on a $0.9 pullback
-	// (v2.0.52 tape). v2.0.56 demands the full 0.5×10=5 arm, so the same
-	// tape now holds and waits for the peak to mature.
-	input.PnLTarget = mustDecimal("10")
-	input.PeakPNL = mustDecimal("3.6")
-	input.RealizedPNL = mustDecimal("2.7")
+	// Below the arm nothing trails: the old 50% arm (peak 6 on target 12)
+	// no longer engages — the upper half of the run is allowed to mature.
+	input.PeakPNL = mustDecimal("6")
+	input.RealizedPNL = mustDecimal("4.5")
 	decision = decideBotAction(input)
 	if decision.Action != ActionHold {
 		t.Fatalf("sub-arm peak must not arm trailing, got %+v", decision)
 	}
-	// A $10 target still trails for real once armed at $5: peak 5, total 4.4
-	// is a 12% pullback — tolerated.
-	input.PeakPNL = mustDecimal("5")
-	input.RealizedPNL = mustDecimal("4.4")
+	// A $10 target trails once armed at $7.5: peak 7.5, total 6.6 is a 12%
+	// pullback — tolerated.
+	input.PnLTarget = mustDecimal("10")
+	input.PeakPNL = mustDecimal("7.5")
+	input.RealizedPNL = mustDecimal("6.6")
 	decision = decideBotAction(input)
 	if decision.Action != ActionHold {
 		t.Fatalf("pullback inside the 20%% tolerance must hold, got %+v", decision)
 	}
-	// Deeper pullback (3.9 < 0.8×5=4.0 floor) trails out.
-	input.RealizedPNL = mustDecimal("3.9")
+	// Deeper pullback (5.9 < 0.8×7.5=6.0 floor) trails out.
+	input.RealizedPNL = mustDecimal("5.9")
 	decision = decideBotAction(input)
 	if decision.Action != ActionCloseTakeProfit || decision.Reason != "TRAILING_TAKE_PROFIT" {
 		t.Fatalf("pullback past the floor must trail out, got %+v", decision)
 	}
-	// The v2.0.19 inversion itself: a $36 target armed at peak 18 must NOT
-	// instantly exit — the pre-v2.0.45 code closed on the arming tick
-	// because 0.30×36 = $10.80 exceeded every plausible peak.
+	// The v2.0.19 inversion guard: a $36 target armed at peak 30 must NOT
+	// instantly exit on a small pullback (floor = 0.8×30 = 24 < 29).
 	input.PnLTarget = mustDecimal("36")
-	input.PeakPNL = mustDecimal("18")
-	input.RealizedPNL = mustDecimal("17")
+	input.PeakPNL = mustDecimal("30")
+	input.RealizedPNL = mustDecimal("29")
 	decision = decideBotAction(input)
 	if decision.Action != ActionHold {
 		t.Fatalf("armed peak with small pullback must keep trailing, got %+v", decision)
 	}
-	// And a developed peak still banks on a 20% pullback: 0.8×20 = 16.
-	input.PeakPNL = mustDecimal("20")
-	input.RealizedPNL = mustDecimal("15.9")
+	// And a developed peak still banks on a 20% pullback: 0.8×30 = 24.
+	input.RealizedPNL = mustDecimal("23.9")
 	decision = decideBotAction(input)
 	if decision.Action != ActionCloseTakeProfit || decision.Reason != "TRAILING_TAKE_PROFIT" {
 		t.Fatalf("20%% pullback from a developed peak must trail out, got %+v", decision)
 	}
+	// v2.0.164 NEUTRAL guard: the same armed tape on a NEUTRAL bot never
+	// trails and never breakeven-locks — the exchange profit_amount card
+	// is its only take-profit.
+	neutral := baseActionInput() // Direction NEUTRAL, target 12
+	neutral.PeakPNL = mustDecimal("11")
+	neutral.RealizedPNL = mustDecimal("0.1")
+	if d := decideBotAction(neutral); d.Action != ActionHold {
+		t.Fatalf("NEUTRAL must not trail/breakeven-lock, got %+v", d)
+	}
 }
 
-// v2.0.56 checkpoint case (a): a σ-scaled $18 target arms at 0.5×18 = $9
-// with no dollar cap. Peak $10 is armed and the exit floors at
-// max(0.8×10, min(0.30×18=5.4, 0.85×9=7.65)) = 8.0 instead of the old
-// $3.50-capped early exit that banked $3.1–6.6 on 0.68–0.79×peak.
+// v2.0.56 checkpoint case (a), re-armed at 0.75 (v2.0.164): a σ-scaled $18
+// target arms at 0.75×18 = $13.5. Peak $15 is armed and the exit floors at
+// max(0.8×15, min(0.30×18=5.4, 0.85×13.5=11.475)) = 12.0 — the upper half
+// of the σ-scaled run is banked, not surrendered at the old 50% arm.
 func TestDecideBotActionTrailingSigmaScaledTargetV56(t *testing.T) {
 	input := baseActionInput()
+	input.Direction = "LONG"
 	input.PnLTarget = mustDecimal("18")
-	input.PeakPNL = mustDecimal("10")
-	// 7.99 dips through the 8.0 floor → trail out.
-	input.RealizedPNL = mustDecimal("7.99")
+	input.PeakPNL = mustDecimal("15")
+	// 11.99 dips through the 12.0 floor → trail out.
+	input.RealizedPNL = mustDecimal("11.99")
 	decision := decideBotAction(input)
 	if decision.Action != ActionCloseTakeProfit || decision.Reason != "TRAILING_TAKE_PROFIT" {
 		t.Fatalf("pullback through the 8.0 floor must trail out, got %+v", decision)
 	}
 	// Sitting exactly ON the floor holds (exit is strictly below).
-	input.RealizedPNL = mustDecimal("8.0")
+	input.RealizedPNL = mustDecimal("12.0")
 	decision = decideBotAction(input)
 	if decision.Action != ActionHold {
-		t.Fatalf("sitting on the 8.0 floor must hold, got %+v", decision)
+		t.Fatalf("sitting on the 12.0 floor must hold, got %+v", decision)
 	}
 }
 
-// v2.0.56 checkpoint case (b): small $6 targets keep the early-exit
-// behavior — the 0.5×6 = $3 arm still catches modest peaks and banks them
-// on a 20% pullback, so nothing changes for the small-target tape.
+// v2.0.56 checkpoint case (b), v2.0.164 arm: small $6 targets arm at
+// 0.75×6 = $4.5 — a modest peak still banks on a 20% pullback, one notch
+// later than the old $3 arm.
 func TestDecideBotActionTrailingSmallTargetStillExitsEarly(t *testing.T) {
 	input := baseActionInput()
+	input.Direction = "LONG"
 	input.PnLTarget = mustDecimal("6")
-	// Peak 3.2 arms (>= 3); floor = max(0.8×3.2=2.56, min(1.8, 2.55)) = 2.56
-	// → the 2.5 pullback trails out early, as before.
-	input.PeakPNL = mustDecimal("3.2")
-	input.RealizedPNL = mustDecimal("2.5")
+	// Peak 5 arms (>= 4.5); floor = max(0.8×5=4.0, min(1.8, 3.825)) = 4.0
+	// → the 3.9 pullback trails out.
+	input.PeakPNL = mustDecimal("5")
+	input.RealizedPNL = mustDecimal("3.9")
 	decision := decideBotAction(input)
 	if decision.Action != ActionCloseTakeProfit || decision.Reason != "TRAILING_TAKE_PROFIT" {
 		t.Fatalf("armed small-target peak must trail out early, got %+v", decision)
 	}
-	// A peak below the $3 arm does not engage trailing at all.
-	input.PeakPNL = mustDecimal("2.8")
+	// A peak below the $4.5 arm does not engage trailing at all.
+	input.PeakPNL = mustDecimal("4.4")
+	input.RealizedPNL = mustDecimal("3.5")
 	decision = decideBotAction(input)
 	if decision.Action != ActionHold {
 		t.Fatalf("sub-arm peak on a small target must hold, got %+v", decision)

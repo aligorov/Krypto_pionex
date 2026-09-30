@@ -23,6 +23,10 @@ const (
 	// Subscription cap mirrors pionex.MaxStreamSymbols; keep the constant
 	// local so the autogrid package doesn't leak the client type into tests.
 	wsMaxFleetSymbols = 60
+	// wsPrewarmCandidateCap bounds the candidate pre-warm pool (v2.0.164):
+	// running bots always stay subscribed; only the TOP candidates beyond
+	// the fleet get warm books — see the postmortem note in syncWSSubscriptions.
+	wsPrewarmCandidateCap = 5
 )
 
 // startWSLane launches the advisory WebSocket lane once per process. It is
@@ -105,9 +109,19 @@ func (worker *Worker) syncWSSubscriptions(ctx context.Context, settings Settings
 		return
 	}
 	// v2.0.131: Pre-warm top accepted candidates from latest successful scan
-	// up to wsMaxFleetSymbols so order books and OFI windows are warm before entry.
+	// so order books and OFI windows are warm before entry.
+	// v2.0.164 (prod 30.09 postmortem): the prewarm pool is capped at
+	// wsPrewarmCandidateCap TOP-SCORED candidates instead of filling the
+	// whole 60-symbol lane — 50+ candidates × 3 streams (INDEX/TRADE/
+	// ORDERBOOK) overloaded the public socket, it died on 1008 rate-limit
+	// every few minutes, the OFI engine reset every book to DESYNC, and the
+	// knife-pause gate then vetoed 100% of entries on "awaiting fresh
+	// snapshot". A small warm pool keeps the lane alive and the gates open.
 	if len(symbols) < wsMaxFleetSymbols {
 		candLimit := wsMaxFleetSymbols - len(symbols)
+		if candLimit > wsPrewarmCandidateCap {
+			candLimit = wsPrewarmCandidateCap
+		}
 		candRows, err := worker.db.Query(ctx, `
 			SELECT symbol
 			FROM autogrid_candidates
