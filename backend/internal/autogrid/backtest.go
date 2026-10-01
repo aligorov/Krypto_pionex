@@ -117,7 +117,12 @@ func normalizeBacktestTF(interval string) string {
 	case "30M":
 		return "30M"
 	case "15M":
-		return "15M"
+		// v2.0.173: 15M grid trades are ~80% serially correlated (consecutive
+		// fills at adjacent levels) → n_eff ≈ raw/9, structurally never
+		// reaching the 15-trade independence minimum even with 100+ raw
+		// round trips. The walk-forward validation runs on 60M where trades
+		// are more independent; entry timing (scanner) stays on 15M.
+		return "60M"
 	default:
 		return "60M"
 	}
@@ -410,6 +415,12 @@ func (worker *Worker) loadBacktestSummaryWithParams(ctx context.Context, symbol,
 		}
 		paramsMap["fee_bps"] = p.FeeBps
 		paramsMap["slippage_bps"] = p.SlippageBps
+	}
+	// v2.0.173: 60M walk-forward needs more history than the 500-candle
+	// default — give it 1000 bars (~42 days) so the train/test folds cover
+	// multiple market regimes and produce independent-enough trades.
+	if interval == "60M" || interval == "1H" {
+		paramsMap["limits"] = 1000
 	}
 	encoded, _ := json.Marshal(paramsMap)
 	_, _ = worker.db.Exec(ctx, `

@@ -115,15 +115,21 @@ func main() {
 		// Start Telegram Outbox Dispatcher Loop. Credentials come from the
 		// telegram_settings table only — Zero-ENV policy, no fallbacks.
 		dispatcher := telegram.NewOutboxDispatcher(dbPool, "", "")
+		dispatcher.SetBuildInfo(Version, GitCommit, BuildTime)
 		go func() {
-			ticker := time.NewTicker(10 * time.Second)
+			ticker := time.NewTicker(time.Second)
 			defer ticker.Stop()
 			for {
 				select {
 				case <-ctx.Done():
 					return
 				case <-ticker.C:
-					_ = dispatcher.DispatchPending(ctx)
+					if err := dispatcher.QueueDigestIfDue(ctx); err != nil {
+						logger.Warn("telegram digest failed", "component", "telegram_outbox", "error", err.Error())
+					}
+					if err := dispatcher.DispatchPending(ctx); err != nil {
+						logger.Warn("telegram dispatcher failed", "component", "telegram_outbox", "error", err.Error())
+					}
 				}
 			}
 		}()

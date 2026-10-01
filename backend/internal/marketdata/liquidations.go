@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aligorov/pionex-bot/backend/internal/telegram"
 	"github.com/gorilla/websocket"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -96,16 +97,9 @@ func pageWS1008Alert(ctx context.Context, db *pgxpool.Pool, source string, strea
 	if db == nil {
 		return
 	}
-	payload, err := json.Marshal(map[string]any{
+	_ = telegram.NewService(db, nil).EnqueueNotification(ctx, "WS_RATE_LIMIT", map[string]any{
 		"message": fmt.Sprintf("⚠️ <b>WebSocket rate-limit</b>: %d подряд отключений 1008 от %s — сокет троттлится, каскад-гейт может закрыть входы. Проверьте подписки.", streak, source),
 	})
-	if err != nil {
-		return
-	}
-	_, _ = db.Exec(ctx, `
-		INSERT INTO notification_outbox (event_type, payload, status)
-		VALUES ('WS_RATE_LIMIT', $1::JSONB, 'PENDING')
-	`, payload)
 }
 
 type liquidationRecord struct {
@@ -219,17 +213,9 @@ func pageFailover(ctx context.Context, db *pgxpool.Pool, from, to string) {
 	if db == nil {
 		return
 	}
-	payload, err := json.Marshal(map[string]any{
-		"message": "⚠️ <b>Ликвидации: 15м тишины</b> — авто-фэйловер источника " + from + " → " + to +
-			". Каскад-гейт оставался в блоке LONG/NEUTRAL; запасной источник поднят.",
+	_ = telegram.NewService(db, nil).EnqueueNotification(ctx, "LIQ_FEED_FAILOVER", map[string]any{
+		"message": "⚠️ <b>Ликвидации: 15м тишины</b> — переключение источника " + from + " → " + to + ". Здоровье нового потока ещё должно подтвердиться heartbeat.",
 	})
-	if err != nil {
-		return
-	}
-	_, _ = db.Exec(ctx, `
-		INSERT INTO notification_outbox (event_type, payload, status)
-		VALUES ('LIQ_FEED_FAILOVER', $1::JSONB, 'PENDING')
-	`, payload)
 }
 
 // bybitStream subscribes to the allLiquidation topic and feeds the shared

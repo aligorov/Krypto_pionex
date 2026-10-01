@@ -1,14 +1,16 @@
 package telegram
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"log/slog"
 	"net/http"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -82,6 +84,19 @@ func (s *Service) GetSettings(ctx context.Context) (*Settings, error) {
 }
 
 func (s *Service) UpdateSettings(ctx context.Context, item Settings) (*Settings, error) {
+	if item.ID != 1 {
+		return nil, errors.New("telegram settings id must be 1")
+	}
+	if item.DigestIntervalMinutes < 1 || item.DigestIntervalMinutes > 1440 {
+		return nil, errors.New("digest interval must be 1..1440 minutes")
+	}
+	item.ChatID, item.TopicID = strings.TrimSpace(item.ChatID), strings.TrimSpace(item.TopicID)
+	if item.TopicID != "" {
+		topic, err := strconv.ParseInt(item.TopicID, 10, 64)
+		if err != nil || topic <= 0 {
+			return nil, errors.New("topic id must be a positive integer")
+		}
+	}
 	// The API never returns the raw token (audit SEC-003), so an unchanged
 	// token arrives empty or masked: keep the stored value in that case.
 	current, err := s.GetSettings(ctx)
@@ -91,6 +106,9 @@ func (s *Service) UpdateSettings(ctx context.Context, item Settings) (*Settings,
 	token := strings.TrimSpace(item.BotToken)
 	if token == "" || strings.Contains(token, "•") {
 		token = current.BotToken
+	}
+	if item.Enabled && (token == "" || item.ChatID == "") {
+		return nil, errors.New("enabled Telegram requires a bot token and chat id")
 	}
 	_, err = s.db.Exec(ctx, `
 		UPDATE telegram_settings
@@ -150,51 +168,35 @@ func (s *Service) TestConnection(ctx context.Context, token, chatID, topicID str
 		return errors.New("bot token and chat id cannot be empty")
 	}
 
-	url := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", token)
 	body := map[string]any{
-		"chat_id":    chatID,
-		"text":       "✅ <b>Pionex Trading Bot: Тестовое сообщение</b>\n\nСвязь с Telegram успешно установлена! Уведомления настроены и готовы к работе.",
-		"parse_mode": "HTML",
+		"chat_id": chatID, "text": "✅ <b>Pionex Trading Bot: тест связи</b>\nСоединение с Telegram проверено.", "parse_mode": "HTML",
 	}
-	if strings.TrimSpace(topicID) != "" {
-		body["message_thread_id"] = topicID
-	}
-
-	jsonBytes, err := json.Marshal(body)
-	if err != nil {
-		return err
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(jsonBytes))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := s.httpClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("telegram request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		var tgErr struct {
-			Description string `json:"description"`
+	if topicID != "" {
+		topic, err := strconv.ParseInt(topicID, 10, 64)
+		if err != nil || topic <= 0 {
+			return errors.New("topic id must be a positive integer")
 		}
-		_ = json.NewDecoder(resp.Body).Decode(&tgErr)
-		return fmt.Errorf("telegram api error (%d): %s", resp.StatusCode, tgErr.Description)
+		body["message_thread_id"] = topic
 	}
-	return nil
+	return callTelegram(ctx, s.httpClient, token, "sendMessage", body, nil)
 }
 
 // RenderTemplate replaces {{key}} placeholders in template string
+var templatePlaceholder = regexp.MustCompile(`\{\{([a-zA-Z_][a-zA-Z_0-9]*)\}\}`)
+
 func RenderTemplate(tmpl string, vars map[string]any) string {
-	result := tmpl
-	for k, v := range vars {
-		placeholder := fmt.Sprintf("{{%s}}", k)
-		result = strings.ReplaceAll(result, placeholder, fmt.Sprintf("%v", v))
-	}
-	return result
+	return templatePlaceholder.ReplaceAllStringFunc(tmpl, func(placeholder string) string {
+		k := strings.TrimSuffix(strings.TrimPrefix(placeholder, "{{"), "}}")
+		v, exists := vars[k]
+		if !exists {
+			return placeholder
+		}
+		value := html.EscapeString(fmt.Sprintf("%v", v))
+		if k == "message" {
+			value = fmt.Sprintf("%v", v)
+		}
+		return value
+	})
 }
 
 // EnqueueNotification inserts a formatted message into notification_outbox
@@ -207,32 +209,7 @@ func (s *Service) EnqueueNotification(ctx context.Context, eventType string, var
 		return nil // notifications disabled
 	}
 
-	var tmpl string
-	var allowed bool
-
-	switch eventType {
-	case "BOT_CREATED":
-		allowed = settings.NotifyBotCreated
-		tmpl = settings.TemplateBotCreated
-	case "TAKE_PROFIT":
-		allowed = settings.NotifyTakeProfit
-		tmpl = settings.TemplateTakeProfit
-	case "STOP_LOSS":
-		allowed = settings.NotifyStopLoss
-		tmpl = settings.TemplateStopLoss
-	case "RANGE_ADJUST":
-		allowed = settings.NotifyRangeAdjust
-		tmpl = settings.TemplateRangeAdjust
-	case "DIGEST":
-		allowed = settings.NotifyDigest
-		tmpl = settings.TemplateDigest
-	case "EMERGENCY":
-		allowed = settings.NotifyEmergency
-		tmpl = "🚨 <b>EMERGENCY ALERT</b>\n{{message}}"
-	default:
-		allowed = true
-		tmpl = "🔔 <b>Уведомление:</b> {{message}}"
-	}
+	allowed, tmpl := EventRouting(eventType, *settings)
 
 	if !allowed || strings.TrimSpace(tmpl) == "" {
 		return nil
@@ -245,7 +222,7 @@ func (s *Service) EnqueueNotification(ctx context.Context, eventType string, var
 	if strings.Contains(rendered, "{{") {
 		parts := make([]string, 0, len(vars))
 		for k, v := range vars {
-			parts = append(parts, fmt.Sprintf("%s=%v", k, v))
+			parts = append(parts, html.EscapeString(fmt.Sprintf("%s=%v", k, v)))
 		}
 		sort.Strings(parts)
 		rendered = fmt.Sprintf("🔔 <b>%s:</b> %s", eventType, strings.Join(parts, ", "))
@@ -257,9 +234,13 @@ func (s *Service) EnqueueNotification(ctx context.Context, eventType string, var
 	}
 	payloadBytes, _ := json.Marshal(payload)
 
+	severity := "INFO"
+	if strings.HasPrefix(eventType, "EMERGENCY") || eventType == "WS_RATE_LIMIT" || eventType == "FUNDING_STALE" || eventType == "FUNDING_UNAVAILABLE" {
+		severity = "CRITICAL"
+	}
 	_, err = s.db.Exec(ctx, `
-		INSERT INTO notification_outbox (event_type, payload, status)
-		VALUES ($1, $2::jsonb, 'PENDING')
-	`, eventType, string(payloadBytes))
+		INSERT INTO notification_outbox (event_type, payload, status,severity)
+		VALUES ($1, $2::jsonb, 'PENDING',$3)
+	`, eventType, string(payloadBytes), severity)
 	return err
 }

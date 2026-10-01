@@ -6,10 +6,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"sort"
 	"strings"
 	"time"
 
+	"github.com/aligorov/pionex-bot/backend/internal/telegram"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/shopspring/decimal"
 )
@@ -100,185 +100,18 @@ type telegramChannels struct {
 // telegramEventRouting decides, per event type, whether the Telegram lane
 // fires and which template renders it. Pure on purpose (v2.0.143 audit-2):
 // channel semantics are pin-able in a unit test without a database.
-func telegramEventRouting(eventType string, ch telegramChannels) (shouldSend bool, tmpl string) {
-	switch eventType {
-	case "BOT_CREATED":
-		shouldSend = ch.notifyCreated
-		tmpl = ch.tmplCreated
-	case "TAKE_PROFIT":
-		shouldSend = ch.notifyTake
-		tmpl = ch.tmplTake
-	case "STOP_LOSS":
-		shouldSend = ch.notifyStop
-		tmpl = ch.tmplStop
-	case "DELIST_SWEEP", "TRANCHE_2":
-		// v2.0.19: shouldSend was never set in this branch (var defaults to
-		// false), so sweep closes and tranche-2 top-ups were silently
-		// dropped from Telegram — operators learned nothing while bots
-		// closed "by themselves".
-		shouldSend = ch.notifyAdjust
-		tmpl = ch.tmplAdjust // same rendering slot as range shifts; vars overlap
-	case "TRANCHE_2_SKIPPED":
-		// v2.0.56 F2: risk-gated top-up skip — operator must see WHY a bot
-		// stays on its first tranche (cap $12 / fleet envelope).
-		shouldSend = ch.notifyAdjust
-		tmpl = "⛔ <b>Транш-2 отложен:</b> бот #{{bot_number}} {{symbol}} — {{reason}}"
-	case "RADAR_RECENTER_FAILED":
-		// v2.0.75: the exchange refusing the radar's escape adjust used to be
-		// a Warn-only swallow — the operator saw a silent radar while bots sat
-		// in band 4 for hours. One line per hour, first-class signal.
-		shouldSend = ch.notifyAdjust
-		tmpl = "⚠️ <b>Радар: эскейп отклонён биржей:</b> бот #{{bot_number}} {{symbol}} band {{band}} — {{error}}"
-	case "RADAR_B2_EARLY_RECENTER":
-		// v2.0.76 "shift on green": the preventive band-2 re-center fired
-		// while the profit preflight still passes — the classic dwell-3
-		// window (v2.0.85: under water the shift now ships keepInvestment
-		// instead of being blocked; see RADAR_B2_VELOCITY_RECENTER for the
-		// one-tick lane).
-		shouldSend = ch.notifyAdjust
-		tmpl = "🛡 <b>Радар: ранний ре-центр на зелёном (B2):</b> бот #{{bot_number}} {{symbol}} — цена прошла {{edge_progress_pct}}% пути к опасному краю, score {{score}}, total {{total}} USDT → [{{lower_price}}, {{upper_price}}]"
-	case "RADAR_B2_VELOCITY_RECENTER":
-		// v2.0.85 "shift early": the trajectory lane — from 55% of the way
-		// to the adverse edge, a price racing at ≥ 0.6×ATR(15м)/15м fires
-		// after ONE tick (dwell 1); the dwell-3 early window slips past on
-		// exactly these pairs. Requires a still-green base (normal shift).
-		shouldSend = ch.notifyAdjust
-		tmpl = "⚡ <b>Радар: скоростной ре-центр (B2 velocity):</b> бот #{{bot_number}} {{symbol}} — цена на {{edge_progress_pct}}% пути к краю, скорость {{speed_atr_15m}}×ATR/15м, score {{score}}, total {{total}} USDT → [{{lower_price}}, {{upper_price}}]"
-	case "RADAR_AUTOCLOSE":
-		// v2.0.84: the radar closed the bot itself (opt-in mode BAND3/STRICT).
-		// Queued BEFORE the close intent — the operator must see the why
-		// (band, score, total at the moment) even when the native stop wins
-		// the race.
-		shouldSend = ch.notifyStop
-		tmpl = "🛑 <b>Радар: автозакрытие ({{mode}}):</b> бот #{{bot_number}} {{symbol}} — band {{band}} (score {{score}}), total {{total}} USDT — {{reason}}"
-	case "STOP_FORECAST_SHADOW":
-		// v2.0.57: the radar's band transitions used to fall into the
-		// generic {{message}} fallback and shipped literal placeholders
-		// (prod 2026-09-01: XLM band 2/3 twice) — they became frequent the
-		// moment the V4 calibration made band 3 reachable.
-		shouldSend = ch.notifyAdjust
-		tmpl = "🛡 <b>Стоп-радар:</b> бот #{{bot_number}} {{symbol}} — band {{band}} (score {{score}}), total {{total}}"
-	case "DGT_REDEPLOY":
-		// v2.0.89 part B: the DGT break re-start fired — the grid follows the
-		// market (arXiv 2506.11921). Rides the bot-created channel: a
-		// new bot exists on the fleet.
-		shouldSend = ch.notifyCreated
-		tmpl = "🔄 <b>DGT: пробой — сетка перезапущена центром {{center_price}}</b>, символ {{symbol}} (бот #{{bot_number}}, бюджет {{budget}} USDT, диапазон [{{lower_price}}, {{upper_price}}])"
-	case "DIRECTION_FLIP":
-		// v2.0.140 (package E): the first direction-flip experiment — a
-		// NEUTRAL slot that died on a confirmed DOWN-side break mid-cascade
-		// does not re-center into the same knife; the scanner's SHORT-cascade
-		// lane takes the slot.
-		// v2.0.143 (audit-2): shouldSend is now UNCONDITIONAL. The flip used
-		// to ride the adjust channel (notify_range_adjust) — but a REAL
-		// direction reversal moving real money must never be silencable by
-		// the range-shift toggle an operator flips to quiet routine grid
-		// maintenance. Same always-on semantics as the generic default lane.
-		shouldSend = true
-		tmpl = "🔁 <b>Флип направления (E):</b> бот #{{bot_number}} {{symbol}} — NEUTRAL закрыт по {{trigger}}, дамп подтверждён ({{ofi_regime}}), каскад ликвидаций {{cascade_usd}}/ч — слот уходит сканеру под SHORT-каскад"
-	case "GRID_AGED_HALF_LIFE":
-		// v2.0.89 part B: the OU half-life rotation — the fitted range
-		// statistically decayed; the slot returns to the scanner. A planned
-		// exit, not an alarm: the adjust channel carries it.
-		shouldSend = ch.notifyAdjust
-		tmpl = "⏳ <b>Half-life ротация:</b> бот #{{bot_number}} {{symbol}} ({{bot_source}}) — возраст {{age_hours}}ч превысил {{max_age_hours}}ч (OU HL {{half_life_hours}}ч), слот свободен для сканера"
-	case "RANGE_ADJUST", "ADJUST_RANGE":
-		shouldSend = ch.notifyAdjust
-		tmpl = ch.tmplAdjust
-	case "DIGEST":
-		shouldSend = ch.notifyDigest
-		tmpl = ch.tmplDigest
-	case "EMERGENCY":
-		shouldSend = ch.notifyEmergency
-		tmpl = "🚨 <b>EMERGENCY ALERT</b>\n{{message}}"
-	case "EMERGENCY_OFI_DUMP", "EMERGENCY_OFI_PUMP":
-		// v2.0.143 (audit-2): the OFI protective exits used to fall into the
-		// generic default lane (shouldSend = true), bypassing the
-		// notify_emergency toggle — the one channel an operator expects to
-		// control stayed always-on for exactly these alarms. They now ride
-		// the emergency channel like every other EMERGENCY_* event; the 🚨
-		// body arrives in vars["message"], supplied by protection.go.
-		shouldSend = ch.notifyEmergency
-		tmpl = "🚨 <b>Экстренный выход (OFI)</b>\n{{message}}"
-	default:
-		shouldSend = true
-		tmpl = "🔔 <b>Уведомление:</b> {{message}}"
-	}
-	return shouldSend, tmpl
+func telegramEventRouting(eventType string, ch telegramChannels) (bool, string) {
+	return telegram.EventRouting(eventType, telegram.Settings{
+		NotifyBotCreated: ch.notifyCreated, NotifyTakeProfit: ch.notifyTake, NotifyStopLoss: ch.notifyStop,
+		NotifyRangeAdjust: ch.notifyAdjust, NotifyDigest: ch.notifyDigest, NotifyEmergency: ch.notifyEmergency,
+		TemplateBotCreated: ch.tmplCreated, TemplateTakeProfit: ch.tmplTake, TemplateStopLoss: ch.tmplStop,
+		TemplateRangeAdjust: ch.tmplAdjust, TemplateDigest: ch.tmplDigest,
+	})
 }
 
 // QueueTelegramEvent formats and inserts a notification into notification_outbox
-func QueueTelegramEvent(
-	ctx context.Context,
-	db *pgxpool.Pool,
-	eventType string,
-	vars map[string]any,
-) error {
-	var enabled bool
-	var botToken, chatID string
-	var notifyCreated, notifyTake, notifyStop, notifyAdjust, notifyDigest, notifyEmergency bool
-	var tmplCreated, tmplTake, tmplStop, tmplAdjust, tmplDigest string
-
-	row := db.QueryRow(ctx, `
-		SELECT enabled, bot_token, chat_id,
-		       notify_bot_created, notify_take_profit, notify_stop_loss,
-		       notify_range_adjust, notify_digest, notify_emergency,
-		       template_bot_created, template_take_profit, template_stop_loss,
-		       template_range_adjust, template_digest
-		FROM telegram_settings
-		WHERE id = 1
-	`)
-	if err := row.Scan(
-		&enabled, &botToken, &chatID,
-		&notifyCreated, &notifyTake, &notifyStop,
-		&notifyAdjust, &notifyDigest, &notifyEmergency,
-		&tmplCreated, &tmplTake, &tmplStop,
-		&tmplAdjust, &tmplDigest,
-	); err != nil || !enabled || strings.TrimSpace(botToken) == "" || strings.TrimSpace(chatID) == "" {
-		return nil // Telegram disabled or not configured
-	}
-
-	shouldSend, tmpl := telegramEventRouting(eventType, telegramChannels{
-		notifyCreated: notifyCreated, notifyTake: notifyTake, notifyStop: notifyStop,
-		notifyAdjust: notifyAdjust, notifyDigest: notifyDigest, notifyEmergency: notifyEmergency,
-		tmplCreated: tmplCreated, tmplTake: tmplTake, tmplStop: tmplStop,
-		tmplAdjust: tmplAdjust, tmplDigest: tmplDigest,
-	})
-
-	if !shouldSend || strings.TrimSpace(tmpl) == "" {
-		return nil
-	}
-
-	// Render placeholders
-	rendered := tmpl
-	for k, v := range vars {
-		rendered = strings.ReplaceAll(rendered, fmt.Sprintf("{{%s}}", k), fmt.Sprintf("%v", v))
-	}
-	// Fallback hardening: an event whose vars don't cover the template's
-	// placeholders must never ship a literal {{...}} to the operator (prod
-	// 2026-09-01: the generic fallback rendered "Уведомление: {{message}}"
-	// twice on radar band transitions). Compose a readable line instead.
-	if strings.Contains(rendered, "{{") {
-		parts := make([]string, 0, len(vars))
-		for k, v := range vars {
-			parts = append(parts, fmt.Sprintf("%s=%v", k, v))
-		}
-		sort.Strings(parts)
-		rendered = fmt.Sprintf("🔔 <b>%s:</b> %s", eventType, strings.Join(parts, ", "))
-	}
-
-	payload := map[string]any{
-		"text":       rendered,
-		"event_type": eventType,
-		"created_at": time.Now().Format(time.RFC3339),
-	}
-	payloadBytes, _ := json.Marshal(payload)
-
-	_, err := db.Exec(ctx, `
-		INSERT INTO notification_outbox (event_type, payload, status)
-		VALUES ($1, $2::jsonb, 'PENDING')
-	`, eventType, string(payloadBytes))
-	return err
+func QueueTelegramEvent(ctx context.Context, db *pgxpool.Pool, eventType string, vars map[string]any) error {
+	return telegram.NewService(db, nil).EnqueueNotification(ctx, eventType, vars)
 }
 
 // recordCandidateOutcome back-fills the deployed candidate's row with the

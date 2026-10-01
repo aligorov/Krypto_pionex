@@ -100,10 +100,10 @@ func shortReason(r string) string {
 func loadFleet(ctx context.Context, db *pgxpool.Pool) ([]fleetRow, error) {
 	rows, err := db.Query(ctx, `
 		SELECT COALESCE(bot_number,0), symbol, leverage, quote_investment,
-		       COALESCE(realized_pnl_usdt,0), COALESCE(unrealized_pnl_usdt,0),
+		       COALESCE(realized_pnl_usdt,0)-COALESCE(fees_paid_usdt,0), COALESCE(unrealized_pnl_usdt,0),
 		       COALESCE(max_loss_usdt,0), adjustments_count, created_at
 		FROM grid_bots
-		WHERE status IN ('RUNNING','STOP_REQUESTED','STOPPING') AND bu_order_id IS NOT NULL
+		WHERE execution_mode='REAL' AND status IN ('RUNNING','STOP_REQUESTED','STOPPING') AND bu_order_id IS NOT NULL
 		ORDER BY bot_number
 	`)
 	if err != nil {
@@ -124,15 +124,17 @@ func loadFleet(ctx context.Context, db *pgxpool.Pool) ([]fleetRow, error) {
 
 func loadClosed(ctx context.Context, db *pgxpool.Pool, limit int, sinceDays int) ([]closedRow, error) {
 	rows, err := db.Query(ctx, `
-		SELECT COALESCE(bot_number,0), symbol, realized_pnl_usdt,
+		SELECT COALESCE(bot_number,0), symbol, realized_pnl_usdt - (COALESCE(fees_paid_usdt,0) -
+         COALESCE(CASE WHEN model_state->>'closeCostUsdt' ~ '^[0-9]+(\.[0-9]+)?$' THEN (model_state->>'closeCostUsdt')::numeric END,0)),
 		       COALESCE(quote_investment,0), COALESCE(closed_reason,''), closed_at,
 		       EXTRACT(EPOCH FROM (closed_at - created_at))/3600
 		FROM grid_bots
-		WHERE closed_at IS NOT NULL AND bu_order_id IS NOT NULL
+		WHERE execution_mode='REAL' AND status IN ('STOPPED','COMPLETED','CANCELLED','LIQUIDATED')
+ AND reconciliation_state='REMOTE_TERMINAL_CONFIRMED' AND closed_at IS NOT NULL AND bu_order_id IS NOT NULL
 		  AND realized_pnl_usdt IS NOT NULL
 		  AND ($2::INT = 0 OR closed_at > NOW() - ($2::INT * INTERVAL '1 day'))
 		ORDER BY closed_at DESC
-		LIMIT $1
+		LIMIT CASE WHEN $2::INT>0 THEN NULL::BIGINT ELSE $1::BIGINT END
 	`, limit, sinceDays)
 	if err != nil {
 		return nil, err
@@ -152,7 +154,7 @@ func loadClosed(ctx context.Context, db *pgxpool.Pool, limit int, sinceDays int)
 func dayStatsFrom(rows []closedRow) []dayStat {
 	byDay := map[string]*dayStat{}
 	for _, r := range rows {
-		key := r.ClosedAt.UTC().Format("02.01")
+		key := r.ClosedAt.UTC().Format("2006-01-02")
 		st, ok := byDay[key]
 		if !ok {
 			st = &dayStat{Day: key}
@@ -162,7 +164,7 @@ func dayStatsFrom(rows []closedRow) []dayStat {
 		st.Net = st.Net.Add(r.Final)
 		if r.Final.IsPositive() {
 			st.Wins++
-		} else {
+		} else if r.Final.IsNegative() {
 			st.Losses++
 			st.AvgLoss = st.AvgLoss.Add(r.Final)
 		}
@@ -261,8 +263,8 @@ func buildFleetTable(fleet []fleetRow, sparks map[int]string) string {
 		if sp == "" {
 			sp = "—"
 		}
-		fmt.Fprintf(&b, "%-4d %-6s %d%-3d %6s %s %s\n",
-			r.BotNumber%10000, sym(r.Symbol), r.Leverage, r.Investment.Round(0).IntPart(),
+		fmt.Fprintf(&b, "%-4d %-6s %dx/$%-3d %6s %s %s\n",
+			r.BotNumber, sym(r.Symbol), r.Leverage, r.Investment.Round(0).IntPart(),
 			moneySigned(total), pct, sp)
 	}
 	b.WriteString("</pre>")
@@ -310,7 +312,7 @@ func buildClosedTable(rows []closedRow) string {
 	var b strings.Builder
 	b.WriteString("<pre>#    симв    финал держал прич\n")
 	for _, r := range rows {
-		fmt.Fprintf(&b, "%-4d %-7s %7s %5.1fh %s\n", r.BotNumber%10000, sym(r.Symbol), moneySigned(r.Final), r.HeldHours, reasonGlyph(r.Reason))
+		fmt.Fprintf(&b, "%-4d %-7s %7s %5.1fh %s\n", r.BotNumber, sym(r.Symbol), moneySigned(r.Final), r.HeldHours, html.EscapeString(reasonGlyph(r.Reason)))
 	}
 	b.WriteString("</pre>")
 	return b.String()
@@ -329,7 +331,7 @@ func buildDayStats(days []dayStat) string {
 		if st.Losses > 0 {
 			avgLoss = st.AvgLoss.Round(2).StringFixed(2)
 		}
-		fmt.Fprintf(&b, "%s %6d   %2d/%-2d %8s %8s\n", st.Day, st.Closes, st.Wins, st.Losses, moneySigned(st.Net), avgLoss)
+		fmt.Fprintf(&b, "%s %6d   %2d/%-2d %8s %8s\n", displayDay(st.Day), st.Closes, st.Wins, st.Losses, moneySigned(st.Net), avgLoss)
 		total = total.Add(st.Net)
 		closes += st.Closes
 		wins += st.Wins
@@ -344,20 +346,21 @@ func buildDayStats(days []dayStat) string {
 	return b.String()
 }
 
-// forecastLine projects the observed daily net onto month/year at the
-// CURRENT deployed capital — a straight read of the run rate, no compounding,
-// labelled as such.
-func forecastLine(days []dayStat, capital decimal.Decimal) string {
-	if len(days) == 0 || !capital.IsPositive() {
+func displayDay(day string) string {
+	if parsed, err := time.Parse("2006-01-02", day); err == nil {
+		return parsed.Format("02.01")
+	}
+	return day
+}
+
+// Historical closed PnL is not a forecast or a return on today's capital.
+func observedDailyAverage(days []dayStat) string {
+	if len(days) == 0 {
 		return ""
 	}
 	var net decimal.Decimal
-	for _, st := range days {
-		net = net.Add(st.Net)
+	for _, day := range days {
+		net = net.Add(day.Net)
 	}
-	perDay := net.Div(decimal.NewFromInt(int64(len(days))))
-	perMonth := perDay.Mul(decimal.NewFromInt(30))
-	pctDay := perDay.Div(capital).Mul(decimal.NewFromInt(100))
-	return fmt.Sprintf("\n📉 Темп: <b>%s/день</b> (~%s%%/день капитала) → месяц <b>≈%s</b> (без реинвеста)",
-		perDay.Round(2).StringFixed(2), pctDay.Round(2).StringFixed(2), perMonth.Round(0).StringFixed(0))
+	return fmt.Sprintf("\nСреднее за %d дней с подтверждёнными закрытиями: <b>%s USDT/день</b>. Дни без закрытий не включены; это не прогноз доходности.", len(days), net.Div(decimal.NewFromInt(int64(len(days)))).StringFixed(2))
 }

@@ -27,7 +27,7 @@ func TestBuildFleetTable(t *testing.T) {
 			CreatedAt: time.Now().Add(-5 * time.Hour)},
 	}
 	out := buildFleetTable(fleet, map[int]string{1395: "▂▄▆█▆▄▂▁", 1381: "▁▂▃▅▇█▇▅"})
-	for _, want := range []string{"1395", "DOT", "ICP", "-1.27", " -16%", "▂▄▆█▆▄▂▁", "4100"} {
+	for _, want := range []string{"1395", "DOT", "ICP", "-1.27", " -16%", "▂▄▆█▆▄▂▁", "4x/$100"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("fleet table missing %q:\n%s", want, out)
 		}
@@ -61,16 +61,16 @@ func TestBuildClosedTableAndDayStats(t *testing.T) {
 	}
 }
 
-func TestForecastLine(t *testing.T) {
+func TestObservedDailyAverage(t *testing.T) {
 	days := []dayStat{
 		{Day: "25.09", Closes: 8, Net: d(t, "5.41"), Wins: 6, Losses: 2},
 		{Day: "26.09", Closes: 25, Net: d(t, "5.13"), Wins: 18, Losses: 7},
 	}
-	out := forecastLine(days, d(t, "800"))
-	if !strings.Contains(out, "5.27/день") || !strings.Contains(out, "0.66%") || !strings.Contains(out, "≈158") {
+	out := observedDailyAverage(days)
+	if !strings.Contains(out, "5.27 USDT/день") || !strings.Contains(out, "не прогноз") || strings.Contains(out, "≈158") || strings.Contains(out, "0.66%") {
 		t.Fatalf("forecast line wrong:\n%s", out)
 	}
-	if forecastLine(nil, d(t, "800")) != "" {
+	if observedDailyAverage(nil) != "" {
 		t.Fatalf("empty days must yield no forecast")
 	}
 }

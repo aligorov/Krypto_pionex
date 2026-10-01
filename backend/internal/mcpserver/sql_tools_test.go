@@ -50,6 +50,8 @@ func TestJournalTablesWhitelisted(t *testing.T) {
 
 func TestValidateAnalyticsSQL(t *testing.T) {
 	ok := []string{
+		"SELECT status,attempts,last_error FROM notification_outbox",
+		"SELECT last_poll_at,last_error FROM telegram_poll_state",
 		"SELECT source, connected, last_message_at FROM liquidation_feed_health ORDER BY source",
 		"SELECT * FROM paper_grid_bots WHERE status = 'RUNNING'",
 		"with x as (select symbol from autogrid_candidates) select * from x",
