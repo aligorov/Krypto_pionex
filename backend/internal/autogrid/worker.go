@@ -3493,12 +3493,32 @@ func (worker *Worker) deployReal(
 			}
 		}
 		if check != nil && liqEstUp == nil && liqEstDown == nil {
-			deployErrors = append(deployErrors,
-				fmt.Sprintf("%s: checkParams вернул без оценок ликвидации", candidate.Symbol))
-			worker.rejectCandidate(ctx, candidate,
-				"ликвидационный гейт: биржа не вернула оценок ликвидации — неизвестный риск не является допустимым риском, деплой отказан (v2.0.168)",
-				map[string]any{"liqEstimatesMissing": true})
-			continue
+			// v2.0.174: the exchange returns zeros for liquidation estimates
+			// on ALL symbols (prod-verified 01.10: XPL, ALGO — both zero
+			// despite investment being well within range). Calculate from
+			// the isolated-margin formula instead of blocking every deploy.
+			fbUp, fbDown := FallbackLiquidationEstimates(trend, candidate.CurrentPrice, botLev)
+			if fbUp.GreaterThan(decimal.Zero) {
+				v := fbUp
+				liqEstUp = &v
+			}
+			if fbDown.GreaterThan(decimal.Zero) {
+				v := fbDown
+				liqEstDown = &v
+			}
+			worker.logger.Info("liq gate: exchange returned zeros — using fallback estimates",
+				"component", "autogrid_worker", "symbol", candidate.Symbol,
+				"fallback_up", fbUp.StringFixed(4), "fallback_down", fbDown.StringFixed(4),
+				"leverage", botLev)
+			// If the fallback also produced nothing (degenerate entry/leverage), reject.
+			if liqEstUp == nil && liqEstDown == nil {
+				deployErrors = append(deployErrors,
+					fmt.Sprintf("%s: не удалось получить/вычислить оценки ликвидации", candidate.Symbol))
+				worker.rejectCandidate(ctx, candidate,
+					"ликвидационный гейт: ни биржа, ни формула не дали оценок — деплой отказан",
+					map[string]any{"liqEstimatesMissing": true})
+				continue
+			}
 		}
 		if reason := liquidationGuardReason(trend, candidate.CurrentPrice,
 			derefZero(liqEstDown), derefZero(liqEstUp), slPrice, slHighPrice, botLev); reason != "" {

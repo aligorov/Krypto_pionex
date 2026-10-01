@@ -119,3 +119,29 @@ func derefZero(d *decimal.Decimal) decimal.Decimal {
 	}
 	return *d
 }
+
+// FallbackLiquidationEstimates computes the wall prices from the standard
+// isolated-margin liquidation formula when the exchange returns zeros:
+//
+//	LONG:  liq_down ≈ entry × (1 - 1/lev + MMR)
+//	SHORT: liq_up   ≈ entry × (1 + 1/lev - MMR)
+//	NEUTRAL: both sides (the bot can hold inventory either way)
+//
+// MMR (maintenance margin rate) is ~1% for Pionex perpetuals. The estimates
+// are conservative: the real wall includes accumulated funding and PnL, so
+// the calculated wall is CLOSER than the actual one — the guard rejects
+// MORE, never less.
+func FallbackLiquidationEstimates(direction string, entry decimal.Decimal, leverage int) (up, down decimal.Decimal) {
+	if !entry.GreaterThan(decimal.Zero) || leverage < 1 {
+		return decimal.Zero, decimal.Zero
+	}
+	lev := decimal.NewFromInt(int64(leverage))
+	mmr := decimal.NewFromFloat(0.01) // 1% maintenance margin rate
+	inverseLev := decimal.NewFromInt(1).Div(lev)
+	down = entry.Mul(decimal.NewFromInt(1).Sub(inverseLev).Add(mmr))
+	if down.LessThan(decimal.Zero) {
+		down = decimal.Zero
+	}
+	up = entry.Mul(decimal.NewFromInt(1).Add(inverseLev).Sub(mmr))
+	return up, down
+}
