@@ -581,7 +581,7 @@ func scoreCandidate(
 			reasons = append(reasons, fmt.Sprintf("Anti-FOMO: положение в канале (%.1f%%) > %.0f%% - вход в LONG выше предела заблокирован", regime.RangePositionPct, posCap))
 		}
 	} else if recommendedTrend == "short" {
-		if antiFomoShortFloorsLifted(config.CascadeShortMode, config.BetaDownShortMode, regime.ADX, regime.EMASlopePct) {
+		if antiFomoShortFloorsLifted(config.CascadeShortMode, config.BetaDownShortMode, regime.ADX, regime.EMASlopePct, regime.RSI) {
 			// v2.0.21 cascade window: skip the RSI/position floors for
 			// shorts (see ScanConfig.CascadeShortMode) — the oversold
 			// reading IS the signal during a forced unwind.
@@ -1111,9 +1111,18 @@ func neutralSqueezeRisk(regime RegimeResult) bool {
 // already widen on) AND a falling EMA. Slope sign is the direction proof:
 // an impulse breakdown sits at the channel bottom by construction, and
 // the oversold reading IS the signal, not a trap, while the trend carries.
-func antiFomoShortFloorsLifted(cascadeMode, betaDownShortMode bool, adx, emaSlopePct float64) bool {
+func antiFomoShortFloorsLifted(cascadeMode, betaDownShortMode bool, adx, emaSlopePct float64, rsi float64) bool {
 	if cascadeMode {
 		return true
+	}
+	// v2.0.169 (consensus-1 debt): the RSI >= 30 floor is RESTORED even for
+	// confirmed downtrends — shorting into a fresh oversold impulse is the
+	// worst entry point (negative funding against shorts, extreme funding
+	// predicts squeeze, bear rallies ~10% every ~44d). The v2.0.166 exempt
+	// function guards the same thing at deploy time; this restores the
+	// scanner-level rejection so the candidate never reaches the deploy gate.
+	if rsi > 0 && rsi < 30.0 {
+		return false
 	}
 	_ = betaDownShortMode // subsumed by the own-tape confirmation below
 	strongTrend := adx > 22.0 || math.Abs(emaSlopePct) > 0.5

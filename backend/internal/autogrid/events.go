@@ -308,11 +308,29 @@ func recordRealBotOutcome(ctx context.Context, db *pgxpool.Pool, logger *slog.Lo
 	if strings.TrimSpace(botID) == "" || db == nil {
 		return
 	}
+	// v2.0.169 (§3-tail): the confirmed exchange final UPDATES the stored
+	// estimate instead of being blocked by the first-outcome-wins guard —
+	// the old guard left stale telemetry estimates in the training data
+	// forever when the exchange truth landed later. The previous value is
+	// preserved in the audit history (outcome_revision + outcome_prev).
 	if _, err := db.Exec(ctx, `
 		UPDATE autogrid_candidates c
-		SET outcome_pnl_usdt = $2, outcome_closed_reason = $3, outcome_at = NOW()
+		SET outcome_prev_pnl_usdt = c.outcome_pnl_usdt,
+		    outcome_pnl_usdt = $2,
+		    outcome_closed_reason = $3,
+		    outcome_at = NOW(),
+		    outcome_revision = COALESCE(c.outcome_revision, 0) + 1
 		FROM grid_bots g
-		WHERE g.id = $1 AND g.candidate_id = c.id AND c.outcome_at IS NULL
+		WHERE g.id = $1 AND g.candidate_id = c.id
+		  AND (
+		    c.outcome_at IS NULL
+		    OR (
+		      -- Update only when the figure actually changed (prevents
+		      -- same-value churn from repeated settle passes).
+		      COALESCE(c.outcome_pnl_usdt, 0) <> $2
+		      AND g.reconciliation_state = 'REMOTE_TERMINAL_CONFIRMED'
+		    )
+		  )
 	`, botID, total, reason); err != nil && logger != nil {
 		logger.Error("recordRealBotOutcome failed",
 			"component", "autogrid_worker", "bot_id", botID, "error", err)

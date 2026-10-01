@@ -2246,14 +2246,15 @@ func (s *Service) AdjustBot(
 	var botLeverage int
 	var currentLower, currentUpper decimal.Decimal
 	var currentRow int
-	var currentUnrealized decimal.Decimal
+	var currentUnrealized, currentInvestment decimal.Decimal
 	if err := s.db.QueryRow(ctx, `
 		SELECT bu_order_id, account_id, symbol, direction, COALESCE(leverage, 1),
-		       lower_price, upper_price, grid_num, COALESCE(unrealized_pnl_usdt, 0)
+		       lower_price, upper_price, grid_num, COALESCE(unrealized_pnl_usdt, 0),
+		       COALESCE(quote_investment, 0)
 		FROM grid_bots
 		WHERE id = $1 AND autogrid_settings_id = $2 AND status = 'RUNNING'
 	`, botID, settingsID).Scan(&buOrderID, &accountID, &botSymbol, &botDirection, &botLeverage,
-		&currentLower, &currentUpper, &currentRow, &currentUnrealized); err == nil {
+		&currentLower, &currentUpper, &currentRow, &currentUnrealized, &currentInvestment); err == nil {
 		if buOrderID == nil || *buOrderID == "" {
 			return "", errors.New("real bot has no remote buOrderId yet")
 		}
@@ -2336,6 +2337,41 @@ func (s *Service) AdjustBot(
 		}
 		if err := client.AdjustFuturesGridBot(ctx, params); err != nil {
 			return "", fmt.Errorf("%w: %w", ErrNativeAdjustRefused, err)
+		}
+		// v2.0.169 (§6-tail): REST confirmation — the native adjust succeeded,
+		// but the local geometry/investment UPDATE below must not run until we
+		// have verified the exchange actually applied it. Fetch the remote bot
+		// and check the bounds/investment match what we just sent; on mismatch
+		// the local state stays untouched and the operator is paged.
+		remoteBot, remoteErr := client.GetFuturesGridBot(ctx, *buOrderID)
+		if remoteErr != nil || remoteBot == nil {
+			s.logger.Warn("adjust REST confirmation unavailable — local update deferred, reconcile will sync",
+				"component", "autogrid_service", "bot_id", botID, "error", remoteErr)
+			return "REAL", nil
+		}
+		if input.Mode == "adjust_params" {
+			remoteTop := remoteBot.BUOrderData.Top
+			remoteBottom := remoteBot.BUOrderData.Bottom
+			if !remoteTop.Equal(input.Upper) || !remoteBottom.Equal(input.Lower) {
+				s.logger.Error("adjust REST confirmation MISMATCH — exchange bounds differ from requested",
+					"component", "autogrid_service", "bot_id", botID,
+					"req_upper", input.Upper.String(), "remote_upper", remoteTop.String(),
+					"req_lower", input.Lower.String(), "remote_lower", remoteBottom.String())
+				return "", fmt.Errorf("REST confirmation: биржа применила диапазон %.4f-%.4f вместо запрошенного %.4f-%.4f — локальное состояние не изменено",
+					remoteBottom.InexactFloat64(), remoteTop.InexactFloat64(),
+					input.Lower.InexactFloat64(), input.Upper.InexactFloat64())
+			}
+		}
+		if input.Mode == "invest_in" {
+			remoteInvestment := remoteBot.BUOrderData.QuoteInvestment
+			expectedInvestment := currentInvestment.Add(input.QuoteInvestment)
+			if remoteInvestment.LessThan(expectedInvestment.Mul(decimal.NewFromFloat(0.99))) {
+				s.logger.Error("invest_in REST confirmation MISMATCH — exchange investment below expected",
+					"component", "autogrid_service", "bot_id", botID,
+					"expected_min", expectedInvestment.String(), "remote", remoteInvestment.String())
+				return "", fmt.Errorf("REST confirmation: биржа инвестиция %s ниже ожидаемой %s — локальное состояние не изменено",
+					remoteInvestment.StringFixed(2), expectedInvestment.StringFixed(2))
+			}
 		}
 		if input.Mode == "adjust_params" {
 			// v2.0.113: Range shifts no longer write shiftFloatingOffset to model_state.

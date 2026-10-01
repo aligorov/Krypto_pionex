@@ -11,20 +11,23 @@ func TestAntiFomoShortFloorsLifted(t *testing.T) {
 	for _, tc := range []struct {
 		name              string
 		cascade, betaDown bool
-		adx, slope        float64
+		adx, slope, rsi   float64
 		wantLifted        bool
 	}{
-		{"cascade window always lifts", true, false, 15, -0.2, true},
-		{"confirmed downtrend by ADX (no flags)", false, false, 29, -1.4, true},
-		{"confirmed by steep slope (no flags)", false, false, 15, -0.9, true},
-		{"beta down confirmed downtrend", false, true, 29, -1.4, true},
-		{"flat pair stays armed", false, true, 15, -0.2, false},
-		{"rising pair stays armed", false, true, 15, 1.2, false},
-		{"strong ADX but rising stays armed", false, true, 29, 0.8, false},
-		{"weak flat tape stays armed", false, false, 15, -0.2, false},
+		{"cascade window always lifts", true, false, 15, -0.2, 50, true},
+		{"confirmed downtrend by ADX (no flags)", false, false, 29, -1.4, 50, true},
+		{"confirmed by steep slope (no flags)", false, false, 15, -0.9, 50, true},
+		{"beta down confirmed downtrend", false, true, 29, -1.4, 50, true},
+		{"flat pair stays armed", false, true, 15, -0.2, 50, false},
+		{"rising pair stays armed", false, true, 15, 1.2, 50, false},
+		{"strong ADX but rising stays armed", false, true, 29, 0.8, 50, false},
+		{"weak flat tape stays armed", false, false, 15, -0.2, 50, false},
+		{"oversold RSI 25 blocks even confirmed downtrend", false, false, 29, -1.4, 25, false},
+		{"RSI 30 exactly passes", false, false, 29, -1.4, 30, true},
+		{"RSI 0 (missing) passes (fail-open)", false, false, 29, -1.4, 0, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := antiFomoShortFloorsLifted(tc.cascade, tc.betaDown, tc.adx, tc.slope); got != tc.wantLifted {
+			if got := antiFomoShortFloorsLifted(tc.cascade, tc.betaDown, tc.adx, tc.slope, tc.rsi); got != tc.wantLifted {
 				t.Fatalf("antiFomoShortFloorsLifted(%v, %v, %.1f, %.1f) = %v, want %v",
 					tc.cascade, tc.betaDown, tc.adx, tc.slope, got, tc.wantLifted)
 			}
