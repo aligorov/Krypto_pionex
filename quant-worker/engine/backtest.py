@@ -650,6 +650,13 @@ def walk_forward(engine: QuantBacktestEngine, candles: List[Dict[str, Any]],
     round_trips = sum(f["round_trips"] for f in folds)
     if use_exact_params and candidate_evaluation:
         round_trips = candidate_evaluation["round_trips"]
+        # v2.0.172 (audit): when exact candidate parameters are evaluated,
+        # the report's return/drawdown MUST come from that evaluation, NOT
+        # from the historical fold averages (which used different grid
+        # parameters). The old mixing showed DOGE 1.02% DD from historical
+        # folds while the exact candidate's true DD was 17.92%.
+        returns = [candidate_evaluation["return_pct"]]
+        dds = [candidate_evaluation["max_drawdown"]]
 
     # Trade-level statistical metrics with autocorrelation (trade dependence) adjustment
     pnls = [t.get("pnl", 0.0) for t in all_trades]

@@ -164,12 +164,16 @@ func evaluateBacktestGate(traded BacktestJobSummary, neighbors []BacktestJobSumm
 		return verdict
 	}
 	if !traded.SampleSufficient {
-		if traded.RoundTrips >= backtestMinRoundTrips && traded.Folds >= backtestMinFolds {
-			traded.SampleSufficient = true
-		} else {
-			verdict.Reason = fmt.Sprintf("backtest gate: sample size not statistically sufficient on traded TF %s", traded.Interval)
-			return verdict
-		}
+		// v2.0.172 (audit): the Go override that flipped SampleSufficient to
+		// true when round_trips >= 15 is REMOVED — the Python engine already
+		// accounts for trade dependence (autocorrelation-adjusted n_eff),
+		// and DOGE's 58 raw / 7.39 effective sample proved the override was
+		// admitting statistically insufficient candidates. Respect the
+		// engine's verdict.
+		verdict.Reason = fmt.Sprintf(
+			"backtest gate: эффективная выборка недостаточна на TF %s (учтена автокорреляция сделок — переопределение Go удалено v2.0.172)",
+			traded.Interval)
+		return verdict
 	}
 	// Task 4: Lower bound of 95% Confidence Interval for Net EV after costs MUST be strictly > 0
 	if !traded.CI95Positive || traded.CI95Lower <= 0.0 {

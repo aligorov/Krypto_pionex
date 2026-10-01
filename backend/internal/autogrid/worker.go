@@ -2249,6 +2249,13 @@ func marginReserveBlocker(
 ) (code, reason string) {
 	equity, activeCommitted, spendable, err := loadBotFundingReserve(ctx, db, accountID)
 	if err != nil {
+		// v2.0.172 (audit §5): a stale/unreadable snapshot is NOT a deficit —
+		// the sequential scan+manage cycle can leave the snapshot >10 min old
+		// while the wallet actually has funds. Separate the code so the
+		// analytics don't count "data freshness" as "no capital".
+		if strings.Contains(err.Error(), "stale") || strings.Contains(err.Error(), "invalid timestamp") {
+			return "FUNDING_STALE", fmt.Sprintf("снимок капитала устарел (не дефицит!): %v — обновление баланса отложено из-за долгого скан-цикла", err)
+		}
 		return "MARGIN_RESERVE", fmt.Sprintf("резерв маржи: капитал ботов недоступен: %v", err)
 	}
 
@@ -3393,13 +3400,38 @@ func (worker *Worker) deployReal(
 				"preflight checkParams недоступен — деплой отказан (fail-closed, v2.0.168): "+checkErr.Error(),
 				map[string]any{"checkParamsRefused": true})
 			continue
-		} else if check != nil && check.GetMinInvestment().GreaterThan(decimal.Zero) &&
-			investAmount.LessThan(check.GetMinInvestment()) {
-			deployErrors = append(deployErrors, fmt.Sprintf(
-				"%s: budget %s below Pionex minimum investment %s",
-				candidate.Symbol, settings.BudgetUSDT, check.GetMinInvestment(),
-			))
-			continue
+		} else if check != nil {
+			// v2.0.172 (audit): log the exchange's ACTUAL boundaries and
+			// estimate presence for diagnostics — the estimate-clearing bug
+			// (investment outside [min, max] range) was invisible because
+			// we only checked the floor.
+			worker.logger.Info("checkParams diagnostics",
+				"component", "autogrid_worker", "symbol", candidate.Symbol,
+				"min_investment", check.GetMinInvestment().StringFixed(2),
+				"max_investment", check.GetMaxInvestment().StringFixed(2),
+				"our_investment", investAmount.StringFixed(2),
+				"liq_up", check.EstimateLiquidationUp.StringFixed(4),
+				"liq_down", check.EstimateLiquidationDown.StringFixed(4))
+			if check.GetMinInvestment().GreaterThan(decimal.Zero) &&
+				investAmount.LessThan(check.GetMinInvestment()) {
+				deployErrors = append(deployErrors, fmt.Sprintf(
+					"%s: budget %s below Pionex minimum investment %s",
+					candidate.Symbol, settings.BudgetUSDT, check.GetMinInvestment(),
+				))
+				continue
+			}
+			// v2.0.172: check the ceiling too — the exchange clears
+			// liquidation estimates when the investment is outside the
+			// allowed range, making the both-empty refuse fire with no
+			// diagnostic context.
+			if check.GetMaxInvestment().GreaterThan(decimal.Zero) &&
+				investAmount.GreaterThan(check.GetMaxInvestment()) {
+				deployErrors = append(deployErrors, fmt.Sprintf(
+					"%s: budget %s above Pionex maximum investment %s (exchange clears liq estimates out of range)",
+					candidate.Symbol, investAmount.StringFixed(2), check.GetMaxInvestment().StringFixed(2),
+				))
+				continue
+			}
 		}
 		// v2.0.161 liquidation guard: the exchange's own estimates must sit
 		// at least liqGuardMinPct beyond the stored stops — a stop closer to

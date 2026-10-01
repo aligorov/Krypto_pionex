@@ -77,6 +77,18 @@ func (r *FuturesGridCheckParamsResult) GetMinInvestment() decimal.Decimal {
 	return r.MinInvestmentCamel
 }
 
+// GetMaxInvestment returns the exchange's maximum allowed investment
+// (zero = not reported).
+func (r *FuturesGridCheckParamsResult) GetMaxInvestment() decimal.Decimal {
+	if r == nil {
+		return decimal.Zero
+	}
+	if r.MaxInvestment.GreaterThan(decimal.Zero) {
+		return r.MaxInvestment
+	}
+	return r.MaxInvestmentCamel
+}
+
 // futuresGridCheckParamsRequest is the checkParams wire format: unlike the
 // create endpoint (camelCase buOrderData: quoteInvestment, extraMargin...),
 // checkParams expects SNAKE_CASE inside buOrderData (quote_investment,

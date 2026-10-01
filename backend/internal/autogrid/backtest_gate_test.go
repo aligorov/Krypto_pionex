@@ -257,7 +257,7 @@ func TestParseBacktestResult_NoOptimisticDefaults(t *testing.T) {
 	if verdict.Allowed {
 		t.Fatalf("unconfirmed CI/liquidity must reject, got allowed=true")
 	}
-	if verdict.Reason == "" || !strings.Contains(verdict.Reason, "нет подтверждения") {
-		t.Fatalf("verdict reason must state 'нет подтверждения', got: %s", verdict.Reason)
+	if verdict.Reason == "" || !strings.Contains(verdict.Reason, "недостаточна") {
+		t.Fatalf("verdict reason must state insufficient sample, got: %s", verdict.Reason)
 	}
 }
