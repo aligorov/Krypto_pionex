@@ -59,7 +59,18 @@ def fetch_klines(symbol, interval, limit):
     the raw newest-first list directly into the backtest engine, which
     assumes oldest-first iteration — every historical result was
     time-reversed.
+
+    v2.0.176b: strip the _PERP suffix — the PUBLIC klines endpoint is a
+    spot/market API that expects "BTC_USDT" not "BTC_USDT_PERP". The Go
+    scanner already sends non-PERP symbols (from /market/symbols); the
+    backtest job table stores the PERP format, so we convert here.
+    Also cap limit at 500 (the Pionex API maximum for klines).
     """
+    # v2.0.176b: Pionex klines API max is 500 — limit=1000 returns
+    # MARKET_PARAMETER_ERROR with 0 candles. The _PERP suffix is CORRECT
+    # (the API expects futures-style symbols for futures klines).
+    if limit > 500:
+        limit = 500
     response = requests.get(
         PIONEX_KLINES_URL,
         params={"symbol": symbol, "interval": interval, "limit": limit},

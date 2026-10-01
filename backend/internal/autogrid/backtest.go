@@ -420,7 +420,7 @@ func (worker *Worker) loadBacktestSummaryWithParams(ctx context.Context, symbol,
 	// default — give it 1000 bars (~42 days) so the train/test folds cover
 	// multiple market regimes and produce independent-enough trades.
 	if interval == "60M" || interval == "1H" {
-		paramsMap["limits"] = 1000
+		paramsMap["limits"] = 500 // v2.0.176b: Pionex klines API max is 500
 	}
 	encoded, _ := json.Marshal(paramsMap)
 	_, _ = worker.db.Exec(ctx, `
