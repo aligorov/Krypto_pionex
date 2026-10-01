@@ -92,12 +92,39 @@ func (d *OutboxDispatcher) pollUpdates(ctx context.Context) {
 	if err = tx.QueryRow(ctx, `SELECT last_update_id,commands_registered FROM telegram_poll_state WHERE token_fingerprint=$1`, key).Scan(&cursor, &registered); err != nil {
 		return
 	}
+	// setMyCommands is a Telegram API write and is rate-limited separately
+	// from getUpdates. If another instance or a recent restart hit the limit,
+	// persist the server-provided pause and do not immediately retry every
+	// three seconds. This also prevents a registration storm from starving
+	// the actual command poller.
+	var paused bool
+	if err = tx.QueryRow(ctx, `SELECT COALESCE(send_paused_until>NOW(),false) FROM telegram_poll_state WHERE token_fingerprint=$1`, key).Scan(&paused); err != nil {
+		return
+	}
+	if paused {
+		return
+	}
 	if !registered {
 		if err = callTelegram(ctx, d.httpClient, token, "setMyCommands", map[string]any{"commands": commandCatalog()}, nil); err == nil {
 			_, err = tx.Exec(ctx, `UPDATE telegram_poll_state SET commands_registered=true WHERE token_fingerprint=$1`, key)
 		}
 		if err != nil {
 			d.logger.Warn("tg console: command menu registration failed", "component", "telegram_console", "error", err.Error())
+			pause := 30 * time.Second
+			var apiErr *APIError
+			if errors.As(err, &apiErr) && apiErr.Code == 429 && apiErr.RetryAfter > 0 {
+				pause = time.Duration(apiErr.RetryAfter) * time.Second
+			}
+			if _, pauseErr := tx.Exec(ctx, `UPDATE telegram_poll_state
+				SET send_paused_until=NOW()+($2::double precision*INTERVAL '1 second'),last_error=$3
+				WHERE token_fingerprint=$1`, key, pause.Seconds(), err.Error()); pauseErr != nil {
+				d.pollFailure(ctx, key, pauseErr)
+				return
+			}
+			if commitErr := tx.Commit(ctx); commitErr != nil {
+				d.pollFailure(ctx, key, commitErr)
+			}
+			return
 		}
 	}
 	var updates []telegramUpdate

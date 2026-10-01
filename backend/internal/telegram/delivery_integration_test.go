@@ -337,3 +337,33 @@ func TestUnauthorizedCallbackIsAcknowledgedWithoutExecution(t *testing.T) {
 		t.Fatalf("denial not acknowledged or executed: ack=%v kill=%v", acknowledged, kill)
 	}
 }
+
+func TestCommandRegistrationRateLimitPausesPoller(t *testing.T) {
+	d := telegramTestDispatcher(t)
+	ctx := context.Background()
+	setCalls, pollCalls := 0, 0
+	d.httpClient.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "setMyCommands"):
+			setCalls++
+			return mockResponse(429, `{"ok":false,"error_code":429,"description":"retry","parameters":{"retry_after":60}}`), nil
+		case strings.HasSuffix(r.URL.Path, "getUpdates"):
+			pollCalls++
+			return mockResponse(200, `{"ok":true,"result":[]}`), nil
+		default:
+			return mockResponse(200, `{"ok":true,"result":true}`), nil
+		}
+	})
+	d.pollUpdates(ctx)
+	d.pollUpdates(ctx)
+	if setCalls != 1 || pollCalls != 0 {
+		t.Fatalf("registration storm or poll despite rate limit: set=%d poll=%d", setCalls, pollCalls)
+	}
+	if _, err := d.db.Exec(ctx, `UPDATE telegram_poll_state SET send_paused_until=NOW()`); err != nil {
+		t.Fatal(err)
+	}
+	d.pollUpdates(ctx)
+	if setCalls != 2 || pollCalls != 0 {
+		t.Fatalf("registration did not resume after pause: set=%d poll=%d", setCalls, pollCalls)
+	}
+}
