@@ -35,6 +35,20 @@ type Services struct {
 
 type EmptyInput struct{}
 
+// v2.0.184c decision-intelligence tool inputs.
+type DecisionHistoryInput struct {
+	Symbol string `json:"symbol,omitempty"`
+	Limit  int    `json:"limit,omitempty"`
+}
+
+type GateQualityInput struct {
+	Window string `json:"window,omitempty"`
+}
+
+type ReplayRunsInput struct {
+	Limit int `json:"limit,omitempty"`
+}
+
 type LimitInput struct {
 	Limit int `json:"limit,omitempty" jsonschema:"Maximum number of rows, from 1 to 500."`
 }
@@ -612,6 +626,56 @@ func registerAutoGridTools(
 		}
 		data, err := services.AutoGrid.State(ctx)
 		return nil, DataOutput{Data: data}, err
+	})
+
+	// v2.0.184c: decision-intelligence read tools (the analysis module's
+	// observability surface over MCP — same rows as the UI screens).
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "decision_history",
+		Description: "Recent entry decisions with per-gate traces (verdicts, thresholds, numeric " +
+			"inputs), episode linkage and the shadow-episode fate. Optional symbol filter.",
+		Annotations: readOnly,
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, input DecisionHistoryInput) (*mcp.CallToolResult, DataOutput, error) {
+		if err := requireScope(principal, "mcp:read"); err != nil {
+			return nil, DataOutput{}, err
+		}
+		if input.Limit <= 0 || input.Limit > 200 {
+			input.Limit = 25
+		}
+		data, err := services.AutoGrid.ListDecisionHistory(ctx, input.Symbol, input.Limit)
+		return nil, DataOutput{Data: data}, err
+	})
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "gate_quality",
+		Description: "Per-regime gate quality aggregates (window 24H or 7D): episodes, coverage, " +
+			"model PnL of blocked entries, proof strength (LOW/MEDIUM/HIGH).",
+		Annotations: readOnly,
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, input GateQualityInput) (*mcp.CallToolResult, DataOutput, error) {
+		if err := requireScope(principal, "mcp:read"); err != nil {
+			return nil, DataOutput{}, err
+		}
+		if input.Window != "7D" {
+			input.Window = "24H"
+		}
+		data, err := services.AutoGrid.ListGateQuality(ctx, input.Window)
+		return nil, DataOutput{Data: data}, err
+	})
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "replay_runs_list",
+		Description: "Saved replay experiments: period, overrides, status, N/K/M/L statistics, " +
+			"chain-admission delta-PnL effect and model calibration flag.",
+		Annotations: readOnly,
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, input ReplayRunsInput) (*mcp.CallToolResult, DataOutput, error) {
+		if err := requireScope(principal, "mcp:read"); err != nil {
+			return nil, DataOutput{}, err
+		}
+		if input.Limit <= 0 || input.Limit > 100 {
+			input.Limit = 20
+		}
+		runs, err := services.AutoGrid.ListReplayRuns(ctx, input.Limit)
+		return nil, DataOutput{Data: runs}, err
 	})
 
 	mcp.AddTool(server, &mcp.Tool{
