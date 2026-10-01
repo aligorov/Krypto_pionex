@@ -64,6 +64,32 @@ func TestCheckFuturesGridParamsContract(t *testing.T) {
 		if r.URL.Path != "/api/v1/bot/orders/futuresGrid/checkParams" {
 			t.Errorf("expected path /api/v1/bot/orders/futuresGrid/checkParams, got %s", r.URL.Path)
 		}
+		// v2.0.168: the REQUEST BODY is part of the contract — checkParams
+		// expects snake_case inside buOrderData (unlike create's camelCase).
+		// The pre-168 client marshaled the create-shaped struct, the exchange
+		// ignored the unrecognized camelCase investment/leverage and the
+		// estimates came back capital-less (empty).
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode checkParams request body: %v", err)
+		}
+		order, ok := body["buOrderData"].(map[string]any)
+		if !ok {
+			t.Fatalf("request body missing buOrderData object: %+v", body)
+		}
+		for _, snake := range []string{"top", "bottom", "row", "grid_type", "trend", "leverage", "quote_investment"} {
+			if _, present := order[snake]; !present {
+				t.Errorf("checkParams request must carry snake_case %q, body: %+v", snake, order)
+			}
+		}
+		for _, camel := range []string{"quoteInvestment", "extraMargin", "gridType"} {
+			if _, present := order[camel]; present {
+				t.Errorf("checkParams request must NOT carry create-side camelCase %q, body: %+v", camel, order)
+			}
+		}
+		if inv, _ := order["quote_investment"].(string); inv != "100" {
+			t.Errorf("quote_investment must serialize as string \"100\", got %#v", order["quote_investment"])
+		}
 		resp := APIEnvelope[FuturesGridCheckParamsResult]{
 			Result: true, Code: "200", Timestamp: 1620000000000,
 			Data: FuturesGridCheckParamsResult{

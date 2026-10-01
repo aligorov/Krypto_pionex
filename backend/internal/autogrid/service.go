@@ -2933,11 +2933,41 @@ func (s *Service) DeployManualBot(
 			return nil, "", errors.New(reason)
 		}
 	}
+	// v2.0.168 fail-closed: the manual lane used to ignore a failed
+	// pre-flight check entirely. Unknown validation state = no deploy.
 	check, checkErr := client.CheckFuturesGridParams(ctx, params)
-	if checkErr == nil && check != nil && check.GetMinInvestment().GreaterThan(decimal.Zero) && investment.LessThan(check.GetMinInvestment()) {
+	if checkErr != nil {
+		return nil, "", fmt.Errorf("preflight checkParams недоступен — ручной деплой отказан (fail-closed, v2.0.168): %w", checkErr)
+	}
+	if check == nil {
+		return nil, "", errors.New("preflight checkParams вернул пустой ответ — ручной деплой отказан (fail-closed, v2.0.168)")
+	}
+	if check.GetMinInvestment().GreaterThan(decimal.Zero) && investment.LessThan(check.GetMinInvestment()) {
 		return nil, "", fmt.Errorf(
 			"investment %s is below the Pionex minimum investment %s",
 			investment.StringFixed(2), check.GetMinInvestment().StringFixed(2))
+	}
+	// v2.0.168: no liquidation estimates at all = unknown wall = refuse.
+	if !check.EstimateLiquidationUp.GreaterThan(decimal.Zero) && !check.EstimateLiquidationDown.GreaterThan(decimal.Zero) {
+		return nil, "", errors.New("биржа не вернула оценок ликвидации — неизвестный риск не является допустимым риском, ручной деплой отказан (v2.0.168)")
+	}
+	// v2.0.168 review P1: the manual lane now runs the SAME deploy-time
+	// liquidation guard as the scanner and DGT lanes (a manually chosen
+	// geometry gets no doctrine exemption) and persists the estimates it
+	// just validated — manual bots carried NULL liq columns before.
+	manualLiqUp := zeroToNil(check.EstimateLiquidationUp)
+	manualLiqDown := zeroToNil(check.EstimateLiquidationDown)
+	// The manual lane sets no native loss-stop on the card (no LossStop in
+	// params above) — the structural guard runs against the grid's own lower
+	// bound for NEUTRAL/LONG and the upper bound for SHORT, the wall any
+	// exchange stop would sit beyond.
+	manualGuardStop := lower
+	if strings.EqualFold(strings.TrimSpace(trend), "short") {
+		manualGuardStop = upper
+	}
+	if reason := liquidationGuardReason(trend, investment, check.EstimateLiquidationDown,
+		check.EstimateLiquidationUp, manualGuardStop, nil, leverage); reason != "" {
+		return nil, "", errors.New(reason)
 	}
 	manager := grid.NewLifecycleManager(s.db, client)
 	gridID, createErr := manager.CreateGridBot(ctx, grid.CreateInput{
@@ -2949,6 +2979,10 @@ func (s *Service) DeployManualBot(
 		Params:         params,
 		PnLTargetUSDT:  botTarget,
 		MaxLossUSDT:    botMaxLoss,
+		// v2.0.168 review P1: persist the validated estimates so the manual
+		// lane no longer ships NULL liq columns.
+		LiqPriceUp:   manualLiqUp,
+		LiqPriceDown: manualLiqDown,
 	})
 	if createErr != nil {
 		if errors.Is(createErr, grid.ErrDuplicateActiveBot) {

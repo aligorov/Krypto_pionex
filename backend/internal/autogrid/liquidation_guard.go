@@ -103,6 +103,15 @@ func liquidationProximityBreached(price, runningLiq decimal.Decimal) bool {
 	return dist.LessThan(decimal.NewFromFloat(liqProximityClosePct))
 }
 
+// zeroToNil maps a zero/empty decimal to a SQL NULL for the liq columns.
+func zeroToNil(d decimal.Decimal) *decimal.Decimal {
+	if !d.GreaterThan(decimal.Zero) {
+		return nil
+	}
+	v := d
+	return &v
+}
+
 // derefZero unwraps an optional decimal for the guard's value-typed calls.
 func derefZero(d *decimal.Decimal) decimal.Decimal {
 	if d == nil {

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strings"
 
 	"github.com/shopspring/decimal"
 )
@@ -76,13 +77,65 @@ func (r *FuturesGridCheckParamsResult) GetMinInvestment() decimal.Decimal {
 	return r.MinInvestmentCamel
 }
 
+// futuresGridCheckParamsRequest is the checkParams wire format: unlike the
+// create endpoint (camelCase buOrderData: quoteInvestment, extraMargin...),
+// checkParams expects SNAKE_CASE inside buOrderData (quote_investment,
+// grid_type, extra_margin...). Sending the create-shaped struct made the
+// exchange ignore the investment/leverage context — every prod checkParams
+// either failed (and the deployer fail-opened past it) or returned estimates
+// computed without capital, so the liquidation estimates came back empty and
+// the v2.0.161 guard never armed (prod 2026-10-01: all six running bots had
+// NULL liq columns). v2.0.168: a dedicated request shape, contract-tested.
+type futuresGridCheckParamsRequest struct {
+	Base        string                    `json:"base"`
+	Quote       string                    `json:"quote"`
+	BUOrderData futuresGridCheckParamsData `json:"buOrderData"`
+}
+
+type futuresGridCheckParamsData struct {
+	Top                string           `json:"top"`
+	Bottom             string           `json:"bottom"`
+	Row                int              `json:"row"`
+	GridType           string           `json:"grid_type"`
+	Trend              string           `json:"trend"`
+	Leverage           int              `json:"leverage"`
+	QuoteInvestment decimal.Decimal `json:"quote_investment"`
+}
+
+// checkParamsRequestFromCreate converts the create-shaped params into the
+// checkParams wire format (field mapping is 1:1; only the casing differs).
+// The base is normalized to the documented `X.PERP` form HERE — review P0
+// (v2.0.168): the scanner REAL lane passed a bare "BTC" and the documented
+// endpoint rejects it, so with fail-closed deploys every fresh candidate
+// would have been refused. Normalizing in one place means no lane can
+// diverge again (the create lifecycle re-normalizes independently).
+func checkParamsRequestFromCreate(p NativeFuturesGridCreateParams) futuresGridCheckParamsRequest {
+	base := p.Base
+	if base != "" && !strings.HasSuffix(base, ".PERP") {
+		base = base + ".PERP"
+	}
+	return futuresGridCheckParamsRequest{
+		Base:  base,
+		Quote: p.Quote,
+		BUOrderData: futuresGridCheckParamsData{
+			Top:               p.BUOrderData.Top.String(),
+			Bottom:            p.BUOrderData.Bottom.String(),
+			Row:               p.BUOrderData.Row,
+			GridType:          p.BUOrderData.GridType,
+			Trend:             p.BUOrderData.Trend,
+			Leverage:          p.BUOrderData.Leverage,
+			QuoteInvestment: p.BUOrderData.QuoteInvestment,
+		},
+	}
+}
+
 // CheckFuturesGridParams validates grid parameters against Pionex before any
 // real capital is committed. It never places an order.
 func (c *Client) CheckFuturesGridParams(
 	ctx context.Context,
 	params NativeFuturesGridCreateParams,
 ) (*FuturesGridCheckParamsResult, error) {
-	body, err := json.Marshal(params)
+	body, err := json.Marshal(checkParamsRequestFromCreate(params))
 	if err != nil {
 		return nil, fmt.Errorf("marshal futures grid checkParams request: %w", err)
 	}

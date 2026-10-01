@@ -179,8 +179,8 @@ type Worker struct {
 	// gateUnreadableStreak counts consecutive entry passes whose advisory
 	// gates were SQL-unreadable (v2.0.167): three in a row (~15m of scan
 	// cadence) pages the operator; lastGateUnreadableAlarmAt dedups hourly.
-	gateUnreadableStreak        int
-	lastGateUnreadableAlarmAt   time.Time
+	gateUnreadableStreak      int
+	lastGateUnreadableAlarmAt time.Time
 	// lastCapitalAlarmAt throttles the v2.0.145 capital-deficiency telegram
 	// to one per hour (single manage goroutine → plain field).
 	lastCapitalAlarmAt time.Time
@@ -2021,8 +2021,13 @@ func (worker *Worker) deployPaper(
 								"биржа запрещает операцию по символу (forbidden/maintenance) — деплой отложен", nil)
 							continue
 						}
-						worker.logger.Warn("paper parity checkParams unavailable, deploying without exchange validation",
+						// v2.0.168: paper parity defers with the candidate when the
+						// exchange pre-flight is unreadable — same fail-closed class
+						// as the REAL lane (the sandbox must exercise the REAL gate
+						// order, not a bypassed one).
+						worker.logger.Warn("paper parity checkParams unavailable — candidate deferred (fail-closed)",
 							"component", "autogrid_worker", "symbol", candidate.Symbol, "error", checkErr)
+						continue
 					} else if check != nil && check.GetMinInvestment().GreaterThan(decimal.Zero) &&
 						investAmount.LessThan(check.GetMinInvestment()) {
 						worker.rejectCandidate(ctx, candidate, fmt.Sprintf(
@@ -2032,8 +2037,10 @@ func (worker *Worker) deployPaper(
 					}
 				}
 			} else {
-				worker.logger.Warn("paper parity checkParams client unavailable, deploying without exchange validation",
+				// v2.0.168: no client at all = defer too (parity with REAL).
+				worker.logger.Warn("paper parity checkParams client unavailable — candidate deferred (fail-closed)",
 					"component", "autogrid_worker", "symbol", candidate.Symbol, "error", clientErr)
+				continue
 			}
 		}
 
@@ -3373,10 +3380,19 @@ func (worker *Worker) deployReal(
 					"биржа запрещает операцию по символу (forbidden/maintenance) — деплой отложен", nil)
 				continue
 			}
-			worker.logger.Warn(
-				"Pionex checkParams estimation returned warning, attempting direct creation",
-				"component", "autogrid_worker", "symbol", candidate.Symbol, "error", checkErr,
-			)
+			// v2.0.168 fail-closed: a failed pre-flight check no longer falls
+			// through to direct creation. The pre-168 shape mismatch (camelCase
+			// create-struct against a snake_case endpoint) made most checks fail
+			// silently — "attempting direct creation" was the norm, the min-
+			// investment and liquidation validations were decorative. Unknown
+			// validation state = no deploy.
+			worker.logger.Warn("entry gate: checkParams failed — real deploy refused (fail-closed)",
+				"component", "autogrid_worker", "symbol", candidate.Symbol, "error", checkErr)
+			deployErrors = append(deployErrors, fmt.Sprintf("%s: checkParams: %v", candidate.Symbol, checkErr))
+			worker.rejectCandidate(ctx, candidate,
+				"preflight checkParams недоступен — деплой отказан (fail-closed, v2.0.168): "+checkErr.Error(),
+				map[string]any{"checkParamsRefused": true})
+			continue
 		} else if check != nil && check.GetMinInvestment().GreaterThan(decimal.Zero) &&
 			investAmount.LessThan(check.GetMinInvestment()) {
 			deployErrors = append(deployErrors, fmt.Sprintf(
@@ -3389,8 +3405,12 @@ func (worker *Worker) deployReal(
 		// at least liqGuardMinPct beyond the stored stops — a stop closer to
 		// the estimated liquidation has no room for wicks/funding drift
 		// before the exchange force-closes (prod: ORDI −$10.45, NEAR −$10.41
-		// were exactly this geometry). Missing estimates skip the guard,
-		// mirroring the checkParams fail-open contract above.
+		// were exactly this geometry).
+		// v2.0.168: BOTH estimates empty = the exchange told us nothing about
+		// the wall — unknown risk is not acceptable risk on a leveraged grid.
+		// (Prod postmortem: the pre-168 request-shape bug made every check
+		// come back estimate-less and all six running bots carried NULL liq
+		// columns with the guard inert.)
 		var liqEstUp, liqEstDown *decimal.Decimal
 		if check != nil {
 			if check.EstimateLiquidationUp.GreaterThan(decimal.Zero) {
@@ -3401,6 +3421,14 @@ func (worker *Worker) deployReal(
 				v := check.EstimateLiquidationDown
 				liqEstDown = &v
 			}
+		}
+		if check != nil && liqEstUp == nil && liqEstDown == nil {
+			deployErrors = append(deployErrors,
+				fmt.Sprintf("%s: checkParams вернул без оценок ликвидации", candidate.Symbol))
+			worker.rejectCandidate(ctx, candidate,
+				"ликвидационный гейт: биржа не вернула оценок ликвидации — неизвестный риск не является допустимым риском, деплой отказан (v2.0.168)",
+				map[string]any{"liqEstimatesMissing": true})
+			continue
 		}
 		if reason := liquidationGuardReason(trend, candidate.CurrentPrice,
 			derefZero(liqEstDown), derefZero(liqEstUp), slPrice, slHighPrice, botLev); reason != "" {
@@ -3472,7 +3500,7 @@ func (worker *Worker) deployReal(
 			LiqPriceUp:       liqEstUp,
 			LiqPriceDown:     liqEstDown,
 			// v2.0.165: the candidate link the outcome cohorts need.
-			CandidateID:      &candidate.ID,
+			CandidateID: &candidate.ID,
 		})
 		if createErr != nil {
 			if errors.Is(createErr, grid.ErrDuplicateActiveBot) {
@@ -4026,6 +4054,9 @@ type managedBot struct {
 	trancheDeployed                                           int
 	trancheBase                                               *string
 	trancheEntry                                              *string
+	liqPriceUp                                                *decimal.Decimal
+	liqPriceDown                                              *decimal.Decimal
+	modelStateMap                                             map[string]any
 	atrEntry                                                  float64
 	trancheFailAt                                             *string
 	trancheIntentAt                                           *string
@@ -4212,7 +4243,8 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 		       target_price, stop_loss_price, stop_loss_high, trailing_sl_price,
 		       COALESCE(adaptive_strategy, ''), risk_reward_ratio,
 		       COALESCE(NULLIF(model_state->>'pricePrecision','')::INT, 0),
-		       NULLIF(model_state->>'trailingSLFailAt','')
+		       NULLIF(model_state->>'trailingSLFailAt',''),
+		       liq_price_up, liq_price_down, model_state
 		FROM grid_bots
 		WHERE autogrid_settings_id = $1 AND bu_order_id IS NOT NULL
 		  AND status IN ('RUNNING', 'STOP_REQUESTED', 'STOPPING')
@@ -4242,6 +4274,7 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 			&item.targetPrice, &item.stopLossPrice, &item.stopLossHigh, &item.trailingSLPrice,
 			&item.adaptiveStrategy, &item.riskRewardRatio,
 			&item.pricePrecision, &item.trailingSLFailAt,
+			&item.liqPriceUp, &item.liqPriceDown, &item.modelStateMap,
 		); err != nil {
 			rows.Close()
 			return clampInterval(settings.ManageIntervalSeconds), err
@@ -5134,11 +5167,11 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 						}
 						_ = LogBotEvent(ctx, worker.db, bot.id, bot.botNumber, "REAL", bot.symbol,
 							"REPAIR_TAKE_PROFIT", &price, nil, map[string]any{
-								"action":       "switched_to_profit_amount",
-								"target_usdt":  profitValStr,
-								"reason":       repairReason,
-								"card_was":     cardWas.StringFixed(2),
-								"harvest_cap":  harvestCap.StringFixed(2),
+								"action":      "switched_to_profit_amount",
+								"target_usdt": profitValStr,
+								"reason":      repairReason,
+								"card_was":    cardWas.StringFixed(2),
+								"harvest_cap": harvestCap.StringFixed(2),
 							})
 					}
 				} else if bot.targetPrice != nil {
@@ -5235,6 +5268,76 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 			PricePrecision:    trailPrecision,
 			StormActive:       &stormNow,
 		})
+		// v2.0.168 liquidation-estimate backfill: the pre-168 checkParams
+		// request-shape bug left EVERY running bot with NULL liq columns —
+		// the proximity guard below never armed. For a bot whose stored
+		// estimates are all empty, re-ask the (now fixed) checkParams with
+		// the bot's own geometry once per hour and persist what comes back;
+		// if the estimate lands closer to the stop than the deploy-time
+		// doctrine allows, page the operator (supervision continues via the
+		// existing ladders — this is instrumentation, not a new close path).
+		if bot.localStatus == "RUNNING" && client != nil &&
+			(bot.liqPriceUp == nil && bot.liqPriceDown == nil) &&
+			remote.BUOrderData.Bottom.GreaterThan(decimal.Zero) && remote.BUOrderData.Top.GreaterThan(remote.BUOrderData.Bottom) {
+			backfillDue := true
+			if last := bot.modelStateMap["liqEstimateBackfillAt"]; last != nil {
+				if ts, pErr := time.Parse(time.RFC3339, fmt.Sprintf("%v", last)); pErr == nil && time.Since(ts) < time.Hour {
+					backfillDue = false
+				}
+			}
+			if backfillDue {
+				checkBase, _, splitErr := SplitPionexPerp(bot.symbol)
+				if splitErr != nil {
+					checkBase = ""
+				}
+				if checkBase != "" && !strings.HasSuffix(checkBase, ".PERP") {
+					checkBase = checkBase + ".PERP"
+				}
+				var checkRes *pionex.FuturesGridCheckParamsResult
+				var cErr error
+				if checkBase != "" {
+					checkRes, cErr = client.CheckFuturesGridParams(ctx, pionex.NativeFuturesGridCreateParams{
+						Base:  checkBase,
+						Quote: "USDT",
+						BUOrderData: pionex.BUOrderData{
+							Top: remote.BUOrderData.Top, Bottom: remote.BUOrderData.Bottom,
+							Row: remote.BUOrderData.Row, GridType: remote.BUOrderData.GridType,
+							Trend: remote.BUOrderData.Trend, Leverage: bot.leverage,
+							QuoteInvestment: bot.investment,
+						},
+					})
+				}
+				nowStamp := time.Now().UTC().Format(time.RFC3339)
+				if cErr == nil && checkRes != nil {
+					_, _ = worker.db.Exec(ctx, `
+						UPDATE grid_bots
+						SET liq_price_up = COALESCE($2::NUMERIC, liq_price_up),
+						    liq_price_down = COALESCE($3::NUMERIC, liq_price_down),
+						    model_state = COALESCE(model_state, '{}'::jsonb) || jsonb_build_object('liqEstimateBackfillAt', $4::TEXT),
+						    updated_at = NOW()
+						WHERE id = $1
+					`, bot.id, zeroToNil(checkRes.EstimateLiquidationUp), zeroToNil(checkRes.EstimateLiquidationDown), nowStamp)
+					guardSL := derefZero(bot.stopLossPrice)
+					if reason := liquidationGuardReason(remote.BUOrderData.Trend, price,
+						checkRes.EstimateLiquidationDown, checkRes.EstimateLiquidationUp,
+						guardSL, bot.stopLossHigh, bot.leverage); reason != "" {
+						worker.logger.Warn("liq backfill: running bot violates the liquidation guard doctrine",
+							"component", "autogrid_worker", "symbol", bot.symbol, "reason", reason)
+						_ = QueueTelegramEvent(ctx, worker.db, "LIQ_GUARD_BACKFILL", map[string]any{
+							"message": "⚠️ Бот #" + fmt.Sprintf("%d", bot.botNumber) + " (" + bot.symbol + "): " + reason +
+								" — бот работает со старой геометрией, проверьте вручную",
+						})
+					}
+				} else {
+					_, _ = worker.db.Exec(ctx, `
+						UPDATE grid_bots
+						SET model_state = COALESCE(model_state, '{}'::jsonb) || jsonb_build_object('liqEstimateBackfillAt', $2::TEXT),
+						    updated_at = NOW()
+						WHERE id = $1
+					`, bot.id, nowStamp)
+				}
+			}
+		}
 		// v2.0.161 liquidation proximity guard: the running liquidation price
 		// is the hard wall behind every stop — when price is within
 		// liqProximityClosePct of it, no stop ladder can be trusted to

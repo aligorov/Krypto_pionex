@@ -1229,6 +1229,14 @@ func (worker *Worker) dgtRedeployReal(ctx context.Context, settings Settings, sp
 			fmt.Sprintf("бюджет %s ниже минимума биржи %s", investAmount.String(), check.GetMinInvestment().String()))
 		return false
 	} else if check != nil {
+		// v2.0.168: BOTH estimates empty = unknown wall = skip the re-deploy
+		// (unknown risk is not acceptable risk, same as the fresh-deploy lane).
+		if !check.EstimateLiquidationUp.GreaterThan(decimal.Zero) &&
+			!check.EstimateLiquidationDown.GreaterThan(decimal.Zero) {
+			worker.noteDgtSkip(ctx, spec, "REAL",
+				"checkParams без оценок ликвидации — редеплой отказан (неизвестный риск, v2.0.168)")
+			return false
+		}
 		// v2.0.161 review P2: the re-centered grid is the same real-money
 		// exposure class as a fresh deploy — the liquidation guard mirrors
 		// here, with the re-deploy's own stop ladder and break price.
