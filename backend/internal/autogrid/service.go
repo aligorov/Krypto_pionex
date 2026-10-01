@@ -2861,6 +2861,12 @@ func (s *Service) DeployManualBot(
 		Direction: entryDirectionFromTrend(input.Direction), Fleet: "REAL",
 	}
 	if code, reason := s.evaluateSharedMarketBlockersSvc(ctx, manualEntryIn); code != "" {
+		if code == entryWaitGateUnreadable {
+			// v2.0.167: manual is human-in-loop — an unreadable protective
+			// gate surfaces as a retryable error, never an ALLOW.
+			journalEntryDecisionSvc(ctx, s.db, manualEntryIn, entryOutcomeWait, code, reason, nil)
+			return nil, "", errors.New(reason + " — повторите деплой после восстановления БД")
+		}
 		journalEntryDecisionSvc(ctx, s.db, manualEntryIn, entryOutcomeReject, code, reason, nil)
 		return nil, "", errors.New(reason)
 	}

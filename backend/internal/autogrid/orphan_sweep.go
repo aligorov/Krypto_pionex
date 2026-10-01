@@ -154,7 +154,12 @@ func (worker *Worker) adoptOrphan(ctx context.Context, settings Settings, accoun
 			jsonb_build_object('adoptedOrphan', true, 'adoptedAt', NOW())
 		)
 	`, accountID, symbol, order.BUOrderID, adoptDirection(data.Trend), "GEOMETRIC",
-		data.Top, data.Bottom, data.Row, adoptLeverage(data.Leverage), investment,
+		// v2.0.167 (week audit P0-1): this INSERT had the bounds swapped since
+		// v2.0.104 — lower_price carried data.Top, upper_price data.Bottom.
+		// The manage-loop upper>lower guard kept a swapped row on HOLD (no
+		// geometric supervision at all) until manual repair; the path has
+		// never fired in prod, but the two tokens are still wrong.
+		data.Bottom, data.Top, data.Row, adoptLeverage(data.Leverage), investment,
 		settings.ID, orphanAdopted); err != nil {
 		worker.logger.Error("orphan sweep: adopt insert failed", "component", "autogrid_worker",
 			"bu_order_id", order.BUOrderID, "error", err)

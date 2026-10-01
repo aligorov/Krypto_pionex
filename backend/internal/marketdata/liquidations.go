@@ -63,6 +63,16 @@ type LiquidationListener struct {
 	mu              sync.Mutex
 	buffer          []liquidationRecord
 	lastHealthWrite time.Time
+	// lastEventAt is the ingest time of the most recent liquidation event
+	// (v2.0.167 auto-failover clock); failoverEpisode guards one page per
+	// silence episode.
+	lastEventAt     *time.Time
+	failoverEpisode bool
+}
+
+// resetEpisode clears the failover latch after a switch (or a fresh event).
+func (l *LiquidationListener) resetEpisode() {
+	l.failoverEpisode = false
 }
 
 type liquidationRecord struct {
@@ -122,12 +132,50 @@ func (l *LiquidationListener) Run(ctx context.Context) {
 			slog.Warn("liquidation listener: stream closed, reconnecting",
 				"source", source, "error", err)
 		}
+		// v2.0.167 auto-failover (week-audit P1-2): the entry gate fail-closes
+		// LONG/NEUTRAL at 15m of event silence. Instead of freezing the fleet
+		// on a dead primary until a human flips app_config, the listener
+		// itself switches to the other source after 15m of silence and pages
+		// once per episode. The DB config stays untouched — a restart returns
+		// to the operator's chosen primary.
+		if l.lastEventAt != nil && time.Since(*l.lastEventAt) > 15*time.Minute && ctx.Err() == nil {
+			previous := source
+			if source == "bybit" {
+				source = "binance"
+			} else {
+				source = "bybit"
+			}
+			l.resetEpisode()
+			slog.Error("liquidation listener: 15m of silence — auto-failover",
+				"from", previous, "to", source)
+			pageFailover(ctx, l.db, previous, source)
+			continue
+		}
 		select {
 		case <-ctx.Done():
 			return
 		case <-time.After(10 * time.Second):
 		}
 	}
+}
+
+// pageFailover writes the LIQ_FEED_FAILOVER telegram event directly (the
+// marketdata package cannot import autogrid; the queue table is the contract).
+func pageFailover(ctx context.Context, db *pgxpool.Pool, from, to string) {
+	if db == nil {
+		return
+	}
+	payload, err := json.Marshal(map[string]any{
+		"message": "⚠️ <b>Ликвидации: 15м тишины</b> — авто-фэйловер источника " + from + " → " + to +
+			". Каскад-гейт оставался в блоке LONG/NEUTRAL; запасной источник поднят.",
+	})
+	if err != nil {
+		return
+	}
+	_, _ = db.Exec(ctx, `
+		INSERT INTO notification_outbox (event_type, payload, status)
+		VALUES ('LIQ_FEED_FAILOVER', $1::JSONB, 'PENDING')
+	`, payload)
 }
 
 // bybitStream subscribes to the allLiquidation topic and feeds the shared
@@ -393,6 +441,10 @@ func (l *LiquidationListener) recordTransport(ctx context.Context, source string
 
 // ingest parses one !forceOrders@arr message — an array of forceOrder events.
 func (l *LiquidationListener) ingest(payload []byte) {
+	now := time.Now().UTC()
+	l.mu.Lock()
+	l.lastEventAt = &now
+	l.mu.Unlock()
 	var events []binanceForceOrderEvent
 	if err := json.Unmarshal(payload, &events); err != nil {
 		return // keep-alive frames and malformed payloads are skipped silently

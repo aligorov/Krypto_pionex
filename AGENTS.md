@@ -8,6 +8,7 @@ This repository (/Users/aleksey/Documents/Krypto_pionex) is a standalone, produc
    - Every API call, endpoint, request body, field naming convention (`camelCase` vs `snake_case`), parameter type, and response schema MUST adhere strictly to official Pionex documentation: `https://www.pionex.com/docs/api-docs` (and raw Markdown endpoints `https://www.pionex.com/docs/api-docs/*.md`).
    - **ZERO GUESSWORK**: Never guess endpoint paths, parameter names, or payload structures. Always read the official documentation before writing or modifying any API client or service code.
    - Never introduce fallback logic to Binance, Bybit, or CCXT.
+   - Pionex-only concerns EXECUTION and PRICES: orders, order geometry, symbol construction, marking and account state come exclusively from Pionex. Read-only external market TELEMETRY (cross-exchange liquidation cascades, funding/OI collectors, FRED/CoinGecko macro feeds) is admissible as gate INPUTS, but must never serve as the price of a traded asset or as a parameter of an order. A dead telemetry feed must degrade loudly (alarm/auto-failover), never silently.
    - Never construct invalid symbol strings. Verify all symbols against `/api/v1/market/symbols`.
 
 2. **Zero-ENV Runtime Policy**:

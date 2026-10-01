@@ -46,6 +46,14 @@ const (
 // means "no blocker" — the composer's clear verdict.
 const (
 	entryBlockedStorm          = "STORM"
+	// entryWaitGateUnreadable (v2.0.167, week-audit P1-1): an ADVISORY leg
+	// (breaker / economic events / cascade) whose SQL read failed even after
+	// one immediate retry. The pass defers the candidate WITHOUT writing a
+	// market REJECT — an infrastructure error must not poison the market
+	// analytics (and must not silently ALLOW either: the audit's WAIT, with a
+	// TTL of one scan pass). Capital-class gates stay fail-closed and the
+	// feed-health leg stays fail-closed exactly as before.
+	entryWaitGateUnreadable = "GATE_UNREADABLE"
 	entryBlockedCircuitBreaker = "CIRCUIT_BREAKER"
 	entryBlockedEconomicEvent  = "ECONOMIC_EVENT"
 	entryBlockedCascade        = "CASCADE"
@@ -110,6 +118,7 @@ type marketBlockerCache struct {
 	econDone     bool
 	econBlocked  bool
 	econTitle    string
+	econErr      error
 }
 
 // breakerCloses is the memoized jointProtectiveClosesLastHour reading.
@@ -125,16 +134,17 @@ func (c *marketBlockerCache) breakerCloses(ctx context.Context, db *pgxpool.Pool
 }
 
 // economicWindow is the memoized economicEventsAhead reading (the composer's
-// fixed 2h-ahead window).
-func (c *marketBlockerCache) economicWindow(ctx context.Context, db *pgxpool.Pool) (bool, string) {
+// fixed 2h-ahead window). v2.0.167: carries the SQL error so the composer
+// can defer as WAIT instead of fail-opening on a partial DB degradation.
+func (c *marketBlockerCache) economicWindow(ctx context.Context, db *pgxpool.Pool) (bool, string, error) {
 	if c == nil {
-		return economicEventsAhead(ctx, db, 2)
+		return economicEventsAheadErr(ctx, db, 2)
 	}
 	if !c.econDone {
-		c.econBlocked, c.econTitle = economicEventsAhead(ctx, db, 2)
+		c.econBlocked, c.econTitle, c.econErr = economicEventsAheadErr(ctx, db, 2)
 		c.econDone = true
 	}
-	return c.econBlocked, c.econTitle
+	return c.econBlocked, c.econTitle, c.econErr
 }
 
 // evaluateSharedMarketBlockers runs the fleet-wide market gates in plan order
@@ -215,21 +225,57 @@ func evaluateSharedMarketBlockersDB(
 	// 2. Portfolio circuit breaker: >= 3 joint paper+REAL protective closes
 	//    in the last hour pauses new entries. The joint count is deliberate —
 	//    a paper fleet under stress proves a pipeline REAL would ride.
-	if closes, err := cache.breakerCloses(ctx, db, in.Settings.ID); err == nil && closes >= 3 {
-		r := circuitBreakerReason(in.Path, closes)
-		return entryBlockedCircuitBreaker, r, r, map[string]any{"closes": closes}
+	//    v2.0.167: an unreadable reading (SQL error even after one direct
+	//    retry bypassing the pass cache) defers the pass as WAIT instead of
+	//    fail-opening.
+	breakerCloses, breakerErr := cache.breakerCloses(ctx, db, in.Settings.ID)
+	if breakerErr != nil {
+		breakerCloses, breakerErr = jointProtectiveClosesLastHour(ctx, db, in.Settings.ID)
+	}
+	if breakerErr != nil {
+		return entryWaitGateUnreadable,
+			"защитный гейт недоступен (breaker SQL) — пасс отложен, повтор на следующем скане",
+			"breaker unreadable after retry", map[string]any{"leg": "breaker"}
+	}
+	if breakerCloses >= 3 {
+		r := circuitBreakerReason(in.Path, breakerCloses)
+		return entryBlockedCircuitBreaker, r, r, map[string]any{"closes": breakerCloses}
 	}
 	// 3. Economic events: the T−2h…T+1h window around high-impact USD prints.
-	if blocked, title := cache.economicWindow(ctx, db); blocked {
-		r := economicEventReason(in.Path, title)
-		return entryBlockedEconomicEvent, r, r, map[string]any{"title": title}
+	//    v2.0.167: unreadable calendar (SQL error after retry) = WAIT, not
+	//    "no events".
+	econBlocked, econTitle, econErr := cache.economicWindow(ctx, db)
+	if econErr != nil {
+		econBlocked, econTitle, econErr = economicEventsAheadErr(ctx, db, 2)
+	}
+	if econErr != nil {
+		return entryWaitGateUnreadable,
+			"защитный гейт недоступен (эконом-календарь SQL) — пасс отложен, повтор на следующем скане",
+			"economic calendar unreadable after retry", map[string]any{"leg": "economic_events"}
+	}
+	if econBlocked {
+		r := economicEventReason(in.Path, econTitle)
+		return entryBlockedEconomicEvent, r, r, map[string]any{"title": econTitle}
 	}
 	direction := entryDirectionFromTrend(in.Direction)
 	if direction != "SHORT" {
 		// 4a. Liquidation cascade: forced long unwinding blocks LONG/NEUTRAL
 		//     entries (v2.0.14/v2.0.19). SHORT participation stays live — the
 		//     unwind window is when shorts are paid.
-		if cascade, totalUSD := liquidationCascadeActive(ctx, db, 50_000_000); cascade {
+		cascade, totalUSD, cascadeErr := liquidationCascadeActive(ctx, db, 50_000_000)
+		if cascadeErr != nil {
+			// v2.0.167: unreadable cascade reading = WAIT (one retry inside
+			// the query helper is not added here — the feed-health leg below
+			// independently fail-closes a dead feed, so this only covers a
+			// transient SQL blip on a live feed).
+			cascade, totalUSD, cascadeErr = liquidationCascadeActive(ctx, db, 50_000_000)
+		}
+		if cascadeErr != nil {
+			return entryWaitGateUnreadable,
+				"защитный гейт недоступен (каскад-ликвидаций SQL) — пасс отложен, повтор на следующем скане",
+				"cascade unreadable after retry", map[string]any{"leg": "liquidation_cascade"}
+		}
+		if cascade {
 			r, n := cascadeReasons(in.Path, totalUSD)
 			return entryBlockedCascade, r, n, map[string]any{"usd_1h": totalUSD}
 		}
@@ -289,7 +335,16 @@ func jointProtectiveClosesLastHour(ctx context.Context, db *pgxpool.Pool, settin
 // SQL, same window — as a package function the worker-free service variant
 // can call. gates.go keeps its method for its existing callers; this copy
 // exists because gates.go is not part of the entry-chain refactor surface.
+// economicEventsAhead keeps its historical fail-open signature for any
+// legacy caller; the composer uses the error-carrying variant below.
 func economicEventsAhead(ctx context.Context, db *pgxpool.Pool, hoursAhead int) (bool, string) {
+	blocked, title, _ := economicEventsAheadErr(ctx, db, hoursAhead)
+	return blocked, title
+}
+
+// economicEventsAheadErr is the v2.0.167 error-carrying core of the
+// economic-events leg.
+func economicEventsAheadErr(ctx context.Context, db *pgxpool.Pool, hoursAhead int) (bool, string, error) {
 	const whereClause = `
         WHERE impact = 'High'
           AND (country = 'USD' OR country IS NULL OR country = '')
@@ -299,27 +354,30 @@ func economicEventsAhead(ctx context.Context, db *pgxpool.Pool, hoursAhead int) 
 	err := db.QueryRow(ctx, `
         SELECT COUNT(*) FROM economic_events`+whereClause,
 		fmt.Sprintf("%d", hoursAhead)).Scan(&count)
-	if err == nil && count > 0 {
+	if err != nil {
+		return false, "", err
+	}
+	if count > 0 {
 		var title string
 		_ = db.QueryRow(ctx, `
         SELECT title FROM economic_events`+whereClause+`
         ORDER BY ABS(EXTRACT(EPOCH FROM (event_time - NOW()))) LIMIT 1`,
 			fmt.Sprintf("%d", hoursAhead)).Scan(&title)
-		return true, title
+		return true, title, nil
 	}
 	var fomcCount int
 	if err := db.QueryRow(ctx, `
 		SELECT COUNT(*) FROM fomc_meetings
 		WHERE decision_at BETWEEN NOW() - INTERVAL '30 minutes' AND NOW() + INTERVAL '3 hours'
 	`).Scan(&fomcCount); err == nil && fomcCount > 0 {
-		return true, "FOMC decision window"
+		return true, "FOMC decision window", nil
 	}
-	return false, ""
+	return false, "", nil
 }
 
 // liquidationCascadeActive mirrors Worker.CheckLiquidationCascade (gates.go):
 // long-side liquidation USD over the trailing hour against the threshold.
-func liquidationCascadeActive(ctx context.Context, db *pgxpool.Pool, thresholdUSD float64) (bool, float64) {
+func liquidationCascadeActive(ctx context.Context, db *pgxpool.Pool, thresholdUSD float64) (bool, float64, error) {
 	var totalUSD float64
 	err := db.QueryRow(ctx, `
         SELECT COALESCE(SUM(value_usd), 0) FROM liquidation_events
@@ -327,9 +385,9 @@ func liquidationCascadeActive(ctx context.Context, db *pgxpool.Pool, thresholdUS
           AND side = 'long'
     `).Scan(&totalUSD)
 	if err != nil {
-		return false, 0
+		return false, 0, err
 	}
-	return totalUSD > thresholdUSD, totalUSD
+	return totalUSD > thresholdUSD, totalUSD, nil
 }
 
 // liquidationSourceHealthyDB mirrors Worker.LiquidationSourceHealthy

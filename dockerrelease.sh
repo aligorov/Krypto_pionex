@@ -104,21 +104,33 @@ echo "[2/5] Building Docker Images (Backend & Quant Worker)..."
 cd "$ROOT_DIR"
 docker compose build --build-arg VERSION="$VERSION" --build-arg GIT_COMMIT="$COMMIT" --build-arg BUILD_TIME="$BUILD_TIME" backend quant-worker
 
-echo "[3/5] Starting Temporary Container Smoke Test..."
-docker compose up -d postgres backend
-sleep 5
-
-echo "[4/5] Checking Health Endpoints..."
-HEALTH_STATUS="$(curl -s http://localhost:8080/health | grep '"status"' || true)"
-if [[ -z "$HEALTH_STATUS" ]]; then
-    echo "Backend Health check failed!"
-    docker compose logs backend
-    docker compose down
+echo "[3/5] Starting ISOLATED Smoke Test (v2.0.167: own compose project, deep /ready probe)..."
+# The smoke must never touch the production compose project: a bare
+# `docker compose down` here would stop the whole trading stack on a host
+# that runs it. Run under a throwaway project name so containers, networks
+# AND named volumes (fresh migrations, empty DB) are isolated, and guard
+# the port so a running stack fails the smoke loudly instead of binding.
+if curl -sf -o /dev/null http://localhost:8080/health; then
+    echo "Port 8080 already serves a backend — smoke on a prod-like host is refused."
     exit 1
 fi
-echo "Backend Health Check Passed!"
+SMOKE_PROJECT="pionex-smoke-$$"
+cleanup_smoke() { docker compose -p "$SMOKE_PROJECT" down -v >/dev/null 2>&1 || true; }
+trap cleanup_smoke EXIT
+docker compose -p "$SMOKE_PROJECT" up -d postgres backend
+sleep 5
 
-docker compose down
+echo "[4/5] Checking Deep Readiness (/ready: HTTP code + status value)..."
+READY_BODY="$(curl -sf http://localhost:8080/ready || true)"
+if ! echo "$READY_BODY" | grep -q '"status":"ready"'; then
+    echo "Backend readiness check failed (body: $READY_BODY)"
+    docker compose -p "$SMOKE_PROJECT" logs backend
+    exit 1
+fi
+echo "Backend Readiness Check Passed!"
+
+cleanup_smoke
+trap - EXIT
 
 echo "[5/5] Tagging Release v$VERSION..."
 if git rev-parse -q --verify "refs/tags/v$VERSION" >/dev/null 2>&1; then

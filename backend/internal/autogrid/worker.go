@@ -176,6 +176,11 @@ type Worker struct {
 	stormTriggers map[string]time.Time
 	stormUntil    time.Time
 	stormLoggedAt time.Time
+	// gateUnreadableStreak counts consecutive entry passes whose advisory
+	// gates were SQL-unreadable (v2.0.167): three in a row (~15m of scan
+	// cadence) pages the operator; lastGateUnreadableAlarmAt dedups hourly.
+	gateUnreadableStreak        int
+	lastGateUnreadableAlarmAt   time.Time
 	// lastCapitalAlarmAt throttles the v2.0.145 capital-deficiency telegram
 	// to one per hour (single manage goroutine → plain field).
 	lastCapitalAlarmAt time.Time
@@ -1135,6 +1140,10 @@ func (worker *Worker) deployPaper(
 		// retries in four minutes and the storm window is rolling.
 		worker.logger.Info("paper deploy deferred by storm mode", "component", "autogrid_worker")
 		return nil
+	case entryWaitGateUnreadable:
+		worker.logger.Warn("paper pass deferred: advisory gates SQL-unreadable (WAIT)",
+			"component", "autogrid_worker", "note", passNote)
+		return nil
 	case entryBlockedCircuitBreaker:
 		worker.logger.Warn("Portfolio circuit breaker: recent stop-losses holding new deployments",
 			"component", "autogrid_worker", "recentStopLossCount", passFeatures["closes"])
@@ -1555,6 +1564,12 @@ func (worker *Worker) deployPaper(
 			CascadeShort: cascadeShort,
 		}
 		if code, reason, _, features := worker.probeSharedMarketBlockersCached(ctx, entryIn, passBlockers); code != "" {
+			if code == entryWaitGateUnreadable {
+				// v2.0.167: infrastructure unreadable — WAIT this pass
+				// WITHOUT a market REJECT (analytics must not count it).
+				worker.journalEntryDecision(ctx, entryIn, entryOutcomeWait, code, reason, features)
+				continue
+			}
 			worker.rejectCandidate(ctx, candidate, reason, features)
 			worker.journalEntryDecision(ctx, entryIn, entryOutcomeReject, code, reason, features)
 			continue
@@ -2384,6 +2399,10 @@ func (worker *Worker) deployReal(
 		worker.logger.Info("deploy deferred by storm mode",
 			"component", "autogrid_worker", "scan_id", scanID)
 		return nil
+	case entryWaitGateUnreadable:
+		worker.logger.Warn("real pass deferred: advisory gates SQL-unreadable (WAIT)",
+			"component", "autogrid_worker", "note", passNote)
+		return nil
 	case entryBlockedCircuitBreaker:
 		worker.logger.Warn("Portfolio circuit breaker: recent real stop-losses holding new deployments",
 			"component", "autogrid_worker", "recentStopLossCountReal", passFeatures["closes"])
@@ -2799,6 +2818,12 @@ func (worker *Worker) deployReal(
 			CascadeShort: cascadeShort,
 		}
 		if code, reason, _, features := worker.probeSharedMarketBlockersCached(ctx, entryIn, passBlockers); code != "" {
+			if code == entryWaitGateUnreadable {
+				// v2.0.167: infrastructure unreadable — WAIT this pass
+				// WITHOUT a market REJECT (analytics must not count it).
+				worker.journalEntryDecision(ctx, entryIn, entryOutcomeWait, code, reason, features)
+				continue
+			}
 			worker.rejectCandidate(ctx, candidate, reason, features)
 			worker.journalEntryDecision(ctx, entryIn, entryOutcomeReject, code, reason, features)
 			continue
@@ -3882,10 +3907,25 @@ func (worker *Worker) dataHealthCheck(ctx context.Context) {
 	var lastLiq *time.Time
 	if err := worker.db.QueryRow(ctx, `
 		SELECT MAX(captured_at) FROM liquidation_events
-	`).Scan(&lastLiq); err == nil &&
-		(lastLiq == nil || time.Since(*lastLiq) > 3*time.Hour) {
-		alarm("liquidation_events",
-			"Ликвидации не пишутся >3ч — каскад-гейт слеп (WS-источник мёртв; см. app_config.liquidation_source)")
+	`).Scan(&lastLiq); err == nil {
+		since := time.Duration(1<<62 - 1)
+		if lastLiq != nil {
+			since = time.Since(*lastLiq)
+		}
+		// v2.0.167 (week-audit P1-2): the cascade gate FAIL-CLOSES LONG/NEUTRAL
+		// entries at 15m of silence — the operator must learn about the
+		// freeze in its first minutes, not three hours later. 20m threshold
+		// (past the gate block, inside the first reconnect cycles), hourly
+		// dedup via the alarm() cadence.
+		if since > 20*time.Minute && since <= 3*time.Hour {
+			alarm("liquidation_events",
+				"Ликвидации не пишутся ~"+since.Truncate(time.Minute).String()+
+					" — каскад-гейт уже БЛОКИРУЕТ входы LONG/NEUTRAL (порог 15м). Проверьте WS-источник (app_config.liquidation_source); авто-фэйловер на запасной источник через 15м тишины (v2.0.167)")
+		}
+		if lastLiq == nil || since > 3*time.Hour {
+			alarm("liquidation_events",
+				"Ликвидации не пишутся >3ч — каскад-гейт слеп (WS-источник мёртв; см. app_config.liquidation_source)")
+		}
 	}
 }
 
