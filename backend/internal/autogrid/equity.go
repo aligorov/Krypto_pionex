@@ -312,7 +312,7 @@ func (worker *Worker) captureBotAggregateEquity(ctx context.Context, settings Se
 	walletAvailable, detailErr := client.GetBotFundingUSDT(ctx)
 	if detailErr != nil {
 		worker.logger.Warn("equity snapshot: Spot bot funding fetch failed",
-			"component", "autogrid_worker", "error", detailErr)
+			"component", "autogrid_worker", "error", detailErr.Error())
 		worker.alertEquityCaptureFailure(ctx, "FETCH_FAILED", detailErr.Error())
 		return
 	}

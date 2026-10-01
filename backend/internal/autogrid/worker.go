@@ -3968,12 +3968,10 @@ func (worker *Worker) pinManagedAccount(ctx context.Context, settings *Settings)
 	settings.AccountID = resolved
 }
 
-// dataHealthCheck (v2.0.58) watches the two feeds whose silent death costs
-// the most: the economic calendar (the deploy gate goes blind with no
-// future events in the table — the faireconomy feed 429'd unnoticed from
-// 2026-08-30) and the liquidation stream (the Binance WS topic was
-// misnamed for the system's entire history, zero rows ever, cascade gate
-// inert). One alarm per feed per 24h; recovered feeds clear silently.
+// dataHealthCheck watches the economic calendar and the configured
+// liquidation transport. It uses the same heartbeat evidence as admission:
+// a quiet market does not imply a dead stream or blocked LONG/NEUTRAL entries.
+// One alarm per feed per 24h; recovered liquidation transport clears silently.
 //
 // v2.0.86: the economic calendar has two writers — the FRED releases
 // calendar (primary, 6h refresh of a ±14d window) and ForexFactory
@@ -4002,29 +4000,17 @@ func (worker *Worker) dataHealthCheck(ctx context.Context) {
 		alarm("economic_events",
 			"Календарь USD пуст: нет событий (FRED/ForexFactory) в окне +7д — эконом-гейт деплоя слеп (оба источника мертвы?)")
 	}
-	var lastLiq *time.Time
-	if err := worker.db.QueryRow(ctx, `
-		SELECT MAX(captured_at) FROM liquidation_events
-	`).Scan(&lastLiq); err == nil {
-		since := time.Duration(1<<62 - 1)
-		if lastLiq != nil {
-			since = time.Since(*lastLiq)
-		}
-		// v2.0.167 (week-audit P1-2): the cascade gate FAIL-CLOSES LONG/NEUTRAL
-		// entries at 15m of silence — the operator must learn about the
-		// freeze in its first minutes, not three hours later. 20m threshold
-		// (past the gate block, inside the first reconnect cycles), hourly
-		// dedup via the alarm() cadence.
-		if since > 20*time.Minute && since <= 3*time.Hour {
-			alarm("liquidation_events",
-				"Ликвидации не пишутся ~"+since.Truncate(time.Minute).String()+
-					" — каскад-гейт уже БЛОКИРУЕТ входы LONG/NEUTRAL (порог 15м). Проверьте WS-источник (app_config.liquidation_source); авто-фэйловер на запасной источник через 15м тишины (v2.0.167)")
-		}
-		if lastLiq == nil || since > 3*time.Hour {
-			alarm("liquidation_events",
-				"Ликвидации не пишутся >3ч — каскад-гейт слеп (WS-источник мёртв; см. app_config.liquidation_source)")
-		}
+	healthy, lastMessage := worker.LiquidationSourceHealthy(ctx)
+	if healthy {
+		delete(worker.dataAlarmAt, "liquidation_events")
+		return
 	}
+	detail := "heartbeat отсутствует или его состояние не удалось прочитать"
+	if !lastMessage.IsZero() {
+		detail = "последний heartbeat: " + lastMessage.UTC().Format(time.RFC3339)
+	}
+	alarm("liquidation_events", "Нет подтверждённого соединения с потоком ликвидаций ("+detail+
+		"). Каскад-гейт откладывает входы LONG/NEUTRAL: соединение разорвано, heartbeat старше 15м или его время неверно. Проверьте app_config.liquidation_source и логи WS. Отсутствие рыночных ликвидаций само по себе не блокирует входы.")
 }
 
 // terminalSettleResult is the v2.0.89 terminal-final decision: the figure to

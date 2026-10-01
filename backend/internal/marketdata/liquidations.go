@@ -163,7 +163,7 @@ func (l *LiquidationListener) Run(ctx context.Context) {
 		l.recordTransport(ctx, source, false)
 		if err != nil && ctx.Err() == nil {
 			slog.Warn("liquidation listener: stream closed, reconnecting",
-				"source", source, "error", err)
+				"source", source, "error", err.Error())
 
 			// v2.0.171 WS-1008 alert (consensus-2.0): three consecutive
 			// rate-limit disconnects = the socket is being throttled — the

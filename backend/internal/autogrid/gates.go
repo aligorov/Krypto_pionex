@@ -83,18 +83,7 @@ const liquidationSourceStaleness = 15 * time.Minute
 // LiquidationSourceHealthy checks transport evidence for the configured
 // source. Quiet markets can be healthy; missing health or SQL errors cannot.
 func (worker *Worker) LiquidationSourceHealthy(ctx context.Context) (healthy bool, lastEvent time.Time) {
-	var last *time.Time
-	var connected bool
-	if err := worker.db.QueryRow(ctx, `
-        SELECT connected, last_message_at FROM liquidation_feed_health
-        WHERE source = COALESCE(
-            (SELECT NULLIF(value#>>'{}', '') FROM app_config WHERE key = 'liquidation_source'),
-            'bybit')
-    `).Scan(&connected, &last); err != nil || last == nil {
-		return false, time.Time{}
-	}
-	age := time.Since(*last)
-	return connected && age >= 0 && age <= liquidationSourceStaleness, *last
+	return liquidationSourceHealthyDB(ctx, worker.db)
 }
 
 // GetFundingForSymbol gets the latest cross-exchange funding rate.
