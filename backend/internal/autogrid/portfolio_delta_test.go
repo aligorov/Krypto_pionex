@@ -273,8 +273,8 @@ func TestMarginReserveBlocker(t *testing.T) {
 	// Missing funding evidence must defer entry; capture runs independently.
 	code, _ = marginReserveBlocker(ctx, env.pool, "00000000-0000-0000-0000-000000000000",
 		decimal.NewFromInt(999999), true, decimal.NewFromInt(30))
-	if code != "MARGIN_RESERVE" {
-		t.Errorf("missing snapshot: code = %q, want fail-closed", code)
+	if code != "FUNDING_UNAVAILABLE" {
+		t.Errorf("missing snapshot: code = %q, want FUNDING_UNAVAILABLE", code)
 	}
 
 	// Stale funding evidence also defers entry.
@@ -285,8 +285,8 @@ func TestMarginReserveBlocker(t *testing.T) {
 	env.seedSnapshot(t, decimal.NewFromInt(1000), time.Now().Add(-48*time.Hour))
 	code, _ = marginReserveBlocker(ctx, env.pool, env.account.ID,
 		decimal.NewFromInt(200), true, decimal.NewFromInt(30))
-	if code != "MARGIN_RESERVE" {
-		t.Errorf("stale snapshot: code = %q, want MARGIN_RESERVE (present ⇒ enforced)", code)
+	if code != "FUNDING_STALE" {
+		t.Errorf("stale snapshot: code = %q, want FUNDING_STALE", code)
 	}
 }
 
@@ -330,8 +330,8 @@ func TestCapitalEffectiveBudgetScalesDown(t *testing.T) {
 	`, account.ID); err != nil {
 		t.Fatalf("seed equity: %v", err)
 	}
-	slot, scaled := worker.capitalEffectiveBudget(ctx, account.ID, decimal.NewFromInt(100), true, decimal.NewFromInt(30))
-	if scaled || !slot.Equal(decimal.NewFromInt(100)) {
+	slot, scaled, err := worker.capitalEffectiveBudget(ctx, account.ID, decimal.NewFromInt(100), true, decimal.NewFromInt(30))
+	if err != nil || scaled || !slot.Equal(decimal.NewFromInt(100)) {
 		t.Fatalf("want full $100 slot, got %s (scaled=%v)", slot, scaled)
 	}
 
@@ -345,8 +345,8 @@ func TestCapitalEffectiveBudgetScalesDown(t *testing.T) {
 		t.Fatalf("create open account: %v", err)
 	}
 	t.Cleanup(func() { _, _ = pool.Exec(ctx, `DELETE FROM pionex_accounts WHERE id = $1`, acct2.ID) })
-	slot2, scaled2 := worker.capitalEffectiveBudget(ctx, acct2.ID, decimal.NewFromInt(100), false, decimal.NewFromInt(30))
-	if !scaled2 || !slot2.IsZero() {
+	slot2, scaled2, err := worker.capitalEffectiveBudget(ctx, acct2.ID, decimal.NewFromInt(100), false, decimal.NewFromInt(30))
+	if err == nil || !scaled2 || !slot2.IsZero() {
 		t.Fatalf("missing snapshot must fail closed to $0, got %s (scaled=%v)", slot2, scaled2)
 	}
 
@@ -357,8 +357,8 @@ func TestCapitalEffectiveBudgetScalesDown(t *testing.T) {
 	`, acct2.ID); err != nil {
 		t.Fatalf("seed low equity: %v", err)
 	}
-	slot3, _ := worker.capitalEffectiveBudget(ctx, acct2.ID, decimal.NewFromInt(100), false, decimal.NewFromInt(30))
-	if !slot3.IsZero() {
+	slot3, _, err := worker.capitalEffectiveBudget(ctx, acct2.ID, decimal.NewFromInt(100), false, decimal.NewFromInt(30))
+	if err != nil || !slot3.IsZero() {
 		t.Fatalf("equity $6 must yield zero slot, got %s", slot3)
 	}
 }

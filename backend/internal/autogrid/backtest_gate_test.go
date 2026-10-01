@@ -1,11 +1,21 @@
 package autogrid
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
 	"github.com/shopspring/decimal"
 )
+
+func TestParseBacktestResultPreservesEngineVersion(t *testing.T) {
+	for _, version := range []string{backtestEngineVersion, "v172", ""} {
+		result, ok := parseBacktestResult([]byte(fmt.Sprintf(`{"folds":4,"engine_version":%q}`, version)))
+		if !ok || result.EngineVersion != version {
+			t.Fatalf("engine version lost while parsing %q: %+v", version, result)
+		}
+	}
+}
 
 func TestNeighborBacktestTFs(t *testing.T) {
 	if got := neighborBacktestTFs("60M"); len(got) != 2 || got[0] != "30M" || got[1] != "4H" {

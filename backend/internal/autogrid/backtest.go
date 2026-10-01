@@ -21,7 +21,7 @@ const (
 	// change — cached results from a different version are INVALID and must
 	// not be served. v170 fixed time-reversed candles; v172 fixed metric
 	// mixing (exact candidate DD now reported). All pre-172 caches are wrong.
-	backtestEngineVersion = "v172"
+	backtestEngineVersion = "v173"
 
 	// Traded-TF hard ceilings calibrated for quality entry filtering:
 	// 1. OOS Net return floor: relaxed from 0.0% to -1.0% to allow minor noise / walk-forward friction.

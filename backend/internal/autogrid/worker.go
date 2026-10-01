@@ -184,6 +184,7 @@ type Worker struct {
 	// lastCapitalAlarmAt throttles the v2.0.145 capital-deficiency telegram
 	// to one per hour (single manage goroutine → plain field).
 	lastCapitalAlarmAt time.Time
+	lastFundingAlarmAt time.Time
 	// fleetStormSet pins the v2.0.111 storm sensor to the RUNNING fleet
 	// (v2.0.144: pre-warmed candidate symbols must not arm market-wide
 	// storms). Managed under stormMu; empty set = legacy count-everything.
@@ -2210,30 +2211,30 @@ func (worker *Worker) revalidateCandidateTrend(
 
 // capitalEffectiveBudget uses only fresh Spot-funded bot equity. Missing,
 // stale or unreadable funding must never restore the full configured budget.
-func (worker *Worker) capitalEffectiveBudget(ctx context.Context, accountID string, settingsBudget decimal.Decimal, trancheOn bool, reservePct decimal.Decimal) (decimal.Decimal, bool) {
+func (worker *Worker) capitalEffectiveBudget(ctx context.Context, accountID string, settingsBudget decimal.Decimal, trancheOn bool, reservePct decimal.Decimal) (decimal.Decimal, bool, error) {
 	equity, committed, spendable, err := loadBotFundingReserve(ctx, worker.db, accountID)
 	if err != nil {
-		// v2.0.172b (audit P1-2): classify the error — stale data is NOT a
-		// capital deficit; the old path silently returned zero and the
-		// caller alarmed "capital deficiency" while the wallet had $1000+.
-		errStr := err.Error()
-		if strings.Contains(errStr, "stale") || strings.Contains(errStr, "invalid timestamp") {
-			worker.logger.Warn("capital snapshot STALE — entries deferred (audit P1-2 v2: zero budget, not full)",
-				"component", "autogrid_worker", "error", err)
-			_ = QueueTelegramEvent(ctx, worker.db, "FUNDING_STALE", map[string]any{
-				"message": "⚠️ Снимок капитала устарел (>10 мин) — входы отложены до обновления баланса, это НЕ дефицит средств.",
-			})
-			// v2.0.172c (audit correction): return ZERO, not the full budget —
-			// returning the budget bypassed the capital check entirely (the
-			// auto path doesn't call marginReserveBlocker). Zero means the
-			// scan defers; the telegram tells the operator it's a data issue.
-			return decimal.Zero, true
-		}
-		worker.logger.Warn("bot funding unavailable", "component", "autogrid_worker", "error", err)
-		return decimal.Zero, true
+		// Preserve the data failure so the caller cannot classify it as a
+		// genuine capital shortfall or authorize spending an unknown balance.
+		return decimal.Zero, true, err
 	}
 	slot, _ := fitBotFundingBudget(equity, committed, decimal.Min(settingsBudget, spendable.Floor()), trancheOn, reservePct)
-	return slot, !slot.Equal(settingsBudget)
+	return slot, !slot.Equal(settingsBudget), nil
+}
+
+// Funding-data failures have their own alarm and never consume the capital
+// deficiency throttle. The worker's serial loop owns both timestamps.
+func (worker *Worker) fundingDataAlarm(ctx context.Context, code, reason string) {
+	if time.Since(worker.lastFundingAlarmAt) < time.Hour {
+		return
+	}
+	if err := QueueTelegramEvent(ctx, worker.db, code, map[string]any{
+		"message": "⚠️ " + reason,
+	}); err != nil {
+		worker.logger.Warn("queue funding data alarm failed", "component", "autogrid_worker", "error", err.Error())
+		return
+	}
+	worker.lastFundingAlarmAt = time.Now()
 }
 
 // capitalDeficiencyAlarm announces a hard capital shortfall at most once an
@@ -2269,10 +2270,8 @@ func marginReserveBlocker(
 		// the sequential scan+manage cycle can leave the snapshot >10 min old
 		// while the wallet actually has funds. Separate the code so the
 		// analytics don't count "data freshness" as "no capital".
-		if strings.Contains(err.Error(), "stale") || strings.Contains(err.Error(), "invalid timestamp") {
-			return "FUNDING_STALE", fmt.Sprintf("снимок капитала устарел (не дефицит!): %v — обновление баланса отложено из-за долгого скан-цикла", err)
-		}
-		return "MARGIN_RESERVE", fmt.Sprintf("резерв маржи: капитал ботов недоступен: %v", err)
+		code, reason = botFundingFailure(err)
+		return code, "резерв маржи: " + reason
 	}
 
 	// A top-up consumes its already reserved tranche, not a second copy.
@@ -2708,10 +2707,23 @@ func (worker *Worker) deployReal(
 		// what fits under the reserve; only a slot below the exchange
 		// minimum rejects. Capital deficiency now ANNOUNCES itself (hourly
 		// telegram) instead of starving the fleet quietly.
-		slotBudget, capitalScaled := worker.capitalEffectiveBudget(ctx, *settings.AccountID, settings.BudgetUSDT, settings.TrancheDeployEnabled, settings.MarginReservePct)
+		slotBudget, capitalScaled, fundingErr := worker.capitalEffectiveBudget(ctx, *settings.AccountID, settings.BudgetUSDT, settings.TrancheDeployEnabled, settings.MarginReservePct)
+		if fundingErr != nil {
+			code, reason := botFundingFailure(fundingErr)
+			worker.logger.Warn("bot funding check unavailable; entry deferred",
+				"component", "autogrid_worker", "symbol", candidate.Symbol, "code", code, "error", fundingErr.Error())
+			worker.fundingDataAlarm(ctx, code, reason)
+			deployErrors = append(deployErrors, fmt.Sprintf("%s: %s", candidate.Symbol, reason))
+			worker.rejectCandidate(ctx, candidate, reason, nil)
+			worker.journalEntryDecision(ctx, EntryChainInput{
+				Path: EntryPathScannerReal, Settings: settings, Symbol: candidate.Symbol,
+				Direction: entryDirectionFromTrend(strings.ToLower(strings.TrimSpace(candidate.RecommendedTrend))), Fleet: "REAL", RefID: candidate.ID,
+			}, entryOutcomeWait, code, reason, nil)
+			continue
+		}
 		if !slotBudget.IsPositive() {
 			worker.capitalDeficiencyAlarm(ctx, settings, slotBudget)
-			reason := fmt.Sprintf("резерв маржи: свободно под новый слот $0 — капитал Spot для ботов недоступен или минимальный слот не влезает в %s%%-резерв", settings.MarginReservePct.StringFixed(0))
+			reason := fmt.Sprintf("резерв маржи: свободно под новый слот $0 — доступного капитала Spot недостаточно для минимального слота с %s%%-резервом", settings.MarginReservePct.StringFixed(0))
 			deployErrors = append(deployErrors, fmt.Sprintf("%s: %s", candidate.Symbol, reason))
 			worker.rejectCandidate(ctx, candidate, reason, nil)
 			worker.journalEntryDecision(ctx, EntryChainInput{

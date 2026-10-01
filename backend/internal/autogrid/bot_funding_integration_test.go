@@ -31,12 +31,12 @@ func TestBotFundingSourceAndReservations(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if v, _ := env.worker.capitalEffectiveBudget(ctx, env.account.ID, decimal.NewFromInt(100), true, decimal.NewFromInt(30)); !v.IsZero() {
+	if v, _, err := env.worker.capitalEffectiveBudget(ctx, env.account.ID, decimal.NewFromInt(100), true, decimal.NewFromInt(30)); !v.IsZero() || err == nil {
 		t.Fatal("legacy Futures wallet must not authorize Spot spending")
 	}
 	env.seedSnapshot(t, decimal.NewFromInt(253), time.Now())
 	botID := env.seedRealBot(t, "PFD-FUNDING_USDT_PERP", "NEUTRAL", "RUNNING", `{"trancheDeployed":1,"trancheBase":"100"}`, "", decimal.NewFromInt(50), 2)
-	if v, _ := env.worker.capitalEffectiveBudget(ctx, env.account.ID, decimal.NewFromInt(100), true, decimal.NewFromInt(30)); !v.Equal(decimal.NewFromInt(77)) {
+	if v, _, err := env.worker.capitalEffectiveBudget(ctx, env.account.ID, decimal.NewFromInt(100), true, decimal.NewFromInt(30)); !v.Equal(decimal.NewFromInt(77)) || err != nil {
 		t.Fatalf("unpaid tranche not reserved: %s", v)
 	}
 	if code, reason := marginReserveBlocker(ctx, env.pool, env.account.ID, decimal.NewFromInt(50), false, decimal.NewFromInt(30), botID); code != "" {
@@ -46,7 +46,7 @@ func TestBotFundingSourceAndReservations(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if v, _ := env.worker.capitalEffectiveBudget(ctx, env.account.ID, decimal.NewFromInt(100), true, decimal.NewFromInt(30)); !v.IsZero() {
+	if v, _, err := env.worker.capitalEffectiveBudget(ctx, env.account.ID, decimal.NewFromInt(100), true, decimal.NewFromInt(30)); !v.IsZero() || err != nil {
 		t.Fatalf("locked equity is not spendable: %s", v)
 	}
 }

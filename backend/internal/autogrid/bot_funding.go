@@ -2,12 +2,22 @@ package autogrid
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/shopspring/decimal"
 )
+
+var ErrBotFundingSnapshotStale = errors.New("Spot funding snapshot is stale or has invalid timestamp")
+
+func botFundingFailure(err error) (code, reason string) {
+	if errors.Is(err, ErrBotFundingSnapshotStale) {
+		return "FUNDING_STALE", "снимок капитала устарел или имеет неверное время — вход отложен до обновления баланса"
+	}
+	return "FUNDING_UNAVAILABLE", "данные капитала недоступны — вход отложен до восстановления проверки баланса"
+}
 
 // Legacy bot_aggregate rows used the Futures trader wallet. Never reuse them
 // as proof of Spot funding. Capture runs independently of admission, so a
@@ -27,7 +37,7 @@ func loadBotFundingReserve(ctx context.Context, db *pgxpool.Pool, accountID stri
 	// app-process time, and cross-container clock skew must not read fresh
 	// Spot evidence as invalid.
 	if time.Since(captured) > 2*equitySnapshotMinSpacing || captured.After(time.Now().Add(10*time.Minute)) {
-		return equity, committed, decimal.Zero, fmt.Errorf("Spot funding snapshot is stale or has invalid timestamp")
+		return equity, committed, decimal.Zero, ErrBotFundingSnapshotStale
 	}
 	// trancheBase is the FULL planned slot, while quote_investment holds
 	// only tranche 1 until top-up. Reserve the unpaid remainder as well.

@@ -2,6 +2,8 @@ import math
 from typing import Dict, List, Any, Optional
 import numpy as np
 
+BACKTEST_ENGINE_VERSION = "v173"
+
 def t_critical_95(df: int) -> float:
     """Two-sided Student's t critical value at alpha=0.05 for degrees of freedom df."""
     if df <= 0:
@@ -663,7 +665,7 @@ def walk_forward(engine: QuantBacktestEngine, candles: List[Dict[str, Any]],
         stop_hits = 1 if candidate_evaluation.get("end_reason") in ("STOP_LOSS", "LIQUIDATION") else 0
         worst_period = {
             "fold": 1,
-            "regime": detect_regime(candles[:eff_train_bars]) if total_bars > eff_train_bars else "RANGE",
+            "regime": detect_regime(cand_slice),
             "return_pct": candidate_evaluation["return_pct"],
             "max_drawdown": candidate_evaluation["max_drawdown"],
             "round_trips": candidate_evaluation["round_trips"],
@@ -766,7 +768,7 @@ def walk_forward(engine: QuantBacktestEngine, candles: List[Dict[str, Any]],
         regimes_tested = sorted(list(set(f["regime"] for f in folds)))
 
     report = {
-        "engine_version": "v172",
+        "engine_version": BACKTEST_ENGINE_VERSION,
         "folds": len(folds),
         "oos_return_pct": round(float(np.mean(returns)), 4),
         "oos_max_drawdown": round(max(dds), 6),

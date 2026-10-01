@@ -1,4 +1,34 @@
-from engine.backtest import QuantBacktestEngine, GridSimulator, walk_forward, detect_regime, t_critical_95
+from engine.backtest import BACKTEST_ENGINE_VERSION, QuantBacktestEngine, GridSimulator, walk_forward, detect_regime, t_critical_95
+
+
+def test_exact_candidate_regime_uses_evaluation_window():
+    candles = []
+    price = 100.0
+    for i in range(150):
+        close = price + (1.0 if i % 2 == 0 else -1.0)
+        candles.append({"open": price, "high": price + 2.0, "low": price - 2.0,
+                        "close": close, "volume": 5000.0})
+        price = close
+    # The training regime is flat; the candidate's OOS window rises sharply.
+    candles[-1] = {"open": price, "high": 140.0, "low": price - 1.0,
+                   "close": 135.0, "volume": 5000.0}
+    report = walk_forward(
+        QuantBacktestEngine(), candles, train_bars=60, test_bars=20, purge_bars=6,
+        deployed_params={"lower": 90.0, "upper": 110.0, "levels": 10,
+                         "leverage": 4.0, "investment": 75.0, "direction": "short",
+                         "stop_loss_pct": 1.0},
+    )
+    exact = report["exact_candidate_evaluation"]
+    worst = report["worst_period"]
+    assert detect_regime(candles[:60]) == "RANGE"
+    assert detect_regime(candles[66:]) == "TREND_UP"
+    assert report["regimes_tested"] == ["TREND_UP"]
+    assert worst["regime"] == "TREND_UP"
+    assert worst["max_drawdown"] == exact["max_drawdown"]
+    assert worst["return_pct"] == exact["return_pct"]
+    assert worst["stop_hit"] and exact["end_reason"] == "STOP_LOSS"
+    assert report["stop_hits"] == 1
+    assert report["engine_version"] == BACKTEST_ENGINE_VERSION
 
 def test_backtest_metrics_calculation():
     engine = QuantBacktestEngine()
@@ -121,4 +151,3 @@ def test_simulation_marked_as_proxy():
     assert res["is_proxy"] is True
     assert res["evaluation_status"] == "indicative_proxy"
     assert "proxy_warning" in res
-
