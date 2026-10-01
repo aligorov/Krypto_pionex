@@ -5713,6 +5713,16 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 				eventType := "STOP_LOSS"
 				if decision.Action == ActionCloseTakeProfit {
 					eventType = "TAKE_PROFIT"
+
+					// v2.0.171 fast-follow re-deploy (consensus-2.0): a TP
+					// close in a bot whose symbol still trends is the BEST
+					// moment to re-enter — the strategy just proved itself on
+					// this pair. Queue an out-of-turn scan (cascade-style)
+					// so the scanner re-evaluates within ~4 min instead of
+					// waiting for the next scheduled slot.
+					if totalPnL.IsPositive() {
+						worker.queueFastFollowScan(ctx, *settings, bot.symbol, bot.botNumber)
+					}
 				} else if decision.Action == ActionCloseSmartHarvest {
 					eventType = "SMART_HARVEST"
 				} else if decision.Action == ActionCloseOURotation {
@@ -7640,6 +7650,38 @@ func (worker *Worker) maybeQueueCascadeShortScan(ctx context.Context, settings S
 		worker.noteDeployBlock(ctx, fmt.Sprintf(
 			"каскад ликвидаций $%.0fM/час: внеочередной SHORT-скан поставлен (LONG/NEUTRAL на паузе)",
 			cascadeUSD/1_000_000))
+	}
+}
+
+// queueFastFollowScan (v2.0.171, consensus-2.0): after a profitable TP close,
+// queue an out-of-turn scan so the scanner can immediately re-deploy the
+// symbol if the trend is still confirmed. At most once per symbol per
+// 15 minutes; the scan itself re-evaluates all gates — this is a priority
+// nudge, not a bypass.
+func (worker *Worker) queueFastFollowScan(ctx context.Context, settings Settings, symbol string, botNumber int) {
+	if settings.Status != "RUNNING" {
+		return
+	}
+	bucket := time.Now().Unix() / (15 * 60)
+	idemKey := fmt.Sprintf("fast-follow-%s-%s-%d", settings.ID, symbol, bucket)
+	tag, err := worker.db.Exec(ctx, `
+		INSERT INTO control_commands (
+			actor_type, command_type, resource_type, resource_id,
+			arguments, sanitized_arguments, idempotency_key, status
+		) VALUES (
+			'SYSTEM', 'autogrid.scan', 'autogrid', $1,
+			$2::jsonb, '{}'::jsonb, $3, 'QUEUED'
+		)
+		ON CONFLICT (idempotency_key) DO NOTHING
+	`, settings.ID,
+		fmt.Sprintf(`{"fastFollowSymbol": "%s", "fastFollowBotNumber": %d}`, symbol, botNumber),
+		idemKey)
+	if err != nil {
+		return // best-effort
+	}
+	if tag.RowsAffected() > 0 {
+		worker.logger.Info("fast-follow scan queued: profitable TP close on trending symbol",
+			"component", "autogrid_worker", "symbol", symbol, "bot_number", botNumber)
 	}
 }
 

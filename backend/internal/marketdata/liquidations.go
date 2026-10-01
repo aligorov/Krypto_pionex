@@ -68,11 +68,44 @@ type LiquidationListener struct {
 	// silence episode.
 	lastEventAt     *time.Time
 	failoverEpisode bool
+	// ws1008Streak counts consecutive stream errors containing "1008"
+	// (rate-limit); three in a row pages the operator (v2.0.171 WS alert).
+	ws1008Streak    int
+	lastWS1008Alert time.Time
 }
 
 // resetEpisode clears the failover latch after a switch (or a fresh event).
 func (l *LiquidationListener) resetEpisode() {
 	l.failoverEpisode = false
+}
+
+func (l *LiquidationListener) lastWS1008Alarm() time.Time {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.lastWS1008Alert
+}
+
+func (l *LiquidationListener) setLastWS1008Alarm(t time.Time) {
+	l.mu.Lock()
+	l.lastWS1008Alert = t
+	l.mu.Unlock()
+}
+
+// pageWS1008Alert writes a WS_RATE_LIMIT telegram event (v2.0.171).
+func pageWS1008Alert(ctx context.Context, db *pgxpool.Pool, source string, streak int) {
+	if db == nil {
+		return
+	}
+	payload, err := json.Marshal(map[string]any{
+		"message": fmt.Sprintf("⚠️ <b>WebSocket rate-limit</b>: %d подряд отключений 1008 от %s — сокет троттлится, каскад-гейт может закрыть входы. Проверьте подписки.", streak, source),
+	})
+	if err != nil {
+		return
+	}
+	_, _ = db.Exec(ctx, `
+		INSERT INTO notification_outbox (event_type, payload, status)
+		VALUES ('WS_RATE_LIMIT', $1::JSONB, 'PENDING')
+	`, payload)
 }
 
 type liquidationRecord struct {
@@ -131,6 +164,27 @@ func (l *LiquidationListener) Run(ctx context.Context) {
 		if err != nil && ctx.Err() == nil {
 			slog.Warn("liquidation listener: stream closed, reconnecting",
 				"source", source, "error", err)
+
+			// v2.0.171 WS-1008 alert (consensus-2.0): three consecutive
+			// rate-limit disconnects = the socket is being throttled — the
+			// operator needs to know before the cascade gate fail-closes.
+			errStr := err.Error()
+			if strings.Contains(errStr, "1008") || strings.Contains(errStr, "rate limit") {
+				l.mu.Lock()
+				l.ws1008Streak++
+				streak := l.ws1008Streak
+				l.mu.Unlock()
+				if streak >= 3 && time.Since(l.lastWS1008Alarm()) >= 15*time.Minute {
+					l.setLastWS1008Alarm(time.Now())
+					slog.Error("liquidation listener: 3+ consecutive rate-limit disconnects",
+						"source", source, "streak", streak)
+					pageWS1008Alert(ctx, l.db, source, streak)
+				}
+			} else {
+				l.mu.Lock()
+				l.ws1008Streak = 0
+				l.mu.Unlock()
+			}
 		}
 		// v2.0.167 auto-failover (week-audit P1-2): the entry gate fail-closes
 		// LONG/NEUTRAL at 15m of event silence. Instead of freezing the fleet
