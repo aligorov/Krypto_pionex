@@ -353,13 +353,13 @@ type GateQualityRow struct {
 // only serves what was computed.
 func (s *Service) ListGateQuality(ctx context.Context, window string) ([]GateQualityRow, error) {
 	rows, err := s.db.Query(ctx, `
-		SELECT window, window_start, computed_at, gate, regime,
+		SELECT window_kind, window_start, computed_at, gate, regime,
 		       episodes, decisions, coverage, skip_reasons,
 		       completed_outcomes, open_outcomes,
 		       blocked_model_pnl, blocked_model_pnl_parts,
 		       proof_strength, calibration, notes
 		FROM gate_quality_daily
-		WHERE window = $1
+		WHERE window_kind = $1
 		ORDER BY gate, regime
 	`, window)
 	if err != nil {
