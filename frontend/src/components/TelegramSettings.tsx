@@ -445,8 +445,13 @@ export const TelegramSettings: React.FC<{ canManage: boolean }> = ({ canManage }
           Вы можете отправлять боту команды прямо в чат Telegram:
         </p>
         <ul style={{ margin: 0, paddingLeft: '1.25rem', fontSize: '0.82rem', color: 'var(--muted)' }}>
-          <li><code>/status</code> — Мгновенный отчет по количеству активных ботов и зафиксированному PnL</li>
-          <li><code>/kill</code> — Экстренная активация Kill Switch (блокирует запуск новых позиций)</li>
+          <li><code>/start</code>, <code>/help</code> — меню с кнопками</li>
+          <li><code>/status</code>, <code>/bots</code> — статус и активные боты после входных комиссий</li>
+          <li><code>/closed N</code>, <code>/day</code> — подтверждённые закрытия; день считается по UTC</li>
+          <li><code>/stats</code>, <code>/pnl</code> — подтверждённые результаты за 30 дней, без прогноза доходности</li>
+          <li><code>/risk</code>, <code>/health</code> — лимиты, версия, свежесть данных и доставка</li>
+          <li><code>/kill</code> — блокировка новых входов, если управляющие команды разрешены в PostgreSQL; работающие боты остаются под надзором</li>
+          <li>Команды доступны только закреплённому приватному пользователю. В группы и темы можно отправлять уведомления.</li>
         </ul>
       </div>
     </div>
