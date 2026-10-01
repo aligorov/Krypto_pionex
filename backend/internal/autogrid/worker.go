@@ -1792,6 +1792,17 @@ func (worker *Worker) deployPaper(
 					mesh.LowerPrice, mesh.UpperPrice = nl, nu
 				}
 			}
+			// v2.0.181 densify-after-widen (paper mirror of the REAL fix):
+			// the widened span must not ride on a count sized for the born
+			// narrow S/R span — re-derive raise-only for the final bounds.
+			if dense := DensifyGridNumForSpan(mesh.GridNum, mesh.LowerPrice, mesh.UpperPrice, candidate.CurrentPrice,
+				settings.BudgetUSDT.Mul(decimal.NewFromInt(int64(botLev))).InexactFloat64(),
+				decimalFloat(settings.FeeBps), decimalFloat(settings.SlippageBps)); dense > mesh.GridNum {
+				worker.logger.Info("v2.0.181 densify: level count follows the widened span (paper)",
+					"component", "autogrid_worker", "symbol", candidate.Symbol,
+					"grid_num_was", mesh.GridNum, "grid_num_now", dense)
+				mesh.GridNum = dense
+			}
 			if spanPct := mesh.UpperPrice.Sub(mesh.LowerPrice).Div(candidate.CurrentPrice).Mul(decimal.NewFromInt(100)).InexactFloat64(); mesh.GridNum > 0 {
 				if stepPct := spanPct / float64(mesh.GridNum); stepPct > 0 {
 					if reason, violated := marketdata.FeeGateRejection(stepPct, decimalFloat(settings.FeeBps), decimalFloat(settings.SlippageBps)); violated {
@@ -3069,6 +3080,22 @@ func (worker *Worker) deployReal(
 					}
 				}
 			}
+		}
+
+		// v2.0.181 densify-after-widen: the span was widened to the 8% floor
+		// with the born level count kept — re-derive the count for the FINAL
+		// span (post HAR, post bid-wall anchor, post re-widen) so the shipped
+		// step lands back in the 0.5% golden band. Raise-only. The backtest
+		// gate below and the create Row read the densified mesh.GridNum, so
+		// the walk-forward exam runs on the geometry that actually deploys.
+		if dense := DensifyGridNumForSpan(mesh.GridNum, lowerPrice, upperPrice, candidate.CurrentPrice,
+			slotBudget.Mul(decimal.NewFromInt(int64(botLev))).InexactFloat64(),
+			decimalFloat(settings.FeeBps), decimalFloat(settings.SlippageBps)); dense > mesh.GridNum {
+			worker.logger.Info("v2.0.181 densify: level count follows the widened span",
+				"component", "autogrid_worker", "symbol", candidate.Symbol,
+				"grid_num_was", mesh.GridNum, "grid_num_now", dense,
+				"span_pct", upperPrice.Sub(lowerPrice).Div(candidate.CurrentPrice).Mul(decimal.NewFromInt(100)).StringFixed(2))
+			mesh.GridNum = dense
 		}
 
 		// Knife Pause & OFI Check (Quant & Vision v3.0)

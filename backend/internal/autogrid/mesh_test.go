@@ -254,3 +254,51 @@ func TestComputeDynamicLeverageNarrowSpan(t *testing.T) {
 		t.Fatalf("extreme ATR on wide span must scale to 2x, got %dx", res.Leverage)
 	}
 }
+
+// v2.0.181 densify-after-widen: prod MUX #1530 shipped 6 rows stretched
+// over the 8.0% widened span (1.4% step, 2.7x the 0.504% golden band) —
+// the count must follow the FINAL span, raise-only.
+func TestDensifyGridNumForSpan(t *testing.T) {
+	price := decimal.NewFromFloat(1049.19)
+	lower := decimal.NewFromFloat(1007.42)
+	upper := decimal.NewFromFloat(1091.38) // MUX #1530 exact bounds, ~8.0% span
+
+	// Born-narrow count densifies into the golden band: 6 → 15 at
+	// $75×4x notional (step floor 0.504% governs, $20/level).
+	got := DensifyGridNumForSpan(6, lower, upper, price, 300, 5, 2)
+	if got < 14 || got > 16 {
+		t.Fatalf("MUX geometry must densify 6 into the 14-16 band, got %d", got)
+	}
+	step := 8.0 / float64(got)
+	if step < 0.504-1e-9 || step > 0.6 {
+		t.Fatalf("densified step %.3f%% must land back in the golden band", step)
+	}
+
+	// Raise-only: a count already denser than the doctrine (INJ-class born
+	// wide, 16) is never thinned.
+	if got := DensifyGridNumForSpan(20, lower, upper, price, 300, 5, 2); got != 20 {
+		t.Fatalf("born-dense count must never thin, got %d", got)
+	}
+
+	// Un-widened narrow span: the doctrine count stays BELOW the born floor
+	// clamp — no change (the 6 stays the doctrine's own minimum).
+	narrowLower := decimal.NewFromFloat(1030.83)
+	narrowUpper := decimal.NewFromFloat(1067.55) // ~3.5% span
+	if got := DensifyGridNumForSpan(6, narrowLower, narrowUpper, price, 300, 5, 2); got != 6 {
+		t.Fatalf("narrow-span born count must keep, got %d", got)
+	}
+
+	// Small notional: the per-level $8 floor widens the min-order step and
+	// caps the densified count (span 8% / $100 → step 0.64% → 12 rows).
+	if got := DensifyGridNumForSpan(6, lower, upper, price, 100, 5, 2); got != 12 {
+		t.Fatalf("$100 notional must densify to 12 rows ($8.33/level), got %d", got)
+	}
+
+	// Degenerate inputs: count unchanged.
+	if got := DensifyGridNumForSpan(6, upper, lower, price, 300, 5, 2); got != 6 {
+		t.Fatalf("inverted bounds must not touch the count, got %d", got)
+	}
+	if got := DensifyGridNumForSpan(6, lower, upper, decimal.Zero, 300, 5, 2); got != 6 {
+		t.Fatalf("zero price must not touch the count, got %d", got)
+	}
+}

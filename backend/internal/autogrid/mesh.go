@@ -49,6 +49,38 @@ func EnsureDeploySpan(lower, upper, price decimal.Decimal) (decimal.Decimal, dec
 	return newLower, newUpper
 }
 
+// DensifyGridNumForSpan (v2.0.181): v2.0.163 widened the span to the 8%
+// floor but deliberately kept the born level count ("levels keep, steps
+// widen") — a grid whose count was sized for a narrow S/R span (6 rows on a
+// 3% range) stretched over the widened span runs a ~1.4% step, 2.7x the
+// 0.504% step the same doctrine calls the golden band, and a RANGE bot
+// never completes a round trip on it (prod MUX #1530: 8.0% span / 6 rows).
+// After every geometry source (S/R mesh, HAR, bid-wall anchor, re-widen)
+// has spoken, the count must be re-derived for the FINAL span under the
+// same margin-density doctrine. Raise-only: a count already denser than
+// the doctrine (wide S/R, HAR's own density) is never thinned, and the
+// per-level notional floor inside GridLevelsForRange keeps every level
+// order-sized. Degenerate inputs return the count unchanged.
+func DensifyGridNumForSpan(
+	gridNum int,
+	lower, upper, price decimal.Decimal,
+	notionalUSDT float64,
+	feeBps, slippageBps float64,
+) int {
+	if gridNum <= 0 || !price.GreaterThan(decimal.Zero) || !upper.GreaterThan(lower) {
+		return gridNum
+	}
+	spanPct, _ := upper.Sub(lower).Div(price).Mul(decimal.NewFromInt(100)).Float64()
+	if spanPct <= 0 {
+		return gridNum
+	}
+	dense := marketdata.GridLevelsForRange(spanPct, notionalUSDT, feeBps, slippageBps)
+	if dense > gridNum {
+		return dense
+	}
+	return gridNum
+}
+
 // ComputeAdaptiveMesh sizes the grid level count under the margin-density
 // doctrine (v2.0.75): step = max(fee-gate floor at the ACTUAL costs, the step
 // at which every level still carries ≥ $8 of the budget×leverage notional),
