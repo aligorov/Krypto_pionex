@@ -657,6 +657,18 @@ def walk_forward(engine: QuantBacktestEngine, candles: List[Dict[str, Any]],
         # folds while the exact candidate's true DD was 17.92%.
         returns = [candidate_evaluation["return_pct"]]
         dds = [candidate_evaluation["max_drawdown"]]
+        # v2.0.172b: stop_hits, worst_period and regimes must also come from
+        # the exact candidate evaluation, not the historical folds (the old
+        # mixing showed stop_hits=0 when the candidate actually stopped).
+        stop_hits = 1 if candidate_evaluation.get("end_reason") in ("STOP_LOSS", "LIQUIDATION") else 0
+        worst_period = {
+            "fold": 1,
+            "regime": detect_regime(candles[:eff_train_bars]) if total_bars > eff_train_bars else "RANGE",
+            "return_pct": candidate_evaluation["return_pct"],
+            "max_drawdown": candidate_evaluation["max_drawdown"],
+            "round_trips": candidate_evaluation["round_trips"],
+            "stop_hit": stop_hits > 0,
+        }
 
     # Trade-level statistical metrics with autocorrelation (trade dependence) adjustment
     pnls = [t.get("pnl", 0.0) for t in all_trades]
@@ -745,6 +757,7 @@ def walk_forward(engine: QuantBacktestEngine, candles: List[Dict[str, Any]],
     regimes_tested = sorted(list(set(f["regime"] for f in folds)))
 
     report = {
+        "engine_version": "v172",
         "folds": len(folds),
         "oos_return_pct": round(float(np.mean(returns)), 4),
         "oos_max_drawdown": round(max(dds), 6),

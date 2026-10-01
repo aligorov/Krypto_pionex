@@ -2213,6 +2213,21 @@ func (worker *Worker) revalidateCandidateTrend(
 func (worker *Worker) capitalEffectiveBudget(ctx context.Context, accountID string, settingsBudget decimal.Decimal, trancheOn bool, reservePct decimal.Decimal) (decimal.Decimal, bool) {
 	equity, committed, spendable, err := loadBotFundingReserve(ctx, worker.db, accountID)
 	if err != nil {
+		// v2.0.172b (audit P1-2): classify the error — stale data is NOT a
+		// capital deficit; the old path silently returned zero and the
+		// caller alarmed "capital deficiency" while the wallet had $1000+.
+		errStr := err.Error()
+		if strings.Contains(errStr, "stale") || strings.Contains(errStr, "invalid timestamp") {
+			worker.logger.Warn("capital snapshot STALE (not a deficit) — scan defers, no alarm",
+				"component", "autogrid_worker", "error", err)
+			_ = QueueTelegramEvent(ctx, worker.db, "FUNDING_STALE", map[string]any{
+				"message": "⚠️ Снимок капитала устарел (>10 мин) — входы отложены, это НЕ дефицит средств. Долгий скан-цикл задержал обновление баланса.",
+			})
+			// Return the full budget: a stale snapshot must not masquerade
+			// as zero available capital. The margin reserve blocker at the
+			// individual candidate level still does its own check.
+			return settingsBudget, false
+		}
 		worker.logger.Warn("bot funding unavailable", "component", "autogrid_worker", "error", err)
 		return decimal.Zero, true
 	}
@@ -3426,10 +3441,15 @@ func (worker *Worker) deployReal(
 			// diagnostic context.
 			if check.GetMaxInvestment().GreaterThan(decimal.Zero) &&
 				investAmount.GreaterThan(check.GetMaxInvestment()) {
-				deployErrors = append(deployErrors, fmt.Sprintf(
-					"%s: budget %s above Pionex maximum investment %s (exchange clears liq estimates out of range)",
-					candidate.Symbol, investAmount.StringFixed(2), check.GetMaxInvestment().StringFixed(2),
-				))
+				maxReason := fmt.Sprintf(
+					"инвестиция %s выше максимума биржи %s — биржа очищает оценки ликвидации вне диапазона",
+					investAmount.StringFixed(2), check.GetMaxInvestment().StringFixed(2))
+				deployErrors = append(deployErrors, fmt.Sprintf("%s: %s", candidate.Symbol, maxReason))
+				// v2.0.172b (audit P2-4): the refusal must reach the
+				// candidate card and the entry-decision journal.
+				worker.rejectCandidate(ctx, candidate, maxReason,
+					map[string]any{"maxInvestmentExceeded": true,
+						"max_investment": check.GetMaxInvestment().StringFixed(2)})
 				continue
 			}
 		}

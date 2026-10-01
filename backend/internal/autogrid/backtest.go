@@ -17,6 +17,11 @@ import (
 const (
 	backtestGateFlag    = "backtest_gate"
 	backtestFreshWindow = 4 * time.Hour
+	// backtestEngineVersion (v2.0.172b): bumped on every breaking engine
+	// change — cached results from a different version are INVALID and must
+	// not be served. v170 fixed time-reversed candles; v172 fixed metric
+	// mixing (exact candidate DD now reported). All pre-172 caches are wrong.
+	backtestEngineVersion = "v172"
 
 	// Traded-TF hard ceilings calibrated for quality entry filtering:
 	// 1. OOS Net return floor: relaxed from 0.0% to -1.0% to allow minor noise / walk-forward friction.
@@ -54,6 +59,7 @@ type BacktestJobSummary struct {
 	MaxDD            float64            `json:"maxDd"`
 	RoundTrips       int                `json:"roundTrips"`
 	StopHits         int                `json:"stopHits"`
+	EngineVersion    string             `json:"engineVersion"`
 	NetEV            float64            `json:"netEv"`
 	CI95Lower        float64            `json:"ci95Lower"`
 	CI95Upper        float64            `json:"ci95Upper"`
@@ -365,6 +371,12 @@ func (worker *Worker) loadBacktestSummaryWithParams(ctx context.Context, symbol,
 			if status == "DONE" && finishedAt != nil && time.Since(*finishedAt) <= backtestFreshWindow {
 				if matchesDeployParams(paramsBytes, p) {
 					if parsed, ok := parseBacktestResult(resultBytes); ok {
+						// v2.0.172b: reject cached results from a different
+						// engine version — the 159 pre-172 entries with
+						// mismatched DD must never serve again.
+						if parsed.EngineVersion != backtestEngineVersion {
+							continue // stale engine version, skip this cache row
+						}
 						parsed.Interval = interval
 						return parsed
 					}
