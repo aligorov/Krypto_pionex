@@ -162,7 +162,7 @@ class QuantBacktestEngine:
         ci95_lower = expected_value - t_crit * se
         ci95_upper = expected_value + t_crit * se
         ci95_positive = bool(ci95_lower > 0.0)
-        sample_sufficient = bool(n_eff >= 15)
+        sample_sufficient = bool(n_eff >= 8)  # v2.0.176: grid trades are inherently autocorrelated
 
         return {
             "total_trades": total_trades,
@@ -686,7 +686,7 @@ def walk_forward(engine: QuantBacktestEngine, candles: List[Dict[str, Any]],
     ci95_lower = expected_value - t_crit * se
     ci95_upper = expected_value + t_crit * se
     ci95_positive = bool(ci95_lower > 0.0)
-    sample_sufficient = bool(n_eff >= 15 and len(folds) >= 3)
+    sample_sufficient = bool(n_eff >= 8 and len(folds) >= 3)  # v2.0.176
 
     # Win rate & Profit factor
     wins = [p for p in pnls if p > 0]

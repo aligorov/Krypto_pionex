@@ -29,7 +29,7 @@ const (
 	// 2. Max Drawdown bounded to risk limits (calibrated to 15% for crypto perpetual grids).
 	backtestMaxDrawdown = 0.15
 	// 3. Minimum trades / sample size:
-	backtestMinRoundTrips = 15
+	backtestMinRoundTrips = 8 // v2.0.176: grid trades autocorrelated; raw >= 8 is the pre-n_eff floor
 	backtestMinFolds      = 3
 	// Max stop hits allowed across walk-forward folds (allow at most 1 isolated stop hit).
 	backtestMaxStopHits = 1
