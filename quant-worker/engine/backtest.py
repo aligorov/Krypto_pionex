@@ -731,16 +731,20 @@ def walk_forward(engine: QuantBacktestEngine, candles: List[Dict[str, Any]],
     notional_per_level = (active_inv * active_lev) / max(active_levels, 1)
     turnover = (float(round_trips) * 2.0 * notional_per_level) / max(active_inv, 1.0)
 
-    # Worst test period
-    worst_fold = min(folds, key=lambda f: f["return_pct"])
-    worst_period = {
-        "fold": worst_fold["fold_idx"],
-        "regime": worst_fold["regime"],
-        "return_pct": worst_fold["return_pct"],
-        "max_drawdown": worst_fold["max_drawdown"],
-        "round_trips": worst_fold["round_trips"],
-        "stop_hit": worst_fold["stop_hit"],
-    }
+    # Worst test period — v2.0.172c: when exact candidate params are used,
+    # the candidate's worst_period was already set above; do NOT overwrite
+    # it with the fold-based calculation (audit: candidate DD 79.97% showed
+    # as worst_period DD 0.46% from a historical fold).
+    if not (use_exact_params and candidate_evaluation):
+        worst_fold = min(folds, key=lambda f: f["return_pct"])
+        worst_period = {
+            "fold": worst_fold["fold_idx"],
+            "regime": worst_fold["regime"],
+            "return_pct": worst_fold["return_pct"],
+            "max_drawdown": worst_fold["max_drawdown"],
+            "round_trips": worst_fold["round_trips"],
+            "stop_hit": worst_fold["stop_hit"],
+        }
 
     # Liquidity check: level notional vs candle volume
     avg_candle_vol = 0.0
@@ -754,7 +758,12 @@ def walk_forward(engine: QuantBacktestEngine, candles: List[Dict[str, Any]],
         liquidity_ok = False
         liquidity_reason = f"order size (${notional_per_level:.2f}) > 10% of avg candle volume (${avg_candle_vol:.2f})"
 
-    regimes_tested = sorted(list(set(f["regime"] for f in folds)))
+    # v2.0.172c: regimes from the candidate's own evaluation period when
+    # exact params are used, not from historical folds.
+    if use_exact_params and candidate_evaluation:
+        regimes_tested = [worst_period.get("regime", "RANGE")]
+    else:
+        regimes_tested = sorted(list(set(f["regime"] for f in folds)))
 
     report = {
         "engine_version": "v172",

@@ -280,12 +280,14 @@ func parseBacktestResult(resultBytes []byte) (BacktestJobSummary, bool) {
 		RegimesTested    []string           `json:"regimes_tested"`
 		LiquidityOK      *bool              `json:"liquidity_ok"`
 		LiquidityReason  string             `json:"liquidity_reason"`
+		EngineVersion    string             `json:"engine_version"`
 	}
 	if json.Unmarshal(resultBytes, &result) != nil || result.Folds <= 0 {
 		return BacktestJobSummary{}, false
 	}
 	summary := BacktestJobSummary{
 		State:            "done",
+		EngineVersion:    result.EngineVersion,
 		Folds:            result.Folds,
 		OOSPct:           result.OOSPct,
 		MaxDD:            result.MaxDD,
@@ -440,6 +442,12 @@ func (worker *Worker) waitForBacktestWithParams(ctx context.Context, symbol, int
 			if err := rows.Scan(&status, &resultBytes, &paramsBytes); err == nil && status == "DONE" {
 				if matchesDeployParams(paramsBytes, p) {
 					if parsed, ok := parseBacktestResult(resultBytes); ok {
+						// v2.0.172c: the WAIT path now checks the engine
+						// version identically to the cache path — a DONE
+						// result from a stale engine must not be served.
+						if parsed.EngineVersion != backtestEngineVersion {
+							continue
+						}
 						rows.Close()
 						parsed.Interval = interval
 						return parsed

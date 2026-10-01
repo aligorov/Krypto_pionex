@@ -2218,15 +2218,16 @@ func (worker *Worker) capitalEffectiveBudget(ctx context.Context, accountID stri
 		// caller alarmed "capital deficiency" while the wallet had $1000+.
 		errStr := err.Error()
 		if strings.Contains(errStr, "stale") || strings.Contains(errStr, "invalid timestamp") {
-			worker.logger.Warn("capital snapshot STALE (not a deficit) — scan defers, no alarm",
+			worker.logger.Warn("capital snapshot STALE — entries deferred (audit P1-2 v2: zero budget, not full)",
 				"component", "autogrid_worker", "error", err)
 			_ = QueueTelegramEvent(ctx, worker.db, "FUNDING_STALE", map[string]any{
-				"message": "⚠️ Снимок капитала устарел (>10 мин) — входы отложены, это НЕ дефицит средств. Долгий скан-цикл задержал обновление баланса.",
+				"message": "⚠️ Снимок капитала устарел (>10 мин) — входы отложены до обновления баланса, это НЕ дефицит средств.",
 			})
-			// Return the full budget: a stale snapshot must not masquerade
-			// as zero available capital. The margin reserve blocker at the
-			// individual candidate level still does its own check.
-			return settingsBudget, false
+			// v2.0.172c (audit correction): return ZERO, not the full budget —
+			// returning the budget bypassed the capital check entirely (the
+			// auto path doesn't call marginReserveBlocker). Zero means the
+			// scan defers; the telegram tells the operator it's a data issue.
+			return decimal.Zero, true
 		}
 		worker.logger.Warn("bot funding unavailable", "component", "autogrid_worker", "error", err)
 		return decimal.Zero, true
@@ -3445,11 +3446,16 @@ func (worker *Worker) deployReal(
 					"инвестиция %s выше максимума биржи %s — биржа очищает оценки ликвидации вне диапазона",
 					investAmount.StringFixed(2), check.GetMaxInvestment().StringFixed(2))
 				deployErrors = append(deployErrors, fmt.Sprintf("%s: %s", candidate.Symbol, maxReason))
-				// v2.0.172b (audit P2-4): the refusal must reach the
-				// candidate card and the entry-decision journal.
+				// v2.0.172c (audit P2-4): the refusal must reach the
+				// candidate card AND the entry-decision journal.
 				worker.rejectCandidate(ctx, candidate, maxReason,
 					map[string]any{"maxInvestmentExceeded": true,
 						"max_investment": check.GetMaxInvestment().StringFixed(2)})
+				worker.journalEntryDecision(ctx, entryIn, entryOutcomeReject, "EXCHANGE_MAX_INVESTMENT",
+					maxReason, map[string]any{
+						"max_investment": check.GetMaxInvestment().StringFixed(2),
+						"our_investment": investAmount.StringFixed(2),
+					})
 				continue
 			}
 		}
