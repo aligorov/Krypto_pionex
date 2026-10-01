@@ -321,6 +321,16 @@ func parseBacktestResult(resultBytes []byte) (BacktestJobSummary, bool) {
 	return summary, true
 }
 
+// deployParamsPriceTolerance (v2.0.182): the S/R geometry drifts a few bps
+// every scan, so a bit-exact params comparison never matched the previous
+// DONE job — every scan enqueued a FRESH job (prod 01.10: MSTRX 15 jobs /
+// 15 distinct params in 90 min) and the gate sat in PENDING forever while
+// the queue happily churned DONE results no one read. 0.2% of price is
+// below half a grid step (0.25% at the doctrine floor), so a matched job
+// backtested a grid materially identical to the deploy geometry; grid_num
+// and leverage stay exact.
+const deployParamsPriceTolerance = 0.002
+
 func matchesDeployParams(jobParamsBytes []byte, p *BacktestDeployParams) bool {
 	if p == nil {
 		return true
@@ -342,7 +352,10 @@ func matchesDeployParams(jobParamsBytes []byte, p *BacktestDeployParams) bool {
 	}
 	pLower := p.LowerPrice.InexactFloat64()
 	pUpper := p.UpperPrice.InexactFloat64()
-	if math.Abs(jobParams.LowerPrice-pLower) > 1e-6 || math.Abs(jobParams.UpperPrice-pUpper) > 1e-6 {
+	if pLower > 0 && math.Abs(jobParams.LowerPrice-pLower) > pLower*deployParamsPriceTolerance {
+		return false
+	}
+	if pUpper > 0 && math.Abs(jobParams.UpperPrice-pUpper) > pUpper*deployParamsPriceTolerance {
 		return false
 	}
 	if p.Leverage > 0 && jobParams.Leverage > 0 && jobParams.Leverage != p.Leverage {

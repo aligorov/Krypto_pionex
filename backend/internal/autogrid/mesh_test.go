@@ -1,6 +1,7 @@
 package autogrid
 
 import (
+	"encoding/json"
 	"testing"
 
 	"github.com/aligorov/pionex-bot/backend/internal/marketdata"
@@ -300,5 +301,34 @@ func TestDensifyGridNumForSpan(t *testing.T) {
 	}
 	if got := DensifyGridNumForSpan(6, lower, upper, decimal.Zero, 300, 5, 2); got != 6 {
 		t.Fatalf("zero price must not touch the count, got %d", got)
+	}
+}
+
+// v2.0.182: S/R geometry drifts a few bps per scan — the params comparator
+// must match a DONE job inside a 0.2% band (below half a grid step), or the
+// gate re-enqueues forever (prod 01.10: MSTRX 15 jobs / 15 distinct params).
+func TestMatchesDeployParamsDriftTolerance(t *testing.T) {
+	p := &BacktestDeployParams{
+		LowerPrice: decimal.NewFromFloat(1030.83),
+		UpperPrice: decimal.NewFromFloat(1067.55),
+		GridNum:    15, Leverage: 4,
+	}
+	mk := func(lo, up float64, grid int) []byte {
+		b, _ := json.Marshal(map[string]any{
+			"lower_price": lo, "upper_price": up, "grid_num": grid, "leverage": 4,
+		})
+		return b
+	}
+	// Drift well inside the band matches.
+	if !matchesDeployParams(mk(1030.5, 1067.9, 15), p) {
+		t.Fatal("0.03% drift must match the cached job")
+	}
+	// Drift beyond 0.2% rejects (that is a materially different grid).
+	if matchesDeployParams(mk(1028.0, 1067.55, 15), p) {
+		t.Fatal("0.27% lower drift must NOT match")
+	}
+	// Grid count must stay exact.
+	if matchesDeployParams(mk(1030.83, 1067.55, 16), p) {
+		t.Fatal("different grid_num must NOT match")
 	}
 }
