@@ -646,3 +646,112 @@ export interface MacroSources {
   updatedAt?: string;
   series: MacroSeriesPoint[] | null;
 }
+
+// ── Модуль «Анализ решений» (v2.0.184, миграция 0062) ──────────────────────
+
+// Одна запись трассы гейтов из entry_decisions.gate_trace.
+export interface GateTraceEntry {
+  gate: string;
+  verdict: string; // PASS | REJECT | WAIT | EXEMPT | NOT_EVALUATED | UNKNOWN
+  threshold?: number | string;
+  exemption?: string;
+  inputs?: Record<string, unknown>;
+  quality?: string;
+}
+
+// Судьба shadow-наблюдения эпизода: две машины состояний (позиция × расчёт)
+// и модельный PnL, когда исход завершён.
+export interface ShadowFate {
+  id: number;
+  posState: string; // OPEN | CLOSED_TP | CLOSED_SL | HORIZON_END | INVALIDATED
+  calcState: string; // PENDING | RUNNING | DONE | RETRYABLE_ERROR | INSUFFICIENT_DATA
+  outcomePnlUsdt: string | null;
+  outcomeReason: string | null;
+}
+
+export interface DecisionEpisode {
+  symbol: string;
+  direction: string;
+  regime: string;
+  attempts: number;
+  disposition: string; // ALLOWED | REJECTED_STILL | OPEN
+  lastSeen: string | null;
+  shadow: ShadowFate | null;
+}
+
+// Строка GET /api/autogrid/decisions — одна попытка допуска с эпизодом.
+export interface EntryDecision {
+  id: string;
+  createdAt: string;
+  decisionAt: string | null;
+  symbol: string;
+  path: string;
+  fleet: string;
+  outcome: 'ALLOW' | 'WAIT' | 'REJECT';
+  code: string;
+  reason: string;
+  stage: string; // SCANNER | INTERMEDIATE | FINAL
+  dataQuality: string; // OK | MISSING | STALE | DESYNC | ERROR
+  episodeId: string | null;
+  attemptNo: number;
+  directionBefore: string | null;
+  directionAfter: string | null;
+  gateTrace: GateTraceEntry[];
+  configSnapshot: Record<string, unknown>;
+  features: Record<string, unknown>;
+  priceAtDecision: string | null;
+  priceSource: string | null;
+  episode: DecisionEpisode | null;
+}
+
+// GET /api/autogrid/replay/runs — неизменяемые эксперименты.
+export interface ReplayRun {
+  id: string;
+  createdAt: string;
+  periodFrom: string;
+  periodTo: string;
+  baseline: Record<string, unknown>;
+  overrides: Record<string, unknown>;
+  codeVersion: string;
+  status: string; // QUEUED | RUNNING | DONE | FAILED | CANCELLED
+  statusReason: string;
+  // N/K/M/L: checked / verdicts_changed / full_chain_available / outcomes_available
+  stats: Record<string, unknown>;
+  // { delta_pnl_proxy, prevented_losses, missed_profits }
+  effect: Record<string, unknown>;
+  modelCalibrated: boolean | null;
+  finishedAt: string | null;
+}
+
+export interface ReplayRunItem {
+  id: number;
+  decisionId: string;
+  symbol: string;
+  verdict: string; // REPRODUCED | CHANGED | NOT_REPLAYABLE
+  notReplayableCause: string;
+  baseOutcome: string;
+  newOutcome: string;
+  chainFollowed: boolean;
+  episodeOutcomePnl: string | null;
+  createdAt: string;
+}
+
+// GET /api/autogrid/gate-quality — агрегаты gate_quality_daily по режимам.
+export interface GateQualityRow {
+  window: string;
+  windowStart: string;
+  computedAt: string;
+  gate: string;
+  regime: string;
+  episodes: number;
+  decisions: number;
+  coverage: string | null;
+  skipReasons: Record<string, unknown>;
+  completedOutcomes: number;
+  openOutcomes: number;
+  blockedModelPnl: string | null;
+  blockedModelPnlParts: Record<string, unknown>;
+  proofStrength: string; // LOW | MEDIUM | HIGH
+  calibration: Record<string, unknown>;
+  notes: Record<string, unknown>;
+}

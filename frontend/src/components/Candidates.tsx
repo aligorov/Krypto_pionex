@@ -1,8 +1,9 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { Fragment, useCallback, useEffect, useMemo, useState } from 'react';
 import { api, describeError, getCachedAutoGrid, setCachedAutoGrid } from '../api';
 
 import { CandlestickChart } from './CandlestickChart';
 import { FundingBadge } from './FundingBadge';
+import DecisionHistoryPanel from './DecisionHistory';
 import type { AIKitResponse, AutoGridCandidate, AutoGridState } from '../types';
 
 interface Props {
@@ -27,6 +28,13 @@ export default function Candidates({ canOperate: _canOperate }: Props) {
   const [selectedForChart, setSelectedForChart] = useState<AutoGridCandidate | null>(null);
   const [lastSyncAt, setLastSyncAt] = useState<Date | null>(null);
   const [syncError, setSyncError] = useState<string | null>(null);
+  // v2.0.184 «История решения»: символ с раскрытой историей (одна панель
+  // открыта за раз — журнал тяжёлый, а сравнивают решения одного символа).
+  const [historySymbol, setHistorySymbol] = useState<string | null>(null);
+
+  const toggleHistory = useCallback((symbol: string) => {
+    setHistorySymbol((current) => (current === symbol ? null : symbol));
+  }, []);
 
   const load = useCallback(async () => {
     try {
@@ -260,17 +268,28 @@ export default function Candidates({ canOperate: _canOperate }: Props) {
                   </th>
                   <th>AI Kit</th>
                   <th>График</th>
+                  <th>Решение</th>
                 </tr>
               </thead>
               <tbody>
                 {accepted.map((candidate) => (
-                  <CandidateRow
-                    key={candidate.id}
-                    candidate={candidate}
-                    aiKit={aiKit[candidate.symbol]}
-                    onFetchAIKit={() => void fetchAIKit(candidate.symbol)}
-                    onOpenChart={() => setSelectedForChart(candidate)}
-                  />
+                  <Fragment key={candidate.id}>
+                    <CandidateRow
+                      candidate={candidate}
+                      aiKit={aiKit[candidate.symbol]}
+                      onFetchAIKit={() => void fetchAIKit(candidate.symbol)}
+                      onOpenChart={() => setSelectedForChart(candidate)}
+                      historyOpen={historySymbol === candidate.symbol}
+                      onToggleHistory={() => toggleHistory(candidate.symbol)}
+                    />
+                    {historySymbol === candidate.symbol && (
+                      <tr>
+                        <td colSpan={18} style={{ padding: '0 16px 12px' }}>
+                          <DecisionHistoryPanel symbol={candidate.symbol} />
+                        </td>
+                      </tr>
+                    )}
+                  </Fragment>
                 ))}
               </tbody>
             </table>
@@ -298,36 +317,55 @@ export default function Candidates({ canOperate: _canOperate }: Props) {
                   <th>Волатильность</th>
                   <th>Объём 24ч</th>
                   <th>График</th>
+                  <th>Решение</th>
                 </tr>
               </thead>
               <tbody>
                 {rejected.map((candidate) => (
-                  <tr key={candidate.id}>
-                    <td>
-                      <span className="badge neutral" title={new Date(candidate.createdAt).toLocaleString()}>
-                        {formatTime(candidate.createdAt)}
-                      </span>
-                    </td>
-                    <td><strong>{candidate.symbol}</strong></td>
-                    <td>
-                      {candidate.rejectionReason?.startsWith('AI:') ? (
-                        <span style={{ color: '#f87171' }}>🧠 {candidate.rejectionReason}</span>
-                      ) : (
-                        <small>{candidate.rejectionReason ?? '—'}</small>
-                      )}
-                    </td>
-                    <td>{candidate.volatilityPct}%</td>
-                    <td>{candidate.volume24h}</td>
-                    <td>
-                      <button
-                        className="button small"
-                        onClick={() => setSelectedForChart(candidate)}
-                        title="Открыть интерактивный график"
-                      >
-                        📊
-                      </button>
-                    </td>
-                  </tr>
+                  <Fragment key={candidate.id}>
+                    <tr>
+                      <td>
+                        <span className="badge neutral" title={new Date(candidate.createdAt).toLocaleString()}>
+                          {formatTime(candidate.createdAt)}
+                        </span>
+                      </td>
+                      <td><strong>{candidate.symbol}</strong></td>
+                      <td>
+                        {candidate.rejectionReason?.startsWith('AI:') ? (
+                          <span style={{ color: '#f87171' }}>🧠 {candidate.rejectionReason}</span>
+                        ) : (
+                          <small>{candidate.rejectionReason ?? '—'}</small>
+                        )}
+                      </td>
+                      <td>{candidate.volatilityPct}%</td>
+                      <td>{candidate.volume24h}</td>
+                      <td>
+                        <button
+                          className="button small"
+                          onClick={() => setSelectedForChart(candidate)}
+                          title="Открыть интерактивный график"
+                        >
+                          📊
+                        </button>
+                      </td>
+                      <td>
+                        <button
+                          className={`button small ${historySymbol === candidate.symbol ? 'primary' : ''}`}
+                          onClick={() => toggleHistory(candidate.symbol)}
+                          title="История решений по символу: трасса гейтов и судьба shadow-эпизода"
+                        >
+                          ⚖️
+                        </button>
+                      </td>
+                    </tr>
+                    {historySymbol === candidate.symbol && (
+                      <tr>
+                        <td colSpan={7} style={{ padding: '0 16px 12px' }}>
+                          <DecisionHistoryPanel symbol={candidate.symbol} />
+                        </td>
+                      </tr>
+                    )}
+                  </Fragment>
                 ))}
               </tbody>
             </table>
@@ -390,11 +428,15 @@ function CandidateRow({
   aiKit,
   onFetchAIKit,
   onOpenChart,
+  historyOpen,
+  onToggleHistory,
 }: {
   candidate: AutoGridCandidate;
   aiKit?: AIKitState;
   onFetchAIKit: () => void;
   onOpenChart: () => void;
+  historyOpen: boolean;
+  onToggleHistory: () => void;
 }) {
   const assumptions = candidate.modelAssumptions as Record<string, unknown>;
   const regime = String(assumptions['regime'] ?? '—');
@@ -535,6 +577,15 @@ function CandidateRow({
           title="Открыть график со слоем сетки"
         >
           📊
+        </button>
+      </td>
+      <td>
+        <button
+          className={`button small ${historyOpen ? 'primary' : ''}`}
+          onClick={onToggleHistory}
+          title="История решений по символу: трасса гейтов и судьба shadow-эпизода"
+        >
+          ⚖️
         </button>
       </td>
     </tr>

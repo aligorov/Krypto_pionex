@@ -14,8 +14,10 @@ import LLMSettings from './components/LLMSettings';
 import MacroSettings from './components/MacroSettings';
 import { TelegramSettings } from './components/TelegramSettings';
 import BacktestLab from './components/BacktestLab';
+import ReplayLab from './components/ReplayLab';
+import GateQuality from './components/GateQuality';
 
-type Tab = 'overview' | 'autogrid' | 'candidates' | 'bots' | 'backtest' | 'llm' | 'accounts' | 'risk' | 'telegram' | 'audit' | 'mcp';
+type Tab = 'overview' | 'autogrid' | 'candidates' | 'bots' | 'backtest' | 'replay' | 'llm' | 'accounts' | 'risk' | 'telegram' | 'audit' | 'mcp';
 
 const canOperate = (role: Role): boolean => role === 'OPERATOR' || role === 'ADMIN';
 const canManage = (role: Role): boolean => role === 'ADMIN';
@@ -251,6 +253,7 @@ export default function App() {
     { id: 'candidates', label: 'Кандидаты', icon: '🎯' },
     { id: 'bots', label: 'Боты · PnL', icon: '📈' },
     { id: 'backtest', label: 'Бэктест-лаб', icon: '🧪' },
+    { id: 'replay', label: 'Replay гейтов', icon: '⏪' },
     { id: 'accounts', label: 'Pionex API', icon: '🔑' },
     { id: 'risk', label: 'Риск', icon: '🛡' },
     { id: 'llm', label: 'AI Мозг', icon: '🧠' },
@@ -395,6 +398,12 @@ export default function App() {
         {activeTab === 'candidates' && <Candidates canOperate={canOperate(user.role)} />}
         {activeTab === 'bots' && <Bots canOperate={canOperate(user.role)} />}
         {activeTab === 'backtest' && <BacktestLab canOperate={canOperate(user.role)} />}
+        {activeTab === 'replay' && (
+          <div className="section-stack">
+            <ReplayLab canOperate={canOperate(user.role)} />
+            <GateQuality />
+          </div>
+        )}
         {activeTab === 'accounts' && <PionexAccounts canManage={canManage(user.role)} />}
         {activeTab === 'risk' && <RiskSettings canManage={canManage(user.role)} />}
         {activeTab === 'llm' && (

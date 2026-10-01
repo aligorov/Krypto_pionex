@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/aligorov/pionex-bot/backend/internal/marketdata"
@@ -45,7 +46,7 @@ const (
 // Machine codes of the deciding gate (entry_decisions.code). Empty string
 // means "no blocker" — the composer's clear verdict.
 const (
-	entryBlockedStorm          = "STORM"
+	entryBlockedStorm = "STORM"
 	// entryWaitGateUnreadable (v2.0.167, week-audit P1-1): an ADVISORY leg
 	// (breaker / economic events / cascade) whose SQL read failed even after
 	// one immediate retry. The pass defers the candidate WITHOUT writing a
@@ -53,7 +54,7 @@ const (
 	// analytics (and must not silently ALLOW either: the audit's WAIT, with a
 	// TTL of one scan pass). Capital-class gates stay fail-closed and the
 	// feed-health leg stays fail-closed exactly as before.
-	entryWaitGateUnreadable = "GATE_UNREADABLE"
+	entryWaitGateUnreadable    = "GATE_UNREADABLE"
 	entryBlockedCircuitBreaker = "CIRCUIT_BREAKER"
 	entryBlockedEconomicEvent  = "ECONOMIC_EVENT"
 	entryBlockedCascade        = "CASCADE"
@@ -556,12 +557,41 @@ func insertEntryDecisionRow(ctx context.Context, db *pgxpool.Pool, in EntryChain
 	if err != nil {
 		featuresJSON = []byte("{}")
 	}
+	// v2.0.184 decision intelligence: every journaled evaluation gets its
+	// episode linkage and a single-element gate trace (the deciding gate with
+	// the numeric inputs it saw). Best-effort alongside the row itself — an
+	// episode-resolution failure downgrades to the plain pre-184 insert.
+	var episodeID *uuid.UUID
+	attemptNo := 1
+	dir := in.Direction
+	if dir == "" {
+		dir = "NEUTRAL"
+	}
+	regime, _ := features["regime"].(string)
+	if eID, att, eErr := ResolveEpisode(ctx, db, in.Symbol, dir, regime); eErr == nil {
+		episodeID = &eID
+		attemptNo = att
+	}
+	stage, _ := features["stage"].(string)
+	if stage == "" {
+		stage = "INTERMEDIATE"
+	}
+	dataQuality, _ := features["dataQuality"].(string)
+	if dataQuality == "" {
+		dataQuality = "OK"
+	}
+	traceJSON, _ := json.Marshal([]GateTraceEntry{{
+		Gate: code, Verdict: outcome, Inputs: features, Quality: dataQuality,
+	}})
 	_, err = db.Exec(ctx, `
 		INSERT INTO entry_decisions (
-			path, fleet, symbol, outcome, code, reason, features, config_version, ref_id
-		) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9)
+			path, fleet, symbol, outcome, code, reason, features, config_version, ref_id,
+			episode_id, attempt_no, decision_at, data_quality, gate_trace, stage
+		) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9,
+			$10, $11, NOW(), $12, $13::jsonb, $14)
 	`,
 		string(in.Path), in.Fleet, in.Symbol, outcome, code, reason,
-		string(featuresJSON), ConfigVersion(ctx, db, in.Settings.ID), in.RefID)
+		string(featuresJSON), ConfigVersion(ctx, db, in.Settings.ID), in.RefID,
+		episodeID, attemptNo, dataQuality, string(traceJSON), stage)
 	return err
 }

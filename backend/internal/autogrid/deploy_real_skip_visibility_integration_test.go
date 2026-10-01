@@ -279,8 +279,12 @@ func newRealDeployHarness(t *testing.T, maxActiveBots int, symbols ...string) *r
 		t.Fatalf("disable backtest gate flag: %v", err)
 	}
 	t.Cleanup(func() {
+		// v2.0.184: restore to FALSE — the no-quant-worker integration suite
+		// hangs any later deploy test in 75s backtest waits when this cleanup
+		// flips the gate back on; tests that need the gate ON enable it in
+		// their own setup (see TestPaperDeployRunsBacktestGate).
 		_, _ = pool.Exec(context.Background(), `
-			UPDATE feature_flags SET enabled = true, updated_at = NOW()
+			UPDATE feature_flags SET enabled = false, updated_at = NOW()
 			WHERE name = 'backtest_gate'
 		`)
 	})

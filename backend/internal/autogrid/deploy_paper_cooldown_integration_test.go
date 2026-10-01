@@ -584,6 +584,12 @@ func TestPaperDeployRunsBacktestGate(t *testing.T) {
 		t.Fatalf("connect: %v", err)
 	}
 	t.Cleanup(pool.Close)
+	// v2.0.184: this test exists to pin the gate — enable it explicitly (the
+	// integration DB default may be off after the real-harness cleanup fix).
+	_, _ = pool.Exec(ctx, `UPDATE feature_flags SET enabled = true, updated_at = NOW() WHERE name = 'backtest_gate'`)
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), `UPDATE feature_flags SET enabled = false, updated_at = NOW() WHERE name = 'backtest_gate'`)
+	})
 
 	worker, _, settings := newCooldownTestWorker(t, pool)
 	// The fake symbol has no live ticker on the real API, and the fresh-price
@@ -686,7 +692,7 @@ func TestPaperDeployRunsBacktestGate(t *testing.T) {
 	if _, err := pool.Exec(ctx, `
 		UPDATE backtest_jobs
 		SET status = 'DONE', finished_at = NOW(),
-		    result = '{"folds": 4, "oos_return_pct": -24.52, "oos_max_drawdown": 0.8106, "round_trips": 4356, "stop_hits": 2}'::jsonb
+		    result = '{"engine_version": "v173", "folds": 4, "oos_return_pct": -24.52, "oos_max_drawdown": 0.8106, "round_trips": 4356, "stop_hits": 2}'::jsonb
 		WHERE symbol = $1 AND interval = $2
 	`, symbol, tradedTF); err != nil {
 		t.Fatalf("finish traded job: %v", err)

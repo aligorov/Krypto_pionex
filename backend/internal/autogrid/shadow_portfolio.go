@@ -107,6 +107,53 @@ func (worker *Worker) captureShadowCandidates(ctx context.Context, settings Sett
 		worker.alertShadowCaptureFailure(ctx, scanID, eligible, err)
 		return
 	}
+	// v2.0.184 decision intelligence: link every captured shadow to the
+	// entry_decisions row that rejected it (episode linkage for the replay
+	// engine and the gate-quality aggregates) and fill the coverage ledger —
+	// inserted rows are observations, eligible-but-capped rejections are the
+	// honest CAP_REACHED share of the denominator.
+	_, lErr := worker.db.Exec(ctx, `
+		UPDATE shadow_candidates sc
+		SET decision_id = d.id, episode_id = d.episode_id, geometry_stage = 'SCANNER'
+		FROM entry_decisions d
+		WHERE sc.scan_id = $1
+		  AND d.symbol = sc.symbol AND d.ref_id = sc.candidate_id::TEXT
+		  AND d.created_at = (
+		      SELECT MAX(d2.created_at) FROM entry_decisions d2
+		      WHERE d2.symbol = sc.symbol AND d2.ref_id = sc.candidate_id::TEXT
+		  )
+		WHERE sc.decision_id IS NULL
+	`, scanID)
+	if lErr != nil {
+		worker.logger.Warn("shadow capture: decision linkage failed",
+			"component", "autogrid_worker", "scan", scanID, "error", lErr)
+	}
+	_, _ = worker.db.Exec(ctx, `
+		INSERT INTO shadow_coverage_log (decision_id, episode_id, symbol, scan_id, shadow_created, skip_reason)
+		SELECT d.id, d.episode_id, c.symbol, c.scan_id, TRUE, NULL
+		FROM autogrid_candidates c
+		JOIN LATERAL (
+		    SELECT id, episode_id FROM entry_decisions
+		    WHERE symbol = c.symbol AND ref_id = c.id::TEXT
+		    ORDER BY created_at DESC LIMIT 1
+		) d ON TRUE
+		WHERE c.scan_id = $1 AND c.decision = 'REJECTED'
+		  AND EXISTS (SELECT 1 FROM shadow_candidates sc
+		              WHERE sc.candidate_id = c.id AND sc.scan_id = $1)
+	`, scanID)
+	_, _ = worker.db.Exec(ctx, `
+		INSERT INTO shadow_coverage_log (decision_id, episode_id, symbol, scan_id, shadow_created, skip_reason)
+		SELECT d.id, d.episode_id, c.symbol, c.scan_id, FALSE, 'CAP_REACHED'
+		FROM autogrid_candidates c
+		JOIN LATERAL (
+		    SELECT id, episode_id FROM entry_decisions
+		    WHERE symbol = c.symbol AND ref_id = c.id::TEXT
+		    ORDER BY created_at DESC LIMIT 1
+		) d ON TRUE
+		WHERE c.scan_id = $1 AND c.decision = 'REJECTED'
+		  AND NOT EXISTS (SELECT 1 FROM shadow_candidates sc
+		                  WHERE sc.candidate_id = c.id AND sc.scan_id = $1)
+	`, scanID)
 	worker.logger.Info(fmt.Sprintf("shadow capture: eligible=%d inserted=%d", eligible, tag.RowsAffected()),
 		"component", "autogrid_worker", "scan", scanID)
 }
@@ -382,20 +429,28 @@ func (worker *Worker) simulateShadowRow(
 		used++
 
 		// Intrabar anti-hunt breach (pessimistic SL-first: checked on the
-		// candle extremes before the close-based decision).
+		// candle extremes before the close-based decision). v2.0.184 fix:
+		// the breach used to SKIP the revaluation entirely (unrealized and
+		// exposure stayed zero), so every stop episode lost its inventory
+		// mark — the MAIN loss of a stopped grid — and gate_value
+		// systematically understated prevented losses. The breach price now
+		// flows through the SAME revaluation as any other close: LONG/SHORT
+		// mark directly by the stop price, NEUTRAL marks the grid inventory
+		// at the clamped stop level (crossings below the stop book no pairs,
+		// so realized is untouched).
 		breached := false
 		if direction == "SHORT" {
 			breached = antiHunt.GreaterThan(decimal.Zero) && c.High.GreaterThanOrEqual(antiHunt)
 		} else {
 			breached = antiHunt.GreaterThan(decimal.Zero) && c.Low.LessThanOrEqual(antiHunt)
 		}
+		if breached {
+			c.Close = antiHunt
+		}
 
 		unrealized := decimal.Zero
 		exposure := decimal.Zero
 		switch {
-		case breached:
-			// fall through to decision below with breach price
-			c.Close = antiHunt
 		case direction == "LONG" || direction == "SHORT":
 			unrealized = investment.Mul(decimal.NewFromInt(int64(leverage)))
 			if direction == "LONG" {

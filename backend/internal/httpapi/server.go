@@ -173,6 +173,16 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /api/autogrid/settings/ai-fill", s.withSession(http.HandlerFunc(s.autoGridAIFill)))
 	mux.Handle("POST /api/autogrid/presets/{id}/apply", s.withRole(auth.RoleOperator, http.HandlerFunc(s.applyAutoGridPreset)))
 	mux.Handle("POST /api/autogrid/paper/clear", s.withRole(auth.RoleOperator, http.HandlerFunc(s.clearPaperHistory)))
+	// v2.0.184 decision intelligence (observation-only): decision history
+	// with episode/shadow fate, immutable replay experiments and per-regime
+	// gate quality. Read-only for sessions; the replay enqueue stays
+	// operator-gated and never touches the trading path.
+	mux.Handle("GET /api/autogrid/decisions", s.withSession(http.HandlerFunc(s.listDecisionHistory)))
+	mux.Handle("GET /api/autogrid/decisions/{id}", s.withSession(http.HandlerFunc(s.getDecisionDetail)))
+	mux.Handle("POST /api/autogrid/replay/run", s.withRole(auth.RoleOperator, http.HandlerFunc(s.runReplayExperiment)))
+	mux.Handle("GET /api/autogrid/replay/runs", s.withSession(http.HandlerFunc(s.listReplayRuns)))
+	mux.Handle("GET /api/autogrid/replay/runs/{id}", s.withSession(http.HandlerFunc(s.getReplayRunDetail)))
+	mux.Handle("GET /api/autogrid/gate-quality", s.withSession(http.HandlerFunc(s.gateQuality)))
 	mux.Handle("GET /api/grids", s.withSession(http.HandlerFunc(s.listGrids)))
 	mux.Handle("GET /api/orders", s.withSession(http.HandlerFunc(s.listOrders)))
 	mux.Handle("GET /api/logs", s.withSession(http.HandlerFunc(s.listLogs)))

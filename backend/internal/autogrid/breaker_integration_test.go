@@ -231,11 +231,13 @@ func TestTranche2DerivedCapGate(t *testing.T) {
 	if skip := worker.tranche2RiskGate(ctx, sixFigure, ghostBot, 6, decimal.NewFromFloat(21.57), 0); skip != "" {
 		t.Fatalf("6x bot $21.57 must pass the derived $37.50 cap (prod SKYAI case), got %q", skip)
 	}
-	skip := worker.tranche2RiskGate(ctx, sixFigure, ghostBot, 6, decimal.NewFromInt(40), 0)
+	// v2.0.177+: the wide-grid floor lifted the 6x/$100 cap to $60, so $40
+	// is legitimately admitted — the overshoot bar moved with it ($70 skips).
+	skip := worker.tranche2RiskGate(ctx, sixFigure, ghostBot, 6, decimal.NewFromInt(70), 0)
 	if skip == "" {
-		t.Fatalf("$40 must be skipped above the derived $37.50 cap")
+		t.Fatalf("$70 must be skipped above the derived $60 cap")
 	}
-	if !strings.Contains(skip, "37.5") || !strings.Contains(skip, "40") {
+	if !strings.Contains(skip, "60") || !strings.Contains(skip, "70") {
 		t.Fatalf("skip reason must print the actual cap and stop, got %q", skip)
 	}
 }

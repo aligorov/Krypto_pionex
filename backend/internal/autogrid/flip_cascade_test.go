@@ -269,8 +269,8 @@ func TestDgtRedeployStressCeiling_Integration(t *testing.T) {
 	settings.StopForecastMode = "ACTIVE"
 	settings.DgtRedeployEnabled = true
 	capPinned := tranche2MaxLossCap(d("250"), 2, 0) // flat 8% floor: $250×2×8%×1.25 = $50 > $31.25 base
-	if !capPinned.Equal(d("31.25")) {
-		t.Fatalf("pinned ceiling must be $31.25 for the $250 slot at 2x, got %s", capPinned.String())
+	if !capPinned.Equal(d("50")) {
+		t.Fatalf("pinned ceiling must be $50 (wide-grid floor) for the $250 slot at 2x, got %s", capPinned.String())
 	}
 
 	// The closed bot: a settled LONG break whose intent carries a high ATR

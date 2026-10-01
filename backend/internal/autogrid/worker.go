@@ -1512,8 +1512,9 @@ func (worker *Worker) deployPaper(
 				worker.logger.Info("entry gate: volatility expansion, skip",
 					"component", "autogrid_worker", "symbol", candidate.Symbol,
 					"rv_ref_ratio", math.Round(ratio*100)/100)
-				worker.rejectCandidate(ctx, candidate,
-					fmt.Sprintf("entry gate: расширение волатильности (RV/базлайн %.2f ≥ 1.5) — вход в ускорение заблокирован", math.Round(ratio*100)/100), nil)
+				worker.rejectCandidateDI(ctx, candidate,
+					fmt.Sprintf("entry gate: расширение волатильности (RV/базлайн %.2f ≥ 1.5) — вход в ускорение заблокирован", math.Round(ratio*100)/100), nil,
+					"SCANNER_PAPER", "PAPER", "RV", map[string]any{"ratio": math.Round(ratio*100) / 100, "threshold": 1.5, "direction": "gte"})
 				continue
 			}
 		}
@@ -1759,8 +1760,9 @@ func (worker *Worker) deployPaper(
 			minCushion := settings.MinDepthCushionRatio.InexactFloat64()
 			ok, profile, depthReason := worker.checkOrderBookCushion(ctx, candidate.Symbol, candidate.CurrentPrice, botNotional, minCushion, false, settings.MaxSpreadPct)
 			if !ok {
-				worker.rejectCandidate(ctx, candidate,
-					fmt.Sprintf("Стакан: %s — отказ по фильтру тонкой ликвидности", depthReason), nil)
+				worker.rejectCandidateDI(ctx, candidate,
+					fmt.Sprintf("Стакан: %s — отказ по фильтру тонкой ликвидности", depthReason), nil,
+					"SCANNER_PAPER", "PAPER", "ORDERBOOK", map[string]any{"depth_reason": depthReason})
 				continue
 			}
 			if trend != "short" && profile.HasBidWall && profile.BidWallPrice.GreaterThan(mesh.LowerPrice) && profile.BidWallPrice.LessThan(candidate.CurrentPrice) {
@@ -1807,7 +1809,8 @@ func (worker *Worker) deployPaper(
 			if spanPct := mesh.UpperPrice.Sub(mesh.LowerPrice).Div(candidate.CurrentPrice).Mul(decimal.NewFromInt(100)).InexactFloat64(); mesh.GridNum > 0 {
 				if stepPct := spanPct / float64(mesh.GridNum); stepPct > 0 {
 					if reason, violated := marketdata.FeeGateRejection(stepPct, decimalFloat(settings.FeeBps), decimalFloat(settings.SlippageBps)); violated {
-						worker.rejectCandidate(ctx, candidate, "fee-gate (финальная геометрия после анкера): "+reason, nil)
+						worker.rejectCandidateDI(ctx, candidate, "fee-gate (финальная геометрия после анкера): "+reason, nil,
+							"SCANNER_PAPER", "PAPER", "FEE_GATE", map[string]any{"floor_pct": 0.504})
 						continue
 					}
 				}
@@ -1818,8 +1821,9 @@ func (worker *Worker) deployPaper(
 		if settings.KnifePauseEnabled {
 			paused, _, knifeReason := worker.checkKnifePause(ctx, candidate.Symbol, trend)
 			if paused {
-				worker.rejectCandidate(ctx, candidate,
-					fmt.Sprintf("Knife Pause: %s — деплой отложен для защиты от падающего ножа", knifeReason), nil)
+				worker.rejectCandidateDI(ctx, candidate,
+					fmt.Sprintf("Knife Pause: %s — деплой отложен для защиты от падающего ножа", knifeReason), nil,
+					"SCANNER_PAPER", "PAPER", "KNIFE", map[string]any{"reason": knifeReason})
 				continue
 			}
 		}
@@ -1856,13 +1860,15 @@ func (worker *Worker) deployPaper(
 				worker.logger.Info("skip paper deploy: stress inventory exceeds loss ceiling",
 					"component", "autogrid_worker", "symbol", candidate.Symbol,
 					"stress_loss", stress.loss.StringFixed(2), "ceiling", stressCeiling.StringFixed(2))
-				worker.rejectCandidate(ctx, candidate,
+				worker.rejectCandidateDI(ctx, candidate,
 					fmt.Sprintf("стресс-инвентарь: полный проход сетки до стопа $%s превышает допустимый убыток $%s — геометрия концентрирует риск больше бюджета",
 						stress.loss.StringFixed(2), stressCeiling.StringFixed(2)),
 					map[string]any{"stressLossFloor": map[string]any{
 						"stressLossUsdt": stress.loss.StringFixed(2),
 						"ceilingUsdt":    stressCeiling.StringFixed(2),
-					}})
+					}},
+					"SCANNER_PAPER", "PAPER", "STRESS", map[string]any{
+						"stress_loss": stress.loss.InexactFloat64(), "ceiling": stressCeiling.InexactFloat64()})
 				continue
 			}
 		}
@@ -2791,8 +2797,9 @@ func (worker *Worker) deployReal(
 				worker.logger.Info("entry gate: volatility expansion, skip real deploy",
 					"component", "autogrid_worker", "symbol", candidate.Symbol,
 					"rv_ref_ratio", math.Round(ratio*100)/100)
-				worker.rejectCandidate(ctx, candidate,
-					fmt.Sprintf("entry gate: расширение волатильности (RV/базлайн %.2f ≥ 1.5) — вход в ускорение заблокирован", math.Round(ratio*100)/100), nil)
+				worker.rejectCandidateDI(ctx, candidate,
+					fmt.Sprintf("entry gate: расширение волатильности (RV/базлайн %.2f ≥ 1.5) — вход в ускорение заблокирован", math.Round(ratio*100)/100), nil,
+					"SCANNER_REAL", "REAL", "RV", map[string]any{"ratio": math.Round(ratio*100) / 100, "threshold": 1.5, "direction": "gte"})
 				continue
 			}
 		}
@@ -3042,8 +3049,9 @@ func (worker *Worker) deployReal(
 			minCushion := settings.MinDepthCushionRatio.InexactFloat64()
 			ok, profile, depthReason := worker.checkOrderBookCushion(ctx, candidate.Symbol, candidate.CurrentPrice, botNotional, minCushion, true, settings.MaxSpreadPct)
 			if !ok {
-				worker.rejectCandidate(ctx, candidate,
-					fmt.Sprintf("Стакан: %s — отказ по фильтру тонкой ликвидности", depthReason), nil)
+				worker.rejectCandidateDI(ctx, candidate,
+					fmt.Sprintf("Стакан: %s — отказ по фильтру тонкой ликвидности", depthReason), nil,
+					"SCANNER_REAL", "REAL", "ORDERBOOK", map[string]any{"depth_reason": depthReason})
 				continue
 			}
 			if trend != "short" && profile.HasBidWall && profile.BidWallPrice.GreaterThan(lowerPrice) && profile.BidWallPrice.LessThan(candidate.CurrentPrice) {
@@ -3077,7 +3085,8 @@ func (worker *Worker) deployReal(
 			if spanPct := upperPrice.Sub(lowerPrice).Div(candidate.CurrentPrice).Mul(decimal.NewFromInt(100)).InexactFloat64(); mesh.GridNum > 0 {
 				if stepPct := spanPct / float64(mesh.GridNum); stepPct > 0 {
 					if reason, violated := marketdata.FeeGateRejection(stepPct, decimalFloat(settings.FeeBps), decimalFloat(settings.SlippageBps)); violated {
-						worker.rejectCandidate(ctx, candidate, "fee-gate (финальная геометрия после анкера): "+reason, nil)
+						worker.rejectCandidateDI(ctx, candidate, "fee-gate (финальная геометрия после анкера): "+reason, nil,
+							"SCANNER_REAL", "REAL", "FEE_GATE", map[string]any{"floor_pct": 0.504})
 						continue
 					}
 				}
@@ -3104,8 +3113,9 @@ func (worker *Worker) deployReal(
 		if settings.KnifePauseEnabled {
 			paused, _, knifeReason := worker.checkKnifePause(ctx, candidate.Symbol, trend)
 			if paused {
-				worker.rejectCandidate(ctx, candidate,
-					fmt.Sprintf("Knife Pause: %s — деплой отложен для защиты от падающего ножа", knifeReason), nil)
+				worker.rejectCandidateDI(ctx, candidate,
+					fmt.Sprintf("Knife Pause: %s — деплой отложен для защиты от падающего ножа", knifeReason), nil,
+					"SCANNER_REAL", "REAL", "KNIFE", map[string]any{"reason": knifeReason})
 				continue
 			}
 		}
@@ -3192,13 +3202,15 @@ func (worker *Worker) deployReal(
 				deployErrors = append(deployErrors, fmt.Sprintf(
 					"%s: stress inventory $%s exceeds loss ceiling $%s",
 					candidate.Symbol, stress.loss.StringFixed(2), stressCeiling.StringFixed(2)))
-				worker.rejectCandidate(ctx, candidate,
+				worker.rejectCandidateDI(ctx, candidate,
 					fmt.Sprintf("стресс-инвентарь: полный проход сетки до стопа $%s превышает допустимый убыток $%s — геометрия концентрирует риск больше бюджета",
 						stress.loss.StringFixed(2), stressCeiling.StringFixed(2)),
 					map[string]any{"stressLossFloor": map[string]any{
 						"stressLossUsdt": stress.loss.StringFixed(2),
 						"ceilingUsdt":    stressCeiling.StringFixed(2),
-					}})
+					}},
+					"SCANNER_REAL", "REAL", "STRESS", map[string]any{
+						"stress_loss": stress.loss.InexactFloat64(), "ceiling": stressCeiling.InexactFloat64()})
 				continue
 			}
 		}
@@ -3453,9 +3465,10 @@ func (worker *Worker) deployReal(
 			worker.logger.Warn("entry gate: checkParams failed — real deploy refused (fail-closed)",
 				"component", "autogrid_worker", "symbol", candidate.Symbol, "error", checkErr)
 			deployErrors = append(deployErrors, fmt.Sprintf("%s: checkParams: %v", candidate.Symbol, checkErr))
-			worker.rejectCandidate(ctx, candidate,
+			worker.rejectCandidateDI(ctx, candidate,
 				"preflight checkParams недоступен — деплой отказан (fail-closed, v2.0.168): "+checkErr.Error(),
-				map[string]any{"checkParamsRefused": true})
+				map[string]any{"checkParamsRefused": true},
+				"SCANNER_REAL", "REAL", "CHECK_PARAMS", map[string]any{"error": checkErr.Error()})
 			continue
 		} else if check != nil {
 			// v2.0.172 (audit): log the exchange's ACTUAL boundaries and
@@ -3968,6 +3981,30 @@ func (worker *Worker) rejectCandidate(
 	`, candidate.ID, reason, assumptions)
 }
 
+// rejectCandidateDI (v2.0.184 decision intelligence): the reject wrapper for
+// the LATE deploy gates that never flowed through the shared entry-chain
+// journal (stress, fee-gate, orderbook, knife, backtest, checkParams, RV).
+// Writes the same candidate rejection PLUS an entry_decisions row with
+// episode linkage and a single-gate trace carrying the gate's numeric
+// inputs — the observation the replay engine later re-judges. Best-effort:
+// RecordDecision self-limits and can never block the trading path.
+func (worker *Worker) rejectCandidateDI(
+	ctx context.Context, candidate Candidate, reason string, assumptions map[string]any,
+	path, fleet, gate string, inputs map[string]any,
+) {
+	worker.rejectCandidate(ctx, candidate, reason, assumptions)
+	RecordDecision(ctx, worker.db, DecisionRecord{
+		Path: path, Fleet: fleet, Symbol: candidate.Symbol, RefID: candidate.ID,
+		Outcome: "REJECT", Code: gate, Reason: reason,
+		Stage:           "INTERMEDIATE",
+		DataQuality:     "OK",
+		Trace:           []GateTraceEntry{{Gate: gate, Verdict: "REJECT", Inputs: inputs, Quality: "OK"}},
+		CandidateID:     candidate.ID,
+		PriceAtDecision: &candidate.CurrentPrice,
+		PriceSource:     "pionex_last",
+	})
+}
+
 // deployStructContext snapshots the market thesis a bot is opened under:
 // confluence readings from the candidate's model_assumptions plus the
 // invalidation level the supervision loop will act on.
@@ -4288,6 +4325,11 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 	if time.Since(worker.gateValueAt) > 24*time.Hour {
 		worker.gateValueAt = time.Now()
 		worker.buildGateValueReport(ctx)
+		// v2.0.184 decision intelligence: per-regime quality aggregates with
+		// coverage, episode finalization (untouched 2h with no ALLOW = closed
+		// rejection), and the immutable replay-experiment worker.
+		RunDueGateQuality(ctx, worker)
+		RunDueReplayExperiments(ctx, worker)
 	}
 	// v2.0.111: surface storm arm/extend transitions once per arm.
 	worker.maybeLogStormState(ctx)
