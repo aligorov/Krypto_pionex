@@ -2,6 +2,7 @@ package autogrid
 
 import (
 	"encoding/json"
+	"math"
 	"testing"
 
 	"github.com/aligorov/pionex-bot/backend/internal/marketdata"
@@ -330,5 +331,54 @@ func TestMatchesDeployParamsDriftTolerance(t *testing.T) {
 	// Grid count must stay exact.
 	if matchesDeployParams(mk(1030.83, 1067.55, 16), p) {
 		t.Fatal("different grid_num must NOT match")
+	}
+}
+
+// v2.0.183: the span floor follows the pair's own daily noise — grids stop
+// collapsing onto the flat 8%, and high-vol pairs earn wider, denser grids.
+func TestDeploySpanFloorVolScaled(t *testing.T) {
+	cases := []struct{ vol, want float64 }{
+		{0, 8},      // unknown vol → flat doctrine floor
+		{2.6, 8},    // quiet pair → floor
+		{4.0, 8},    // 2σ = 8% → exactly the floor
+		{5.7, 11.4}, // SNXXX-class: 2σ above the floor
+		{8.2, 16.4}, // WLD-class
+		{20.0, 25},  // clamped at the doctrine cap
+	}
+	for _, c := range cases {
+		if got := DeploySpanFloorPct(c.vol); math.Abs(got-c.want) > 1e-9 {
+			t.Fatalf("DeploySpanFloorPct(%v) = %v, want %v", c.vol, got, c.want)
+		}
+	}
+	// WLD-class widening: 5% span on vol 8.2% must widen to ~16.4%.
+	price := decimal.NewFromFloat(0.4884)
+	lower := decimal.NewFromFloat(0.4762)
+	upper := decimal.NewFromFloat(0.5006)
+	nl, nu := EnsureDeploySpanForVol(lower, upper, price, 8.2)
+	span, _ := nu.Sub(nl).Div(price).Mul(decimal.NewFromInt(100)).Float64()
+	if span < 16.3 || span > 16.5 {
+		t.Fatalf("vol 8.2%% must widen to ~16.4%% span, got %.2f%%", span)
+	}
+	// Already-wider span is never shrunk.
+	wl, wu := EnsureDeploySpanForVol(nl, nu, price, 2.0)
+	if !wl.Equal(nl) || !wu.Equal(nu) {
+		t.Fatal("wider span must not shrink")
+	}
+	// Densify follows the vol span: 16.4% / 0.504% → 32 rows at $75×4x.
+	if rows := DensifyGridNumForSpan(15, nl, nu, price, 300, 5, 2); rows < 31 || rows > 33 {
+		t.Fatalf("16.4%% span must densify to 31-33 rows, got %d", rows)
+	}
+}
+
+// v2.0.183: the stress ceiling reads the ACTUAL span.
+func TestBotGridSpanPct(t *testing.T) {
+	price := decimal.NewFromFloat(1049.19)
+	lower := decimal.NewFromFloat(1007.42)
+	upper := decimal.NewFromFloat(1091.38)
+	if got := botGridSpanPct(lower, upper, price); got < 7.9 || got > 8.1 {
+		t.Fatalf("MUX span must read ~8%%, got %.2f", got)
+	}
+	if got := botGridSpanPct(upper, lower, price); got != 0 {
+		t.Fatalf("inverted bounds must read 0, got %.2f", got)
 	}
 }

@@ -223,7 +223,7 @@ func runStopEnvelopeSeries(t *testing.T, budgetUSDT decimal.Decimal, fullStops [
 		step()
 		// Tranche-2 gate: per-bot derived cap first, then the fleet envelope
 		// over the DOUBLED stop (the manage loop's effMaxLoss).
-		cap := tranche2MaxLossCap(budgetUSDT, impliedLeverage(budgetUSDT, full))
+		cap := tranche2MaxLossCap(budgetUSDT, impliedLeverage(budgetUSDT, full), 0)
 		eff := fleet[len(fleet)-1].full
 		if eff.GreaterThan(cap) ||
 			stopEnvelopeExceeded(stopEnvelopeFleet(fleet, len(fleet)-1, eff), breaker) {

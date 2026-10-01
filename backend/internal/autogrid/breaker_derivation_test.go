@@ -62,29 +62,37 @@ func TestDeriveDailyLossBreaker(t *testing.T) {
 	}
 }
 
-// TestTranche2MaxLossCap pins the v2.075 per-bot tranche-2 ceiling
-// budget×leverage×5% CEILING×1.25: the floor-based cap (2% → $15 at 6x/$100)
-// refused exactly the wide σ-scaled stops the design formula legally
-// produces (prod SKYAI: $21.57 skipped ×3). The ceiling cap admits the whole
-// legal stop range and still blocks genuine overshoots.
+// TestTranche2MaxLossCap pins the per-bot tranche-2 ceiling. v2.0.177 made
+// the wide-grid floor (flat 8% × 1.25) exceed the 5% × 1.25 base; v2.0.183
+// scales that floor with the ACTUAL deployed span — a 12% vol-scaled grid is
+// judged against 12%, not the 8% yardstick (prod DOT $41.79 > $37.50 cut).
 func TestTranche2MaxLossCap(t *testing.T) {
 	budget := decimal.NewFromInt(200)
 	// v2.0.177: wide-grid floor (8% × 1.25 = 10%) now exceeds the old 5% × 1.25 base
-	if cap := tranche2MaxLossCap(budget, 2); !cap.Equal(decimal.NewFromInt(40)) {
-		t.Fatalf("2x cap must be $40 (wide-grid floor), got %s", cap)
+	if cap := tranche2MaxLossCap(budget, 2, 0); !cap.Equal(decimal.NewFromInt(40)) {
+		t.Fatalf("2x cap must be $40 (flat wide-grid floor), got %s", cap)
 	}
-	if cap := tranche2MaxLossCap(budget, 4); !cap.Equal(decimal.NewFromInt(80)) {
-		t.Fatalf("4x cap must be $80 (wide-grid floor), got %s", cap)
+	if cap := tranche2MaxLossCap(budget, 4, 0); !cap.Equal(decimal.NewFromInt(80)) {
+		t.Fatalf("4x cap must be $80 (flat wide-grid floor), got %s", cap)
 	}
 	// Degenerate leverage falls back to 1x, never to zero.
-	if cap := tranche2MaxLossCap(budget, 0); !cap.Equal(decimal.NewFromInt(20)) {
-		t.Fatalf("0x (fallback 1x) cap must be $20 (wide-grid floor), got %s", cap)
+	if cap := tranche2MaxLossCap(budget, 0, 0); !cap.Equal(decimal.NewFromInt(20)) {
+		t.Fatalf("0x (fallback 1x) cap must be $20 (flat wide-grid floor), got %s", cap)
+	}
+	// v2.0.183: the floor follows the ACTUAL span — a 12% vol-scaled grid at
+	// 2x/$200 → $200×2×12%×1.25 = $60, not the flat $40.
+	if cap := tranche2MaxLossCap(budget, 2, 12.0); !cap.Equal(decimal.NewFromInt(60)) {
+		t.Fatalf("2x/12%%-span cap must be $60, got %s", cap)
+	}
+	// Span beyond the doctrine cap clamps at 25%: $100×6×25%×1.25 = $187.50.
+	if cap := tranche2MaxLossCap(decimal.NewFromInt(100), 6, 40.0); !cap.Equal(decimal.NewFromFloat(187.5)) {
+		t.Fatalf("6x/40%%-span cap must clamp to $187.50, got %s", cap)
 	}
 
 	// Operator case: 6x on $100 → cap $37.50; a $21.57 dynamic stop passes,
 	// a $40 overshoot does not.
 	// v2.0.177: 6x/$100 wide-grid floor: $100 × 6 × 8% × 1.25 = $60
-	sixCap := tranche2MaxLossCap(decimal.NewFromInt(100), 6)
+	sixCap := tranche2MaxLossCap(decimal.NewFromInt(100), 6, 0)
 	if !sixCap.Equal(decimal.NewFromInt(60)) {
 		t.Fatalf("6x/$100 cap must be $60 (wide-grid floor), got %s", sixCap)
 	}

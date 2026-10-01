@@ -1520,9 +1520,10 @@ func (worker *Worker) deployPaper(
 		if harGeo != nil {
 			harGeo.applyToMesh(candidate.CurrentPrice, &mesh)
 		}
-		// v2.0.163 wide-grid doctrine (paper mirror): ≥8% span after every
-		// geometry source; levels keep, steps widen with the span.
-		mesh.LowerPrice, mesh.UpperPrice = EnsureDeploySpan(mesh.LowerPrice, mesh.UpperPrice, candidate.CurrentPrice)
+		// v2.0.163 wide-grid doctrine (paper mirror): the span floor follows
+		// the pair's own daily noise (v2.0.183) after every geometry source;
+		// levels re-derive via DensifyGridNumForSpan below.
+		mesh.LowerPrice, mesh.UpperPrice = EnsureDeploySpanForVol(mesh.LowerPrice, mesh.UpperPrice, candidate.CurrentPrice, candidate.VolatilityPct.InexactFloat64())
 
 		trend := strings.ToLower(strings.TrimSpace(candidate.RecommendedTrend))
 		if trend == "no_trend" || trend == "" {
@@ -1850,7 +1851,7 @@ func (worker *Worker) deployPaper(
 		// and then has its top-up structurally refused forever. FIXED-mode
 		// targets are exempt — the operator set the stop deliberately.
 		if settings.PnLTargetMode != "FIXED" {
-			stressCeiling := tranche2MaxLossCap(settings.BudgetUSDT, botLev)
+			stressCeiling := tranche2MaxLossCap(settings.BudgetUSDT, botLev, meshSpanPct)
 			if stress.loss.GreaterThan(stressCeiling) {
 				worker.logger.Info("skip paper deploy: stress inventory exceeds loss ceiling",
 					"component", "autogrid_worker", "symbol", candidate.Symbol,
@@ -2805,11 +2806,12 @@ func (worker *Worker) deployReal(
 		}
 
 		// v2.0.163 wide-grid doctrine: after every geometry source has
-		// spoken, the span must still cover a normal move — ≥8% of price.
-		// The level count keeps: wider bounds with the same levels widen
-		// every step (bigger harvest per crossing, same fee share).
-		if nl, nu := EnsureDeploySpan(mesh.LowerPrice, mesh.UpperPrice, candidate.CurrentPrice); !nl.Equal(mesh.LowerPrice) || !nu.Equal(mesh.UpperPrice) {
-			worker.logger.Info("v2.0.163 wide-grid: span widened to 8% floor",
+		// spoken, the span must still cover the pair's own daily noise —
+		// v2.0.183: the floor scales with Parkinson vol (2σ range), not the
+		// flat 8% every narrow-S/R candidate used to collapse onto. The
+		// level count re-derives below (densify).
+		if nl, nu := EnsureDeploySpanForVol(mesh.LowerPrice, mesh.UpperPrice, candidate.CurrentPrice, candidate.VolatilityPct.InexactFloat64()); !nl.Equal(mesh.LowerPrice) || !nu.Equal(mesh.UpperPrice) {
+			worker.logger.Info("v2.0.183 wide-grid: vol-scaled span floor applied",
 				"component", "autogrid_worker", "symbol", candidate.Symbol,
 				"was_lower", mesh.LowerPrice.StringFixed(6), "was_upper", mesh.UpperPrice.StringFixed(6),
 				"new_lower", nl.StringFixed(6), "new_upper", nu.StringFixed(6), "grid_num", mesh.GridNum)
@@ -3058,7 +3060,7 @@ func (worker *Worker) deployReal(
 			// the one unrounded mutation reaching CreateFuturesGridBot and
 			// the exchange refused five accepted candidates with
 			// "top not match quote precision" (XLM/ALABX/ARB/SOXLX/UNI).
-			if nl, nu := EnsureDeploySpan(lowerPrice, upperPrice, candidate.CurrentPrice); !nl.Equal(lowerPrice) || !nu.Equal(upperPrice) {
+			if nl, nu := EnsureDeploySpanForVol(lowerPrice, upperPrice, candidate.CurrentPrice, candidate.VolatilityPct.InexactFloat64()); !nl.Equal(lowerPrice) || !nu.Equal(upperPrice) {
 				nl = nl.Round(int32(pricePrecision))
 				nu = nu.Round(int32(pricePrecision))
 				if nu.GreaterThan(nl) {
@@ -3185,7 +3187,7 @@ func (worker *Worker) deployReal(
 		// is not budget-sized: refuse BEFORE a grid row or a create fee is
 		// ever submitted. FIXED-mode targets are exempt (operator's stop).
 		if settings.PnLTargetMode != "FIXED" {
-			stressCeiling := tranche2MaxLossCap(slotBudget, botLev)
+			stressCeiling := tranche2MaxLossCap(slotBudget, botLev, botTargetSpan)
 			if stress.loss.GreaterThan(stressCeiling) {
 				deployErrors = append(deployErrors, fmt.Sprintf(
 					"%s: stress inventory $%s exceeds loss ceiling $%s",
@@ -5533,7 +5535,7 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 					// injected margin — same risk gate as the paper path. The
 					// skip writes a 1h backoff marker so an armed 24h time-box
 					// cannot re-log every manage pass.
-					if skip := worker.tranche2RiskGate(ctx, *settings, bot.id, bot.leverage, botMaxLoss.Mul(decimal.NewFromInt(2))); skip != "" {
+					if skip := worker.tranche2RiskGate(ctx, *settings, bot.id, bot.leverage, botMaxLoss.Mul(decimal.NewFromInt(2)), botGridSpanPct(bot.lower, bot.upper, price)); skip != "" {
 						tag, tErr2 := worker.db.Exec(ctx, `
 						UPDATE grid_bots
 						SET model_state = jsonb_set(model_state, '{tranche2SkipAt}',
@@ -6463,7 +6465,7 @@ func fleetStopEnvelope(
 // The ceiling-based cap admits the whole legal stop range (6x/$100 → $37.50)
 // while still refusing genuine overshoots (a $40 stop on 6x/$100 exceeds
 // even the ceiling by headroom).
-func tranche2MaxLossCap(budgetUSDT decimal.Decimal, botLeverage int) decimal.Decimal {
+func tranche2MaxLossCap(budgetUSDT decimal.Decimal, botLeverage int, spanPct float64) decimal.Decimal {
 	if botLeverage < 1 {
 		botLeverage = 1
 	}
@@ -6471,16 +6473,26 @@ func tranche2MaxLossCap(budgetUSDT decimal.Decimal, botLeverage int) decimal.Dec
 	// narrow; the wide-grid doctrine (v2.0.163, span ≥8%) made the full
 	// traverse to stop structurally exceed it (prod 01.10: SOXLX $38.65
 	// vs $37.50 cap, AXTIX $56.02). The cap now ALSO accommodates the
-	// deploy-span floor (8%) + a 1.5×ATR stop buffer ≈ 11% — whichever
-	// is larger.
+	// full-traverse distance of the ACTUAL deployed grid (v2.0.183: the
+	// floor follows the geometry — a vol-scaled 12-16% span must not be
+	// judged against an 8% yardstick, prod DOT $41.79 > $37.50 cuts) —
+	// whichever is larger.
 	base := budgetUSDT.
 		Mul(decimal.NewFromInt(int64(botLeverage))).
 		Mul(designStopCeilFrac()).
 		Mul(decimal.NewFromFloat(breakerHeadroom))
-	// Wide-grid floor: budget × leverage × minDeploySpanPct% × breakerHeadroom
+	// Wide-grid floor: budget × leverage × the ACTUAL span (≥ the flat
+	// doctrine floor, ≤ the doctrine cap) × breakerHeadroom.
+	spanFloor := minDeploySpanPct
+	if spanPct > spanFloor {
+		spanFloor = spanPct
+	}
+	if spanFloor > maxDeploySpanPct {
+		spanFloor = maxDeploySpanPct
+	}
 	wideGridFloor := budgetUSDT.
 		Mul(decimal.NewFromInt(int64(botLeverage))).
-		Mul(decimal.NewFromFloat(minDeploySpanPct / 100.0)).
+		Mul(decimal.NewFromFloat(spanFloor / 100.0)).
 		Mul(decimal.NewFromFloat(breakerHeadroom))
 	if wideGridFloor.GreaterThan(base) {
 		return wideGridFloor
@@ -6502,8 +6514,9 @@ func (worker *Worker) tranche2RiskGate(
 	botID string,
 	botLeverage int,
 	effMaxLoss decimal.Decimal,
+	spanPct float64,
 ) string {
-	capUSDT := tranche2MaxLossCap(settings.BudgetUSDT, botLeverage)
+	capUSDT := tranche2MaxLossCap(settings.BudgetUSDT, botLeverage, spanPct)
 	if effMaxLoss.GreaterThan(capUSDT) {
 		return fmt.Sprintf("кап эффективного стопа: %s > %s USDT", effMaxLoss.StringFixed(2), capUSDT.StringFixed(2))
 	}
@@ -6521,6 +6534,17 @@ func (worker *Worker) tranche2RiskGate(
 			envelope.StringFixed(2), envelopeLimit.StringFixed(2))
 	}
 	return ""
+}
+
+// botGridSpanPct (v2.0.183): the ACTUAL deployed-grid span for the top-up
+// gates — the stress ceiling must judge the geometry the bot really runs,
+// not the flat doctrine floor.
+func botGridSpanPct(lower, upper, price decimal.Decimal) float64 {
+	if !price.GreaterThan(decimal.Zero) || !upper.GreaterThan(lower) {
+		return 0
+	}
+	spanPct, _ := upper.Sub(lower).Div(price).Mul(decimal.NewFromInt(100)).Float64()
+	return spanPct
 }
 
 // riskStopEnvelopeFraction is the fleet stop-envelope ceiling as a fraction
@@ -7392,7 +7416,7 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 							}, entryOutcomeReject, "TRANCHE_STRESS",
 								"мораторий стресса: шторм-режим или радар-полоса ≥2 — вторая доля не вливается в спасаемую позицию", nil)
 						}
-					} else if skip := worker.tranche2RiskGate(ctx, settings, bot.id, bot.leverage, effMaxLoss); skip != "" {
+					} else if skip := worker.tranche2RiskGate(ctx, settings, bot.id, bot.leverage, effMaxLoss, botGridSpanPct(bot.lower, bot.upper, bot.entry)); skip != "" {
 						// Backoff marker: the 24h time-box keeps the trigger
 						// armed forever, so a gated skip must not re-log on
 						// every manage pass — one event per hour max.

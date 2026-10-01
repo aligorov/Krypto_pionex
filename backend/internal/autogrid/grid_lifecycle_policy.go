@@ -380,7 +380,7 @@ func (worker *Worker) dgtSharedGateBlockers(ctx context.Context, settings Settin
 			  AND COALESCE(closed_at, updated_at) > NOW() - INTERVAL '24 hours'
 		`, spec.accountID, spec.symbol).Scan(&chainSum); err == nil && chainSum < 0 {
 			chainLoss := decimal.NewFromFloat(-chainSum)
-			chainBudget := tranche2MaxLossCap(spec.slotBudget, settings.Leverage).
+			chainBudget := tranche2MaxLossCap(spec.slotBudget, settings.Leverage, 0).
 				Mul(decimal.NewFromInt(2))
 			if chainLoss.GreaterThan(chainBudget) {
 				return fmt.Sprintf("цепочка прорывов: −$%s убытка по символу за 24ч превышает бюджет цепочки $%s — слот остаётся сканеру",
@@ -459,8 +459,8 @@ func (worker *Worker) dgtFreshGeometry(
 	if spanPct < minDeploySpanPct {
 		spanPct = minDeploySpanPct
 	}
-	if spanPct > 25.0 {
-		spanPct = 25.0
+	if spanPct > maxDeploySpanPct { // v2.0.183: shared doctrine cap (was a local literal)
+		spanPct = maxDeploySpanPct
 	}
 	half := spec.breakPrice.Mul(decimal.NewFromFloat(spanPct / 200.0))
 	stubLower := spec.breakPrice.Sub(half)
@@ -879,7 +879,7 @@ func (worker *Worker) dgtRedeployPaper(ctx context.Context, settings Settings, s
 	// exact v2.0.139-deploy-gate class the deploy arms reject. FIXED-mode
 	// targets are exempt — the operator set the stop deliberately.
 	if settings.PnLTargetMode != "FIXED" {
-		stressCeiling := tranche2MaxLossCap(spec.slotBudget, botLev)
+		stressCeiling := tranche2MaxLossCap(spec.slotBudget, botLev, botGridSpanPct(mesh.LowerPrice, mesh.UpperPrice, spec.breakPrice))
 		if stress.loss.GreaterThan(stressCeiling) {
 			worker.noteDgtSkip(ctx, spec, "PAPER", fmt.Sprintf(
 				"стресс-инвентарь: полный проход сетки до стопа $%s превышает допустимый убыток $%s — геометрия концентрирует риск больше бюджета",
@@ -1142,7 +1142,7 @@ func (worker *Worker) dgtRedeployReal(ctx context.Context, settings Settings, sp
 	// create fee or a native stop is ever submitted. FIXED-mode targets are
 	// exempt — the operator set the stop deliberately.
 	if settings.PnLTargetMode != "FIXED" {
-		stressCeiling := tranche2MaxLossCap(spec.slotBudget, botLev)
+		stressCeiling := tranche2MaxLossCap(spec.slotBudget, botLev, botGridSpanPct(mesh.LowerPrice, mesh.UpperPrice, spec.breakPrice))
 		if stress.loss.GreaterThan(stressCeiling) {
 			worker.noteDgtSkip(ctx, spec, "REAL", fmt.Sprintf(
 				"стресс-инвентарь: полный проход сетки до стопа $%s превышает допустимый убыток $%s — геометрия концентрирует риск больше бюджета",

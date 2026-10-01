@@ -430,7 +430,7 @@ func TestDeployPaperStopEnvelopeGate(t *testing.T) {
 	if !storedStop.Equal(decimal.NewFromInt(4)) {
 		t.Fatalf("tranche-1 storage must keep the half stop (4), got %s", storedStop)
 	}
-	if skip := worker.tranche2RiskGate(ctx, *settings, botID, botLeverage, decimal.NewFromInt(8)); skip != "" {
+	if skip := worker.tranche2RiskGate(ctx, *settings, botID, botLeverage, decimal.NewFromInt(8), 0); skip != "" {
 		t.Fatalf("newborn's tranche-2 must fit at birth under full-stop reservation, got skip %q", skip)
 	}
 }

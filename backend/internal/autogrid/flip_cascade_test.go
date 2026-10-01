@@ -238,7 +238,7 @@ func TestDgtChainLossBudget_Integration(t *testing.T) {
 // TestDgtRedeployStressCeiling_Integration pins the ceiling half of the
 // v2.0.139 floor/ceiling pair the re-center arms were missing: a LONG
 // replacement whose full adverse traverse to the anti-hunt stop overflows
-// tranche2MaxLossCap(slotBudget, botLev) must be refused BEFORE any exchange
+// tranche2MaxLossCap(slotBudget, botLev, 0) must be refused BEFORE any exchange
 // create — noteDgtSkip's DGT_REDEPLOY_SKIPPED event carries the deploy
 // gates' стресс-инвентарь reason. Geometry forcing is deterministic by
 // construction: leverage pinned to 2 (ceiling = 250×2×5%×1.25 = $31.25) and
@@ -268,7 +268,7 @@ func TestDgtRedeployStressCeiling_Integration(t *testing.T) {
 	settings := *reloaded
 	settings.StopForecastMode = "ACTIVE"
 	settings.DgtRedeployEnabled = true
-	capPinned := tranche2MaxLossCap(d("250"), 2)
+	capPinned := tranche2MaxLossCap(d("250"), 2, 0) // flat 8% floor: $250×2×8%×1.25 = $50 > $31.25 base
 	if !capPinned.Equal(d("31.25")) {
 		t.Fatalf("pinned ceiling must be $31.25 for the $250 slot at 2x, got %s", capPinned.String())
 	}
@@ -433,5 +433,5 @@ func seedLongLiquidationCascade(t *testing.T, pool *pgxpool.Pool, symbol string)
 // designed stop ceiling for the harness's $250 slot (kept next to the tests
 // so a cap-formula change fails here, not silently in production).
 func chainBudgetFor(settings Settings) decimal.Decimal {
-	return tranche2MaxLossCap(d("250"), settings.Leverage).Mul(d("2"))
+	return tranche2MaxLossCap(d("250"), settings.Leverage, 0).Mul(d("2"))
 }

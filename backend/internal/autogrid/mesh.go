@@ -20,24 +20,61 @@ type AdaptiveMeshResult struct {
 
 // minDeploySpanPct is the v2.0.163 wide-grid doctrine: a futures grid
 // narrower than 8% of price dies to the first ordinary crypto move (prod
-// 29.09: bots born and stopped within hours, spans of 3-5%). A wide span
-// with the SAME level count widens the step proportionally — the harvest
-// per crossing grows while the fee share of it stays fixed.
+// 29.09: bots born and stopped within hours, spans of 3-5%).
 const minDeploySpanPct = 8.0
 
-// EnsureDeploySpan widens the grid bounds to at least minDeploySpanPct of
-// the current price, centered on the price and never shrinking an existing
-// wider side. The level count is deliberately left to the caller — with the
-// bounds widened and the levels kept, every step widens with the span.
+// maxDeploySpanPct caps any doctrine-derived span (parity with the DGT
+// re-deploy stub clamp that always lived at 25%).
+const maxDeploySpanPct = 25.0
+
+// volSpanMultiple ties the span floor to the pair's own daily noise: the
+// grid must cover ±1σ of the daily Parkinson volatility, or the first
+// ordinary day traverses it into the stop — the same "stop outside the
+// one-day noise band" doctrine the v2.0.52 narrow-span de-gear enforces on
+// the leverage side. 2×σ centers the range on the price with each edge at
+// exactly one daily sigma. No new magic: the multiple IS that identity.
+const volSpanMultiple = 2.0
+
+// DeploySpanFloorPct (v2.0.183): the span floor follows the pair —
+// max(minDeploySpanPct, volSpanMultiple×volPct), clamped to
+// [minDeploySpanPct, maxDeploySpanPct]. volPct ≤ 0 (unknown) degrades to
+// the flat v2.0.163 floor.
+func DeploySpanFloorPct(volPct float64) float64 {
+	floor := minDeploySpanPct
+	if volPct > 0 {
+		if scaled := volSpanMultiple * volPct; scaled > floor {
+			floor = scaled
+		}
+	}
+	if floor > maxDeploySpanPct {
+		floor = maxDeploySpanPct
+	}
+	return floor
+}
+
+// EnsureDeploySpan widens the grid bounds to at least the flat v2.0.163
+// floor, centered on the price and never shrinking an existing wider side.
+// The level count is deliberately left to the caller — with the bounds
+// widened and the levels re-derived by DensifyGridNumForSpan, every step
+// stays in the golden fee-gate band.
 func EnsureDeploySpan(lower, upper, price decimal.Decimal) (decimal.Decimal, decimal.Decimal) {
+	return EnsureDeploySpanForVol(lower, upper, price, 0)
+}
+
+// EnsureDeploySpanForVol (v2.0.183): the vol-aware widening — the floor is
+// DeploySpanFloorPct(volPct), so a high-volatility pair earns a
+// proportionally WIDER grid (more rows at the same golden step) instead of
+// the flat 8% every narrow-S/R candidate used to collapse onto.
+func EnsureDeploySpanForVol(lower, upper, price decimal.Decimal, volPct float64) (decimal.Decimal, decimal.Decimal) {
 	if !price.GreaterThan(decimal.Zero) || !upper.GreaterThan(lower) {
 		return lower, upper
 	}
+	floorPct := decimal.NewFromFloat(DeploySpanFloorPct(volPct))
 	spanPct := upper.Sub(lower).Div(price).Mul(decimal.NewFromInt(100))
-	if spanPct.GreaterThanOrEqual(decimal.NewFromFloat(minDeploySpanPct)) {
+	if spanPct.GreaterThanOrEqual(floorPct) {
 		return lower, upper
 	}
-	half := price.Mul(decimal.NewFromFloat(minDeploySpanPct / 200.0))
+	half := price.Mul(floorPct).Div(decimal.NewFromInt(200))
 	newLower := price.Sub(half)
 	if lower.LessThan(newLower) {
 		newLower = lower
