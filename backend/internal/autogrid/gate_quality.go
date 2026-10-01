@@ -2,6 +2,7 @@ package autogrid
 
 import (
 	"context"
+	"strconv"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -48,10 +49,13 @@ const (
 	// only honest calibration verdict is "insufficient".
 	gateQualityMinPairs = 5
 
-	// gateQualityDueInterval throttles the daily hook: the worker may call
-	// every manage pass, the summary fires at most once per ~day. Slightly
-	// under 24h so a fixed-time daily pass never skips a day.
-	gateQualityDueInterval = 20 * time.Hour
+	// gateQualityDueInterval is the FALLBACK digest cadence; the live value
+	// comes from the app_config key gate_quality_digest_interval_hours
+	// (v2.0.185: the operator moved the module to a frequent "where do
+	// entries bump into walls" rhythm — default 4h, DB-only per AGENTS.md,
+	// clamp 1..24h, parse failure falls back to this constant).
+	gateQualityDueInterval = 4 * time.Hour
+	gateQualityIntervalKey = "gate_quality_digest_interval_hours"
 
 	// gateQualityEvent rides the default Telegram lane (always-on, renders
 	// vars["message"] verbatim — same pattern as SHADOW_CAPTURE_FAILED in
@@ -536,14 +540,26 @@ func RunDueGateQuality(ctx context.Context, worker *Worker) {
 	if !gateQualityEnabled(ctx, worker) {
 		return
 	}
+	// v2.0.185: cadence is a DB setting (default 4h, clamp 1..24) — the
+	// operator runs the module as a frequent "where do entries bump" pulse,
+	// not a daily retrospective.
+	dueHours := gateQualityDueInterval.Hours()
+	var raw string
+	if cfgErr := worker.db.QueryRow(ctx,
+		`SELECT NULLIF(value #>> '{}', '') FROM app_config WHERE key = $1`,
+		gateQualityIntervalKey).Scan(&raw); cfgErr == nil && raw != "" {
+		if hours, pErr := strconv.ParseFloat(raw, 64); pErr == nil && hours >= 1 && hours <= 24 {
+			dueHours = hours
+		}
+	}
 	var sent bool
 	if err := worker.db.QueryRow(ctx, `
 		SELECT EXISTS (
 			SELECT 1 FROM bot_execution_events
 			WHERE event_type = $1 AND bot_id = $2
-			  AND created_at > NOW() - INTERVAL '20 hours'
+			  AND created_at > NOW() - ($3::TEXT || ' hours')::INTERVAL
 		)
-	`, gateQualityMarkerEvent, gateQualityMarkerBot).Scan(&sent); err != nil {
+	`, gateQualityMarkerEvent, gateQualityMarkerBot, fmt.Sprintf("%g", dueHours)).Scan(&sent); err != nil {
 		logGateQualityWarn(worker, "gate quality: due check failed", err)
 		return
 	}
