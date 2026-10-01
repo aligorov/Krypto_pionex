@@ -6440,10 +6440,25 @@ func tranche2MaxLossCap(budgetUSDT decimal.Decimal, botLeverage int) decimal.Dec
 	if botLeverage < 1 {
 		botLeverage = 1
 	}
-	return budgetUSDT.
+	// v2.0.177: the 5% × 1.25 ceiling = 6.25% was set when grids were
+	// narrow; the wide-grid doctrine (v2.0.163, span ≥8%) made the full
+	// traverse to stop structurally exceed it (prod 01.10: SOXLX $38.65
+	// vs $37.50 cap, AXTIX $56.02). The cap now ALSO accommodates the
+	// deploy-span floor (8%) + a 1.5×ATR stop buffer ≈ 11% — whichever
+	// is larger.
+	base := budgetUSDT.
 		Mul(decimal.NewFromInt(int64(botLeverage))).
 		Mul(designStopCeilFrac()).
 		Mul(decimal.NewFromFloat(breakerHeadroom))
+	// Wide-grid floor: budget × leverage × minDeploySpanPct% × breakerHeadroom
+	wideGridFloor := budgetUSDT.
+		Mul(decimal.NewFromInt(int64(botLeverage))).
+		Mul(decimal.NewFromFloat(minDeploySpanPct / 100.0)).
+		Mul(decimal.NewFromFloat(breakerHeadroom))
+	if wideGridFloor.GreaterThan(base) {
+		return wideGridFloor
+	}
+	return base
 }
 
 // tranche2RiskGate (v2.0.56 F2, derived cap v2.0.67) guards the tranche-2

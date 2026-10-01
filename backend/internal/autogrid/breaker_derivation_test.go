@@ -69,27 +69,30 @@ func TestDeriveDailyLossBreaker(t *testing.T) {
 // legal stop range and still blocks genuine overshoots.
 func TestTranche2MaxLossCap(t *testing.T) {
 	budget := decimal.NewFromInt(200)
-	if cap := tranche2MaxLossCap(budget, 2); !cap.Equal(decimal.NewFromInt(25)) {
-		t.Fatalf("2x cap must be $25, got %s", cap)
+	// v2.0.177: wide-grid floor (8% × 1.25 = 10%) now exceeds the old 5% × 1.25 base
+	if cap := tranche2MaxLossCap(budget, 2); !cap.Equal(decimal.NewFromInt(40)) {
+		t.Fatalf("2x cap must be $40 (wide-grid floor), got %s", cap)
 	}
-	if cap := tranche2MaxLossCap(budget, 4); !cap.Equal(decimal.NewFromInt(50)) {
-		t.Fatalf("4x cap must be $50, got %s", cap)
+	if cap := tranche2MaxLossCap(budget, 4); !cap.Equal(decimal.NewFromInt(80)) {
+		t.Fatalf("4x cap must be $80 (wide-grid floor), got %s", cap)
 	}
 	// Degenerate leverage falls back to 1x, never to zero.
-	if cap := tranche2MaxLossCap(budget, 0); !cap.Equal(decimal.NewFromFloat(12.5)) {
-		t.Fatalf("0x (fallback 1x) cap must be $12.50, got %s", cap)
+	if cap := tranche2MaxLossCap(budget, 0); !cap.Equal(decimal.NewFromInt(20)) {
+		t.Fatalf("0x (fallback 1x) cap must be $20 (wide-grid floor), got %s", cap)
 	}
 
 	// Operator case: 6x on $100 → cap $37.50; a $21.57 dynamic stop passes,
 	// a $40 overshoot does not.
+	// v2.0.177: 6x/$100 wide-grid floor: $100 × 6 × 8% × 1.25 = $60
 	sixCap := tranche2MaxLossCap(decimal.NewFromInt(100), 6)
-	if !sixCap.Equal(decimal.NewFromFloat(37.5)) {
-		t.Fatalf("6x/$100 cap must be $37.50, got %s", sixCap)
+	if !sixCap.Equal(decimal.NewFromInt(60)) {
+		t.Fatalf("6x/$100 cap must be $60 (wide-grid floor), got %s", sixCap)
 	}
 	if stop := decimal.NewFromFloat(21.57); stop.GreaterThan(sixCap) {
 		t.Fatalf("$21.57 must fit under the 6x cap %s", sixCap)
 	}
-	if stop := decimal.NewFromFloat(40); !stop.GreaterThan(sixCap) {
-		t.Fatalf("$40 must exceed the 6x cap %s", sixCap)
+	// $40 no longer exceeds — wide-grid floor accommodates it
+	if stop := decimal.NewFromFloat(70); !stop.GreaterThan(sixCap) {
+		t.Fatalf("$70 must exceed the 6x cap %s", sixCap)
 	}
 }

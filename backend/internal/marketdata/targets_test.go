@@ -334,7 +334,7 @@ func TestComputeIndividualTargetPrices(t *testing.T) {
 	}
 	// MaxLossUSDT must be clamped between [2%..5%] of notional (300 * 1 = $300 -> [$6..$15])
 	if resNeutral.MaxLossUSDT < 6.0 || resNeutral.MaxLossUSDT > 15.0 {
-		t.Fatalf("NEUTRAL MaxLossUSDT %f must be clamped between $6 and $15, got %f", resNeutral.MaxLossUSDT, resNeutral.MaxLossUSDT)
+		t.Fatalf("NEUTRAL MaxLossUSDT %f must be clamped between $6 and $24, got %f", resNeutral.MaxLossUSDT, resNeutral.MaxLossUSDT)
 	}
 
 	// Test 4: Precision rounding and wide-stop clamp [2..5%]
