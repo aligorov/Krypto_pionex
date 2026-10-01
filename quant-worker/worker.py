@@ -3,18 +3,23 @@ Pionex quant worker: polls the backtest_jobs queue in PostgreSQL, fetches
 public market klines from Pionex and runs the purged walk-forward grid
 simulation. Zero-ENV policy: DATABASE_URL is the only environment variable.
 
+v2.0.170 fixes (master-plan §7):
+  - Parses the `time` field from each kline row, sorts OLDEST-FIRST
+    (Pionex returns newest-first — all prior results were time-reversed).
+  - Drops the still-forming candle (the newest row).
+  - Deduplicates candles with identical timestamps.
+  - Validates OHLC sanity (high >= max(open,close), low <= min(open,close)).
+
 Job params (JSONB):
   {
-    "interval": "60M",           # optional override of the column
-    "train_bars": 240,           # optional overrides
+    "interval": "60M",
+    "train_bars": 240,
     "test_bars": 60,
     "purge_bars": 6,
     "stop_loss_pct": 8.0,
     "investment": 100.0,
     "limits": 500
   }
-Result (JSONB): walk-forward report (folds, oos_return_pct, oos_max_drawdown,
-round_trips, stop_hits) plus a per-fold detail sample.
 """
 import json
 import logging
@@ -27,7 +32,12 @@ import requests
 
 PIONEX_KLINES_URL = "https://api.pionex.com/api/v1/market/klines"
 POLL_SECONDS = 5
-FETCH_PAUSE = 0.5  # stay far below the shared 10 req/s public budget
+FETCH_PAUSE = 0.5
+
+INTERVAL_SECONDS = {
+    "1M": 60, "5M": 300, "15M": 900, "30M": 1800,
+    "60M": 3600, "1H": 3600, "4H": 14400, "1D": 86400,
+}
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -40,6 +50,16 @@ def database_url():
 
 
 def fetch_klines(symbol, interval, limit):
+    """Fetch klines from Pionex, sort oldest-first, drop the forming candle.
+
+    The Pionex /api/v1/market/klines endpoint returns the N most recent
+    candles in NEWEST-FIRST order (verified against the Go client's
+    live-probed contract: regime.go, shadow_portfolio.go, scanner.go all
+    explicitly reverse before use). Prior versions of this worker passed
+    the raw newest-first list directly into the backtest engine, which
+    assumes oldest-first iteration — every historical result was
+    time-reversed.
+    """
     response = requests.get(
         PIONEX_KLINES_URL,
         params={"symbol": symbol, "interval": interval, "limit": limit},
@@ -50,17 +70,57 @@ def fetch_klines(symbol, interval, limit):
     data = payload.get("data")
     if not data or not data.get("klines"):
         raise ValueError(f"no klines returned for {symbol}")
-    candles = []
-    for row in data["klines"]:
-        # Pionex returns kline OBJECTS with string-typed numbers.
-        candles.append({
+    raw = data["klines"]
+
+    # Parse with timestamps
+    parsed = []
+    for row in raw:
+        ts = row.get("time") or row.get("timestamp")
+        if ts is None:
+            raise ValueError(f"kline row missing 'time' field for {symbol}: keys={list(row.keys())}")
+        ts = int(ts)
+        # Pionex returns milliseconds
+        if ts > 1e12:
+            ts = ts // 1000
+        candle = {
+            "time": ts,
             "open": float(row["open"]),
             "high": float(row["high"]),
             "low": float(row["low"]),
             "close": float(row["close"]),
             "volume": float(row["volume"]),
-        })
-    return candles
+        }
+        # OHLC sanity check
+        if candle["high"] < max(candle["open"], candle["close"]) or candle["low"] > min(candle["open"], candle["close"]):
+            logging.warning("Skipping OHLC-invalid candle for %s at %s", symbol, ts)
+            continue
+        if candle["volume"] < 0 or any(v != v for v in candle.values() if isinstance(v, float)):  # NaN check
+            logging.warning("Skipping NaN/negative-volume candle for %s at %s", symbol, ts)
+            continue
+        parsed.append(candle)
+
+    # Sort oldest-first (Pionex returns newest-first)
+    parsed.sort(key=lambda c: c["time"])
+
+    # Deduplicate identical timestamps
+    deduped = []
+    for c in parsed:
+        if deduped and deduped[-1]["time"] == c["time"]:
+            deduped[-1] = c  # keep the later fetch
+        else:
+            deduped.append(c)
+
+    # Drop the still-forming candle: if the newest candle's interval
+    # hasn't fully elapsed yet, it's incomplete.
+    interval_sec = INTERVAL_SECONDS.get(str(interval).upper(), 3600)
+    now = int(time.time())
+    if deduped and deduped[-1]["time"] + interval_sec > now:
+        deduped = deduped[:-1]
+        logging.debug("Dropped forming candle for %s (ts=%s)", symbol, deduped[-1]["time"] + interval_sec if deduped else "last")
+
+    if len(deduped) < 30:
+        raise ValueError(f"insufficient candles after cleaning for {symbol}: {len(deduped)}")
+    return deduped
 
 
 def run_job(conn, job):
@@ -82,8 +142,7 @@ def run_job(conn, job):
         slippage=slippage,
         funding_rate_8h=funding_rate_8h,
     )
-    interval_hours = {"5M": 5 / 60, "15M": 0.25, "30M": 0.5, "60M": 1.0, "1H": 1.0, "4H": 4.0, "1D": 24.0}
-    bar_hours = interval_hours.get(str(interval).upper(), 1.0)
+    bar_hours = INTERVAL_SECONDS.get(str(interval).upper(), 3600) / 3600.0
 
     deployed_params = None
     if "lower_price" in params and "upper_price" in params and "grid_num" in params:
@@ -111,6 +170,8 @@ def run_job(conn, job):
     report["symbol"] = symbol
     report["interval"] = interval
     report["candles"] = len(candles)
+    report["candle_start"] = candles[0]["time"] if candles else None
+    report["candle_end"] = candles[-1]["time"] if candles else None
     return report
 
 
@@ -155,9 +216,8 @@ def finish_job(conn, job_id, result=None, error=None):
 
 
 def run_worker():
-    logging.info("Starting Pionex Quant Worker (walk-forward grid backtest engine)")
+    logging.info("Starting Pionex Quant Worker v2.0.170 (candle-order fixed, unclosed-bar dropped)")
     db_url = database_url()
-    # Never log credentials: keep only the host part of the URL.
     logging.info("Target Database: %s", db_url.split("@", 1)[-1] if "@" in db_url else "configured")
 
     conn = psycopg2.connect(db_url)
@@ -178,7 +238,7 @@ def run_worker():
                     job["id"], result.get("folds"), result.get("oos_return_pct"),
                     result.get("oos_max_drawdown"),
                 )
-            except Exception as exc:  # noqa: BLE001 - job isolation boundary
+            except Exception as exc:
                 logging.error("Backtest job %s failed: %s", job["id"], exc)
                 finish_job(conn, job["id"], error=str(exc))
             time.sleep(FETCH_PAUSE)
@@ -186,11 +246,11 @@ def run_worker():
             logging.info("Stopping Quant Worker cleanly...")
             conn.close()
             break
-        except Exception as exc:  # noqa: BLE001 - poll loop isolation boundary
+        except Exception as exc:
             logging.error("Worker poll cycle failed: %s", exc)
             try:
                 conn.rollback()
-            except Exception:  # noqa: BLE001
+            except Exception:
                 conn = psycopg2.connect(db_url)
             time.sleep(POLL_SECONDS)
 

@@ -230,7 +230,7 @@ class GridSimulator:
         if not (lower < entry_price < upper):
             entry_price = min(max(entry_price, lower + step), upper - step)
 
-        open_lots = {}       # level index -> list of entry prices
+        open_lots = {}       # level index -> list of (price, base_size, quote_size)
         base_held = 0.0      # signed: positive for long, negative for short
         quote_spent = 0.0
         realized = 0.0
@@ -240,6 +240,23 @@ class GridSimulator:
         equity_curve = []
         trades = []
         end_reason = "COMPLETED"
+
+        # v2.0.170 FIX: a directional grid bot enters with an immediate
+        # base position at creation (the native Pionex bot opens inventory
+        # on the opposite side of entry). Without this, LONG/SHORT
+        # candidates were simulated as flat (neutral) and directional
+        # inventory/funding/liquidation risk was understated.
+        if direction in ("long", "short"):
+            base_notional = total_notional / 2.0  # half the notional opens now
+            base_base = base_notional / entry_price
+            base_fee = base_notional * self.taker_fee
+            if direction == "long":
+                base_held += base_base
+            else:
+                base_held -= base_base
+            quote_spent += base_notional
+            fees_paid += base_fee
+            realized -= base_fee
 
         # Stop price determination
         stop_price = None
@@ -252,6 +269,9 @@ class GridSimulator:
         last_price = entry_price
         stop_hit = False
         liquidated = False
+        # v2.0.170 FIX: seed the curve at the initial capital so the
+        # first-bar PnL enters the return/drawdown calculation.
+        equity_curve.append(investment)
 
         def level_of(price):
             return int((price - lower) / step)
@@ -261,8 +281,8 @@ class GridSimulator:
             if prev == nxt:
                 return
             down = nxt < prev
-            lo_level = level_of(min(prev, nxt))
-            hi_level = level_of(max(prev, nxt))
+            lo_level = max(0, level_of(min(prev, nxt)))
+            hi_level = min(levels - 1, level_of(max(prev, nxt)))
 
             for lvl in range(lo_level + 1, hi_level + 1):
                 price = lower + lvl * step
@@ -288,7 +308,7 @@ class GridSimulator:
                             continue
                         base = notional_to_fill / price
                         fee = notional_to_fill * self.maker_fee
-                        open_lots.setdefault(lvl, []).append(price)
+                        open_lots.setdefault(lvl, []).append((price, base, notional_to_fill))
                         base_held -= base
                         quote_spent += notional_to_fill
                         fees_paid += fee
@@ -297,18 +317,17 @@ class GridSimulator:
                         # Downward crossing covers short bought at level above
                         sell_lvl = lvl + 1
                         if open_lots.get(sell_lvl):
-                            entry = open_lots[sell_lvl].pop(0)
+                            entry, lot_base, lot_quote = open_lots[sell_lvl].pop(0)
                             if not open_lots[sell_lvl]:
                                 del open_lots[sell_lvl]
-                            base = notional_to_fill / entry
-                            gross = base * (entry - price) # short gain
-                            fee = notional_to_fill * self.maker_fee * 2
+                            gross = lot_base * (entry - price) # short gain
+                            fee = lot_quote * self.maker_fee + lot_base * price * self.maker_fee
                             fees_paid += fee
                             trade_net = gross - fee
                             realized += trade_net
                             round_trips += 1
-                            base_held += base
-                            quote_spent -= notional_to_fill
+                            base_held += lot_base
+                            quote_spent -= lot_quote
                             trades.append({"pnl": round(trade_net, 6), "side": "SHORT"})
                 else:
                     # NEUTRAL / LONG grid mechanics:
@@ -319,7 +338,10 @@ class GridSimulator:
                             continue
                         base = notional_to_fill / price
                         fee = notional_to_fill * self.maker_fee
-                        open_lots.setdefault(lvl, []).append(price)
+                        # v2.0.170 FIX: store the ACTUAL fill size with the
+                        # price — the close side must settle exactly this
+                        # size, not re-derive from per_level_quote.
+                        open_lots.setdefault(lvl, []).append((price, base, notional_to_fill))
                         base_held += base
                         quote_spent += notional_to_fill
                         fees_paid += fee
@@ -327,18 +349,18 @@ class GridSimulator:
                     else:
                         buy_lvl = lvl - 1
                         if open_lots.get(buy_lvl):
-                            entry = open_lots[buy_lvl].pop(0)
+                            # v2.0.170 FIX: close exactly the stored size
+                            entry, lot_base, lot_quote = open_lots[buy_lvl].pop(0)
                             if not open_lots[buy_lvl]:
                                 del open_lots[buy_lvl]
-                            base = notional_to_fill / entry
-                            gross = base * (price - entry)
-                            fee = notional_to_fill * self.maker_fee * 2
+                            gross = lot_base * (price - entry)
+                            fee = lot_quote * self.maker_fee + lot_base * price * self.maker_fee
                             fees_paid += fee
                             trade_net = gross - fee
                             realized += trade_net
                             round_trips += 1
-                            base_held -= base
-                            quote_spent -= notional_to_fill
+                            base_held -= lot_base
+                            quote_spent -= lot_quote
                             trades.append({"pnl": round(trade_net, 6), "side": "LONG"})
 
         mmr = 0.01 # 1% maintenance margin rate
@@ -385,6 +407,11 @@ class GridSimulator:
                 last_price = point
 
             if stop_hit:
+                # v2.0.170 FIX: append the post-stop equity so final_equity
+                # and return_pct INCLUDE the stop-loss loss (the old code
+                # returned the pre-stop mark-to-market, overstating every
+                # stopped run).
+                equity_curve.append(max(0.0, investment + realized))
                 break
 
             # Perpetual funding accrual per bar
