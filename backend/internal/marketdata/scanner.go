@@ -572,7 +572,13 @@ func scoreCandidate(
 	if recommendedTrend == "long" {
 		rsiCap, posCap := 70.0, 75.0
 		if strongTrend {
-			rsiCap, posCap = 78.0, 88.0
+			// v2.0.189: RSI cap stays lifted for a strong trend, but the
+			// CHANNEL-POSITION cap no longer does — prod MSTRX #1546 entered
+			// LONG at 80-88% of its range (the rally top) on a strong-trend
+			// exemption and rode the reversal to -73% of its stop. Entries
+			// at the ceiling are the long-side twin of "no shorts at the
+			// floor": buy pullbacks in a trend, not its peak.
+			rsiCap, posCap = 78.0, 75.0
 		}
 		if regime.RSI > rsiCap {
 			reasons = append(reasons, fmt.Sprintf("Anti-FOMO: RSI (%.1f) > %.0f - пара перекуплена на экстремуме, вход в LONG заблокирован", regime.RSI, rsiCap))

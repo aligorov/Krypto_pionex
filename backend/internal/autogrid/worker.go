@@ -5602,6 +5602,32 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 					}
 				}
 				if topUp != "" {
+					// v2.0.189 (operator doctrine change): NO top-up underwater.
+					// Prod 02.10 PENGU #1545: the adverse-excursion pour doubled the
+					// margin of an already-negative LONG and doubled the loss (-1.55
+					// -> -8.55). Averaging-down saved ranges exists, but the operator
+					// has called it: tranche-2 reinforces WINNERS, it no longer
+					// rescues losers. Skip (with the same 1h backoff marker) whenever
+					// the bot's total is negative at the pour decision.
+					if realized.Add(supervisionFloor).LessThan(decimal.Zero) {
+						if tag, uErr := worker.db.Exec(ctx, `
+							UPDATE grid_bots
+							SET model_state = jsonb_set(model_state, '{tranche2SkipAt}',
+								to_jsonb(to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'))),
+								updated_at = NOW()
+							WHERE id = $1
+								AND COALESCE((model_state->>'tranche2SkipAt')::TIMESTAMPTZ, '1970-01-01') < NOW() - INTERVAL '1 hour'
+						`, bot.id); uErr == nil && tag.RowsAffected() == 1 {
+							_ = LogBotEvent(ctx, worker.db, bot.id, bot.botNumber, "REAL", bot.symbol, "TRANCHE_2_SKIPPED", &price, nil, map[string]any{
+								"reason": "бот под водой — усиление только победителей (v2.0.189)",
+								"total_usdt": realized.Add(supervisionFloor).StringFixed(2),
+							})
+							worker.logger.Info("tranche 2 (REAL) skipped: bot underwater",
+								"component", "autogrid_worker", "bot_id", bot.id,
+								"total", realized.Add(supervisionFloor).StringFixed(2))
+						}
+					topUp = ""
+					}
 					// v2.0.56 (F2): the doubling below doubles max_loss with the
 					// injected margin — same risk gate as the paper path. The
 					// skip writes a 1h backoff marker so an armed 24h time-box
@@ -7474,7 +7500,23 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 						trancheReason = "подтверждённый adverse 0.75×ATR(1h)"
 					}
 				}
-				if trancheReason != "" {
+				if trancheReason != "" && realized.Add(unrealized).LessThan(decimal.Zero) {
+				// v2.0.189 paper mirror: no top-up underwater (see the REAL-path
+				// comment) — tranche-2 reinforces winners only.
+				worker.logger.Info("tranche 2 (paper) skipped: bot underwater",
+					"component", "autogrid_worker", "bot_id", bot.id,
+					"total", realized.Add(unrealized).StringFixed(2))
+				_, _ = worker.db.Exec(ctx, `
+					UPDATE grid_bots
+					SET model_state = jsonb_set(model_state, '{tranche2SkipAt}',
+						to_jsonb(to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'))),
+						updated_at = NOW()
+					WHERE id = $1
+						AND COALESCE((model_state->>'tranche2SkipAt')::TIMESTAMPTZ, '1970-01-01') < NOW() - INTERVAL '1 hour'
+				`, bot.id)
+				trancheReason = ""
+			}
+			if trancheReason != "" {
 					// v2.0.56 (F2): gate the doubling — per-bot effective stop
 					// cap + fleet envelope ≤ 0.8× daily breaker. The event
 					// payload now carries the effective target/stop so the

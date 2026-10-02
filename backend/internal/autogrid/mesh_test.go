@@ -430,3 +430,37 @@ func TestNeutralPreBreakRegimeExit(t *testing.T) {
 func decVal(v float64) decimal.Decimal {
 	return decimal.NewFromFloat(v)
 }
+
+// v2.0.189: directionals get the pre-break save too — a LONG riding a
+// confirmed TREND_DOWN at the floor of its range exits before the break
+// (prod MSTRX #1546 class).
+func TestDirectionalPreBreakRegimeExit(t *testing.T) {
+	mk := func(direction string, price, total float64, regime string) botActionInput {
+		totalD := decimal.NewFromFloat(total)
+		return botActionInput{
+			Direction: direction, Regime: regime,
+			Lower: decimal.NewFromFloat(100), Upper: decimal.NewFromFloat(110),
+			CurrentPrice: decimal.NewFromFloat(price),
+			RealizedPNL: decimal.Zero, UnrealizedPNL: totalD, PeakPNL: totalD,
+			Budget: decimal.NewFromInt(75),
+			PnLTarget: decVal(1.5), MaxLoss: decVal(16),
+			RangeBreakBuffer: decimal.NewFromInt(2),
+		}
+	}
+	// LONG underwater at 10% of the range in TREND_DOWN -> early exit.
+	if d := decideBotAction(mk("LONG", 101.0, -5.0, "TREND_DOWN")); d.Action != ActionCloseRangeBreak || d.Reason != "RANGE_BREAK_DOWN_EARLY" {
+		t.Fatalf("underwater LONG at the down edge in TREND_DOWN must exit early, got %+v", d)
+	}
+	// LONG in profit -> the normal path owns it.
+	if d := decideBotAction(mk("LONG", 101.0, 2.0, "TREND_DOWN")); d.Action == ActionCloseRangeBreak && d.Reason == "RANGE_BREAK_DOWN_EARLY" {
+		t.Fatal("profitable LONG must not take the early loss exit")
+	}
+	// LONG underwater mid-range -> hold the line.
+	if d := decideBotAction(mk("LONG", 105.0, -5.0, "TREND_DOWN")); d.Action == ActionCloseRangeBreak && d.Reason == "RANGE_BREAK_DOWN_EARLY" {
+		t.Fatal("mid-range LONG must not early-exit")
+	}
+	// SHORT underwater at the ceiling in TREND_UP -> early exit (mirror).
+	if d := decideBotAction(mk("SHORT", 108.9, -5.0, "TREND_UP")); d.Action != ActionCloseRangeBreak || d.Reason != "RANGE_BREAK_UP_EARLY" {
+		t.Fatalf("underwater SHORT at the up edge in TREND_UP must exit early, got %+v", d)
+	}
+}

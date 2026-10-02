@@ -294,15 +294,22 @@ func decideBotAction(input botActionInput) manageDecision {
 	// edge reuses the scanner's anti-FOMO strong-trend extreme band (same
 	// threshold class, not a new constant); the profit side is left to the
 	// normal TP — this is a stop-class save, it never cuts a working grid.
-	if input.Direction == "NEUTRAL" &&
-		(input.Regime == "TREND_UP" || input.Regime == "TREND_DOWN") &&
-		total.LessThan(decimal.Zero) &&
-		input.CurrentPrice.LessThan(breakUp) && input.CurrentPrice.GreaterThan(breakDown) { // strictly PRE-break
+	preBreak := input.CurrentPrice.LessThan(breakUp) && input.CurrentPrice.GreaterThan(breakDown) // strictly PRE-break
+	adverseRegime := (input.Direction == "NEUTRAL" && (input.Regime == "TREND_UP" || input.Regime == "TREND_DOWN")) ||
+		// v2.0.189: directionals get the same early save — a LONG riding a
+		// confirmed TREND_DOWN at the floor of its range (prod MSTRX #1546
+		// class) exits before the break pays full price, mirroring the SHORT
+		// at the ceiling in a TREND_UP.
+		(input.Direction == "LONG" && input.Regime == "TREND_DOWN") ||
+		(input.Direction == "SHORT" && input.Regime == "TREND_UP")
+	if adverseRegime && preBreak && total.LessThan(decimal.Zero) {
 		span := input.Upper.Sub(input.Lower)
 		if span.GreaterThan(decimal.Zero) {
 			posPct := input.CurrentPrice.Sub(input.Lower).Div(span).Mul(decimal.NewFromInt(100))
-			edgeUp := input.Regime == "TREND_UP" && posPct.GreaterThanOrEqual(decimal.NewFromFloat(88.0))
-			edgeDown := input.Regime == "TREND_DOWN" && posPct.LessThanOrEqual(decimal.NewFromFloat(12.0))
+			edgeUp := (input.Direction == "NEUTRAL" || input.Direction == "SHORT") &&
+				input.Regime == "TREND_UP" && posPct.GreaterThanOrEqual(decimal.NewFromFloat(88.0))
+			edgeDown := (input.Direction == "NEUTRAL" || input.Direction == "LONG") &&
+				input.Regime == "TREND_DOWN" && posPct.LessThanOrEqual(decimal.NewFromFloat(12.0))
 			if edgeUp || edgeDown {
 				reason := "RANGE_BREAK_UP_EARLY"
 				if edgeDown {
