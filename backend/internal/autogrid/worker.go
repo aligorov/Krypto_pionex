@@ -5668,24 +5668,36 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 							Mode:            "invest_in",
 							QuoteInvestment: pending.Round(2),
 						}); err != nil {
-							worker.logger.Error("tranche 2 invest_in failed",
-								"component", "autogrid_worker", "bot_id", bot.id, "error", err)
-							if (errors.Is(err, ErrNativeAdjustRefused) && !pionex.IsOutcomeUnknown(err)) ||
-								tranchePourGateRefused(err) {
-								// The exchange itself refused the call, OR a durable
-								// gate refused it before any native call left the
-								// building (v2.0.142 audit P2d: breaker/margin-reserve/
-								// risk-engine refusals are not ErrNativeAdjustRefused,
-								// so the pour intent used to stay armed and fence the
-								// next attempt for 24h instead of the intended 1h
-								// backoff): the pour provably never landed — clear the
-								// intent so the backoff retry is not fenced by a
-								// stale marker.
-								_, _ = worker.db.Exec(ctx, `
+							if errors.Is(err, ErrAdjustConfirmUnverified) {
+								// v2.0.188: the pour WAS sent and accepted — only the
+								// read-back stayed stale after retries. Prod 01-02.10
+								// (8/8 pous landed): this is a WARN, not a failure; the
+								// armed intent lets the next pass see the remote
+								// investment and the self-heal branch completes the
+								// target doubling. No fail-marker: the attempt did not
+								// fail, and the 1h backoff would only delay the heal.
+								worker.logger.Warn("tranche 2 pour UNVERIFIED — reconcile/self-heal will complete it",
+									"component", "autogrid_worker", "bot_id", bot.id, "error", err)
+							} else {
+								worker.logger.Error("tranche 2 invest_in failed",
+									"component", "autogrid_worker", "bot_id", bot.id, "error", err)
+								if (errors.Is(err, ErrNativeAdjustRefused) && !pionex.IsOutcomeUnknown(err)) ||
+									tranchePourGateRefused(err) {
+									// The exchange itself refused the call, OR a durable
+									// gate refused it before any native call left the
+									// building (v2.0.142 audit P2d: breaker/margin-reserve/
+									// risk-engine refusals are not ErrNativeAdjustRefused,
+									// so the pour intent used to stay armed and fence the
+									// next attempt for 24h instead of the intended 1h
+									// backoff): the pour provably never landed — clear the
+									// intent so the backoff retry is not fenced by a
+									// stale marker.
+									_, _ = worker.db.Exec(ctx, `
 								UPDATE grid_bots
 								SET model_state = model_state - 'trancheIntentAt', updated_at = NOW()
 								WHERE id = $1
 							`, bot.id)
+								}
 							}
 							if _, markErr := worker.db.Exec(ctx, `
 							UPDATE grid_bots

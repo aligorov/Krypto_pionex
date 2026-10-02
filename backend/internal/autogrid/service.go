@@ -2227,6 +2227,11 @@ type AdjustBotInput struct {
 // (errors.Is reaches through the wrap, IsOutcomeUnknown still classifies).
 var ErrNativeAdjustRefused = errors.New("native adjust failed")
 
+// ErrAdjustConfirmUnverified (v2.0.188): the native adjust call SUCCEEDED
+// but the read-back could not confirm it after retries (exchange read is
+// eventually consistent). Not a refusal: the reconcile loop owns the truth.
+var ErrAdjustConfirmUnverified = errors.New("adjust confirmation unverified")
+
 // AdjustBot manages a single running bot through the native Pionex
 // adjustParams endpoint (invest_in adds capital, adjust_params moves the
 // grid range). Paper bots only move their simulated range.
@@ -2363,14 +2368,39 @@ func (s *Service) AdjustBot(
 			}
 		}
 		if input.Mode == "invest_in" {
-			remoteInvestment := remoteBot.BUOrderData.QuoteInvestment
 			expectedInvestment := currentInvestment.Add(input.QuoteInvestment)
+			// v2.0.188: Pionex's bot detail is read-after-write EVENTUALLY
+			// CONSISTENT — the very first read after a successful invest_in
+			// can still show the pre-pour investment. Prod 01-02.10: every
+			// single tranche-2 pour (8/8) landed on the exchange (verified:
+			// all bots carry the doubled 150) yet was flagged MISMATCH from a
+			// stale snapshot, logged as ERROR "tranche 2 invest_in failed",
+			// and the target doubling had to wait for the self-heal branch.
+			// Retry the read a few times before judging.
+			remoteInvestment := remoteBot.BUOrderData.QuoteInvestment
+			for attempt := 0; attempt < 3 && remoteInvestment.LessThan(expectedInvestment.Mul(decimal.NewFromFloat(0.99))); attempt++ {
+				select {
+				case <-ctx.Done():
+				case <-time.After(2 * time.Second):
+				}
+				retryBot, retryErr := client.GetFuturesGridBot(ctx, *buOrderID)
+				if retryErr != nil || retryBot == nil {
+					break
+				}
+				remoteInvestment = retryBot.BUOrderData.QuoteInvestment
+			}
 			if remoteInvestment.LessThan(expectedInvestment.Mul(decimal.NewFromFloat(0.99))) {
-				s.logger.Error("invest_in REST confirmation MISMATCH — exchange investment below expected",
+				// Still short after retries: the adjust call itself returned
+				// success, so this is an UNVERIFIED pour, not a refused one —
+				// the reconcile loop owns the final truth (it sees the real
+				// remote investment on the next pass). Distinct error class so
+				// the tranche-2 handler does not treat it as an exchange
+				// refusal (24h-fencing) nor as a landing failure.
+				s.logger.Warn("invest_in REST confirmation UNVERIFIED after retries — reconcile will confirm",
 					"component", "autogrid_service", "bot_id", botID,
 					"expected_min", expectedInvestment.String(), "remote", remoteInvestment.String())
-				return "", fmt.Errorf("REST confirmation: биржа инвестиция %s ниже ожидаемой %s — локальное состояние не изменено",
-					remoteInvestment.StringFixed(2), expectedInvestment.StringFixed(2))
+				return "", fmt.Errorf("%w: REST подтверждение invest_in: биржа инвестиция %s ниже ожидаемой %s после ретраев — заливка отправлена успешно, reconcile подтвердит",
+					ErrAdjustConfirmUnverified, remoteInvestment.StringFixed(2), expectedInvestment.StringFixed(2))
 			}
 		}
 		if input.Mode == "adjust_params" {
