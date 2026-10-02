@@ -120,7 +120,10 @@ func (s *Server) runReplayExperiment(w http.ResponseWriter, r *http.Request) {
 		if params == nil {
 			params = map[string]any{}
 		}
-		overrides = map[string]any{"gate": gate, "overrides": params}
+		// v2.0.187: the engine reads overrides["params"]["threshold"]
+		// (replay_engine.go contract) — the old "overrides" key made every
+		// operator run collapse to NOT_REPLAYABLE(threshold_not_stored).
+		overrides = map[string]any{"gate": gate, "params": params}
 	}
 	runID, err := s.autogrid.EnqueueReplayRunOperator(r.Context(), from, to, overrides)
 	if err != nil {

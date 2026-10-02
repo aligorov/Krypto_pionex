@@ -149,6 +149,8 @@ type Worker struct {
 	// (package D, v2.0.139) to one per 24h (single manage goroutine → plain
 	// field). The report builder itself lives in gate_value.go.
 	gateValueAt time.Time
+	// replayPollAt throttles the off-loop replay worker poll (5min).
+	replayPollAt time.Time
 	// terminalRecheckAt throttles the v2.0.99 finished-record re-check sweep
 	// (single manage goroutine → plain field).
 	terminalRecheckAt time.Time
@@ -637,6 +639,13 @@ func (worker *Worker) scanAndDeploy(
 				return scanID, err
 			}
 		}
+		// F10 shadow capture (v2.0.187 moved to the scan pass): the call
+		// used to live at the end of deployPaper only, so a REAL-only fleet
+		// (ours since 26.09) never captured a single shadow observation —
+		// coverage 0%, the module observed emptiness (audit 02.10). The
+		// capture is mode-agnostic by construction: it reads the scan's
+		// REJECTED candidates regardless of which lane deployed.
+		worker.captureShadowCandidates(ctx, *settings, scanID)
 	}
 	return scanID, nil
 }
@@ -2154,9 +2163,6 @@ func (worker *Worker) deployPaper(
 			WHERE id = $1
 		`, settings.ID)
 	}
-	// F10: capture the scan's top-scored rejections for the shadow
-	// portfolio — after the deploy loop, off the hot path, fail-open.
-	worker.captureShadowCandidates(ctx, settings, scanID)
 	return nil
 }
 
@@ -4325,11 +4331,24 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 	if time.Since(worker.gateValueAt) > 24*time.Hour {
 		worker.gateValueAt = time.Now()
 		worker.buildGateValueReport(ctx)
-		// v2.0.184 decision intelligence: per-regime quality aggregates with
-		// coverage, episode finalization (untouched 2h with no ALLOW = closed
-		// rejection), and the immutable replay-experiment worker.
-		RunDueGateQuality(ctx, worker)
-		RunDueReplayExperiments(ctx, worker)
+	}
+	// v2.0.187: gate quality left the daily gate — RunDueGateQuality
+	// throttles itself by its durable marker against the app_config
+	// cadence (default 4h); hiding it behind a 24h gate made the digest
+	// daily no matter what the DB said (audit 02.10).
+	RunDueGateQuality(ctx, worker)
+	// v2.0.187: replay experiments run OFF the supervision loop — a heavy
+	// 14-day run used to monopolize this goroutine and freeze stop/radar
+	// processing for minutes (audit 02.10). Own goroutine, hard 15-minute
+	// budget per pass; the lease/claim machinery makes a timeout harmless
+	// (the run resumes on the next pass).
+	if time.Since(worker.replayPollAt) > 5*time.Minute {
+		worker.replayPollAt = time.Now()
+		replayCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Minute)
+		go func() {
+			defer cancel()
+			RunDueReplayExperiments(replayCtx, worker)
+		}()
 	}
 	// v2.0.111: surface storm arm/extend transitions once per arm.
 	worker.maybeLogStormState(ctx)
@@ -5095,11 +5114,21 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 		}
 		// Fetch the regime lazily: klines are only needed once price escapes
 		// the grid range, otherwise the decision is HOLD anyway.
+		// v2.0.187: NEUTRALs parked at the very EDGE of their range (>=88% /
+		// <=12%, the pre-break exit band) also need the regime — the v2.0.186
+		// early exit was dead code without it (audit 02.10: the fetch only ran
+		// outside the borders, mutually exclusive with the pre-break condition).
 		regime := ""
 		buffer := settings.RangeBreakBufferPct.Div(decimal.NewFromInt(100))
 		if price.LessThan(bot.lower.Mul(decimal.NewFromInt(1).Sub(buffer))) ||
 			price.GreaterThan(bot.upper.Mul(decimal.NewFromInt(1).Add(buffer))) {
 			regime = worker.regimeForSymbol(ctx, bot.symbol)
+		} else if bot.direction == "NEUTRAL" && bot.upper.GreaterThan(bot.lower) {
+			posPct := price.Sub(bot.lower).Div(bot.upper.Sub(bot.lower)).Mul(decimal.NewFromInt(100))
+			if posPct.GreaterThanOrEqual(decimal.NewFromFloat(88.0)) ||
+				posPct.LessThanOrEqual(decimal.NewFromFloat(12.0)) {
+				regime = worker.regimeForSymbol(ctx, bot.symbol)
+			}
 		}
 		botTarget, botMaxLoss := settings.PnLTargetUSDT, settings.MaxLossUSDT
 		if bot.pnlTarget != nil {
@@ -7047,12 +7076,22 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 			}
 		}
 
-		// Lazily detect regime only when price escapes the range
+		// Lazily detect regime only when price escapes the range.
+		// v2.0.187: NEUTRALs parked at the very EDGE of their range (>=88% /
+		// <=12%, the pre-break exit band) also need the regime — the v2.0.186
+		// early exit was dead code without it (audit 02.10: the fetch only ran
+		// outside the borders, mutually exclusive with the pre-break condition).
 		regime := ""
 		buffer := settings.RangeBreakBufferPct.Div(decimal.NewFromInt(100))
 		if price.LessThan(bot.lower.Mul(decimal.NewFromInt(1).Sub(buffer))) ||
 			price.GreaterThan(bot.upper.Mul(decimal.NewFromInt(1).Add(buffer))) {
 			regime = worker.regimeForSymbol(ctx, bot.symbol)
+		} else if bot.direction == "NEUTRAL" && bot.upper.GreaterThan(bot.lower) {
+			posPct := price.Sub(bot.lower).Div(bot.upper.Sub(bot.lower)).Mul(decimal.NewFromInt(100))
+			if posPct.GreaterThanOrEqual(decimal.NewFromFloat(88.0)) ||
+				posPct.LessThanOrEqual(decimal.NewFromFloat(12.0)) {
+				regime = worker.regimeForSymbol(ctx, bot.symbol)
+			}
 		}
 
 		var ofiRegime *string
@@ -7540,6 +7579,24 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 	_, _ = worker.db.Exec(ctx, `DELETE FROM ofi_decision_snapshots WHERE created_at < NOW() - INTERVAL '14 days'`)
 	_, _ = worker.db.Exec(ctx, `DELETE FROM entry_decisions WHERE created_at < NOW() - INTERVAL '14 days'`)
 	_, _ = worker.db.Exec(ctx, `DELETE FROM gate_value_snapshots WHERE created_at < NOW() - INTERVAL '90 days'`)
+	// v2.0.187 (audit 02.10): the promised 0062 retention — three tables
+	// had NO sweep at all (the migration comment claimed "existing
+	// housekeeping picks these up"; it did not) and autogrid_candidates
+	// was 80% of the whole database with zero deletes ever (+2.5GB/mo).
+	// candidates go in 50k batches (shadow_candidates FK cascades); replay
+	// items of runs older than 30 days; backtest jobs older than 30 days.
+	_, _ = worker.db.Exec(ctx, `DELETE FROM shadow_coverage_log WHERE created_at < NOW() - INTERVAL '14 days'`)
+	_, _ = worker.db.Exec(ctx, `DELETE FROM entry_episodes WHERE last_seen < NOW() - INTERVAL '90 days' AND disposition <> 'OPEN'`)
+	_, _ = worker.db.Exec(ctx, `DELETE FROM entry_episodes WHERE last_seen < NOW() - INTERVAL '7 days' AND disposition = 'OPEN' AND attempts <= 1`)
+	_, _ = worker.db.Exec(ctx, `DELETE FROM replay_run_items WHERE run_id IN (SELECT id FROM replay_runs WHERE created_at < NOW() - INTERVAL '30 days') AND created_at < NOW() - INTERVAL '30 days'`)
+	_, _ = worker.db.Exec(ctx, `DELETE FROM backtest_jobs WHERE created_at < NOW() - INTERVAL '30 days'`)
+	for range 6 {
+		tag, err := worker.db.Exec(ctx, `DELETE FROM autogrid_candidates WHERE id IN (
+			SELECT id FROM autogrid_candidates WHERE created_at < NOW() - INTERVAL '30 days' LIMIT 50000)`)
+		if err != nil || tag.RowsAffected() == 0 {
+			break
+		}
+	}
 	return nil
 }
 

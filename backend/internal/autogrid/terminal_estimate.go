@@ -22,6 +22,8 @@ func lossClassClose(reason string) bool {
 		normalized == "RANGE_BREAK_DOWN",
 		normalized == "RANGE_BREAK_UP",
 		normalized == "RANGE_BREAK_UP_TREND_STOP",
+		normalized == "RANGE_BREAK_UP_EARLY",
+		normalized == "RANGE_BREAK_DOWN_EARLY",
 		normalized == "LOSS_STOP",
 		normalized == "FORCE_LIQUIDATION":
 		return true

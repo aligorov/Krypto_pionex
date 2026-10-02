@@ -128,7 +128,9 @@ func (worker *Worker) captureShadowCandidates(ctx context.Context, settings Sett
 		worker.logger.Warn("shadow capture: decision linkage failed",
 			"component", "autogrid_worker", "scan", scanID, "error", lErr)
 	}
-	_, _ = worker.db.Exec(ctx, `
+	// v2.0.187: the coverage ledger is the reports' denominator — a
+	// silently failed INSERT invisibly skews it (audit 02.10: swallowed).
+	if _, errCov := worker.db.Exec(ctx, `
 		INSERT INTO shadow_coverage_log (decision_id, episode_id, symbol, scan_id, shadow_created, skip_reason)
 		SELECT d.id, d.episode_id, c.symbol, c.scan_id, TRUE, NULL
 		FROM autogrid_candidates c
@@ -140,8 +142,11 @@ func (worker *Worker) captureShadowCandidates(ctx context.Context, settings Sett
 		WHERE c.scan_id = $1 AND c.decision = 'REJECTED'
 		  AND EXISTS (SELECT 1 FROM shadow_candidates sc
 		              WHERE sc.candidate_id = c.id AND sc.scan_id = $1)
-	`, scanID)
-	_, _ = worker.db.Exec(ctx, `
+	`, scanID); errCov != nil {
+		worker.logger.Warn("shadow coverage ledger (created) write failed",
+			"component", "autogrid_worker", "scan", scanID, "error", errCov)
+	}
+	if _, errSkip := worker.db.Exec(ctx, `
 		INSERT INTO shadow_coverage_log (decision_id, episode_id, symbol, scan_id, shadow_created, skip_reason)
 		SELECT d.id, d.episode_id, c.symbol, c.scan_id, FALSE, 'CAP_REACHED'
 		FROM autogrid_candidates c
@@ -153,7 +158,10 @@ func (worker *Worker) captureShadowCandidates(ctx context.Context, settings Sett
 		WHERE c.scan_id = $1 AND c.decision = 'REJECTED'
 		  AND NOT EXISTS (SELECT 1 FROM shadow_candidates sc
 		                  WHERE sc.candidate_id = c.id AND sc.scan_id = $1)
-	`, scanID)
+	`, scanID); errSkip != nil {
+		worker.logger.Warn("shadow coverage ledger (cap) write failed",
+			"component", "autogrid_worker", "scan", scanID, "error", errSkip)
+	}
 	worker.logger.Info(fmt.Sprintf("shadow capture: eligible=%d inserted=%d", eligible, tag.RowsAffected()),
 		"component", "autogrid_worker", "scan", scanID)
 }
