@@ -285,6 +285,34 @@ func decideBotAction(input botActionInput) manageDecision {
 	adverseDown := input.Regime == "TREND_DOWN" || input.Regime == ""
 	adverseUp := input.Regime == "TREND_UP" || input.Regime == ""
 
+	// 4.6 Pre-break regime exit (v2.0.186, prod ZAMA #1537): the scanner
+	// confirmed TREND_UP a full 1.5h BEFORE the physical border cross
+	// (position 76%→89%, EMA slope accelerating) while the NEUTRAL sat on
+	// growing short inventory and only RANGE_BREAK_UP at full cost. An
+	// UNDERWATER neutral parked at the edge of its range in a confirmed
+	// adverse regime now exits before the break pays full price. The 88%
+	// edge reuses the scanner's anti-FOMO strong-trend extreme band (same
+	// threshold class, not a new constant); the profit side is left to the
+	// normal TP — this is a stop-class save, it never cuts a working grid.
+	if input.Direction == "NEUTRAL" &&
+		(input.Regime == "TREND_UP" || input.Regime == "TREND_DOWN") &&
+		total.LessThan(decimal.Zero) &&
+		input.CurrentPrice.LessThan(breakUp) && input.CurrentPrice.GreaterThan(breakDown) { // strictly PRE-break
+		span := input.Upper.Sub(input.Lower)
+		if span.GreaterThan(decimal.Zero) {
+			posPct := input.CurrentPrice.Sub(input.Lower).Div(span).Mul(decimal.NewFromInt(100))
+			edgeUp := input.Regime == "TREND_UP" && posPct.GreaterThanOrEqual(decimal.NewFromFloat(88.0))
+			edgeDown := input.Regime == "TREND_DOWN" && posPct.LessThanOrEqual(decimal.NewFromFloat(12.0))
+			if edgeUp || edgeDown {
+				reason := "RANGE_BREAK_UP_EARLY"
+				if edgeDown {
+					reason = "RANGE_BREAK_DOWN_EARLY"
+				}
+				return manageDecision{Action: ActionCloseRangeBreak, Reason: reason}
+			}
+		}
+	}
+
 	if input.CurrentPrice.LessThan(breakDown) {
 		// v2.0 DGT reset: instead of closing on range break, try rebuilding
 		// the grid around the new price. Falls back to close when no

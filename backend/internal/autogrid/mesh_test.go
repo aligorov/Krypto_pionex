@@ -3,6 +3,7 @@ package autogrid
 import (
 	"encoding/json"
 	"math"
+	"strings"
 	"testing"
 
 	"github.com/aligorov/pionex-bot/backend/internal/marketdata"
@@ -381,4 +382,51 @@ func TestBotGridSpanPct(t *testing.T) {
 	if got := botGridSpanPct(upper, lower, price); got != 0 {
 		t.Fatalf("inverted bounds must read 0, got %.2f", got)
 	}
+}
+
+// v2.0.186 pre-break regime exit: prod ZAMA #1537 sat underwater at the
+// top edge of its range in a CONFIRMED TREND_UP for 1.5h before the
+// physical break; the early exit cuts it at the edge instead.
+func TestNeutralPreBreakRegimeExit(t *testing.T) {
+	base := func(price, total float64, regime string) botActionInput {
+		totalD := decimal.NewFromFloat(total)
+		return botActionInput{
+			Direction: "NEUTRAL", Regime: regime,
+			Lower: decimal.NewFromFloat(100), Upper: decimal.NewFromFloat(110),
+			CurrentPrice: decimal.NewFromFloat(price),
+			RealizedPNL: decimal.Zero, UnrealizedPNL: totalD, PeakPNL: totalD,
+			Budget: decimal.NewFromInt(75),
+			PnLTarget: decVal(1.5), MaxLoss: decVal(30),
+			RangeBreakBuffer: decimal.NewFromInt(2),
+		}
+	}
+	// ZAMA shape: TREND_UP, 89% of the range, underwater -> early exit.
+	d := decideBotAction(base(108.9, -3.0, "TREND_UP"))
+	if d.Action != ActionCloseRangeBreak || d.Reason != "RANGE_BREAK_UP_EARLY" {
+		t.Fatalf("underwater neutral at the up edge in TREND_UP must exit early, got %+v", d)
+	}
+	// Same position, but IN PROFIT -> the normal TP path owns it.
+	d = decideBotAction(base(108.9, 1.0, "TREND_UP"))
+	if d.Action == ActionCloseRangeBreak && d.Reason == "RANGE_BREAK_UP_EARLY" {
+		t.Fatal("profitable neutral must not take the early loss exit")
+	}
+	// TREND_UP but mid-range -> not an edge, hold the line.
+	d = decideBotAction(base(105.0, -3.0, "TREND_UP"))
+	if d.Action == ActionCloseRangeBreak && d.Reason == "RANGE_BREAK_UP_EARLY" {
+		t.Fatal("mid-range neutral must not early-exit")
+	}
+	// Mirror: TREND_DOWN, 10% of the range, underwater -> early exit down.
+	d = decideBotAction(base(101.0, -3.0, "TREND_DOWN"))
+	if d.Action != ActionCloseRangeBreak || d.Reason != "RANGE_BREAK_DOWN_EARLY" {
+		t.Fatalf("underwater neutral at the down edge in TREND_DOWN must exit early, got %+v", d)
+	}
+	// RANGE regime -> the classic border logic only.
+	d = decideBotAction(base(108.9, -3.0, "RANGE"))
+	if d.Action == ActionCloseRangeBreak && strings.HasPrefix(d.Reason, "RANGE_BREAK_UP_EARLY") {
+		t.Fatal("RANGE regime must not trigger the pre-break exit")
+	}
+}
+
+func decVal(v float64) decimal.Decimal {
+	return decimal.NewFromFloat(v)
 }
