@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"sort"
 	"strings"
@@ -417,9 +418,18 @@ func (worker *Worker) simulateShadowRow(
 		WHERE symbol = $1 AND captured_at > NOW() - INTERVAL '24 hours'
 	`, symbol).Scan(&fundingAvg)
 	rateBps := fundingAvg.Mul(decimal.NewFromInt(10000))
+	// v2.0.190 (calibration): with no collected funding the shadow core ran
+	// funding-free and overstated the fleet by the whole funding bill. The
+	// market norm 10 bps/8h is the honest default until a snapshot arrives.
+	if !rateBps.GreaterThan(decimal.Zero) {
+		rateBps = decimal.NewFromInt(10)
+	}
 
 	outcome, outcomeReason := "", "WINDOW_END"
 	total := decimal.Zero
+	// v2.0.190 calibration state: entry-fee accounting + one-shot exit cost.
+	prevInvNotional := decimal.Zero
+	exitCostBooked := false
 
 	candleTime := time.Time{}
 	for _, c := range candles {
@@ -446,11 +456,20 @@ func (worker *Worker) simulateShadowRow(
 		// mark directly by the stop price, NEUTRAL marks the grid inventory
 		// at the clamped stop level (crossings below the stop book no pairs,
 		// so realized is untouched).
+		// v2.0.190 (calibration): directional stops trigger on the candle
+		// CLOSE beyond the stop (mark semantics), not the intrabar extreme —
+		// SL-first at the wick marked the full notional ~1.6x worse than the
+		// exchange actually closes (prod PENGU #1545: model -37.8 vs real
+		// -23.7). NEUTRAL keeps the pessimistic intrabar check below.
 		breached := false
-		if direction == "SHORT" {
-			breached = antiHunt.GreaterThan(decimal.Zero) && c.High.GreaterThanOrEqual(antiHunt)
-		} else {
-			breached = antiHunt.GreaterThan(decimal.Zero) && c.Low.LessThanOrEqual(antiHunt)
+		if direction == "LONG" || direction == "SHORT" {
+			if direction == "SHORT" {
+				breached = antiHunt.GreaterThan(decimal.Zero) && c.Close.GreaterThanOrEqual(antiHunt)
+			} else {
+				breached = antiHunt.GreaterThan(decimal.Zero) && c.Close.LessThanOrEqual(antiHunt)
+			}
+		} else if antiHunt.GreaterThan(decimal.Zero) {
+			breached = c.Low.LessThanOrEqual(antiHunt)
 		}
 		if breached {
 			c.Close = antiHunt
@@ -476,10 +495,40 @@ func (worker *Worker) simulateShadowRow(
 			pairProfit, uninv, invNotional := neutralGridPaperPNL(
 				lower, upper, gridNum, investment, leverage, lastLevel, level, c.Close,
 				decimal.NewFromFloat(pionexMakerFeeBps))
+			// v2.0.190 (calibration): a FRESH grid has no ladder yet — the
+			// stateless model books the full below-mid inventory from the
+			// first candle and painted -7.33 of fictitious stops on bots
+			// that lived 6-30 minutes (the exchange closed them at ~0: no
+			// inventory was built). Ramp the inventory in over the first
+			// 30 minutes of life.
+			ageMin := candleTime.Sub(capturedAt).Minutes()
+			if ageMin < 30 {
+				ramp := decimal.NewFromFloat(math.Max(0, ageMin) / 30.0)
+				uninv = uninv.Mul(ramp)
+				invNotional = invNotional.Mul(ramp)
+			}
+			// v2.0.190: the ladder BUILD pays the maker entry fee on each
+			// new tranche of inventory (the calibration fleet was missing
+			// -5.37 USDT of entry fees entirely).
+			if invNotional.GreaterThan(prevInvNotional) {
+				feeEntry := invNotional.Sub(prevInvNotional).
+					Mul(decimal.NewFromFloat(pionexMakerFeeBps)).Div(decimal.NewFromInt(10000))
+				realized = realized.Sub(feeEntry)
+			}
+			prevInvNotional = invNotional
 			realized = realized.Add(pairProfit)
 			unrealized = uninv
 			lastLevel = level
 			exposure = invNotional
+		}
+
+		// v2.0.190: closing the inventory at a stop/break pays taker+
+		// slippage on the whole position — the model used to exit at mark
+		// for free (a hidden optimist bias on every loss episode).
+		if breached && exposure.GreaterThan(decimal.Zero) && !exitCostBooked {
+			realized = realized.Sub(exposure.
+				Mul(decimal.NewFromFloat(0.0010))) // taker 5 bps + slippage 5 bps
+			exitCostBooked = true
 		}
 
 		if delta, anchor := fundingAccrual(exposure, rateBps, capturedAt, fundingLast, candleTime); delta != nil {
