@@ -352,8 +352,24 @@ func (e *Engine) ValidateDailyLoss(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("risk engine: check daily loss: %w", err)
 	}
-	if dailyRealizedLoss.GreaterThanOrEqual(settings.MaxDailyLossUSD) {
-		return fmt.Errorf("risk engine: daily loss limit reached ($%s / max $%s) - new entries paused", dailyRealizedLoss.StringFixed(2), settings.MaxDailyLossUSD.StringFixed(2))
+	// v2.0.192 (audit F13): the daily breaker used to count CLOSED losses
+	// only — a fleet sitting on a deep floating drawdown spent none of the
+	// budget until each bot actually stopped. The negative unrealized MTM of
+	// RUNNING bots now draws from the same budget (positive MTM does NOT
+	// credit it: no offsetting). Read failure fails CLOSED: an unknown
+	// account state is not a zero-risk state.
+	var floatingLoss decimal.Decimal
+	if err := e.db.QueryRow(ctx, `
+		SELECT COALESCE(SUM(LEAST(unrealized_pnl_usdt, 0)), 0)
+		FROM grid_bots
+		WHERE status = 'RUNNING'
+	`).Scan(&floatingLoss); err != nil {
+		return fmt.Errorf("risk engine: floating MTM read failed — entry refused (fail-closed): %w", err)
+	}
+	totalLoss := dailyRealizedLoss.Add(floatingLoss.Abs())
+	if totalLoss.GreaterThanOrEqual(settings.MaxDailyLossUSD) {
+		return fmt.Errorf("risk engine: daily loss limit reached ($%s realized + $%s floating / max $%s) - new entries paused",
+			dailyRealizedLoss.StringFixed(2), floatingLoss.Abs().StringFixed(2), settings.MaxDailyLossUSD.StringFixed(2))
 	}
 	return nil
 }

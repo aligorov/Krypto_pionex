@@ -90,17 +90,23 @@ type BacktestGateVerdict struct {
 
 // BacktestDeployParams holds the exact configuration that will be deployed to the exchange.
 type BacktestDeployParams struct {
-	Symbol      string          `json:"symbol"`
-	Interval    string          `json:"interval"`
-	LowerPrice  decimal.Decimal `json:"lower_price"`
-	UpperPrice  decimal.Decimal `json:"upper_price"`
-	GridNum     int             `json:"grid_num"`
-	Leverage    int             `json:"leverage"`
-	Investment  decimal.Decimal `json:"investment"`
-	StopLossPct float64         `json:"stop_loss_pct"`
-	Direction   string          `json:"direction"`
-	FeeBps      float64         `json:"fee_bps"`
-	SlippageBps float64         `json:"slippage_bps"`
+	Symbol      string           `json:"symbol"`
+	Interval    string           `json:"interval"`
+	LowerPrice  decimal.Decimal  `json:"lower_price"`
+	UpperPrice  decimal.Decimal  `json:"upper_price"`
+	GridNum     int              `json:"grid_num"`
+	Leverage    int              `json:"leverage"`
+	Investment  decimal.Decimal  `json:"investment"`
+	StopLossPct float64          `json:"stop_loss_pct"`
+	// StopLossPrice is the ABSOLUTE anti-hunt stop price that will be sent
+	// to the exchange (v2.0.192, audit F06): StopLossPct is a DISTANCE FROM
+	// ENTRY, while the engine used to re-derive the stop from the range
+	// borders — entry=100/lower=96/intended stop=94 became 90.24 in the
+	// engine. The absolute price is authoritative when present.
+	StopLossPrice *decimal.Decimal `json:"stop_loss_price,omitempty"`
+	Direction     string           `json:"direction"`
+	FeeBps        float64          `json:"fee_bps"`
+	SlippageBps   float64          `json:"slippage_bps"`
 }
 
 // normalizeBacktestTF maps scanner interval names onto the test ladder.
@@ -196,6 +202,17 @@ func evaluateBacktestGate(traded BacktestJobSummary, neighbors []BacktestJobSumm
 	if traded.OOSPct <= backtestMinOOSPct {
 		verdict.Reason = fmt.Sprintf("backtest gate: OOS return %.2f%% <= %.1f%% on traded TF %s",
 			traded.OOSPct, backtestMinOOSPct, traded.Interval)
+		return verdict
+	}
+	// v2.0.192 (audit F04): positive pair EV together with a NEGATIVE total
+	// OOS return is a contradiction, not a pass — the pair metrics are
+	// completed-lot events and ignore the open inventory/funding/entry side
+	// (prod 597 DONE verdicts: 108 carried positive EV over negative OOS,
+	// 105 even had 100% pair win-rate on a losing window). The bot's NET
+	// outcome is the admission subject; pairs are diagnostics.
+	if traded.OOSPct < 0 && traded.CI95Lower > 0 {
+		verdict.Reason = fmt.Sprintf("backtest gate: противоречие метрик — pair EV положителен (ДИ95 lower %.4f), но итоговый OOS доход бота %.2f%% < 0: пары не видят инвентарь/фандинг/вход (v2.0.192)",
+			traded.CI95Lower, traded.OOSPct)
 		return verdict
 	}
 	// Max Drawdown within risk limit (15%)
@@ -339,10 +356,13 @@ func matchesDeployParams(jobParamsBytes []byte, p *BacktestDeployParams) bool {
 		return false
 	}
 	var jobParams struct {
-		LowerPrice float64 `json:"lower_price"`
-		UpperPrice float64 `json:"upper_price"`
-		GridNum    int     `json:"grid_num"`
-		Leverage   int     `json:"leverage"`
+		LowerPrice    float64  `json:"lower_price"`
+		UpperPrice    float64  `json:"upper_price"`
+		GridNum       int      `json:"grid_num"`
+		Leverage      int      `json:"leverage"`
+		Direction     string   `json:"direction"`
+		Investment    float64  `json:"investment"`
+		StopLossPrice *float64 `json:"stop_loss_price"`
 	}
 	if json.Unmarshal(jobParamsBytes, &jobParams) != nil {
 		return false
@@ -360,6 +380,27 @@ func matchesDeployParams(jobParamsBytes []byte, p *BacktestDeployParams) bool {
 	}
 	if p.Leverage > 0 && jobParams.Leverage > 0 && jobParams.Leverage != p.Leverage {
 		return false
+	}
+	// v2.0.192 (audit F07): direction, investment and the absolute stop are
+	// part of the identity — a LONG-result cached at the same geometry used
+	// to serve a SHORT request, and a missing investment/stop quietly
+	// widened the match. Missing field in the job = miss, not pass.
+	if p.Direction != "" && jobParams.Direction != "" && jobParams.Direction != p.Direction {
+		return false
+	}
+	pInvest := p.Investment.InexactFloat64()
+	if pInvest > 0 && jobParams.Investment > 0 &&
+		math.Abs(jobParams.Investment-pInvest) > pInvest*0.01 {
+		return false
+	}
+	if p.StopLossPrice != nil {
+		if jobParams.StopLossPrice == nil {
+			return false // pre-192 jobs carry no absolute stop — not the same bot
+		}
+		pStop := p.StopLossPrice.InexactFloat64()
+		if math.Abs(*jobParams.StopLossPrice-pStop) > pStop*deployParamsPriceTolerance {
+			return false
+		}
 	}
 	return true
 }
@@ -423,6 +464,9 @@ func (worker *Worker) loadBacktestSummaryWithParams(ctx context.Context, symbol,
 		paramsMap["leverage"] = p.Leverage
 		paramsMap["investment"] = p.Investment.InexactFloat64()
 		paramsMap["direction"] = p.Direction
+		if p.StopLossPrice != nil {
+			paramsMap["stop_loss_price"] = p.StopLossPrice.InexactFloat64()
+		}
 		if p.StopLossPct > 0 {
 			paramsMap["stop_loss_pct"] = p.StopLossPct
 		}

@@ -206,7 +206,7 @@ class GridSimulator:
         return [open_, low, high, close]
 
     def simulate(self, candles, lower, upper, levels, investment, leverage=1.0, direction="neutral",
-                 stop_loss_pct=None):
+                 stop_loss_pct=None, stop_loss_price=None):
         """
         Simulates grid execution against OHLCV candle sequence.
         
@@ -262,7 +262,14 @@ class GridSimulator:
 
         # Stop price determination
         stop_price = None
-        if stop_loss_pct is not None and stop_loss_pct > 0:
+        # v2.0.192 (audit F06): an ABSOLUTE stop price from the deploy spec is
+        # authoritative — stop_loss_pct is a distance FROM ENTRY and used to
+        # be re-derived from the range borders here (entry=100/lower=96/
+        # intended stop=94 became 90.24). Legacy pct-only jobs keep the old
+        # path; the Go comparator now misses them for absolute-stop requests.
+        if stop_loss_price is not None and stop_loss_price > 0:
+            stop_price = float(stop_loss_price)
+        elif stop_loss_pct is not None and stop_loss_pct > 0:
             if direction == "short":
                 stop_price = upper * (1 + stop_loss_pct / 100.0)
             else:
@@ -558,7 +565,8 @@ def walk_forward(engine: QuantBacktestEngine, candles: List[Dict[str, Any]],
             # Historical walk-forward simulation of derived strategy parameters on out-of-sample test window
             res = sim.simulate(
                 test, params["lower"], params["upper"], params["levels"], investment,
-                stop_loss_pct=stop_loss_pct
+                stop_loss_pct=stop_loss_pct,
+                stop_loss_price=deployed_params.get("stop_loss_price") if deployed_params else None
             )
             if "error" not in res:
                 fold_data = {
@@ -603,6 +611,7 @@ def walk_forward(engine: QuantBacktestEngine, candles: List[Dict[str, Any]],
             leverage=deployed_params.get("leverage", 1.0),
             direction=deployed_params.get("direction", "neutral"),
             stop_loss_pct=deployed_params.get("stop_loss_pct", stop_loss_pct),
+            stop_loss_price=deployed_params.get("stop_loss_price"),
         )
         if "error" not in cand_res:
             c_trades = cand_res.get("trades", [])

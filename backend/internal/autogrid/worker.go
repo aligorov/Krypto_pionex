@@ -3394,8 +3394,22 @@ func (worker *Worker) deployReal(
 				Investment:  investAmount,
 				Direction:   trend,
 				StopLossPct: stopLossPct,
-				FeeBps:      decimalFloat(settings.FeeBps),
-				SlippageBps: decimalFloat(settings.SlippageBps),
+				// v2.0.192 (F06): the absolute anti-hunt stop the exchange will
+				// actually receive — the engine no longer re-derives it from
+				// the range borders.
+				StopLossPrice: &antiHuntStop,
+				FeeBps:        decimalFloat(settings.FeeBps),
+				SlippageBps:   decimalFloat(settings.SlippageBps),
+			}
+			// v2.0.192 (audit F12): the ACTUAL payout after every TP/SL
+			// mutation is journaled on the decision — the stored
+			// risk_reward_ratio described a pre-cap quantity and hid that
+			// the 2% TP cap produces target/loss ratios as low as 0.1
+			// (binary break-even ≈ 91% wins). Admission thresholds stay
+			// the operator's call; the number becomes measurable now.
+			if botMaxLoss != nil && botMaxLoss.GreaterThan(decimal.Zero) && botTarget != nil {
+				candidate.ModelAssumptions["payoutRatioActual"] =
+					botTarget.Div(*botMaxLoss).InexactFloat64()
 			}
 			verdict := worker.backtestGateWithParams(ctx, settings, candidate.Symbol, &deployParams)
 			if verdict.Pending {
