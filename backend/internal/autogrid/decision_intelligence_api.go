@@ -360,6 +360,9 @@ func (s *Service) ListGateQuality(ctx context.Context, window string) ([]GateQua
 		       proof_strength, calibration, notes
 		FROM gate_quality_daily
 		WHERE window_kind = $1
+		  AND window_start = (
+		      SELECT MAX(window_start) FROM gate_quality_daily WHERE window_kind = $1
+		  )
 		ORDER BY gate, regime
 	`, window)
 	if err != nil {

@@ -104,17 +104,18 @@ func (worker *Worker) volExpansionBlocked(ctx context.Context, symbol string, fo
 	if forecastAnnPct > 0 {
 		candles, err := worker.publicClient.GetKlines(ctx, symbol, "15M", volExpansionWindow+4)
 		if err != nil || len(candles) < volExpansionWindow+1 {
-			// No fresh candles → cannot prove expansion → do not block. The
-			// research ranks a false block (missing the post-flush window)
-			// above a false pass (range sizing still bounds the damage).
-			return false, 0
+			// v2.0.193 (audit F15): missing candles used to mean "pass".
+			// Absent data is not proof of calm — the expansion gate now
+			// fails CLOSED (ratio -1 marks the data-out cause in the log
+			// line; a dead feed alarms separately via feed health).
+			return true, -1
 		}
 		ratio := RealizedVolPct15m(candles, volExpansionWindow) / forecastAnnPct
 		return ratio >= volExpansionRatioThreshold, ratio
 	}
 	candles, err := worker.publicClient.GetKlines(ctx, symbol, "15M", volExpansionBaseline+4)
 	if err != nil || len(candles) < volExpansionBaseline+1 {
-		return false, 0
+		return true, -1
 	}
 	baseline := RealizedVolPct15m(candles, volExpansionBaseline)
 	if baseline <= 0 {

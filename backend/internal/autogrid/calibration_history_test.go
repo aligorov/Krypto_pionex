@@ -340,6 +340,7 @@ func calibReplayBot(bot calibBotRow, candles []calibCandle, rangeBreakBuffer dec
 	exitCostBooked := false
 	fundingLast := bot.CreatedAt
 	openedAt := bot.CreatedAt
+	worstLevel := gridNum - 1
 
 	for _, c := range life {
 		used++
@@ -377,8 +378,11 @@ func calibReplayBot(bot calibBotRow, candles []calibCandle, rangeBreakBuffer dec
 			exposure = notional
 		default: // NEUTRAL — the paper ladder
 			level := gridLevelForPrice(lower, upper, gridNum, closePrice)
-			pairProfit, uninv, invNotional := neutralGridPaperPNL(
-				lower, upper, gridNum, investment, leverage, lastLevel, level, closePrice,
+			if level < worstLevel {
+				worstLevel = level
+			}
+			pairProfit, uninv, invNotional := neutralGridPaperPNLWithExtreme(
+				lower, upper, gridNum, investment, leverage, lastLevel, level, worstLevel, closePrice,
 				decimal.NewFromFloat(pionexMakerFeeBps))
 			ageMin := candleTime.Sub(openedAt).Minutes()
 			if ageMin < 30 {

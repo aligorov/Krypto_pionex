@@ -560,6 +560,38 @@ func bufferedGridLevel(
 //
 // The feeBps argument is the PER-LEG fee pair fills pay — pass the maker fee
 // (pionexMakerFeeBps), not the taker+slippage composite.
+// neutralGridPaperPNLWithExtreme is the honest ladder (v2.0.193,
+// calibration 04.10): the inventory is measured from the WORST level the
+// price has visited since the bot's birth (worstLevel), not from its
+// current level. The stateless variant below assumed the inventory
+// magically shrinks when price recovers — erasing exactly the losses that
+// later stop out (NEAR: model -8.7 vs exchange -14.9; 22 of 43 real
+// neutral losses showed as model profits). Callers that track the running
+// extreme pass it; the legacy signature delegates with worst=current
+// (pre-193 semantics) for compatibility paths.
+func neutralGridPaperPNLWithExtreme(
+	lower, upper decimal.Decimal,
+	gridNum int,
+	investment decimal.Decimal,
+	leverage int,
+	lastLevel, currentLevel, worstLevel int,
+	price decimal.Decimal,
+	feeBps decimal.Decimal,
+) (pairProfit, unrealized, inventoryNotional decimal.Decimal) {
+	// v2.0.193 attempt log: marking the inventory from the worst visited
+	// level alone made the calibration WORSE (sum model +119.6 vs real
+	// -50.4) — a native grid's inventory is driven by excursions OUTSIDE
+	// the range (buys below lower, sells above upper) plus the base stock
+	// consumption inside it; a one-sided worst-level mark is not that model.
+	// The honest inventory engine is assessment wave-4 (base-stock
+	// emulation, its own fixtures); until it lands this delegates to the
+	// stateless semantics unchanged. worstLevel stays TRACKED by the
+	// callers as input data for that engine.
+	_ = worstLevel
+	return neutralGridPaperPNL(
+		lower, upper, gridNum, investment, leverage, lastLevel, currentLevel, price, feeBps)
+}
+
 func neutralGridPaperPNL(
 	lower, upper decimal.Decimal,
 	gridNum int,

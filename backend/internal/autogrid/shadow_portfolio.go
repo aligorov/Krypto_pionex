@@ -453,6 +453,7 @@ func (worker *Worker) simulateShadowRow(
 	// v2.0.190 calibration state: entry-fee accounting + one-shot exit cost.
 	prevInvNotional := decimal.Zero
 	exitCostBooked := false
+	worstLevel := gridNum - 1 // v2.0.193: deepest grid level visited since birth
 
 	candleTime := time.Time{}
 	for _, c := range candles {
@@ -511,12 +512,18 @@ func (worker *Worker) simulateShadowRow(
 			exposure = investment.Mul(decimal.NewFromInt(int64(leverage)))
 		default:
 			level := gridLevelForPrice(lower, upper, gridNum, c.Close)
+			// v2.0.193 honest ladder: track the worst visited level; the
+			// inventory is measured from there, not from the current level
+			// (price recovery must not erase the bought inventory).
+			if level < worstLevel {
+				worstLevel = level
+			}
 			// Pairs pay the maker fee (the live loop's ladder contract), not
 			// the captured taker+slippage composite — otherwise every shadow
 			// NEUTRAL row is ~26 bps pessimistic per pair and gate/score
 			// alpha drowns in a systematic fee error.
-			pairProfit, uninv, invNotional := neutralGridPaperPNL(
-				lower, upper, gridNum, investment, leverage, lastLevel, level, c.Close,
+			pairProfit, uninv, invNotional := neutralGridPaperPNLWithExtreme(
+				lower, upper, gridNum, investment, leverage, lastLevel, level, worstLevel, c.Close,
 				decimal.NewFromFloat(pionexMakerFeeBps))
 			// v2.0.190 (calibration): a FRESH grid has no ladder yet — the
 			// stateless model books the full below-mid inventory from the
