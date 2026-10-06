@@ -97,6 +97,21 @@ func (manager *LifecycleManager) CreateGridBot(
 	if err := manager.validatePionexSymbol(ctx, symbol); err != nil {
 		return "", err
 	}
+	// v2.0.191 (audit F10): the LAST-line risk re-read. The admission
+	// gates ran minutes ago (backtest waits up to 75s per TF, order-book
+	// fetches, tranche math); a kill switch flipped in that window used to
+	// be discovered only after the create already landed. Re-read the
+	// durable switch immediately before the intent is persisted — an
+	// enabled switch (or an unreadable one: fail-closed) refuses here.
+	var killEnabled bool
+	if err := manager.db.QueryRow(ctx,
+		`SELECT COALESCE((SELECT enabled FROM risk_settings ORDER BY updated_at DESC LIMIT 1), false)`).
+		Scan(&killEnabled); err != nil {
+		return "", fmt.Errorf("kill-switch re-read failed — create refused (fail-closed): %w", err)
+	}
+	if killEnabled {
+		return "", errors.New("kill switch enabled — create refused at the last line")
+	}
 	fingerprint, err := requestFingerprint(input)
 	if err != nil {
 		return "", err

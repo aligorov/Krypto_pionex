@@ -709,7 +709,16 @@ func (c *Client) do(
 					cancel()
 				}
 			}
-			return &APIError{StatusCode: resp.StatusCode, Code: envelope.Code, Message: message}
+			// v2.0.191 (audit F11): a VALID error envelope from a 5xx (or a
+			// documented BOT_INTERNAL_ERROR on any code) is NOT an
+			// authoritative rejection — Pionex docs classify it as a
+			// system/RPC/network/downstream problem that does not prove the
+			// mutation never happened. Mark the outcome unknown so the
+			// lifecycle reconciles instead of book-keeping FAILED and
+			// allowing a blind retry.
+			outcomeUnknown := method != http.MethodGet &&
+				(resp.StatusCode >= 500 || envelope.Code == "BOT_INTERNAL_ERROR")
+			return &APIError{StatusCode: resp.StatusCode, Code: envelope.Code, Message: message, OutcomeUnknown: outcomeUnknown}
 		}
 		if out == nil || len(envelope.Data) == 0 || string(envelope.Data) == "null" {
 			return nil

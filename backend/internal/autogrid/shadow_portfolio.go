@@ -118,12 +118,12 @@ func (worker *Worker) captureShadowCandidates(ctx context.Context, settings Sett
 		SET decision_id = d.id, episode_id = d.episode_id, geometry_stage = 'SCANNER'
 		FROM entry_decisions d
 		WHERE sc.scan_id = $1
+		  AND sc.decision_id IS NULL
 		  AND d.symbol = sc.symbol AND d.ref_id = sc.candidate_id::TEXT
 		  AND d.created_at = (
 		      SELECT MAX(d2.created_at) FROM entry_decisions d2
 		      WHERE d2.symbol = sc.symbol AND d2.ref_id = sc.candidate_id::TEXT
 		  )
-		WHERE sc.decision_id IS NULL
 	`, scanID)
 	if lErr != nil {
 		worker.logger.Warn("shadow capture: decision linkage failed",
@@ -309,7 +309,29 @@ func transientSimFailure(err error) bool {
 	return true
 }
 
+// shadowTerminalStates maps a replay outcome_reason onto the 0062 state
+// machines (F02 fix, audit 05.10): the old completion UPDATE wrote the
+// legacy outcome columns but never closed pos_state/calc_state, leaving
+// 1290 simulated rows as OPEN/PENDING — invisible to the gate-quality
+// aggregates that read calc_state='DONE'.
+func shadowTerminalStates(outcomeReason string) (posState, calcState string) {
+	switch {
+	case strings.HasPrefix(outcomeReason, "TAKE_PROFIT"), strings.HasPrefix(outcomeReason, "TRAILING"):
+		return "CLOSED_TP", "DONE"
+	case strings.HasPrefix(outcomeReason, "STOP_LOSS"), strings.HasPrefix(outcomeReason, "STRUCT_INVALID"),
+		strings.HasPrefix(outcomeReason, "RANGE_BREAK"):
+		return "CLOSED_SL", "DONE"
+	case outcomeReason == "WINDOW_END_AT_CLOSED_AT" || outcomeReason == "WINDOW_END":
+		return "HORIZON_END", "DONE"
+	case outcomeReason == "":
+		return "OPEN", "PENDING"
+	default:
+		return "INVALIDATED", "DONE"
+	}
+}
+
 // simulateShadowRow replays one captured rejection through the paper-model
+
 // core. Best-effort per row: a PERMANENT failure marks the row simulated
 // with the error note so one bad row cannot wedge the batch; a TRANSIENT
 // one leaves it pending for the next run (see transientSimFailure).
@@ -329,7 +351,8 @@ func (worker *Worker) simulateShadowRow(
 		nb, _ := json.Marshal(map[string]string{"error": note})
 		if _, err := worker.db.Exec(ctx, `
 			UPDATE shadow_candidates
-			SET simulated = TRUE, simulated_at = NOW(), sim_notes = $2::JSONB
+			SET simulated = TRUE, simulated_at = NOW(), sim_notes = $2::JSONB,
+			    pos_state = 'INVALIDATED', calc_state = 'RETRYABLE_ERROR', closed_at = NOW()
 			WHERE id = $1 AND NOT simulated
 		`, id, string(nb)); err != nil {
 			worker.logger.Warn("shadow sim failure note write failed",
@@ -581,16 +604,18 @@ func (worker *Worker) simulateShadowRow(
 		"simplifications": []string{"no_tranche2", "no_recenter", "regime_unknown", "scanner_mesh"},
 		"window_clipped":  started && windowStart.Sub(capturedAt) > 15*time.Minute,
 	})
+	posState, calcState := shadowTerminalStates(outcomeReason)
 	if _, err := worker.db.Exec(ctx, `
 		UPDATE shadow_candidates
 		SET simulated = TRUE, simulated_at = NOW(),
 		    pnl_target_usdt = $2, max_loss_usdt = $3,
 		    sim_window_start = $4, sim_window_end = $5, candles_used = $6,
 		    outcome_pnl_usdt = $7::NUMERIC, outcome_reason = $8,
-		    mfe_usdt = $9, mae_usdt = $10, sim_notes = $11::JSONB
+		    mfe_usdt = $9, mae_usdt = $10, sim_notes = $11::JSONB,
+		    pos_state = $12, calc_state = $13, closed_at = NOW()
 		WHERE id = $1 AND NOT simulated
 	`, id, pnlTarget, maxLossUSDT, windowStart, candleTime, used,
-		outcome, outcomeReason, peak, trough, string(notes)); err != nil {
+		outcome, outcomeReason, peak, trough, string(notes), posState, calcState); err != nil {
 		// The replay result is gone if this write fails, but the row stays
 		// pending and the next run redoes it — visible in logs either way.
 		worker.logger.Warn("shadow sim result write failed; row stays pending",

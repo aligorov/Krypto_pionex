@@ -576,6 +576,15 @@ func insertEntryDecisionRow(ctx context.Context, db *pgxpool.Pool, in EntryChain
 	if stage == "" {
 		stage = "INTERMEDIATE"
 	}
+	// v2.0.191 (audit F03-min): every journaled decision now carries the
+	// post-override direction and a full VALUES snapshot of the deciding
+	// settings/flags — 4214 rows had neither, making replay/config
+	// reproduction impossible. Best-effort alongside the row itself.
+	directionAfter := in.Direction
+	if directionAfter == "" {
+		directionAfter = "NEUTRAL"
+	}
+	configSnapshot := BuildConfigSnapshot(ctx, db, in.Settings)
 	dataQuality, _ := features["dataQuality"].(string)
 	if dataQuality == "" {
 		dataQuality = "OK"
@@ -586,12 +595,14 @@ func insertEntryDecisionRow(ctx context.Context, db *pgxpool.Pool, in EntryChain
 	_, err = db.Exec(ctx, `
 		INSERT INTO entry_decisions (
 			path, fleet, symbol, outcome, code, reason, features, config_version, ref_id,
-			episode_id, attempt_no, decision_at, data_quality, gate_trace, stage
+			episode_id, attempt_no, decision_at, data_quality, gate_trace, stage,
+			direction_after, config_snapshot
 		) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9,
-			$10, $11, NOW(), $12, $13::jsonb, $14)
+			$10, $11, NOW(), $12, $13::jsonb, $14, $15, $16::jsonb)
 	`,
 		string(in.Path), in.Fleet, in.Symbol, outcome, code, reason,
 		string(featuresJSON), ConfigVersion(ctx, db, in.Settings.ID), in.RefID,
-		episodeID, attemptNo, dataQuality, string(traceJSON), stage)
+		episodeID, attemptNo, dataQuality, string(traceJSON), stage,
+		directionAfter, string(marshalJSONMap(configSnapshot)))
 	return err
 }

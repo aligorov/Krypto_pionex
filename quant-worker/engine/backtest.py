@@ -323,7 +323,10 @@ class GridSimulator:
                             if not open_lots[sell_lvl]:
                                 del open_lots[sell_lvl]
                             gross = lot_base * (entry - price) # short gain
-                            fee = lot_quote * self.maker_fee + lot_base * price * self.maker_fee
+                            # v2.0.191 (audit F08): the entry leg's fee was
+                            # already paid when the lot OPENED — charging
+                            # lot_quote again here double-billed every close.
+                            fee = lot_base * price * self.maker_fee
                             fees_paid += fee
                             trade_net = gross - fee
                             realized += trade_net
@@ -356,7 +359,10 @@ class GridSimulator:
                             if not open_lots[buy_lvl]:
                                 del open_lots[buy_lvl]
                             gross = lot_base * (price - entry)
-                            fee = lot_quote * self.maker_fee + lot_base * price * self.maker_fee
+                            # v2.0.191 (audit F08): the entry leg's fee was
+                            # already paid when the lot OPENED — charging
+                            # lot_quote again here double-billed every close.
+                            fee = lot_base * price * self.maker_fee
                             fees_paid += fee
                             trade_net = gross - fee
                             realized += trade_net
@@ -754,9 +760,16 @@ def walk_forward(engine: QuantBacktestEngine, candles: List[Dict[str, Any]],
         vols = [c.get("volume", 0.0) * c.get("close", 0.0) for c in candles]
         avg_candle_vol = float(np.mean(vols)) if vols else 0.0
 
+    # v2.0.191 (audit F09): missing/zero volume data used to pass as
+    # liquidity OK — absent data is NOT proof of executability. Zero or
+    # no candles now refuses with an explicit reason; the exchange book
+    # remains the real gate, this is only the candle-side precondition.
     liquidity_ok = True
     liquidity_reason = "OK"
-    if avg_candle_vol > 0 and notional_per_level > 0.10 * avg_candle_vol:
+    if avg_candle_vol <= 0 or not candles:
+        liquidity_ok = False
+        liquidity_reason = "NO_VOLUME_DATA"
+    elif notional_per_level > 0.10 * avg_candle_vol:
         liquidity_ok = False
         liquidity_reason = f"order size (${notional_per_level:.2f}) > 10% of avg candle volume (${avg_candle_vol:.2f})"
 
