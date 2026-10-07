@@ -165,6 +165,9 @@ def run_job(conn, job):
             "investment": float(params.get("investment", 100.0)),
             "direction": str(params.get("direction", "neutral")).lower(),
             "stop_loss_pct": float(params.get("stop_loss_pct", 8.0)) if params.get("stop_loss_pct") is not None else None,
+            # v2.0.194 (plan wave-A / F06 tail): the ABSOLUTE anti-hunt stop —
+            # the engine honors it when present; pct stays as the legacy path.
+            "stop_loss_price": float(params["stop_loss_price"]) if params.get("stop_loss_price") is not None else None,
         }
 
     report = walk_forward(

@@ -1509,7 +1509,11 @@ func (worker *Worker) deployPaper(
 			forecastPct = harGeo.forecastPct
 		}
 		if blocked, ratio := worker.volExpansionBlocked(ctx, candidate.Symbol, forecastPct); blocked {
-			if v := directionalTrendExempt(candidate, betaDown, betaUp); v.Exempt {
+			// v2.0.194 (plan wave-A): a data-out block (ratio -1, the F15
+			// fail-closed) must NOT be bypassed by the trend exemption — unknown
+			// volatility is not "the expansion IS the trend"; wait for data.
+			v := directionalTrendExempt(candidate, betaDown, betaUp)
+			if ratio > 0 && v.Exempt {
 				// v2.0.148/v2.0.161: the RV gate is direction-blind by design,
 				// but for a pair with its own CONFIRMED trend the "expansion"
 				// IS the move the directional grid is paid to ride
@@ -1944,6 +1948,14 @@ func (worker *Worker) deployPaper(
 		if settings.PnLTargetMode == "DYNAMIC" {
 			botTargetVal := decimal.NewFromFloat(adaptiveRes.TargetUSDT).Round(2)
 			target = &botTargetVal
+			// v2.0.194 (plan wave-A): PAPER NEUTRAL gets the SAME 2% harvest
+			// cap as REAL — the paper epoch was validating $22-46 targets the
+			// REAL doctrine would never run; the experiments must share one
+			// economics (cap BEFORE the tranche halving below, matching the
+			// REAL site's pre-tranche semantics).
+			if isNeutralPaper {
+				target = applyNeutralHarvestTP(settings.PnLTargetMode, investAmount, target)
+			}
 			botMaxLossVal := decimal.NewFromFloat(adaptiveRes.MaxLossUSDT).Round(2)
 			maxLoss = &botMaxLossVal
 			if stress.loss.GreaterThan(*maxLoss) {
@@ -2793,7 +2805,11 @@ func (worker *Worker) deployReal(
 			forecastPct = harGeo.forecastPct
 		}
 		if blocked, ratio := worker.volExpansionBlocked(ctx, candidate.Symbol, forecastPct); blocked {
-			if v := directionalTrendExempt(candidate, betaDownEntry, betaUpEntry); v.Exempt {
+			// v2.0.194 (plan wave-A): a data-out block (ratio -1, the F15
+			// fail-closed) must NOT be bypassed by the trend exemption — unknown
+			// volatility is not "the expansion IS the trend"; wait for data.
+			v := directionalTrendExempt(candidate, betaDownEntry, betaUpEntry)
+			if ratio > 0 && v.Exempt {
 				// v2.0.148 (REAL mirror)/v2.0.161: expansion is the confirmed
 				// trend's payload, not its hazard — the RV gate stands down
 				// for the confirmed own-direction cohort (short always; long
@@ -3187,6 +3203,62 @@ func (worker *Worker) deployReal(
 		// create). The settings plane already rejects the combination
 		// (validateSettings), but a raw SQL settings edit must not be
 		// able to buy an unprotected grid: refuse the deploy outright.
+		// v2.0.194 (plan wave-C): ROI-допуск — достижимость чистой цели на
+		// ФИНАЛЬНОЙ геометрии до create. Профиль calm_2pct (мягкий допуск),
+		// окно 48ч, консервативный ярус циклов k=2.0, фандинг-фолбэк 5bps/8ч
+		// при пустом фиде. REJECT при недостижимости — с числами в причине.
+		roiSpanPct := 0.0
+		if upperPrice.GreaterThan(lowerPrice) && candidate.CurrentPrice.IsPositive() {
+			roiSpanPct = upperPrice.Sub(lowerPrice).Div(candidate.CurrentPrice).Mul(decimal.NewFromInt(100)).InexactFloat64()
+		}
+		roiStep := 0.0
+		if mesh.GridNum > 0 {
+			roiStep = roiSpanPct / float64(mesh.GridNum)
+		}
+		roiFundingBps := 0.0
+		if candidate.FundingRate != nil {
+			roiFundingBps = candidate.FundingRate.Mul(decimal.NewFromInt(10000)).InexactFloat64()
+		}
+		roiDir := strings.ToUpper(trend)
+		if roiDir != "LONG" && roiDir != "SHORT" {
+			roiDir = "NEUTRAL"
+		}
+		roiRoom := 0.0
+		if (roiDir == "LONG" || roiDir == "SHORT") && candidate.TargetPrice != nil && candidate.CurrentPrice.IsPositive() {
+			if roiDir == "LONG" {
+				roiRoom = candidate.TargetPrice.Sub(candidate.CurrentPrice).Div(candidate.CurrentPrice).Mul(decimal.NewFromInt(100)).InexactFloat64()
+			} else {
+				roiRoom = candidate.CurrentPrice.Sub(*candidate.TargetPrice).Div(candidate.CurrentPrice).Mul(decimal.NewFromInt(100)).InexactFloat64()
+			}
+		}
+		roiOuHL := 0.0
+		if v, ok := candidate.ModelAssumptions["ouHalfLifeHours"].(float64); ok {
+			roiOuHL = v
+		}
+		roiAssessment := AssessROI(ROIAssessmentInput{
+			Direction: roiDir, Investment: slotBudget, SpanPct: roiSpanPct,
+			GridNum: mesh.GridNum, GridStepPct: roiStep, Leverage: botLev,
+			FeeBps: decimalFloat(settings.FeeBps), SlippageBps: decimalFloat(settings.SlippageBps),
+			StressLossUSDT: stress.loss, AvgWinUSDT: decimal.NewFromFloat(0.48),
+			FundingBps8h: roiFundingBps, HoldHours: 48.0,
+			DayVolPct: candidate.VolatilityPct.InexactFloat64(), OUHalfLifeHours: roiOuHL,
+			RoomPctPct: roiRoom,
+		}, ROIProfileCalm2Pct)
+		candidate.ModelAssumptions["roiAssessment"] = map[string]any{
+			"feasible": roiAssessment.Feasible, "reason": roiAssessment.Reason,
+			"est_net_usdt":      roiAssessment.EstNetUSDT.StringFixed(2),
+			"required_win_rate": roiAssessment.RequiredWinRate.StringFixed(2),
+			"profile":           "calm_2pct",
+		}
+		if !roiAssessment.Feasible {
+			worker.rejectCandidateDI(ctx, candidate,
+				"ROI-допуск: "+roiAssessment.Reason, nil,
+				"SCANNER_REAL", "REAL", "ROI_GATE", map[string]any{
+					"est_net_usdt":      roiAssessment.EstNetUSDT.StringFixed(2),
+					"required_win_rate": roiAssessment.RequiredWinRate.StringFixed(2)})
+			continue
+		}
+
 		if botTarget == nil || botMaxLoss == nil {
 			deployErrors = append(deployErrors, fmt.Sprintf(
 				"%s: no target/loss resolved (FIXED без стопа?) — deploy refused",
@@ -5633,14 +5705,14 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 								AND COALESCE((model_state->>'tranche2SkipAt')::TIMESTAMPTZ, '1970-01-01') < NOW() - INTERVAL '1 hour'
 						`, bot.id); uErr == nil && tag.RowsAffected() == 1 {
 							_ = LogBotEvent(ctx, worker.db, bot.id, bot.botNumber, "REAL", bot.symbol, "TRANCHE_2_SKIPPED", &price, nil, map[string]any{
-								"reason": "бот под водой — усиление только победителей (v2.0.189)",
+								"reason":     "бот под водой — усиление только победителей (v2.0.189)",
 								"total_usdt": realized.Add(supervisionFloor).StringFixed(2),
 							})
 							worker.logger.Info("tranche 2 (REAL) skipped: bot underwater",
 								"component", "autogrid_worker", "bot_id", bot.id,
 								"total", realized.Add(supervisionFloor).StringFixed(2))
 						}
-					topUp = ""
+						topUp = ""
 					}
 					// v2.0.56 (F2): the doubling below doubles max_loss with the
 					// injected margin — same risk gate as the paper path. The
@@ -7515,12 +7587,12 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 					}
 				}
 				if trancheReason != "" && realized.Add(unrealized).LessThan(decimal.Zero) {
-				// v2.0.189 paper mirror: no top-up underwater (see the REAL-path
-				// comment) — tranche-2 reinforces winners only.
-				worker.logger.Info("tranche 2 (paper) skipped: bot underwater",
-					"component", "autogrid_worker", "bot_id", bot.id,
-					"total", realized.Add(unrealized).StringFixed(2))
-				_, _ = worker.db.Exec(ctx, `
+					// v2.0.189 paper mirror: no top-up underwater (see the REAL-path
+					// comment) — tranche-2 reinforces winners only.
+					worker.logger.Info("tranche 2 (paper) skipped: bot underwater",
+						"component", "autogrid_worker", "bot_id", bot.id,
+						"total", realized.Add(unrealized).StringFixed(2))
+					_, _ = worker.db.Exec(ctx, `
 					UPDATE grid_bots
 					SET model_state = jsonb_set(model_state, '{tranche2SkipAt}',
 						to_jsonb(to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'))),
@@ -7528,9 +7600,9 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 					WHERE id = $1
 						AND COALESCE((model_state->>'tranche2SkipAt')::TIMESTAMPTZ, '1970-01-01') < NOW() - INTERVAL '1 hour'
 				`, bot.id)
-				trancheReason = ""
-			}
-			if trancheReason != "" {
+					trancheReason = ""
+				}
+				if trancheReason != "" {
 					// v2.0.56 (F2): gate the doubling — per-bot effective stop
 					// cap + fleet envelope ≤ 0.8× daily breaker. The event
 					// payload now carries the effective target/stop so the

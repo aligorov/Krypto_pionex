@@ -96,7 +96,27 @@ type ScanConfig struct {
 	UniverseScanCap int
 	MaxSpreadPct    float64
 	GaussianDensity bool
+	// VolQuota (wave B "2-5% in 24-72h" plan) reserves pre-selection slots
+	// for volatile pairs: beyond the turnover top-K that already enters L2
+	// deep analysis, up to VolQuota candidates whose 24h ticker range sits
+	// inside [volQuotaMinRangePct, volQuotaMaxRangePct] join the pool — the
+	// movers a pure turnover top silently starves. ≤0 falls back to
+	// DefaultVolQuota (the autogrid Settings path leaves it unset, so the
+	// default rides the zero value).
+	VolQuota int
 }
+
+const (
+	// DefaultVolQuota is the size of the volatile-pair pre-selection quota
+	// when ScanConfig.VolQuota is unset (zero).
+	DefaultVolQuota = 8
+	// volQuotaMinRangePct / volQuotaMaxRangePct bound the 24h ticker range
+	// band that marks a pair "volatile enough to matter, sane enough to
+	// grid" for the quota: below 2.5%/day there is nothing to harvest in
+	// 24-72h, above 10%/day the tape is a lottery.
+	volQuotaMinRangePct = 2.5
+	volQuotaMaxRangePct = 10.0
+)
 
 type MarketClient interface {
 	GetMarketSymbols(context.Context, string) ([]pionex.SymbolInfo, error)
@@ -105,11 +125,12 @@ type MarketClient interface {
 }
 
 type Scanner struct {
-	client MarketClient
+	client   MarketClient
+	universe UniverseProvider
 }
 
 func NewScanner(client MarketClient) *Scanner {
-	return &Scanner{client: client}
+	return &Scanner{client: client, universe: NewCachedUniverse(client)}
 }
 
 type rankedSymbol struct {
@@ -128,9 +149,9 @@ func (s *Scanner) ScanMarkets(
 	if err := validateConfig(config); err != nil {
 		return nil, err
 	}
-	symbols, err := s.client.GetMarketSymbols(ctx, "PERP")
+	symbols, err := s.universe.TradableUSDTPerps(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("fetch Pionex PERP symbols: %w", err)
+		return nil, fmt.Errorf("fetch Pionex PERP universe: %w", err)
 	}
 	tickers, err := s.client.GetTickers(ctx, "", "PERP")
 	if err != nil {
@@ -199,8 +220,13 @@ func (s *Scanner) ScanMarkets(
 	}
 	activeRanked := ranked
 	if len(activeRanked) > scanCap {
-		activeRanked = ranked[:scanCap]
+		activeRanked = activeRanked[:scanCap]
 	}
+	// Wave B volatile quota: keep the turnover top intact AND admit a bounded
+	// set of volatile pairs from the turnover tail — the 24-72h movers that
+	// never crack a pure liquidity top. The quota candidates passed the same
+	// min-volume L1 floor as everyone; they just rank lower on turnover.
+	activeRanked = appendVolatilityQuota(activeRanked, ranked[len(activeRanked):], config.VolQuota)
 
 	// L2 Concurrent Worker Pool for Deep Kline Analysis across all Pionex pairs
 	type scanJob struct {
@@ -293,6 +319,66 @@ func (s *Scanner) ScanMarkets(
 	}
 
 	return candidates, nil
+}
+
+// volQuotaSize resolves the configured quota: unset (0) or negative falls
+// back to DefaultVolQuota, the same use-site-default idiom UniverseScanCap
+// follows (the autogrid Settings path does not plumb the field yet).
+func volQuotaSize(configured int) int {
+	if configured <= 0 {
+		return DefaultVolQuota
+	}
+	return configured
+}
+
+// appendVolatilityQuota extends the turnover top-K pre-selection with a
+// bounded quota of volatile pairs (wave B). `rest` is the turnover tail
+// (already sorted by amount descending, already past the min-volume L1
+// floor); among it, the first `quota` pairs whose 24h ticker range sits in
+// [volQuotaMinRangePct, volQuotaMaxRangePct] — most liquid first — join the
+// L2 pool. No symbol is ever duplicated (a defensive seen-set holds even for
+// overlapping inputs) and no member of `active` is dropped: the quota only
+// ADDS candidates the pure turnover top would starve.
+func appendVolatilityQuota(active, rest []rankedSymbol, quota int) []rankedSymbol {
+	quota = volQuotaSize(quota)
+	if len(rest) == 0 {
+		return active
+	}
+	seen := make(map[string]struct{}, len(active)+quota)
+	for _, item := range active {
+		seen[item.symbol.Symbol] = struct{}{}
+	}
+	out := active
+	for _, item := range rest {
+		if len(out)-len(active) >= quota {
+			break
+		}
+		if _, duplicate := seen[item.symbol.Symbol]; duplicate {
+			continue
+		}
+		rangePct := tickerRangePct(item.ticker)
+		if rangePct < volQuotaMinRangePct || rangePct > volQuotaMaxRangePct {
+			continue
+		}
+		seen[item.symbol.Symbol] = struct{}{}
+		out = append(out, item)
+	}
+	return out
+}
+
+// tickerRangePct estimates daily volatility from the 24h ticker alone —
+// (High−Low)/Open in percent. L1 has no candles yet, so this proxy bands
+// the volatile quota; the L2 candle blend (VolatilityPct) remains the
+// authoritative metric scored downstream. Zero when the ticker carries no
+// usable High/Low (the pair is then simply not quota-eligible).
+func tickerRangePct(ticker pionex.TickerInfo) float64 {
+	open, _ := ticker.Open.Float64()
+	high, _ := ticker.High.Float64()
+	low, _ := ticker.Low.Float64()
+	if open <= 0 || low <= 0 || high < low {
+		return 0
+	}
+	return (high - low) / open * 100
 }
 
 func scoreCandidate(
@@ -688,10 +774,25 @@ func scoreCandidate(
 		decision = "REJECTED"
 	}
 
-	score := scannerScore(
+	score, rangeShare := scannerScore(
 		volatilityPct, evPct, sharpe, maxDrawdown, profitFactor,
 		regime.Choppiness, sharpeValid, pfValid, regime.IsSqueeze, config,
 	)
+
+	// Wave B separate ranking: directional candidates swap the neutral
+	// baseline's range-relevance share for trend relevance, so the final
+	// list orders NEUTRALs by range quality and LONG/SHORTs by trend
+	// quality. The global score sort below is a linear extension of every
+	// per-direction ordering — no gate or decision changes here.
+	directionTrendFit := 0.0
+	directionRangeShare := 0.0
+	if adjust, ok := directionalScoreAdjust(
+		recommendedTrend, rangeShare, regime.ADX, regime.EMASlopePct, regime.RangePositionPct,
+	); ok {
+		score = clamp(score-adjust.RangeShare+adjust.TrendShare, 0, 1)
+		directionTrendFit = adjust.TrendFit
+		directionRangeShare = adjust.RangeShare
+	}
 
 	// Entry Fit: directional grids require entry within viable channel structure,
 	// neutral grids prefer entries near the midpoint.
@@ -780,38 +881,40 @@ func scoreCandidate(
 		LowerPrice: lower, UpperPrice: upper, GridNum: gridNum,
 		RecommendedLeverage: leverage, RecommendedTrend: recommendedTrend,
 		ModelAssumptions: map[string]any{
-			"isProxy":             true,
-			"proxyReference":      true,
-			"proxyEvaluation":     "indicative_reference_only",
-			"proxyWarning":        "свечной прокси является справочной оценкой и не служит доказательством качества входа",
-			"sharpeValid":         sharpeValid,
-			"sharpeDisplay":       formatProxyDisplay(sharpe, sharpeValid),
-			"sortinoValid":        sortinoValid,
-			"sortinoDisplay":      formatProxyDisplay(sortino, sortinoValid),
-			"profitFactorValid":   pfValid,
-			"profitFactorDisplay": formatProxyDisplay(profitFactor, pfValid),
-			"winRateValid":        wrValid,
-			"winRateDisplay":      formatWinRateDisplay(winRate, wrValid),
-			"model":               "neutral_grid_capture_proxy_v3_multitier",
-			"interval":            config.Interval,
-			"lookbackCandles":     len(sorted),
-			"feeBpsPerFill":       config.FeeBps,
-			"slippageBpsPerFill":  config.SlippageBps,
-			"captureEfficiency":   0.40,
-			"recommendedTrend":    recommendedTrend,
-			"regime":              regime.Regime,
-			"adx":                 regime.ADX,
-			"rsi":                 regime.RSI,
-			"choppiness":          regime.Choppiness,
-			"isSqueeze":           regime.IsSqueeze,
-			"emaSlopePct":         regime.EMASlopePct,
-			"rangePositionPct":    regime.RangePositionPct,
-			"atrPct":              regime.ATRPct,
-			"volatilityParkinson": volParkinson,
-			"hurst":               bundle.Hurst,
-			"kaufmanER":           bundle.KaufmanER,
-			"kaufmanRegime":       kaufmanRegimeLabel(bundle.KaufmanER),
-			"ouHalfLifeHours":     ouHalfLifeHours,
+			"isProxy":               true,
+			"proxyReference":        true,
+			"proxyEvaluation":       "indicative_reference_only",
+			"proxyWarning":          "свечной прокси является справочной оценкой и не служит доказательством качества входа",
+			"sharpeValid":           sharpeValid,
+			"sharpeDisplay":         formatProxyDisplay(sharpe, sharpeValid),
+			"sortinoValid":          sortinoValid,
+			"sortinoDisplay":        formatProxyDisplay(sortino, sortinoValid),
+			"profitFactorValid":     pfValid,
+			"profitFactorDisplay":   formatProxyDisplay(profitFactor, pfValid),
+			"winRateValid":          wrValid,
+			"winRateDisplay":        formatWinRateDisplay(winRate, wrValid),
+			"model":                 "neutral_grid_capture_proxy_v3_multitier",
+			"interval":              config.Interval,
+			"lookbackCandles":       len(sorted),
+			"feeBpsPerFill":         config.FeeBps,
+			"slippageBpsPerFill":    config.SlippageBps,
+			"captureEfficiency":     0.40,
+			"recommendedTrend":      recommendedTrend,
+			"regime":                regime.Regime,
+			"adx":                   regime.ADX,
+			"rsi":                   regime.RSI,
+			"choppiness":            regime.Choppiness,
+			"isSqueeze":             regime.IsSqueeze,
+			"emaSlopePct":           regime.EMASlopePct,
+			"rangePositionPct":      regime.RangePositionPct,
+			"atrPct":                regime.ATRPct,
+			"volatilityParkinson":   volParkinson,
+			"hurst":                 bundle.Hurst,
+			"kaufmanER":             bundle.KaufmanER,
+			"kaufmanRegime":         kaufmanRegimeLabel(bundle.KaufmanER),
+			"ouHalfLifeHours":       ouHalfLifeHours,
+			"directionalTrendFit":   directionTrendFit,
+			"directionalRangeShare": directionRangeShare,
 			"confluence": map[string]any{
 				"verdict":           confluence.Verdict,
 				"strength":          confluence.Strength,
@@ -1039,12 +1142,18 @@ func formatWinRateDisplay(val float64, valid bool) string {
 	return fmt.Sprintf("%.1f%%", val)
 }
 
+// scannerScore produces the direction-agnostic ranking baseline plus the
+// RANGE-relevance share embedded in it. The choppiness term below is the one
+// range-shaped reward every candidate — neutral or directional — used to
+// receive identically; reporting its exact final-score contribution lets
+// directionalScoreAdjust swap that share for trend relevance so each
+// direction ranks by its own thesis (wave B separate ranking).
 func scannerScore(
 	volatility, ev, sharpe, drawdown, profitFactor, choppiness float64,
 	sharpeValid, pfValid bool,
 	isSqueeze bool,
 	config ScanConfig,
-) float64 {
+) (score float64, rangeShare float64) {
 	volatilityFit := 1 - math.Abs(
 		volatility-(config.MinVolatilityPct+config.MaxVolatilityPct)/2,
 	)/math.Max(config.MaxVolatilityPct-config.MinVolatilityPct, 1)
@@ -1065,14 +1174,93 @@ func scannerScore(
 		pfFactor = clamp(profitFactor/math.Max(config.MinProfitFactor, 1), 0, 2)
 	}
 
-	score := clamp(volatilityFit, 0, 1)*0.15 +
+	raw := clamp(volatilityFit, 0, 1)*0.15 +
 		clamp(ev/math.Max(config.MinExpectedValuePct+0.25, 0.25), 0, 2)*0.20 +
 		sharpeFactor*0.20 +
 		clamp(1-drawdown/math.Max(config.MaxDrawdownPct, 1), 0, 1)*0.15 +
 		pfFactor*0.15 +
-		chopFit*0.15
+		chopFit*scannerRangeWeight
 
-	return clamp((score/1.4)*squeezePenalty, 0, 1)
+	score = clamp((raw/scannerScoreNorm)*squeezePenalty, 0, 1)
+	rangeShare = chopFit * scannerRangeWeight / scannerScoreNorm * squeezePenalty
+	return score, rangeShare
+}
+
+const (
+	// scannerRangeWeight is the choppiness (range-relevance) term's weight
+	// in the raw scannerScore sum; scannerScoreNorm is the divisor that
+	// brings the capped raw sum back to 0..1. directionalScoreAdjust
+	// re-uses the same budget for the trend-relevance term it swaps in.
+	scannerRangeWeight = 0.15
+	scannerScoreNorm   = 1.4
+)
+
+// DirectionalScoreAdjustment decomposes the ranking correction applied to a
+// directional thesis: RangeShare is removed from the neutral baseline,
+// TrendShare is added in its place (same weight budget), and TrendFit is the
+// 0..1 trend relevance behind that share (surfaced in ModelAssumptions for
+// telemetry).
+type DirectionalScoreAdjustment struct {
+	RangeShare float64
+	TrendShare float64
+	TrendFit   float64
+}
+
+// directionalScoreAdjust implements separate per-direction ranking (wave B):
+// for recommendedTrend long/short the range-relevance share scannerScore paid
+// (the choppiness term — the squeeze anchor, confluence range support and
+// the OU half-life gate are neutral-scoped by construction and need no
+// directional removal) is dropped and replaced by trend relevance:
+//
+//   - EMA(20) slope co-directional with the thesis (a counter-slope earns
+//     nothing),
+//   - ADX confirmation ramping 22→30 — DetectRegime calls a trend at 22 and
+//     the 22-30 band is where directionals become reachable; the ramp stays
+//     flat at 1.0 above 30 (v2.0.162 doctrine: mature trends feed LONG
+//     grids, they are not punished),
+//   - channel position matching the anti-FOMO floors the gates enforce —
+//     long ≤75%, short ≥25%; the deeper the compliance margin the better.
+//
+// Gates are untouched: this ONLY reorders candidates inside each direction
+// so neutrals rank by range quality and directionals by trend quality.
+// ok=false for neutral candidates — their baseline score already ranks by
+// range relevance.
+func directionalScoreAdjust(
+	trend string,
+	rangeShare, adx, emaSlopePct, rangePositionPct float64,
+) (DirectionalScoreAdjustment, bool) {
+	if trend != "long" && trend != "short" {
+		return DirectionalScoreAdjustment{}, false
+	}
+	fit := directionalTrendFit(trend, adx, emaSlopePct, rangePositionPct)
+	return DirectionalScoreAdjustment{
+		RangeShare: rangeShare,
+		TrendShare: fit * scannerRangeWeight / scannerScoreNorm,
+		TrendFit:   fit,
+	}, true
+}
+
+// directionalTrendFit blends the three trend-voice components into 0..1.
+func directionalTrendFit(trend string, adx, emaSlopePct, rangePositionPct float64) float64 {
+	emaFit := 0.0
+	if (trend == "long" && emaSlopePct > 0) || (trend == "short" && emaSlopePct < 0) {
+		// Full credit at |slope| ≥ 1%/10 candles (the confirmed-trend band
+		// the engine keys on is ±0.5%).
+		emaFit = clamp(math.Abs(emaSlopePct), 0, 1)
+	}
+	// ADX 22→30 ramp, flat 1.0 above — see the v2.0.162 note in the
+	// directionalScoreAdjust doc.
+	adxFit := clamp((adx-adxTrendThreshold)/8.0, 0, 1)
+	posFit := 0.0
+	if trend == "long" {
+		// Anti-FOMO LONG cap is 75%: full credit entering deep in the lower
+		// half of the channel, nothing at the cap itself.
+		posFit = clamp((75.0-rangePositionPct)/50.0, 0, 1)
+	} else {
+		// Anti-FOMO SHORT floor is 25%: mirrored.
+		posFit = clamp((rangePositionPct-25.0)/50.0, 0, 1)
+	}
+	return clamp(0.40*emaFit+0.35*adxFit+0.25*posFit, 0, 1)
 }
 
 func clamp(value, minimum, maximum float64) float64 {

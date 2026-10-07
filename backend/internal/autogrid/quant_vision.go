@@ -3,6 +3,7 @@ package autogrid
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -159,6 +160,10 @@ func (worker *Worker) directionalConfirmedByPriceAction(ctx context.Context, sym
 	if err != nil || len(candles) < 2 {
 		return false, "insufficient candle data"
 	}
+	// v2.0.194 (plan wave-A): Pionex returns klines NEWEST-FIRST — sort
+	// chronologically so the "last CLOSED candle" is index len-2 by
+	// construction, not by a lucky coincidence of the request limit.
+	sort.Slice(candles, func(i, j int) bool { return candles[i].Time < candles[j].Time })
 	prev := candles[len(candles)-2]
 	curr := candles[len(candles)-1]
 	currAnalysis := marketdata.AnalyzeCandle(curr)
