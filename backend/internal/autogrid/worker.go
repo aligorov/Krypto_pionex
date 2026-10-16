@@ -1907,6 +1907,62 @@ func (worker *Worker) deployPaper(
 			srRes = sr
 		}
 
+		// v2.0.195: ROI-допуск для PAPER-деплоя — зеркало REAL-пути (v2.0.194
+		// врезал гейт ТОЛЬКО в REAL, а флот работает в PAPER: ANTHROPIC LONG
+		// #1638 открыт ПОСЛЕ выката 194 и закрыт STOP_LOSS -$31.12 в обход
+		// гейта; SUI/AVAX/XPL-класс должен отсекаться числом в ОБОИХ режимах.
+		roiSpanPctPaper := 0.0
+		if mesh.UpperPrice.GreaterThan(mesh.LowerPrice) && candidate.CurrentPrice.IsPositive() {
+			roiSpanPctPaper = mesh.UpperPrice.Sub(mesh.LowerPrice).Div(candidate.CurrentPrice).Mul(decimal.NewFromInt(100)).InexactFloat64()
+		}
+		roiStepPaper := 0.0
+		if mesh.GridNum > 0 {
+			roiStepPaper = roiSpanPctPaper / float64(mesh.GridNum)
+		}
+		roiFundingPaper := 0.0
+		if candidate.FundingRate != nil {
+			roiFundingPaper = candidate.FundingRate.Mul(decimal.NewFromInt(10000)).InexactFloat64()
+		}
+		roiDirPaper := strings.ToUpper(trend)
+		if roiDirPaper != "LONG" && roiDirPaper != "SHORT" {
+			roiDirPaper = "NEUTRAL"
+		}
+		roiRoomPaper := 0.0
+		if (roiDirPaper == "LONG" || roiDirPaper == "SHORT") && candidate.TargetPrice != nil && candidate.TargetPrice.GreaterThan(decimal.Zero) && candidate.CurrentPrice.IsPositive() {
+			if roiDirPaper == "LONG" {
+				roiRoomPaper = candidate.TargetPrice.Sub(candidate.CurrentPrice).Div(candidate.CurrentPrice).Mul(decimal.NewFromInt(100)).InexactFloat64()
+			} else {
+				roiRoomPaper = candidate.CurrentPrice.Sub(*candidate.TargetPrice).Div(candidate.CurrentPrice).Mul(decimal.NewFromInt(100)).InexactFloat64()
+			}
+		}
+		roiOuHLPaper := 0.0
+		if v, ok := candidate.ModelAssumptions["ouHalfLifeHours"].(float64); ok {
+			roiOuHLPaper = v
+		}
+		roiPaper := AssessROI(ROIAssessmentInput{
+			Direction: roiDirPaper, Investment: investAmount, SpanPct: roiSpanPctPaper,
+			GridNum: mesh.GridNum, GridStepPct: roiStepPaper, Leverage: botLev,
+			FeeBps: decimalFloat(settings.FeeBps), SlippageBps: decimalFloat(settings.SlippageBps),
+			StressLossUSDT: stress.loss, AvgWinUSDT: decimal.NewFromFloat(0.48),
+			FundingBps8h: roiFundingPaper, HoldHours: 48.0,
+			DayVolPct: candidate.VolatilityPct.InexactFloat64(), OUHalfLifeHours: roiOuHLPaper,
+			RoomPctPct: roiRoomPaper,
+		}, ROIProfileCalm2Pct)
+		candidate.ModelAssumptions["roiAssessment"] = map[string]any{
+			"feasible": roiPaper.Feasible, "reason": roiPaper.Reason,
+			"est_net_usdt":      roiPaper.EstNetUSDT.StringFixed(2),
+			"required_win_rate": roiPaper.RequiredWinRate.StringFixed(2),
+			"profile":           "calm_2pct",
+		}
+		if !roiPaper.Feasible {
+			worker.rejectCandidateDI(ctx, candidate,
+				"ROI-допуск: "+roiPaper.Reason, nil,
+				"SCANNER_PAPER", "PAPER", "ROI_GATE", map[string]any{
+					"est_net_usdt":      roiPaper.EstNetUSDT.StringFixed(2),
+					"required_win_rate": roiPaper.RequiredWinRate.StringFixed(2)})
+			continue
+		}
+
 		minRR := 1.8
 		if settings.MinRiskReward.IsPositive() {
 			minRR = settings.MinRiskReward.InexactFloat64()
