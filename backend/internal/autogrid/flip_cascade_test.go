@@ -241,11 +241,13 @@ func TestDgtChainLossBudget_Integration(t *testing.T) {
 // tranche2MaxLossCap(slotBudget, botLev, 0) must be refused BEFORE any exchange
 // create — noteDgtSkip's DGT_REDEPLOY_SKIPPED event carries the deploy
 // gates' стресс-инвентарь reason. Geometry forcing is deterministic by
-// construction: leverage pinned to 2 (ceiling = 250×2×5%×1.25 = $31.25) and
-// the closed bot's model_state atrPctEntry 5.0 (the intent scan's
-// atrFallback) drives the stub span to the 25% clamp, so the LONG traverse
-// — full 250×2 notional from entry to a stop ≥1.5×5% below the mesh floor —
-// prices ≥$37.50 whatever the HAR layer does to the bounds.
+// construction: leverage pinned to 2 and the closed bot's model_state
+// atrPctEntry 15.0 (the intent scan's atrFallback) drives the stub span to the
+// 25% clamp; the anti-hunt stop then sits 1.5×15% below the mesh floor, i.e.
+// 35% under the entry (half-span 12.5 + 22.5), so the LONG traverse on the
+// full 250×2 notional prices $175 — above the $156.25 the wide-grid ceiling
+// allows at that span (was a $37.50 traverse in the pre-v2.0.177 fixture,
+// which the wide-grid floor legitimately admits).
 func TestDgtRedeployStressCeiling_Integration(t *testing.T) {
 	ctx := context.Background()
 	h := newRealDeployHarness(t, 10, "BTC_USDT_PERP")
@@ -284,7 +286,7 @@ func TestDgtRedeployStressCeiling_Integration(t *testing.T) {
 		    closed_reason = 'RANGE_BREAK_DOWN',
 		    closed_at = NOW(), updated_at = NOW(),
 		    model_state = jsonb_build_object(
-		        'atrPctEntry', 5.0::FLOAT8,
+		        'atrPctEntry', 15.0::FLOAT8,
 		        'trancheBase', '250',
 		        'dgtBreakPrice', '100')
 		WHERE id = $1
@@ -303,7 +305,7 @@ func TestDgtRedeployStressCeiling_Integration(t *testing.T) {
 		slotBudget:   d("250"),
 		oldBotID:     botID,
 		oldBotNumber: botNumber,
-		atrFallback:  5.0,
+		atrFallback:  15.0,
 		accountID:    h.account.ID,
 	}
 

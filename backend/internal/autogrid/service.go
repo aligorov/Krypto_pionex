@@ -1201,7 +1201,19 @@ func (s *Service) SetStatus(
 		return fmt.Errorf("set AutoGrid status: %w", err)
 	}
 	if status == "STOPPED" || status == "EMERGENCY_STOPPED" {
-		_ = s.CloseAllActiveBots(ctx, status)
+		// v2.0.196: a stop status must never report success while bots are
+		// still alive. The old discarded error let the command queue record
+		// SUCCEEDED (and the API answer "всё закрыто") after the settlement or
+		// cancel pass had failed. The failure is persisted to last_error — the
+		// row the UI and alarms read — and returned to the caller.
+		if closeErr := s.CloseAllActiveBots(ctx, status); closeErr != nil {
+			_, _ = s.db.Exec(ctx, `
+				UPDATE autogrid_settings
+				SET last_error = $2::TEXT, updated_at = NOW()
+				WHERE scope_key = $1
+			`, DefaultScope, fmt.Sprintf("%s: closing active bots failed — %v", status, closeErr))
+			return fmt.Errorf("%s written but closing active bots failed: %w", status, closeErr)
+		}
 	}
 	return nil
 }
@@ -1223,7 +1235,7 @@ func (s *Service) CloseAllActiveBots(ctx context.Context, reason string) error {
 	rows, err := s.db.Query(ctx, `
 		SELECT id, COALESCE(bot_number, 0), symbol, direction, entry_price, leverage,
 		       quote_investment, lower_price, upper_price, grid_num, last_grid_level,
-		       realized_pnl_usdt, COALESCE(mark_price, 0), candidate_id
+		       realized_pnl_usdt, COALESCE(mark_price, 0), COALESCE(unrealized_pnl_usdt, 0), candidate_id
 		FROM paper_grid_bots
 		WHERE settings_id = $1 AND status = 'RUNNING'
 	`, settings.ID)
@@ -1240,6 +1252,7 @@ func (s *Service) CloseAllActiveBots(ctx context.Context, reason string) error {
 		gridNum                  int
 		lastLevel                *int
 		realized, mark           decimal.Decimal
+		floating                 decimal.Decimal
 		candidateID              *string
 	}
 	bots := make([]closeBot, 0)
@@ -1248,7 +1261,7 @@ func (s *Service) CloseAllActiveBots(ctx context.Context, reason string) error {
 		if err := rows.Scan(
 			&b.id, &b.bNum, &b.symbol, &b.direction, &b.entry, &b.leverage,
 			&b.investment, &b.lower, &b.upper, &b.gridNum, &b.lastLevel,
-			&b.realized, &b.mark, &b.candidateID,
+			&b.realized, &b.mark, &b.floating, &b.candidateID,
 		); err != nil {
 			rows.Close()
 			return fmt.Errorf("close all paper bots: %w", err)
@@ -1265,6 +1278,11 @@ func (s *Service) CloseAllActiveBots(ctx context.Context, reason string) error {
 				lower: b.lower, upper: b.upper, leverage: b.leverage,
 				gridNum: b.gridNum, lastLevel: b.lastLevel, realized: b.realized,
 			}, b.mark, *settings)
+		} else {
+			// No mark price: settle at realized + the LAST KNOWN floating.
+			// Writing total = realized and unrealized = 0 erased an open loss
+			// from every aggregate that sums the two.
+			total = b.realized.Add(b.floating)
 		}
 		if _, err := s.db.Exec(ctx, `
 			UPDATE paper_grid_bots
@@ -1299,19 +1317,19 @@ func (s *Service) CloseAllActiveBots(ctx context.Context, reason string) error {
 		return fmt.Errorf("close all paper bots: %w", err)
 	}
 
-	// 2. Request stop for all real bots. v2.0.78 CRIT-3: rows without a
-	// buOrderId are never touched — a stop request on an unadopted submission
-	// makes the row a STOP_REQUESTED zombie the manage loop cannot see (it
-	// only supervises rows WITH a remote id) while it keeps blocking the
-	// symbol and the slot. Adoption owns NULL-bu rows; once adopted, the stop
-	// intent can be honored.
+	// 2. Request stop for all real bots — INCLUDING rows without a buOrderId.
+	// v2.0.78 CRIT-3 left them untouched because a STOP_REQUESTED NULL-bu row
+	// was a zombie nothing could see; the adoption pool now covers exactly
+	// that status, so the intent is honored (adopt → manage loop cancels, or
+	// cleared as NOT_CREATED_ON_EXCHANGE) instead of letting an in-flight
+	// create land RUNNING right after an emergency stop. The lifecycle's
+	// RUNNING write preserves a raced STOP_REQUESTED.
 	_, err = s.db.Exec(ctx, `
 		UPDATE grid_bots
 		SET status = 'STOP_REQUESTED',
 		    closed_reason = COALESCE(closed_reason, $2),
 		    updated_at = NOW()
 		WHERE autogrid_settings_id = $1
-		  AND bu_order_id IS NOT NULL
 		  AND status IN ('PENDING_SUBMISSION', 'SUBMISSION_UNKNOWN', 'RUNNING')
 	`, settings.ID, reason)
 	if err != nil {
@@ -1867,10 +1885,10 @@ func (s *Service) listClosedBots(ctx context.Context, settingsID string) ([]Clos
 		       g.realized_pnl_usdt, g.closed_reason, g.status, g.pnl_target_usdt,
 		       g.target_price, g.stop_loss_price, g.adaptive_strategy, g.risk_reward_ratio,
 		       COALESCE(g.closed_at, g.updated_at),
-		       est.total_pnl
+		       est.total_pnl, COALESCE(est.inventory_notional, 0), g.max_loss_usdt
 		FROM grid_bots g
 		LEFT JOIN LATERAL (
-			SELECT t.total_pnl
+			SELECT t.total_pnl, COALESCE(t.inventory_notional, 0) AS inventory_notional
 			FROM bot_telemetry t
 			WHERE t.bot_id = g.id
 			  AND t.captured_at <= COALESCE(g.closed_at, g.updated_at)
@@ -1888,15 +1906,32 @@ func (s *Service) listClosedBots(ctx context.Context, settingsID string) ([]Clos
 	for rows.Next() {
 		var item ClosedBot
 		item.Source = "REAL"
+		var estTotal *decimal.Decimal
+		var estNotional decimal.Decimal
+		var maxLoss *decimal.Decimal
 		if err := rows.Scan(
 			&item.ID, &item.BotNumber, &item.Symbol, &item.Direction, &item.QuoteInvestment,
 			&item.RealizedPNLUSDT, &item.ClosedReason, &item.Status, &item.PnLTargetUSDT,
 			&item.TargetPrice, &item.StopLossPrice, &item.AdaptiveStrategy, &item.RiskRewardRatio,
 			&item.ClosedAt,
-			&item.EstimatedFinalUSDT,
+			&estTotal, &estNotional, &maxLoss,
 		); err != nil {
 			rows.Close()
 			return nil, fmt.Errorf("scan closed real AutoGrid bot: %w", err)
+		}
+		// v2.0.196: run the SAME estimator the epoch headline runs. The raw
+		// telemetry total is gross of the close cost, and a stop-class close
+		// is floored at −maxLoss − closeCost there — so the per-bot table used
+		// to show a rosier final than closed_estimated summed, contradicting
+		// the field's own contract.
+		if estTotal != nil {
+			reason := ""
+			if item.ClosedReason != nil {
+				reason = *item.ClosedReason
+			}
+			estimate, _ := terminalTelemetryEstimate(*estTotal, estNotional,
+				derefZero(maxLoss), reason)
+			item.EstimatedFinalUSDT = &estimate
 		}
 		items = append(items, item)
 	}
@@ -2344,17 +2379,31 @@ func (s *Service) AdjustBot(
 			return "", fmt.Errorf("%w: %w", ErrNativeAdjustRefused, err)
 		}
 		// v2.0.169 (§6-tail): REST confirmation — the native adjust succeeded,
-		// but the local geometry/investment UPDATE below must not run until we
-		// have verified the exchange actually applied it. Fetch the remote bot
-		// and check the bounds/investment match what we just sent; on mismatch
-		// the local state stays untouched and the operator is paged.
+		// but the local geometry/investment UPDATE below must not claim a bound
+		// the exchange CONTRADICTS. Fetch the remote bot and compare; on a
+		// mismatch the local state stays untouched and the operator is paged.
+		//
+		// v2.0.196: an UNAVAILABLE read is not a contradiction. Returning here
+		// skipped the local persist entirely, so the row stayed permanently
+		// short of the poured capital — the tranche resync only covers
+		// trancheActive bots and a manual top-up has no resync at all. The cost
+		// was understated exposure in the risk engine, an unbooked taker fee, an
+		// unconsumed shift budget and, worst, a phantom profit at the terminal
+		// settle: the unlock identity subtracts OUR quote_investment from the
+		// cash the exchange returned (the ARB #1286 class). The accepted
+		// mutation is the primary witness, so the persist now runs and the
+		// missing confirmation is stamped into model_state + logged loudly.
+		confirmUnverified := ""
 		remoteBot, remoteErr := client.GetFuturesGridBot(ctx, *buOrderID)
 		if remoteErr != nil || remoteBot == nil {
-			s.logger.Warn("adjust REST confirmation unavailable — local update deferred, reconcile will sync",
-				"component", "autogrid_service", "bot_id", botID, "error", remoteErr)
-			return "REAL", nil
-		}
-		if input.Mode == "adjust_params" {
+			if remoteErr != nil {
+				confirmUnverified = "remote read failed: " + remoteErr.Error()
+			} else {
+				confirmUnverified = "remote read returned no record"
+			}
+			s.logger.Error("adjust REST confirmation unavailable — local state persisted from the accepted mutation and marked unverified",
+				"component", "autogrid_service", "bot_id", botID, "mode", input.Mode, "error", remoteErr)
+		} else if input.Mode == "adjust_params" {
 			remoteTop := remoteBot.BUOrderData.Top
 			remoteBottom := remoteBot.BUOrderData.Bottom
 			if !remoteTop.Equal(input.Upper) || !remoteBottom.Equal(input.Lower) {
@@ -2367,8 +2416,9 @@ func (s *Service) AdjustBot(
 					input.Lower.InexactFloat64(), input.Upper.InexactFloat64())
 			}
 		}
-		if input.Mode == "invest_in" {
-			expectedInvestment := currentInvestment.Add(input.QuoteInvestment)
+		expectedInvestment := decimal.Zero
+		if confirmUnverified == "" && input.Mode == "invest_in" {
+			expectedInvestment = currentInvestment.Add(input.QuoteInvestment)
 			// v2.0.188: Pionex's bot detail is read-after-write EVENTUALLY
 			// CONSISTENT — the very first read after a successful invest_in
 			// can still show the pre-pour investment. Prod 01-02.10: every
@@ -2395,12 +2445,14 @@ func (s *Service) AdjustBot(
 				// the reconcile loop owns the final truth (it sees the real
 				// remote investment on the next pass). Distinct error class so
 				// the tranche-2 handler does not treat it as an exchange
-				// refusal (24h-fencing) nor as a landing failure.
+				// refusal (24h-fencing) nor as a landing failure. v2.0.196: the
+				// local persist still runs — an unverified pour that skipped it
+				// left the fee unbooked and the investment short forever.
+				confirmUnverified = fmt.Sprintf("remote investment %s below expected %s after retries",
+					remoteInvestment.StringFixed(2), expectedInvestment.StringFixed(2))
 				s.logger.Warn("invest_in REST confirmation UNVERIFIED after retries — reconcile will confirm",
 					"component", "autogrid_service", "bot_id", botID,
 					"expected_min", expectedInvestment.String(), "remote", remoteInvestment.String())
-				return "", fmt.Errorf("%w: REST подтверждение invest_in: биржа инвестиция %s ниже ожидаемой %s после ретраев — заливка отправлена успешно, reconcile подтвердит",
-					ErrAdjustConfirmUnverified, remoteInvestment.StringFixed(2), expectedInvestment.StringFixed(2))
 			}
 		}
 		if input.Mode == "adjust_params" {
@@ -2411,10 +2463,17 @@ func (s *Service) AdjustBot(
 			query := `
 				UPDATE grid_bots
 				SET lower_price = $2, upper_price = $3, grid_num = $4,
-				    adjustments_count = adjustments_count + 1, updated_at = NOW()
+				    adjustments_count = adjustments_count + 1,
+				    model_state = CASE WHEN $5::TEXT = '' THEN COALESCE(model_state, '{}'::jsonb)
+				        ELSE COALESCE(model_state, '{}'::jsonb) || jsonb_build_object(
+				            'adjustConfirmUnverifiedAt',
+				                to_jsonb(to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')),
+				            'adjustConfirmUnverifiedReason', to_jsonb($5::TEXT))
+				    END,
+				    updated_at = NOW()
 				WHERE id = $1
 			`
-			_, err = s.db.Exec(ctx, query, botID, input.Lower, input.Upper, params.Row)
+			_, err = s.db.Exec(ctx, query, botID, input.Lower, input.Upper, params.Row, confirmUnverified)
 		} else {
 			// v2.0.89 REAL ledger: every REAL invest_in (the tranche-2 pour
 			// AND manual top-ups) opens position notional pour × leverage and
@@ -2426,9 +2485,16 @@ func (s *Service) AdjustBot(
 				UPDATE grid_bots
 				SET quote_investment = quote_investment + $2,
 				    fees_paid_usdt = fees_paid_usdt + $3::NUMERIC,
-				    adjustments_count = adjustments_count + 1, updated_at = NOW()
+				    adjustments_count = adjustments_count + 1,
+				    model_state = CASE WHEN $4::TEXT = '' THEN COALESCE(model_state, '{}'::jsonb)
+				        ELSE COALESCE(model_state, '{}'::jsonb) || jsonb_build_object(
+				            'adjustConfirmUnverifiedAt',
+				                to_jsonb(to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')),
+				            'adjustConfirmUnverifiedReason', to_jsonb($4::TEXT))
+				    END,
+				    updated_at = NOW()
 				WHERE id = $1
-			`, botID, input.QuoteInvestment, entryFee)
+			`, botID, input.QuoteInvestment, entryFee, confirmUnverified)
 		}
 		if err != nil {
 			return "", fmt.Errorf("persist adjustment: %w", err)
@@ -2443,6 +2509,16 @@ func (s *Service) AdjustBot(
 				fmt.Sprintf("invest_in +%s USDT", input.QuoteInvestment.StringFixed(2)),
 				map[string]any{"added_usdt": input.QuoteInvestment.String()})
 		}
+		if confirmUnverified != "" && input.Mode == "invest_in" {
+			// Real margin moved and the local ledger now reflects it, but the
+			// exchange never confirmed the amount: the tranche-2 handler treats
+			// this sentinel as a WARN (not a refusal, not a landing failure) and
+			// reconcile keeps the truth. A geometry shift returns success — the
+			// radar's error branch would page the operator about a shift that
+			// did land and report an unconsumed budget.
+			return "", fmt.Errorf("%w: REST подтверждение invest_in: %s — заливка отправлена успешно, локальный ledger обновлён, reconcile подтвердит",
+				ErrAdjustConfirmUnverified, confirmUnverified)
+		}
 		return "REAL", nil
 	}
 	if input.Mode == "adjust_params" {
@@ -2453,9 +2529,22 @@ func (s *Service) AdjustBot(
 		if row <= 0 {
 			return "", errors.New("adjust_params requires a positive row")
 		}
+		// v2.0.196: re-base the pair-counting level against the NEW geometry in the
+		// same statement. last_grid_level is an index into [lower, upper] — left at
+		// the old bounds, the next supervision tick measured a phantom traverse and
+		// booked fictional completed pairs (the internal radar path already re-based
+		// at worker.go:7708; this one shipped the pre-fix behavior). No mark price
+		// yet → clear the baseline: a NULL level makes the next tick a no-op
+		// baseline instead of an invention.
 		tag, err := s.db.Exec(ctx, `
 			UPDATE paper_grid_bots
-			SET lower_price = $2, upper_price = $3, grid_num = $4, updated_at = NOW()
+			SET lower_price = $2, upper_price = $3, grid_num = $4,
+			    last_grid_level = CASE WHEN COALESCE(mark_price, 0) > 0
+			        THEN (
+			            SELECT LEAST(GREATEST(
+			                trunc((mark_price - $2) / (($3 - $2) / $4))::BIGINT, 0), $4 - 1)::INT)
+			        ELSE NULL END,
+			    updated_at = NOW()
 			WHERE id = $1 AND settings_id = $5 AND status = 'RUNNING'
 		`, botID, input.Lower, input.Upper, row, settingsID)
 		if err != nil {
@@ -2473,20 +2562,49 @@ func (s *Service) AdjustBot(
 	// notional it adds — directional: pour × leverage; neutral: half the
 	// leveraged pour (the ladder fraction a live neutral grid holds).
 	var pourLeverage int
-	var pourDirection string
+	var pourDirection, pourSymbol string
 	if err := s.db.QueryRow(ctx, `
-		SELECT leverage, direction
+		SELECT leverage, direction, symbol
 		FROM paper_grid_bots WHERE id = $1 AND settings_id = $2 AND status = 'RUNNING'
-	`, botID, settingsID).Scan(&pourLeverage, &pourDirection); err != nil {
+	`, botID, settingsID).Scan(&pourLeverage, &pourDirection, &pourSymbol); err != nil {
 		return "", fmt.Errorf("load paper bot for pour fee: %w", err)
 	}
 	if pourLeverage < 1 {
 		pourLeverage = 1
 	}
+	// v2.0.196: a paper top-up grows simulated notional, so it clears the same
+	// durable gates a paper DEPLOY does (kill switch, leverage cap, paper
+	// account/symbol exposure). The REAL branch above had them; this one had
+	// none — an operator could pour past the caps, or after the kill switch was
+	// thrown, and the ROI admission gate that reads paper statistics would be
+	// fed a fleet the risk engine would never have allowed.
+	if err := s.risk.ValidatePaperGridTopUp(ctx, pourSymbol, pourLeverage, input.QuoteInvestment); err != nil {
+		journalEntryDecisionSvc(ctx, s.db, EntryChainInput{
+			Path: EntryPathInvestIn, Settings: Settings{ID: settingsID},
+			Symbol: pourSymbol, Direction: pourDirection, Fleet: "PAPER", RefID: botID,
+		}, entryOutcomeReject, entryBlockedRiskEngine, err.Error(), nil)
+		return "", fmt.Errorf("paper invest_in rejected by risk engine: %w", err)
+	}
 	pourFee := paperPourEntryFee(pourDirection, input.QuoteInvestment, pourLeverage)
+	// v2.0.196: the directional paper mark is investment×leverage×(price/entry − 1),
+	// so growing quote_investment while entry_price stayed at the deploy price
+	// invented profit at the pour instant — doubling the capital of a LONG in
+	// profit instantly doubled its unrealized gain without a single fill. The
+	// added notional enters at the last supervised mark, and because the formula
+	// is linear in investment/entry the exact two-leg equivalent is the harmonic
+	// blend entry' = I' / (I/entry + pour/mark): it reproduces
+	// Σ leg_k = Σ I_k×(p/e_k − 1) for EVERY later price, not just at the pour.
 	tag, err := s.db.Exec(ctx, `
 		UPDATE paper_grid_bots
-		SET quote_investment = quote_investment + $2,
+		SET entry_price = CASE
+		        WHEN UPPER(direction) <> 'NEUTRAL'
+		             AND COALESCE(entry_price, 0) > 0
+		             AND COALESCE(mark_price, 0) > 0
+		        THEN (quote_investment + $2)
+		             / (quote_investment / entry_price + $2 / mark_price)
+		        ELSE entry_price
+		    END,
+		    quote_investment = quote_investment + $2,
 		    realized_pnl_usdt = realized_pnl_usdt - $4::NUMERIC,
 		    fees_paid_usdt = fees_paid_usdt + $4::NUMERIC,
 		    updated_at = NOW()
@@ -2871,7 +2989,22 @@ func (s *Service) DeployManualBot(
 		manualEntryFee := paperEntryFee(dbDirection(trend), lower, upper, row,
 			investment, leverage, livePrice).Round(8).String()
 		var id string
-		if err := s.db.QueryRow(ctx, `
+		// v2.0.196: the caps are re-read inside the transaction that writes the
+		// row, under an advisory lock — ValidateNewPaperGrid above ran before
+		// the price fetch and could not see a concurrent deploy.
+		createErr := func() error {
+			tx, txErr := s.db.Begin(ctx)
+			if txErr != nil {
+				return fmt.Errorf("begin paper create transaction: %w", txErr)
+			}
+			defer tx.Rollback(ctx)
+			if lockErr := risk.LockEntryGate(ctx, tx, "paper_entry", settings.ID); lockErr != nil {
+				return lockErr
+			}
+			if capErr := risk.RecheckPaperEntryCaps(ctx, tx, input.Symbol, leverage, investment); capErr != nil {
+				return capErr
+			}
+			if scanErr := tx.QueryRow(ctx, `
 			INSERT INTO paper_grid_bots (
 				settings_id, symbol, status, direction, grid_type,
 				lower_price, upper_price, grid_num, leverage, quote_investment,
@@ -2891,19 +3024,24 @@ func (s *Service) DeployManualBot(
 			DO NOTHING
 			RETURNING id
 		`, settings.ID, input.Symbol, dbDirection(trend), "ARITHMETIC",
-			lower, upper, row, leverage, investment,
-			livePrice, input.RangeSource, settings.PnLTargetMode,
-			botTarget, botMaxLoss,
-			manualEntryFee,
-		).Scan(&id); err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
-				return nil, "", fmt.Errorf(
-					"a %s bot is already RUNNING — close it first on the bots screen", input.Symbol)
+				lower, upper, row, leverage, investment,
+				livePrice, input.RangeSource, settings.PnLTargetMode,
+				botTarget, botMaxLoss,
+				manualEntryFee,
+			).Scan(&id); scanErr != nil {
+				if errors.Is(scanErr, pgx.ErrNoRows) {
+					return fmt.Errorf(
+						"a %s bot is already RUNNING — close it first on the bots screen", input.Symbol)
+				}
+				return fmt.Errorf("deploy manual paper bot: %w", scanErr)
 			}
-			return nil, "", fmt.Errorf("deploy manual paper bot: %w", err)
-		}
-		if id == "" {
-			return nil, "", errors.New("a paper bot for this symbol is already RUNNING")
+			if id == "" {
+				return errors.New("a paper bot for this symbol is already RUNNING")
+			}
+			return tx.Commit(ctx)
+		}()
+		if createErr != nil {
+			return nil, "", createErr
 		}
 		return &ActiveBot{ID: id, Source: "PAPER", Symbol: input.Symbol,
 			Status: "RUNNING", Direction: dbDirection(trend),

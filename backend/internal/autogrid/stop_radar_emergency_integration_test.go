@@ -209,7 +209,7 @@ func TestRadarMicrostructureEmergencyExit_DBZeroRowsRetry_Integration(t *testing
 	service := NewService(pool, riskEngine)
 
 	account, err := accountService.Create(ctx, accounts.CreateInput{
-		Name: fmt.Sprintf("itest-em-retry-%d", time.Now().UnixNano()),
+		Name:   fmt.Sprintf("itest-em-retry-%d", time.Now().UnixNano()),
 		APIKey: "itest-key", APISecret: "itest-secret",
 		HasFuturesPermission: true, HasBotPermission: true,
 	})
@@ -265,7 +265,7 @@ func TestRadarMicrostructureEmergencyExit_DBZeroRowsRetry_Integration(t *testing
 // fix in radarBreakFlip: with a confirmed-adverse flow and edge progress past
 // the accelerated threshold, the escape lane must actually take over —
 // STOP_REQUESTED with a RANGE_BREAK_* reason and a queued REAL DGT intent.
-// (The pre-fix COALESCE(account_id,'') failed at plan time on every call, so
+// (The pre-fix COALESCE(account_id,”) failed at plan time on every call, so
 // this lane — and its DGT intent — never fired in production.)
 func TestRadarBreakFlip_OFIEscapeLane_Integration(t *testing.T) {
 	ctx := context.Background()

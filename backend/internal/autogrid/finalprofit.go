@@ -134,6 +134,32 @@ func estimateTerminalFinal(
 	return &final, closeCost, nil
 }
 
+// unlockIdentityFinal is the settlement-identity leg of the terminal ladder:
+// unlockUsdtAmount («USDT returned to main account (only when TO_USDT)») minus
+// OUR final invested amount. Both legs are settlement figures, so the identity
+// holds by construction; the band rejects a garbled payload — isolated margin
+// bounds the loss at the investment and a same-day grid profit stays well under
+// it. The exchange's own usdtInvestment is deliberately NOT the subtrahend: it
+// goes stale across invest_in/adjust_params (v2.0.105, ARB #1286 wrote +51.67
+// instead of +1.67). Returns (0, FinalProfitNone) when the record carries no
+// usable identity.
+func unlockIdentityFinal(
+	finished *pionex.BUOrderDataResponse, investment decimal.Decimal,
+) (decimal.Decimal, pionex.FinalProfitSource) {
+	if finished == nil || !investment.IsPositive() {
+		return decimal.Zero, pionex.FinalProfitNone
+	}
+	unlock := finished.UnlockUsdtAmount()
+	if !unlock.IsPositive() {
+		return decimal.Zero, pionex.FinalProfitNone
+	}
+	net := unlock.Sub(investment)
+	if !net.Abs().LessThan(investment) {
+		return decimal.Zero, pionex.FinalProfitNone
+	}
+	return net, pionex.FinalProfitUnlockIdentity
+}
+
 // recordRealEntryFee durably books the taker entry fee of a REAL deploy into
 // grid_bots.fees_paid_usdt + the model_state fee breakdown. The fee itself is
 // priced by pionex.EntryFeeUSDT (taker 0.05% × investment × leverage — ONE
@@ -164,6 +190,44 @@ func recordRealEntryFee(
 		return fmt.Errorf("persist entry fee for %s: bot row not found", botID)
 	}
 	return nil
+}
+
+// healUnbookedEntryFees completes deploy entry fees whose booking write failed
+// at deploy time: the deploy path stamps model_state.entryFeeUnbookedUsdt
+// instead of losing the leg, and this sweep books fee + marker removal in ONE
+// statement, so it is exactly-once per row and simply retries next pass on
+// failure. Without it a failed write left Σ fees — the leg every epoch net
+// figure subtracts — permanently short of what the wallet actually paid.
+func (worker *Worker) healUnbookedEntryFees(ctx context.Context) {
+	rows, err := worker.db.Query(ctx, `
+		UPDATE grid_bots
+		SET fees_paid_usdt = fees_paid_usdt + (model_state->>'entryFeeUnbookedUsdt')::NUMERIC,
+		    model_state = (jsonb_set(COALESCE(model_state, '{}'::jsonb), ARRAY['entryFeeUsdt'],
+		            to_jsonb(((COALESCE((model_state->>'entryFeeUsdt')::NUMERIC, 0)
+		                       + (model_state->>'entryFeeUnbookedUsdt')::NUMERIC)::TEXT)))
+		        - 'entryFeeUnbookedUsdt'),
+		    updated_at = NOW()
+		WHERE COALESCE((model_state->>'entryFeeUnbookedUsdt')::NUMERIC, 0) > 0
+		RETURNING id, symbol
+	`)
+	if err != nil {
+		worker.logger.Warn("unbooked entry fee heal failed — will retry next pass",
+			"component", "autogrid_worker", "error", err)
+		return
+	}
+	type healedRow struct{ id, symbol string }
+	healed := make([]healedRow, 0, 4)
+	for rows.Next() {
+		var item healedRow
+		if rows.Scan(&item.id, &item.symbol) == nil {
+			healed = append(healed, item)
+		}
+	}
+	rows.Close()
+	for _, item := range healed {
+		worker.logger.Warn("booked a deploy entry fee left unbooked by a failed write",
+			"component", "autogrid_worker", "bot_id", item.id, "symbol", item.symbol)
+	}
 }
 
 // terminalRefusalError reports whether an order-detail error is the exchange

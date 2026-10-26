@@ -242,10 +242,12 @@ func TestTranche2DerivedCapGate(t *testing.T) {
 	}
 }
 
-// seedFleetTickers stubs the public ticker feed for one deploy symbol.
+// seedFleetTickers stubs the public ticker feed for one deploy symbol. The
+// shared mux fronts it with the klines the RV vol-expansion gate needs; a
+// ticker-only stub leaves that gate fail-closed (RV/базлайн -1.00).
 func seedFleetTickers(t *testing.T, worker *Worker, symbol string) {
 	t.Helper()
-	tickers := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	tickers := httptest.NewServer(itestPublicMux(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
 			"result":    true,
@@ -278,10 +280,10 @@ func seedFleetScan(t *testing.T, pool *pgxpool.Pool, symbol string) string {
 	if _, err := pool.Exec(context.Background(), `
 		INSERT INTO autogrid_candidates (
 			scan_id, symbol, decision, current_price, lower_price, upper_price,
-			grid_num, recommended_trend, model_assumptions
+			grid_num, recommended_trend, volatility, model_assumptions
 		) VALUES (
 			$1, $2, 'ACCEPTED', 100, 90, 110,
-			10, 'no_trend', '{"atrPct": 1.0, "regime": "RANGE"}'::jsonb
+			10, 'no_trend', 10, '{"atrPct": 1.0, "regime": "RANGE", "llmAuditId": "itest-audit", "ouHalfLifeHours": 8}'::jsonb
 		)
 	`, scanID, symbol); err != nil {
 		t.Fatalf("insert candidate: %v", err)

@@ -158,6 +158,15 @@ func (worker *Worker) recheckPendingExchangeFinals(ctx context.Context, settings
 			continue
 		}
 		settled, source := finished.SettledProfit()
+		// v2.0.196: the identity is computed whether or not the chain returned a
+		// total, because it also RESCUES a total the sanity gate refuses. The
+		// docs define profitExited only as «Exited profit» — no netting formula —
+		// so a POSITIVE one on a loss-class close is unverifiable rather than
+		// provably wrong; the old order tried the identity solely when the chain
+		// returned NOTHING and then froze the row at the floored telemetry
+		// estimate, even though the same payload could carry the wallet's own
+		// settlement figure.
+		unlockSettled, unlockSource := unlockIdentityFinal(finished, item.investment)
 		if source == pionex.FinalProfitNone {
 			// v2.0.105 unlock identity, OUR-investment variant: the exchange
 			// returned unlockUsdtAmount and we know the final capital that
@@ -166,12 +175,7 @@ func (worker *Worker) recheckPendingExchangeFinals(ctx context.Context, settings
 			// +$50 phantom per tranche-2 bot). Sanity: isolated margin bounds
 			// the loss at the investment and a same-day grid profit well
 			// under it.
-			unlock := finished.UnlockUsdtAmount()
-			if unlock.IsPositive() && item.investment.IsPositive() {
-				if net := unlock.Sub(item.investment); net.Abs().LessThan(item.investment) {
-					settled, source = net, pionex.FinalProfitUnlockIdentity
-				}
-			}
+			settled, source = unlockSettled, unlockSource
 		}
 		if source == pionex.FinalProfitNone {
 			// v2.0.100: the record exists but carries none of the settle
@@ -193,16 +197,27 @@ func (worker *Worker) recheckPendingExchangeFinals(ctx context.Context, settings
 			continue
 		}
 		if gated := gateSettledProfit(settled, source, item.closedReason, strings.TrimSpace(finished.ReasonBy)); gated != nil {
-			settled = *gated
-		} else {
-			worker.logger.Warn("terminal final recheck: exchange total refused by sanity gate — estimate kept",
-				"component", "autogrid_worker", "bot_number", item.botNumber, "symbol", item.symbol,
-				"exchange_total", settled.StringFixed(4), "stored_reason", item.closedReason,
-				"exchange_reason", finished.ReasonBy)
-			worker.confirmTerminalFinal(ctx, item, source)
+			worker.applyExchangeFinal(ctx, item, *gated, source)
 			continue
 		}
-		worker.applyExchangeFinal(ctx, item, settled, source)
+		if unlockSource != pionex.FinalProfitNone {
+			worker.logger.Warn("terminal final recheck: exchange total refused by sanity gate — settling from the unlock identity",
+				"component", "autogrid_worker", "bot_number", item.botNumber, "symbol", item.symbol,
+				"refused_total", settled.StringFixed(4), "refused_source", string(source),
+				"unlock_net", unlockSettled.StringFixed(4),
+				"stored_reason", item.closedReason, "exchange_reason", finished.ReasonBy)
+			worker.applyExchangeFinal(ctx, item, unlockSettled, unlockSource)
+			continue
+		}
+		// No settlement witness at all. Keep the row PENDING instead of
+		// confirming it: unlockUsdtAmount lands only after the exchange settles
+		// (TO_USDT), so a refused total is "still unverifiable", not "no better
+		// figure will ever exist". The 48h freeze sweep settles what never
+		// resolves.
+		worker.logger.Warn("terminal final recheck: exchange total refused by sanity gate — estimate kept, row stays pending",
+			"component", "autogrid_worker", "bot_number", item.botNumber, "symbol", item.symbol,
+			"exchange_total", settled.StringFixed(4), "refused_source", string(source),
+			"stored_reason", item.closedReason, "exchange_reason", finished.ReasonBy)
 	}
 }
 
@@ -268,24 +283,6 @@ func (worker *Worker) applyExchangeFinal(ctx context.Context, item pendingTermin
 				"intent", stopIntent.StringFixed(4), "settled", settled.StringFixed(4), "delta", delta.StringFixed(4))
 		}
 	}
-}
-
-// confirmTerminalFinal freezes a pending row whose finished record offers no
-// better figure than the estimate already stored.
-func (worker *Worker) confirmTerminalFinal(ctx context.Context, item pendingTerminalFinal, source pionex.FinalProfitSource) {
-	_, err := worker.db.Exec(ctx, `
-		UPDATE grid_bots
-		SET reconciliation_state = 'REMOTE_TERMINAL_CONFIRMED', updated_at = NOW()
-		WHERE id = $1 AND reconciliation_state = $2
-	`, item.id, TerminalFinalPendingExchange)
-	if err != nil {
-		worker.logger.Warn("terminal final confirm persist failed",
-			"component", "autogrid_worker", "bot_id", item.id, "error", err)
-		return
-	}
-	worker.logger.Info("terminal final confirmed at telemetry estimate — finished record carries no exchange total",
-		"component", "autogrid_worker", "bot_number", item.botNumber, "symbol", item.symbol,
-		"estimate", item.currentRealized, "probe_source", string(source))
 }
 
 // truncateForLog keeps raw payload witnesses bounded in structured logs.
@@ -380,12 +377,12 @@ func (worker *Worker) healV107ShiftOffset(ctx context.Context) {
 // healV127ScreenParity restores screen parity between our UI ("Всего") and
 // Pionex Web ("Profit") for bots that underwent range shifts or re-anchored
 // positions:
-// 1. OP #1427: Pionex resets gridProfit on range shift; restore 0.08955 USDT
-//    earned in Range 1 to realized_pnl_usdt and seed shiftRealizedBase.
-// 2. AR #1422: Absorbed -0.2299 USDT basis loss across 3 keepInvestment shifts;
-//    seed rebasePool = -0.2299 and rebasePos = -4.8.
-// 3. EDGE #1416: Absorbed -0.42 USDT basis loss across 1 keepInvestment shift;
-//    seed rebasePool = -0.42 and rebasePos = -80.
+//  1. OP #1427: Pionex resets gridProfit on range shift; restore 0.08955 USDT
+//     earned in Range 1 to realized_pnl_usdt and seed shiftRealizedBase.
+//  2. AR #1422: Absorbed -0.2299 USDT basis loss across 3 keepInvestment shifts;
+//     seed rebasePool = -0.2299 and rebasePos = -4.8.
+//  3. EDGE #1416: Absorbed -0.42 USDT basis loss across 1 keepInvestment shift;
+//     seed rebasePool = -0.42 and rebasePos = -80.
 func (worker *Worker) healV127ScreenParity(ctx context.Context) {
 	if worker.v127ScreenParityHealDone {
 		return

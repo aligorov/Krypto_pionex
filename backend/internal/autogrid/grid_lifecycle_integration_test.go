@@ -120,10 +120,16 @@ func newGridLifecycleExchangeMock(t *testing.T, prices map[string]string) *gridL
 		json.NewEncoder(w).Encode(map[string]any{"result": true, "timestamp": time.Now().UnixMilli()})
 	})
 	mux.HandleFunc("POST /api/v1/bot/orders/futuresGrid/checkParams", func(w http.ResponseWriter, _ *http.Request) {
+		// v2.0.168: the DGT re-center and the deploy path fail closed when
+		// checkParams carries no liquidation estimates (unknown risk).
+		data := map[string]any{"min_investment": "5", "slippage": "0.1"}
+		for k, v := range itestLiquidationEstimates() {
+			data[k] = v
+		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
 			"result": true, "timestamp": time.Now().UnixMilli(),
-			"data": map[string]any{"min_investment": "5", "slippage": "0.1"},
+			"data": data,
 		})
 	})
 	mux.HandleFunc("POST /api/v1/bot/orders/futuresGrid/create", func(w http.ResponseWriter, r *http.Request) {

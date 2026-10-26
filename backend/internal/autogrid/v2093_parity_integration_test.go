@@ -73,12 +73,12 @@ func TestV2093ManualPaperDeployRiskGates(t *testing.T) {
 		t.Helper()
 		_, _, deployErr := service.DeployManualBot(ctx, nil, ManualDeployInput{
 			Symbol: symbol, Mode: "PAPER", Direction: "NEUTRAL", Leverage: leverage,
-			// Row 11 keeps the level step (4% span / 11 levels = 0.364%)
-			// above the v2.0.94 fee-gate floor (2.5× the 0.14% round trip
-			// = 0.35%) so the CLEAN-deploy case reaches the risk exam it
-			// tests; the refused cases fail on risk before geometry anyway
-			// (v2.0.119 hoisted the durable exam above the fee-gate).
-			Lower: decimal.NewFromInt(98), Upper: decimal.NewFromInt(102), Row: 11,
+			// Row 7 keeps the level step (4% span / 7 levels = 0.571%) above
+			// the v2.0.163 fee-gate floor (3.6× the 0.14% round trip = 0.504%)
+			// so the CLEAN-deploy case reaches the risk exam it tests; the
+			// refused cases fail on risk before geometry anyway (v2.0.119
+			// hoisted the durable exam above the fee-gate).
+			Lower: decimal.NewFromInt(98), Upper: decimal.NewFromInt(102), Row: 7,
 		})
 		return deployErr
 	}
@@ -162,10 +162,13 @@ func TestV2093RealTranchePourWaitsForHoldTick(t *testing.T) {
 		t.Fatalf("load bot after manage: %v", err)
 	}
 	// The mock has no cancel endpoint, so the native cancel maps the 404 to
-	// "already closed" and settles the row STOPPED/ALREADY_CLOSED — either
-	// terminal is the stop decision executing; the invariant under test is
-	// that the bot left RUNNING by CLOSE, not by pour.
-	if status != "STOP_REQUESTED" && !(status == "STOPPED" && reason == "ALREADY_CLOSED") {
+	// "already closed" and settles the row STOPPED/ALREADY_CLOSED. Depending on
+	// where the cancel confirm lands the row is still in flight as STOPPING
+	// (CANCEL_SUBMITTING) — the same tolerance the other stop-in-flight tests
+	// carry. Every accepted terminal is the stop decision executing; the
+	// invariant under test is that the bot left RUNNING by CLOSE, not by pour.
+	if status != "STOP_REQUESTED" && status != "STOPPING" &&
+		!(status == "STOPPED" && reason == "ALREADY_CLOSED") {
 		t.Fatalf("the stop decision must win the conflicting tick, got status=%s reason=%s", status, reason)
 	}
 	if trancheDeployed != 1 {
@@ -197,7 +200,9 @@ func TestV2093DeployPaperLLMAuditGate(t *testing.T) {
 	t.Cleanup(pool.Close)
 
 	worker, _, settings := newCooldownTestWorker(t, pool)
-	tickers := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	// The RV vol-expansion gate needs real 15M candles; the shared mux serves
+	// them and proxies everything else to the ticker stub below.
+	tickers := httptest.NewServer(itestPublicMux(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
 			"result":    true,
@@ -256,8 +261,8 @@ func TestV2093DeployPaperLLMAuditGate(t *testing.T) {
 		if _, err := pool.Exec(ctx, `
 			INSERT INTO autogrid_candidates (
 				scan_id, symbol, decision, current_price, lower_price, upper_price,
-				grid_num, recommended_trend, model_assumptions
-			) VALUES ($1, $2, 'ACCEPTED', 100, 90, 110, 10, 'no_trend', $3::jsonb)
+				grid_num, recommended_trend, volatility, model_assumptions
+			) VALUES ($1, $2, 'ACCEPTED', 100, 90, 110, 10, 'no_trend', 10, $3::jsonb)
 		`, scanID, symbol, assumptions); err != nil {
 			t.Fatalf("insert candidate: %v", err)
 		}

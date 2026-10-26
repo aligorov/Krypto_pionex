@@ -418,4 +418,3 @@ func TestV127ParityMath(t *testing.T) {
 		t.Fatalf("expected live price 0.1431, got %v (%v)", p, ok)
 	}
 }
-

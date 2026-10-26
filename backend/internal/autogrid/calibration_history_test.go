@@ -27,12 +27,12 @@ package autogrid
 // aggregate paperEntryFee figure is reported separately in the log).
 
 import (
-	"math"
 	"context"
 	"encoding/csv"
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"os"

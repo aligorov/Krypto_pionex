@@ -99,18 +99,18 @@ func (r *FuturesGridCheckParamsResult) GetMaxInvestment() decimal.Decimal {
 // the v2.0.161 guard never armed (prod 2026-10-01: all six running bots had
 // NULL liq columns). v2.0.168: a dedicated request shape, contract-tested.
 type futuresGridCheckParamsRequest struct {
-	Base        string                    `json:"base"`
-	Quote       string                    `json:"quote"`
+	Base        string                     `json:"base"`
+	Quote       string                     `json:"quote"`
 	BUOrderData futuresGridCheckParamsData `json:"buOrderData"`
 }
 
 type futuresGridCheckParamsData struct {
-	Top                string           `json:"top"`
-	Bottom             string           `json:"bottom"`
-	Row                int              `json:"row"`
-	GridType           string           `json:"grid_type"`
-	Trend              string           `json:"trend"`
-	Leverage           int              `json:"leverage"`
+	Top             string          `json:"top"`
+	Bottom          string          `json:"bottom"`
+	Row             int             `json:"row"`
+	GridType        string          `json:"grid_type"`
+	Trend           string          `json:"trend"`
+	Leverage        int             `json:"leverage"`
 	QuoteInvestment decimal.Decimal `json:"quote_investment"`
 }
 
@@ -130,12 +130,12 @@ func checkParamsRequestFromCreate(p NativeFuturesGridCreateParams) futuresGridCh
 		Base:  base,
 		Quote: p.Quote,
 		BUOrderData: futuresGridCheckParamsData{
-			Top:               p.BUOrderData.Top.String(),
-			Bottom:            p.BUOrderData.Bottom.String(),
-			Row:               p.BUOrderData.Row,
-			GridType:          p.BUOrderData.GridType,
-			Trend:             p.BUOrderData.Trend,
-			Leverage:          p.BUOrderData.Leverage,
+			Top:             p.BUOrderData.Top.String(),
+			Bottom:          p.BUOrderData.Bottom.String(),
+			Row:             p.BUOrderData.Row,
+			GridType:        p.BUOrderData.GridType,
+			Trend:           p.BUOrderData.Trend,
+			Leverage:        p.BUOrderData.Leverage,
 			QuoteInvestment: p.BUOrderData.QuoteInvestment,
 		},
 	}
@@ -180,6 +180,43 @@ type AdjustFuturesGridParams struct {
 	Row             int              `json:"row,omitempty"`
 	QuoteInvestment *decimal.Decimal `json:"quoteInvestment,omitempty"`
 	KeepInvestment  *bool            `json:"keepInvestment,omitempty"`
+}
+
+// MarshalJSON enforces the documented field TYPES (v2.0.196). The adjustParams
+// schema declares `openPrice` and `quoteInvestment` as **number** but `bottom`
+// and `top` as **string** — shopspring's default marshals every decimal as a
+// quoted string, so the two number fields went out as `"openPrice":"1.23"`.
+// json.Number emits the same exact decimal text unquoted.
+func (p AdjustFuturesGridParams) MarshalJSON() ([]byte, error) {
+	type wire struct {
+		BUOrderID       string           `json:"buOrderId"`
+		Type            string           `json:"type"`
+		ExtraMargin     bool             `json:"extraMargin"`
+		OpenPrice       *json.Number     `json:"openPrice,omitempty"`
+		Bottom          *decimal.Decimal `json:"bottom,omitempty"`
+		Top             *decimal.Decimal `json:"top,omitempty"`
+		Row             int              `json:"row,omitempty"`
+		QuoteInvestment *json.Number     `json:"quoteInvestment,omitempty"`
+		KeepInvestment  *bool            `json:"keepInvestment,omitempty"`
+	}
+	out := wire{
+		BUOrderID:      p.BUOrderID,
+		Type:           p.Type,
+		ExtraMargin:    p.ExtraMargin,
+		Bottom:         p.Bottom,
+		Top:            p.Top,
+		Row:            p.Row,
+		KeepInvestment: p.KeepInvestment,
+	}
+	if p.OpenPrice != nil {
+		number := json.Number(p.OpenPrice.String())
+		out.OpenPrice = &number
+	}
+	if p.QuoteInvestment != nil {
+		number := json.Number(p.QuoteInvestment.String())
+		out.QuoteInvestment = &number
+	}
+	return json.Marshal(out)
 }
 
 // FuturesGridAdjustCheckResult carries the optional payload of the documented
@@ -231,10 +268,15 @@ func (c *Client) CheckAdjustFuturesGridBot(
 // (GET /api/v1/bot/orders). The shape is shared across bot types, so the
 // type-specific grid payload stays raw.
 type BotOrder struct {
-	BUOrderID    string          `json:"buOrderId"`
-	BUOrderType  string          `json:"buOrderType"`
-	Status       string          `json:"status"`
-	Canceling    bool            `json:"canceling"`
+	BUOrderID   string `json:"buOrderId"`
+	BUOrderType string `json:"buOrderType"`
+	Status      string `json:"status"`
+	// v2.0.196: the schema declares `"canceling":{"type":"integer","format":"int64"}`.
+	// It was typed bool, so one bot mid-cancel answering `"canceling":1` failed the
+	// WHOLE envelope unmarshal in ListBotOrders — and that list is how the
+	// terminal-final ladder finds finished bots, so a single transitional bot could
+	// hide every final on the account behind "exchange has no final".
+	Canceling    int64           `json:"canceling"`
 	Base         string          `json:"base"`
 	Quote        string          `json:"quote"`
 	CreateTimeMS int64           `json:"createTime"`
@@ -304,9 +346,9 @@ func (c *Client) ListBotOrders(
 		return nil, "", err
 	}
 	var envelope struct {
-		Orders           []BotOrder `json:"orders"`
-		BotOrders        []BotOrder `json:"botOrders"`
-		Items            []BotOrder `json:"items"`
+		Orders    []BotOrder `json:"orders"`
+		BotOrders []BotOrder `json:"botOrders"`
+		Items     []BotOrder `json:"items"`
 		// `results` is the DOCUMENTED key of BotOrderListResponse; the
 		// others are tolerated aliases. Missing it made the finished-list
 		// path decode an empty array and report "exchange has no final".
@@ -356,15 +398,15 @@ func (c *Client) GetSpotBalances(ctx context.Context) ([]SpotBalance, error) {
 // POST /api/v1/bot/orders/futuresGrid/updateTriggerProfitLoss endpoint.
 // Per official OpenAPI spec, field names are strictly snake_case.
 type FuturesGridTriggerProfitLossItem struct {
-	Type                string  `json:"type"`                           // "stop_loss" | "stop_profit"
-	StopType            string  `json:"stop_type"`                      // "price" | "price_limit" | "profit_amount" | "profit_ratio"
-	Value               string  `json:"value"`                          // target price/ratio, or "" to clear
-	LimitPrice          *string `json:"limit_price,omitempty"`          // limit price when stop_type="price_limit"
-	StopDelay           *int64  `json:"stop_delay,omitempty"`           // delay in seconds before triggering (0 = immediate)
-	LossStopSellModel   string  `json:"loss_stop_sell_model,omitempty"` // "TO_QUOTE" | "TO_USDT"
+	Type                string  `json:"type"`                             // "stop_loss" | "stop_profit"
+	StopType            string  `json:"stop_type"`                        // "price" | "price_limit" | "profit_amount" | "profit_ratio"
+	Value               string  `json:"value"`                            // target price/ratio, or "" to clear
+	LimitPrice          *string `json:"limit_price,omitempty"`            // limit price when stop_type="price_limit"
+	StopDelay           *int64  `json:"stop_delay,omitempty"`             // delay in seconds before triggering (0 = immediate)
+	LossStopSellModel   string  `json:"loss_stop_sell_model,omitempty"`   // "TO_QUOTE" | "TO_USDT"
 	ProfitStopSellModel string  `json:"profit_stop_sell_model,omitempty"` // "TO_QUOTE" | "TO_USDT"
-	StopHighPrice       *string `json:"stop_high_price,omitempty"`      // upper stop-loss for neutral grid (no_trend)
-	LimitHighPrice      *string `json:"limit_high_price,omitempty"`     // upper limit stop for neutral grid
+	StopHighPrice       *string `json:"stop_high_price,omitempty"`        // upper stop-loss for neutral grid (no_trend)
+	LimitHighPrice      *string `json:"limit_high_price,omitempty"`       // upper limit stop for neutral grid
 }
 
 // FuturesGridUpdateTriggerProfitLossRequest payload for updating or clearing
@@ -405,4 +447,3 @@ func (c *Client) UpdateFuturesGridTriggerProfitLoss(
 	}
 	return &resp, nil
 }
-

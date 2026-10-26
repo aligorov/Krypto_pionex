@@ -124,6 +124,45 @@ def test_walk_forward_deployed_params():
     assert report["exact_candidate_evaluation"]["levels"] == 10
 
 
+def test_walk_forward_reports_window_and_cost_witness():
+    """v2.0.196 (audit F05): the verdict must name the data cut and the cost
+    model it was computed on — the Go gate refuses a cached result whose
+    fee/slippage witness no longer matches the deploy, and the operator needs to
+    see WHICH window certified the geometry."""
+    engine = QuantBacktestEngine(maker_fee=0.0003, taker_fee=0.0005, slippage=0.0007)
+    candles = []
+    price = 100.0
+    for i in range(150):
+        close = price + (1.0 if i % 2 == 0 else -1.0)
+        candles.append({
+            "time": 1_700_000_000_000 + i * 3_600_000,
+            "open": price, "high": price + 2.0, "low": price - 2.0,
+            "close": close, "volume": 5000.0,
+        })
+        price = close
+
+    deployed = {"lower": 90.0, "upper": 110.0, "levels": 10, "leverage": 2.0,
+                "investment": 100.0, "direction": "neutral", "stop_loss_pct": 10.0}
+    report = walk_forward(engine, candles, test_bars=30, deployed_params=deployed)
+
+    # Top-level witness: the cost model actually simulated, in bps.
+    assert report["fee_bps"] == 3.0
+    assert report["slippage_bps"] == 7.0
+    assert report["as_of"] == candles[-1]["time"]
+
+    cand = report["exact_candidate_evaluation"]
+    assert cand["fee_bps"] == 3.0
+    assert cand["slippage_bps"] == 7.0
+    assert cand["as_of"] == candles[-1]["time"]
+
+    window = cand["eval_window"]
+    assert window["bars"] == len(candles) - window["start_idx"]
+    assert window["total_bars"] == len(candles)
+    assert window["start_time"] == candles[window["start_idx"]]["time"]
+    assert window["end_time"] == candles[-1]["time"]
+    assert window["train_bars"] + window["purge_bars"] == window["start_idx"]
+
+
 def test_autocorr_effective_sample_size():
     from engine.backtest import lag1_autocorr, effective_sample_size
     # Perfectly alternating series has negative autocorrelation -> no artificial inflation

@@ -321,4 +321,3 @@ func TestKnifePause_RESTFailurePreservesOFIVeto(t *testing.T) {
 		t.Fatalf("expected dump pressure veto reason, got %q", reason)
 	}
 }
-

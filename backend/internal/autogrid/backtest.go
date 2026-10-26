@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"strings"
 	"time"
 
 	"github.com/shopspring/decimal"
@@ -21,7 +22,10 @@ const (
 	// change — cached results from a different version are INVALID and must
 	// not be served. v170 fixed time-reversed candles; v172 fixed metric
 	// mixing (exact candidate DD now reported). All pre-172 caches are wrong.
-	backtestEngineVersion = "v173"
+	// v196 (audit F05): the report now carries as_of and the cost model it was
+	// simulated with, and the gate refuses a cached verdict whose fee/slippage
+	// no longer match the deploy — every older cache lacks that witness.
+	backtestEngineVersion = "v196"
 
 	// Traded-TF hard ceilings calibrated for quality entry filtering:
 	// 1. OOS Net return floor: relaxed from 0.0% to -1.0% to allow minor noise / walk-forward friction.
@@ -76,6 +80,14 @@ type BacktestJobSummary struct {
 	RegimesTested    []string           `json:"regimesTested,omitempty"`
 	LiquidityOK      bool               `json:"liquidityOk"`
 	LiquidityReason  string             `json:"liquidityReason,omitempty"`
+	// v2.0.196 (audit F05): the witness the engine now ships — which data cut and
+	// which cost model produced this verdict. CostWitness separates "the engine
+	// reported zero fees" from "the engine reported nothing" (pre-v196 result),
+	// so a legitimately free cost model is not mistaken for a missing witness.
+	AsOf        int64   `json:"asOf,omitempty"`
+	FeeBps      float64 `json:"feeBps,omitempty"`
+	SlippageBps float64 `json:"slippageBps,omitempty"`
+	CostWitness bool    `json:"-"`
 }
 
 // BacktestGateVerdict is the deploy decision context for one candidate.
@@ -90,14 +102,14 @@ type BacktestGateVerdict struct {
 
 // BacktestDeployParams holds the exact configuration that will be deployed to the exchange.
 type BacktestDeployParams struct {
-	Symbol      string           `json:"symbol"`
-	Interval    string           `json:"interval"`
-	LowerPrice  decimal.Decimal  `json:"lower_price"`
-	UpperPrice  decimal.Decimal  `json:"upper_price"`
-	GridNum     int              `json:"grid_num"`
-	Leverage    int              `json:"leverage"`
-	Investment  decimal.Decimal  `json:"investment"`
-	StopLossPct float64          `json:"stop_loss_pct"`
+	Symbol      string          `json:"symbol"`
+	Interval    string          `json:"interval"`
+	LowerPrice  decimal.Decimal `json:"lower_price"`
+	UpperPrice  decimal.Decimal `json:"upper_price"`
+	GridNum     int             `json:"grid_num"`
+	Leverage    int             `json:"leverage"`
+	Investment  decimal.Decimal `json:"investment"`
+	StopLossPct float64         `json:"stop_loss_pct"`
 	// StopLossPrice is the ABSOLUTE anti-hunt stop price that will be sent
 	// to the exchange (v2.0.192, audit F06): StopLossPct is a DISTANCE FROM
 	// ENTRY, while the engine used to re-derive the stop from the range
@@ -303,6 +315,9 @@ func parseBacktestResult(resultBytes []byte) (BacktestJobSummary, bool) {
 		LiquidityOK      *bool              `json:"liquidity_ok"`
 		LiquidityReason  string             `json:"liquidity_reason"`
 		EngineVersion    string             `json:"engine_version"`
+		AsOf             int64              `json:"as_of"`
+		FeeBps           *float64           `json:"fee_bps"`
+		SlippageBps      *float64           `json:"slippage_bps"`
 	}
 	if json.Unmarshal(resultBytes, &result) != nil || result.Folds <= 0 {
 		return BacktestJobSummary{}, false
@@ -331,6 +346,16 @@ func parseBacktestResult(resultBytes []byte) (BacktestJobSummary, bool) {
 		RegimesTested:    result.RegimesTested,
 		LiquidityOK:      false,
 		LiquidityReason:  result.LiquidityReason,
+		AsOf:             result.AsOf,
+	}
+	if result.FeeBps != nil || result.SlippageBps != nil {
+		summary.CostWitness = true
+		if result.FeeBps != nil {
+			summary.FeeBps = *result.FeeBps
+		}
+		if result.SlippageBps != nil {
+			summary.SlippageBps = *result.SlippageBps
+		}
 	}
 	if result.LiquidityOK != nil {
 		summary.LiquidityOK = *result.LiquidityOK
@@ -348,6 +373,41 @@ func parseBacktestResult(resultBytes []byte) (BacktestJobSummary, bool) {
 // and leverage stay exact.
 const deployParamsPriceTolerance = 0.002
 
+// defaultBacktestStopLossPct is the legacy stop distance the engine falls back
+// to when a job carries none (quant-worker/worker.py:180).
+const defaultBacktestStopLossPct = 8.0
+
+// deployStopLossPct resolves the pct the engine will actually simulate, so the
+// enqueue and matchesDeployParams cannot disagree about it — a deploy with no
+// explicit stop is enqueued as 8.0, and comparing 0 against that would miss
+// every job this writer produced.
+func deployStopLossPct(p *BacktestDeployParams) float64 {
+	if p != nil && p.StopLossPct > 0 {
+		return p.StopLossPct
+	}
+	return defaultBacktestStopLossPct
+}
+
+// costModelMatches (v2.0.196, audit F05) checks the cost model the engine
+// REPORTED against the one the deploy will pay. matchesDeployParams already
+// compares the job's params; this is the second witness, from the result itself,
+// so a job whose params were edited after the run — or an engine that ignored
+// them — cannot certify a deploy it never simulated. A result with no witness at
+// all (pre-v196 engine) is refused: the engine-version check already excludes it,
+// and silence is not proof.
+func costModelMatches(result BacktestJobSummary, p *BacktestDeployParams) bool {
+	if p == nil {
+		return true
+	}
+	if !result.CostWitness {
+		return false
+	}
+	if math.Abs(result.FeeBps-p.FeeBps) > 0.01 {
+		return false
+	}
+	return math.Abs(result.SlippageBps-p.SlippageBps) <= 0.01
+}
+
 func matchesDeployParams(jobParamsBytes []byte, p *BacktestDeployParams) bool {
 	if p == nil {
 		return true
@@ -356,41 +416,54 @@ func matchesDeployParams(jobParamsBytes []byte, p *BacktestDeployParams) bool {
 		return false
 	}
 	var jobParams struct {
-		LowerPrice    float64  `json:"lower_price"`
-		UpperPrice    float64  `json:"upper_price"`
-		GridNum       int      `json:"grid_num"`
-		Leverage      int      `json:"leverage"`
-		Direction     string   `json:"direction"`
-		Investment    float64  `json:"investment"`
+		LowerPrice    *float64 `json:"lower_price"`
+		UpperPrice    *float64 `json:"upper_price"`
+		GridNum       *int     `json:"grid_num"`
+		Leverage      *int     `json:"leverage"`
+		Direction     *string  `json:"direction"`
+		Investment    *float64 `json:"investment"`
 		StopLossPrice *float64 `json:"stop_loss_price"`
+		StopLossPct   *float64 `json:"stop_loss_pct"`
+		FeeBps        *float64 `json:"fee_bps"`
+		SlippageBps   *float64 `json:"slippage_bps"`
 	}
 	if json.Unmarshal(jobParamsBytes, &jobParams) != nil {
 		return false
 	}
-	if jobParams.GridNum != p.GridNum {
+	// v2.0.196 (audit F05): every field of the deploy identity must be PRESENT
+	// in the job. The previous guards (`jobParams.X > 0 && X != p.X`) read a
+	// missing field as a PASS, so a job that never carried the field certified a
+	// deploy it did not simulate — and fees/slippage were not compared at all, so
+	// a result produced under the old cost model kept serving deploys after the
+	// operator raised them. Pointers distinguish "absent" from "zero".
+	if jobParams.LowerPrice == nil || jobParams.UpperPrice == nil || jobParams.GridNum == nil ||
+		jobParams.Leverage == nil || jobParams.Direction == nil || jobParams.Investment == nil ||
+		jobParams.FeeBps == nil || jobParams.SlippageBps == nil {
+		return false
+	}
+	if *jobParams.GridNum != p.GridNum {
 		return false
 	}
 	pLower := p.LowerPrice.InexactFloat64()
 	pUpper := p.UpperPrice.InexactFloat64()
-	if pLower > 0 && math.Abs(jobParams.LowerPrice-pLower) > pLower*deployParamsPriceTolerance {
+	if pLower > 0 && math.Abs(*jobParams.LowerPrice-pLower) > pLower*deployParamsPriceTolerance {
 		return false
 	}
-	if pUpper > 0 && math.Abs(jobParams.UpperPrice-pUpper) > pUpper*deployParamsPriceTolerance {
+	if pUpper > 0 && math.Abs(*jobParams.UpperPrice-pUpper) > pUpper*deployParamsPriceTolerance {
 		return false
 	}
-	if p.Leverage > 0 && jobParams.Leverage > 0 && jobParams.Leverage != p.Leverage {
+	if p.Leverage > 0 && *jobParams.Leverage != p.Leverage {
 		return false
 	}
 	// v2.0.192 (audit F07): direction, investment and the absolute stop are
 	// part of the identity — a LONG-result cached at the same geometry used
 	// to serve a SHORT request, and a missing investment/stop quietly
 	// widened the match. Missing field in the job = miss, not pass.
-	if p.Direction != "" && jobParams.Direction != "" && jobParams.Direction != p.Direction {
+	if p.Direction != "" && !strings.EqualFold(*jobParams.Direction, p.Direction) {
 		return false
 	}
 	pInvest := p.Investment.InexactFloat64()
-	if pInvest > 0 && jobParams.Investment > 0 &&
-		math.Abs(jobParams.Investment-pInvest) > pInvest*0.01 {
+	if pInvest > 0 && math.Abs(*jobParams.Investment-pInvest) > pInvest*0.01 {
 		return false
 	}
 	if p.StopLossPrice != nil {
@@ -401,6 +474,25 @@ func matchesDeployParams(jobParamsBytes []byte, p *BacktestDeployParams) bool {
 		if math.Abs(*jobParams.StopLossPrice-pStop) > pStop*deployParamsPriceTolerance {
 			return false
 		}
+	} else if jobParams.StopLossPct != nil {
+		// No absolute stop: the engine derives it from the pct (backtest.py:272),
+		// so the pct IS part of the identity. When an absolute stop is present the
+		// engine ignores the pct entirely and comparing it would re-enqueue on
+		// every drift for a field that cannot change the result.
+		pPct := deployStopLossPct(p)
+		if math.Abs(*jobParams.StopLossPct-pPct) > pPct*0.05 {
+			return false
+		}
+	}
+	// Cost model: the simulator's maker fee and slippage come straight from these
+	// two job fields (quant-worker/worker.py:146-147), so a cached verdict is only
+	// valid for the cost model that produced it. 0.01 bps — a float round-trip, not
+	// a policy change.
+	if math.Abs(*jobParams.FeeBps-p.FeeBps) > 0.01 {
+		return false
+	}
+	if math.Abs(*jobParams.SlippageBps-p.SlippageBps) > 0.01 {
+		return false
 	}
 	return true
 }
@@ -438,6 +530,12 @@ func (worker *Worker) loadBacktestSummaryWithParams(ctx context.Context, symbol,
 						if parsed.EngineVersion != backtestEngineVersion {
 							continue // stale engine version, skip this cache row
 						}
+						// v2.0.196 (audit F05): the engine's own witness, not the
+						// job's params echo — a result simulated under a cheaper
+						// cost model must never certify this deploy.
+						if !costModelMatches(parsed, p) {
+							continue
+						}
 						parsed.Interval = interval
 						return parsed
 					}
@@ -451,11 +549,10 @@ func (worker *Worker) loadBacktestSummaryWithParams(ctx context.Context, symbol,
 
 	// Nothing usable: enqueue a fresh job
 	paramsMap := map[string]any{
-		"interval":      interval,
-		"train_bars":    240,
-		"test_bars":     60,
-		"purge_bars":    6,
-		"stop_loss_pct": 8.0,
+		"interval":   interval,
+		"train_bars": 240,
+		"test_bars":  60,
+		"purge_bars": 6,
 	}
 	if p != nil {
 		paramsMap["lower_price"] = p.LowerPrice.InexactFloat64()
@@ -467,9 +564,7 @@ func (worker *Worker) loadBacktestSummaryWithParams(ctx context.Context, symbol,
 		if p.StopLossPrice != nil {
 			paramsMap["stop_loss_price"] = p.StopLossPrice.InexactFloat64()
 		}
-		if p.StopLossPct > 0 {
-			paramsMap["stop_loss_pct"] = p.StopLossPct
-		}
+		paramsMap["stop_loss_pct"] = deployStopLossPct(p)
 		paramsMap["fee_bps"] = p.FeeBps
 		paramsMap["slippage_bps"] = p.SlippageBps
 	}
@@ -514,6 +609,10 @@ func (worker *Worker) waitForBacktestWithParams(ctx context.Context, symbol, int
 						// version identically to the cache path — a DONE
 						// result from a stale engine must not be served.
 						if parsed.EngineVersion != backtestEngineVersion {
+							continue
+						}
+						// v2.0.196 (audit F05): same cost-model witness as the cache path.
+						if !costModelMatches(parsed, p) {
 							continue
 						}
 						rows.Close()

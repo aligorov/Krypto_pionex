@@ -11,6 +11,7 @@ import (
 	"github.com/aligorov/pionex-bot/backend/internal/grid"
 	"github.com/aligorov/pionex-bot/backend/internal/marketdata"
 	"github.com/aligorov/pionex-bot/backend/internal/pionex"
+	"github.com/aligorov/pionex-bot/backend/internal/risk"
 	"github.com/jackc/pgx/v5"
 	"github.com/shopspring/decimal"
 )
@@ -909,7 +910,24 @@ func (worker *Worker) dgtRedeployPaper(ctx context.Context, settings Settings, s
 
 	var botID string
 	var botNumber int
-	err := worker.db.QueryRow(ctx, `
+	// v2.0.196: caps re-read inside the transaction that writes the row, under
+	// an advisory lock. ValidateNewPaperGrid ran before the geometry gates and
+	// the price fetch; two overlapping re-deploys both counted the same fleet.
+	var capSkip string
+	err := func() error {
+		tx, txErr := worker.db.Begin(ctx)
+		if txErr != nil {
+			return fmt.Errorf("begin paper create transaction: %w", txErr)
+		}
+		defer tx.Rollback(ctx)
+		if lockErr := risk.LockEntryGate(ctx, tx, "paper_entry", settings.ID); lockErr != nil {
+			return lockErr
+		}
+		if capErr := risk.RecheckPaperEntryCaps(ctx, tx, spec.symbol, botLev, spec.slotBudget); capErr != nil {
+			capSkip = capErr.Error()
+			return capErr
+		}
+		if scanErr := tx.QueryRow(ctx, `
 		INSERT INTO paper_grid_bots (
 			settings_id, candidate_id, symbol, status, direction, grid_type,
 			lower_price, upper_price, grid_num, leverage, quote_investment,
@@ -945,17 +963,25 @@ func (worker *Worker) dgtRedeployPaper(ctx context.Context, settings Settings, s
 		DO NOTHING
 		RETURNING id, bot_number
 	`, settings.ID, spec.candidateID, spec.symbol,
-		spec.direction, mesh.GridType,
-		mesh.LowerPrice, mesh.UpperPrice, mesh.GridNum,
-		botLev, investAmount,
-		spec.breakPrice, settings.PnLTargetMode, target, maxLoss,
-		levMode, settings.Leverage, spec.oldBotNumber, "RANGE_BREAK",
-		trancheFlag(trancheOn), spec.slotBudget.String(), atrPct,
-		paperEntryFeePaid.Round(8).String(),
-		mesh.GridStepPct, antiHuntStop,
-		targetPriceDec, stopLossPriceDec, stopLossHighDec, stopLossPriceDec,
-		adaptiveStrat, riskRewardDec).Scan(&botID, &botNumber)
+			spec.direction, mesh.GridType,
+			mesh.LowerPrice, mesh.UpperPrice, mesh.GridNum,
+			botLev, investAmount,
+			spec.breakPrice, settings.PnLTargetMode, target, maxLoss,
+			levMode, settings.Leverage, spec.oldBotNumber, "RANGE_BREAK",
+			trancheFlag(trancheOn), spec.slotBudget.String(), atrPct,
+			paperEntryFeePaid.Round(8).String(),
+			mesh.GridStepPct, antiHuntStop,
+			targetPriceDec, stopLossPriceDec, stopLossHighDec, stopLossPriceDec,
+			adaptiveStrat, riskRewardDec).Scan(&botID, &botNumber); scanErr != nil {
+			return scanErr
+		}
+		return tx.Commit(ctx)
+	}()
 	if err != nil {
+		if capSkip != "" {
+			worker.noteDgtSkip(ctx, spec, "PAPER", "риск-движок отказал редеплою: "+capSkip)
+			return false
+		}
 		if errors.Is(err, pgx.ErrNoRows) {
 			worker.noteDgtSkip(ctx, spec, "PAPER", "символ уже в работе — конфликт INSERT, редеплой не нужен")
 			return false

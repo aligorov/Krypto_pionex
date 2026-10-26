@@ -81,26 +81,12 @@ func newRealDeployExchangeMock(t *testing.T, symbols ...string) *realDeployExcha
 			},
 		})
 	})
-	// 60 candles oscillating around 100: the fresh-trend revalidation reads
-	// RANGE/no_trend, the fresh price equals the scan price, and both the
-	// HAR fit and the 24h vol-expansion baseline stay deterministic.
-	mux.HandleFunc("GET /api/v1/market/klines", func(w http.ResponseWriter, r *http.Request) {
-		klines := make([]map[string]any, 0, 60)
-		for i := 0; i < 60; i++ {
-			close := "100.5"
-			if i%2 == 0 {
-				close = "99.5"
-			}
-			klines = append(klines, map[string]any{
-				"time": time.Now().UnixMilli() - int64(60-i)*3600_000,
-				"open": "100", "close": close, "high": "101", "low": "99", "volume": "10",
-			})
-		}
-		writeJSON(w, map[string]any{
-			"result": true, "timestamp": time.Now().UnixMilli(),
-			"data": map[string]any{"klines": klines},
-		})
-	})
+	// Oscillating candles around 100: the fresh-trend revalidation reads
+	// RANGE/no_trend, the fresh price equals the scan price, and both the HAR
+	// fit and the 24h vol-expansion baseline stay deterministic. The shared
+	// handler also serves the ≥ volExpansionBaseline+1 15M candles the RV
+	// vol-expansion gate needs to pass instead of failing closed.
+	mux.HandleFunc("GET /api/v1/market/klines", itestKlinesHandler())
 	mux.HandleFunc("GET /api/v1/common/symbols", func(w http.ResponseWriter, _ *http.Request) {
 		list := make([]map[string]any, 0, len(symbolSet))
 		for symbol := range symbolSet {
@@ -124,9 +110,15 @@ func newRealDeployExchangeMock(t *testing.T, symbols ...string) *realDeployExcha
 			_, _ = w.Write([]byte(maintenanceBody()))
 			return
 		}
+		// v2.0.168: checkParams must carry liquidation estimates — the deploy
+		// and DGT re-center paths refuse geometry whose liquidation is unknown.
+		data := map[string]any{"minInvestment": "30"}
+		for k, v := range itestLiquidationEstimates() {
+			data[k] = v
+		}
 		writeJSON(w, map[string]any{
 			"result": true, "timestamp": time.Now().UnixMilli(),
-			"data": map[string]any{"minInvestment": "30"},
+			"data": data,
 		})
 	})
 	mux.HandleFunc("POST /api/v1/bot/orders/futuresGrid/create", func(w http.ResponseWriter, _ *http.Request) {
@@ -345,10 +337,10 @@ func (h *realDeployHarness) seedAcceptedCandidate(t *testing.T, symbol string) s
 	if _, err := h.pool.Exec(ctx, `
 		INSERT INTO autogrid_candidates (
 			scan_id, symbol, decision, current_price, lower_price, upper_price,
-			grid_num, recommended_trend, model_assumptions
+			grid_num, recommended_trend, volatility, model_assumptions
 		) VALUES (
 			$1, $2, 'ACCEPTED', 100, 90, 110,
-			10, 'no_trend', '{"atrPct": 1.0, "regime": "RANGE"}'::jsonb
+			10, 'no_trend', 10, '{"atrPct": 1.0, "regime": "RANGE", "llmAuditId": "itest-audit", "ouHalfLifeHours": 8}'::jsonb
 		)
 	`, scanID, symbol); err != nil {
 		t.Fatalf("insert candidate %s: %v", symbol, err)

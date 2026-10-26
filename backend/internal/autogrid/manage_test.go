@@ -850,5 +850,3 @@ func TestProtectiveCloseExemptReasons_IncludesAllProfitableExits(t *testing.T) {
 		}
 	}
 }
-
-

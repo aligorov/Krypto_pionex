@@ -53,23 +53,9 @@ func newManualDeployExchangeMock(t *testing.T, minInvestment string) *manualDepl
 	})
 	// 60 deterministic hourly candles oscillating around 100: sigma and ATR
 	// are identical for every deploy, so DYNAMIC targets differ ONLY by budget.
-	mux.HandleFunc("GET /api/v1/market/klines", func(w http.ResponseWriter, r *http.Request) {
-		klines := make([]map[string]any, 0, 60)
-		for i := 0; i < 60; i++ {
-			close := "100.5"
-			if i%2 == 0 {
-				close = "99.5"
-			}
-			klines = append(klines, map[string]any{
-				"time": time.Now().UnixMilli() - int64(60-i)*3600_000,
-				"open": "100", "close": close, "high": "101", "low": "99", "volume": "10",
-			})
-		}
-		writeJSON(w, map[string]any{
-			"result": true, "timestamp": time.Now().UnixMilli(),
-			"data": map[string]any{"klines": klines},
-		})
-	})
+	// The 15M branch of the helper feeds the RV expansion gate, which fails
+	// closed on a short feed (v2.0.193).
+	mux.HandleFunc("GET /api/v1/market/klines", itestKlinesHandler())
 	mux.HandleFunc("GET /api/v1/common/symbols", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, map[string]any{
 			"result": true, "timestamp": time.Now().UnixMilli(),
@@ -90,9 +76,15 @@ func newManualDeployExchangeMock(t *testing.T, minInvestment string) *manualDepl
 		mock.checkCalls++
 		min := mock.minInvestment
 		mock.mu.Unlock()
+		data := map[string]any{"minInvestment": min}
+		// v2.0.168: the manual lane refuses a checkParams answer with no
+		// liquidation estimates (unknown risk is not admissible risk).
+		for key, value := range itestLiquidationEstimates() {
+			data[key] = value
+		}
 		writeJSON(w, map[string]any{
 			"result": true, "timestamp": time.Now().UnixMilli(),
-			"data": map[string]any{"minInvestment": min},
+			"data": data,
 		})
 	})
 	mux.HandleFunc("POST /api/v1/bot/orders/futuresGrid/create", func(w http.ResponseWriter, r *http.Request) {
@@ -225,6 +217,9 @@ func snapshotManualSettings(t *testing.T, pool *pgxpool.Pool, settingsID string)
 			t.Errorf("restore feature_flags: %v", err)
 		}
 	})
+	// The manual lane runs the full entry chain, whose cascade leg fails closed
+	// on a silent liquidation source (v2.0.119).
+	seedHealthyLiquidationFeed(t, pool)
 	return snap
 }
 

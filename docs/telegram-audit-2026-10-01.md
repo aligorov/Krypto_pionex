@@ -106,3 +106,13 @@ Telegram sendMessage не предоставляет ключа идемпоте
 Документация: [Telegram Bot API](https://core.telegram.org/bots/api), включая [getUpdates](https://core.telegram.org/bots/api#getupdates), [sendMessage](https://core.telegram.org/bots/api#sendmessage), [ResponseParameters](https://core.telegram.org/bots/api#responseparameters), [answerCallbackQuery](https://core.telegram.org/bots/api#answercallbackquery), [setMyCommands](https://core.telegram.org/bots/api#setmycommands).
 
 Основные файлы: `backend/internal/telegram/{inbound,delivery,api,digest,health,routing,commands,commands_router,service}.go`; подключение — `backend/cmd/pionex-bot/main.go`; производители событий — AutoGrid/marketdata; UI — `frontend/src/components/TelegramSettings.tsx`.
+
+## Устранение конфликта на сервере · 2026-10-01
+
+На сервере подтверждён v2.0.180 (`1fc0174`). Telegram возвращает `409: terminated by other getUpdates request`; это подтверждает конкурирующий опрос, но не устанавливает хост или процесс конкурента. Наличие токена в памяти 3x-ui оказалось недостаточным доказательством: `getMe` сохранённых токенов показывает разных ботов — Pionex `aligorov_crypto_bot`, 3x-ui `dom25monitoring_bot`.
+
+Диагностическое отключение `tgBotEnable` в 3x-ui не устранило Pionex 409. Исходное значение `true` восстановлено; для применения выполнен перезапуск 3x-ui, который кратковременно прерывает VPN. Перед экспериментом создана резервная SQLite-копия с правами 0600. Ligament 2FA не изменялся. Вывод о найденном источнике и полном восстановлении отозван.
+
+В 19:29 МСК `telegram_poll_state` содержит cursor 703217761, последний успешный poll 19:25:12 МСК и ошибку 409. В outbox есть три SENT-ответа TG_CONSOLE за последний час, последний в 19:22:37 МСК; также SENT BOT_CREATED и DIGEST. Исходящая доставка подтверждена для этих отдельных сообщений, стабильный приём команд не подтверждён. Старые updates, подтверждённые другим клиентом, восстановить из Telegram нельзя.
+
+Следующий этап по текущему указанию пользователя — план исправления. Код webhook, миграции и переключение production в рамках этого этапа не выполнялись. Рассматриваются: найти и остановить конкурента; перейти на защищённый webhook; заменить токен через BotFather с остановкой известных старых клиентов. Для webhook обязательны сохранение updates в PostgreSQL до HTTP 2xx, дедупликация по update_id, повторная обработка после сбоя, отказ от getUpdates/deleteWebhook в этом режиме и проверка Secret-Token. HTTPS и наличие webhook сами по себе не защищают от другого процесса, владеющего токеном и вызывающего deleteWebhook.

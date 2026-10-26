@@ -37,13 +37,39 @@ func TestMenuCommandsUseConfirmedNetResults(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	// loadFleet/loadClosed are fleet-wide, so under a parallel `go test ./...`
+	// another package's REAL bots share the database and land in the result.
+	// The invariant under test is the netting of THIS test's rows, so pick them
+	// out by symbol instead of asserting the whole fleet shape.
 	fleet, err := loadFleet(ctx, dispatcher.db)
-	if err != nil || len(fleet) != 1 || fleet[0].Realized.String() != "2.6" {
+	if err != nil {
+		t.Fatalf("loadFleet: %v", err)
+	}
+	var running *fleetRow
+	for i := range fleet {
+		if fleet[i].Symbol == "TGTEST_USDT_PERP" {
+			running = &fleet[i]
+		}
+	}
+	if running == nil || running.Realized.String() != "2.6" {
 		t.Fatalf("running fees lost: %+v %v", fleet, err)
 	}
-	closed, err := loadClosed(ctx, dispatcher.db, 10, 0)
-	if err != nil || len(closed) != 1 || closed[0].Final.String() != "9.3" {
-		t.Fatalf("unconfirmed/fees mixed: %+v %v", closed, err)
+	closed, err := loadClosed(ctx, dispatcher.db, 500, 0)
+	if err != nil {
+		t.Fatalf("loadClosed: %v", err)
+	}
+	var settled int
+	for _, item := range closed {
+		if item.Symbol != "TGTEST_USDT_PERP" {
+			continue
+		}
+		settled++
+		if item.Final.String() != "9.3" {
+			t.Fatalf("unconfirmed/fees mixed: %+v", item)
+		}
+	}
+	if settled != 1 {
+		t.Fatalf("exactly the REMOTE_TERMINAL_CONFIRMED row may settle: %+v %v", closed, err)
 	}
 	for _, cmd := range []string{"/start", "/help", "/status", "/bots", "/closed 50", "/day", "/stats", "/pnl", "/risk", "/health", "МЕНЮ", "/STATUS@test_bot"} {
 		dispatcher.routeCommand(ctx, "test-token", "42", cmd)

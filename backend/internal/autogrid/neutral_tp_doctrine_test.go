@@ -13,12 +13,12 @@ func TestNeutralHarvestTPCap(t *testing.T) {
 		invest float64
 		want   float64
 	}{
-		{50, 1.00},   // 2% of $50 tranche-1 slot
-		{80, 1.60},   // LYN-class scaler slot
-		{100, 2.00},  // full $100 slot
-		{200, 4.00},  // doubled tranche-2 commitment
-		{20, 1.00},   // below the 2% floor: $0.40 → floor $1
-		{0, 1.00},    // degenerate: floor holds
+		{50, 1.00},  // 2% of $50 tranche-1 slot
+		{80, 1.60},  // LYN-class scaler slot
+		{100, 2.00}, // full $100 slot
+		{200, 4.00}, // doubled tranche-2 commitment
+		{20, 1.00},  // below the 2% floor: $0.40 → floor $1
+		{0, 1.00},   // degenerate: floor holds
 	}
 	for _, c := range cases {
 		got := NeutralHarvestTPCap(usdt(c.invest))

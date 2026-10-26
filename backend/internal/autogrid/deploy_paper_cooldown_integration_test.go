@@ -39,6 +39,9 @@ func newCooldownTestWorker(t *testing.T, pool *pgxpool.Pool) (*Worker, *Service,
 	if _, err := pool.Exec(ctx, `UPDATE risk_settings SET kill_switch_enabled = false WHERE id = 1`); err != nil {
 		t.Fatalf("disable kill switch: %v", err)
 	}
+	// The paper deploy lane runs the same entry chain as REAL, whose cascade
+	// leg fails closed on a silent liquidation source (v2.0.119).
+	seedHealthyLiquidationFeed(t, pool)
 	return worker, service, *settings
 }
 
@@ -61,7 +64,7 @@ func TestDeployPaperCooldownAfterProtectiveClose(t *testing.T) {
 	// unreadable price). The fake symbol has no live ticker, so round 2 was
 	// silently skipped and the test has been red since — point the worker's
 	// public client at a stub ticker server pinned to the candidate price.
-	tickers := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	tickers := httptest.NewServer(itestPublicMux(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
 			"result":    true,
@@ -129,10 +132,12 @@ func TestDeployPaperCooldownAfterProtectiveClose(t *testing.T) {
 	if _, err := pool.Exec(ctx, `
 		INSERT INTO autogrid_candidates (
 			scan_id, symbol, decision, current_price, lower_price, upper_price,
-			grid_num, recommended_trend, model_assumptions
+			grid_num, recommended_trend, volatility, model_assumptions
 		) VALUES (
+			-- σ_day 10% = половина спана 20% (доктрина span = 2σ). v2.0.197:
+			-- модель циклов ROI квадратична по σ и без σ отказывает fail-closed.
 			$1, $2, 'ACCEPTED', 100, 90, 110,
-			10, 'no_trend', '{"atrPct": 1.0, "regime": "RANGE"}'::jsonb
+			10, 'no_trend', 10, '{"atrPct": 1.0, "regime": "RANGE", "llmAuditId": "itest-audit", "ouHalfLifeHours": 8}'::jsonb
 		)
 	`, scanID, symbol); err != nil {
 		t.Fatalf("insert candidate: %v", err)
@@ -178,10 +183,12 @@ func TestDeployPaperCooldownAfterProtectiveClose(t *testing.T) {
 	if _, err := pool.Exec(ctx, `
 		INSERT INTO autogrid_candidates (
 			scan_id, symbol, decision, current_price, lower_price, upper_price,
-			grid_num, recommended_trend, model_assumptions
+			grid_num, recommended_trend, volatility, model_assumptions
 		) VALUES (
+			-- σ_day 10% = половина спана 20% (доктрина span = 2σ). v2.0.197:
+			-- модель циклов ROI квадратична по σ и без σ отказывает fail-closed.
 			$1, $2, 'ACCEPTED', 100, 90, 110,
-			10, 'no_trend', '{"atrPct": 1.0, "regime": "RANGE"}'::jsonb
+			10, 'no_trend', 10, '{"atrPct": 1.0, "regime": "RANGE", "llmAuditId": "itest-audit", "ouHalfLifeHours": 8}'::jsonb
 		)
 	`, scanID2, symbol); err != nil {
 		t.Fatalf("insert candidate round 2: %v", err)
@@ -293,7 +300,7 @@ func TestDeployPaperStopEnvelopeGate(t *testing.T) {
 		t.Fatalf("reload pinned settings: %v", err)
 	}
 
-	tickers := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	tickers := httptest.NewServer(itestPublicMux(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
 			"result":    true,
@@ -366,10 +373,12 @@ func TestDeployPaperStopEnvelopeGate(t *testing.T) {
 		if _, err := pool.Exec(ctx, `
 			INSERT INTO autogrid_candidates (
 				scan_id, symbol, decision, current_price, lower_price, upper_price,
-				grid_num, recommended_trend, model_assumptions
+				grid_num, recommended_trend, volatility, model_assumptions
 			) VALUES (
+				-- σ_day 10% = половина спана 20% (доктрина span = 2σ): v2.0.197
+				-- модель циклов ROI без σ отказывает fail-closed.
 				$1, $2, 'ACCEPTED', 100, 90, 110,
-				10, 'no_trend', '{"atrPct": 1.0, "regime": "RANGE"}'::jsonb
+				10, 'no_trend', 10, '{"atrPct": 1.0, "regime": "RANGE", "llmAuditId": "itest-audit", "ouHalfLifeHours": 8}'::jsonb
 			)
 		`, scanID, symbol); err != nil {
 			t.Fatalf("insert candidate: %v", err)
@@ -477,7 +486,7 @@ func TestPaperAdjustPersistsCountAndNotifies(t *testing.T) {
 		t.Fatalf("enable telegram: %v", err)
 	}
 
-	tickers := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	tickers := httptest.NewServer(itestPublicMux(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
 			"result":    true,
@@ -597,7 +606,7 @@ func TestPaperDeployRunsBacktestGate(t *testing.T) {
 	// candidate price every round fail-closes as "stale" and the test never
 	// reaches the gate it exists to pin (same disease the cooldown test had;
 	// red since v2.0.12, surfaced by the 2026-08-20 postgres run).
-	tickers := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	tickers := httptest.NewServer(itestPublicMux(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
 			"result":    true,
@@ -648,10 +657,12 @@ func TestPaperDeployRunsBacktestGate(t *testing.T) {
 	if err := pool.QueryRow(ctx, `
 		INSERT INTO autogrid_candidates (
 			scan_id, symbol, decision, current_price, lower_price, upper_price,
-			grid_num, recommended_trend, model_assumptions
+			grid_num, recommended_trend, volatility, model_assumptions
 		) VALUES (
+			-- σ_day 10% = половина спана 20% (доктрина span = 2σ). v2.0.197:
+			-- модель циклов ROI квадратична по σ и без σ отказывает fail-closed.
 			$1, $2, 'ACCEPTED', 100, 90, 110,
-			10, 'no_trend', '{"atrPct": 1.0, "regime": "RANGE"}'::jsonb
+			10, 'no_trend', 10, '{"atrPct": 1.0, "regime": "RANGE", "llmAuditId": "itest-audit", "ouHalfLifeHours": 8}'::jsonb
 		)
 		RETURNING id
 	`, scanID, symbol).Scan(&candidateID); err != nil {
@@ -688,11 +699,18 @@ func TestPaperDeployRunsBacktestGate(t *testing.T) {
 	}
 
 	// Round 2: catastrophic traded-TF verdict (the TUT numbers) — candidate
-	// rejected, no bot.
+	// rejected, no bot. v2.0.196: the result must carry the cost-model witness
+	// the gate now demands, so it is copied from the params the worker itself
+	// enqueued instead of hardcoding a fee the seeded settings may not use.
 	if _, err := pool.Exec(ctx, `
 		UPDATE backtest_jobs
 		SET status = 'DONE', finished_at = NOW(),
-		    result = '{"engine_version": "v173", "folds": 4, "oos_return_pct": -24.52, "oos_max_drawdown": 0.8106, "round_trips": 4356, "stop_hits": 2}'::jsonb
+		    result = jsonb_build_object(
+		        'engine_version', 'v196',
+		        'folds', 4, 'oos_return_pct', -24.52, 'oos_max_drawdown', 0.8106,
+		        'round_trips', 4356, 'stop_hits', 2,
+		        'fee_bps', COALESCE(params->'fee_bps', to_jsonb(0)),
+		        'slippage_bps', COALESCE(params->'slippage_bps', to_jsonb(0)))
 		WHERE symbol = $1 AND interval = $2
 	`, symbol, tradedTF); err != nil {
 		t.Fatalf("finish traded job: %v", err)
@@ -714,6 +732,11 @@ func TestPaperDeployRunsBacktestGate(t *testing.T) {
 	}
 
 	// Round 3: passing traded-TF verdict — deploys even with pending neighbors.
+	// The witness keys (engine_version/fee_bps/slippage_bps) round 2 copied from
+	// the job params are MERGED, not dropped: loadBacktestSummaryWithParams skips
+	// a DONE row whose result carries a foreign engine version or a cheaper cost
+	// model (v2.0.172b, v2.0.196 F05), so a bare metrics object reads as "no
+	// usable verdict" and the gate never lets the deploy through.
 	if _, err := pool.Exec(ctx, `
 		UPDATE autogrid_candidates
 		SET decision = 'ACCEPTED', rejection_reason = NULL WHERE id = $1
@@ -722,7 +745,7 @@ func TestPaperDeployRunsBacktestGate(t *testing.T) {
 	}
 	if _, err := pool.Exec(ctx, `
 		UPDATE backtest_jobs
-		SET result = '{"folds": 4, "oos_return_pct": 1.56, "oos_max_drawdown": 0.0183, "round_trips": 397, "stop_hits": 0, "net_ev": 0.15, "ci95_lower": 0.05, "ci95_upper": 0.25, "ci95_positive": true, "sample_sufficient": true, "liquidity_ok": true}'::jsonb
+		SET result = result || '{"folds": 4, "oos_return_pct": 1.56, "oos_max_drawdown": 0.0183, "round_trips": 397, "stop_hits": 0, "net_ev": 0.15, "ci95_lower": 0.05, "ci95_upper": 0.25, "ci95_positive": true, "sample_sufficient": true, "liquidity_ok": true}'::jsonb
 		WHERE symbol = $1 AND interval = $2
 	`, symbol, tradedTF); err != nil {
 		t.Fatalf("pass traded job: %v", err)
@@ -749,7 +772,7 @@ func TestDeployPaperCooldownEscalation(t *testing.T) {
 	t.Cleanup(pool.Close)
 
 	worker, _, settings := newCooldownTestWorker(t, pool)
-	tickers := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	tickers := httptest.NewServer(itestPublicMux(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
 			"result":    true,
@@ -818,10 +841,12 @@ func TestDeployPaperCooldownEscalation(t *testing.T) {
 	if _, err := pool.Exec(ctx, `
 		INSERT INTO autogrid_candidates (
 			scan_id, symbol, decision, current_price, lower_price, upper_price,
-			grid_num, recommended_trend, model_assumptions
+			grid_num, recommended_trend, volatility, model_assumptions
 		) VALUES (
+			-- σ_day 10% = половина спана 20% (доктрина span = 2σ). v2.0.197:
+			-- модель циклов ROI квадратична по σ и без σ отказывает fail-closed.
 			$1, $2, 'ACCEPTED', 100, 90, 110,
-			10, 'no_trend', '{"atrPct": 1.0, "regime": "RANGE"}'::jsonb
+			10, 'no_trend', 10, '{"atrPct": 1.0, "regime": "RANGE", "llmAuditId": "itest-audit", "ouHalfLifeHours": 8}'::jsonb
 		)
 	`, scanID, symbol); err != nil {
 		t.Fatalf("insert candidate: %v", err)
@@ -922,7 +947,7 @@ func TestDeployPaperCascadeShortFreshPriceExempt(t *testing.T) {
 
 	// Scan price 100, atrPct 1.0 → the 0.5×ATR staleness limit is 0.5%;
 	// the live ticker answers 98 → drift 2% = 2×ATR, far beyond it.
-	tickers := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	tickers := httptest.NewServer(itestPublicMux(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		if strings.Contains(r.URL.Path, "/market/tickers") {
 			json.NewEncoder(w).Encode(map[string]any{
@@ -973,15 +998,25 @@ func TestDeployPaperCascadeShortFreshPriceExempt(t *testing.T) {
 		if _, err := pool.Exec(ctx, `
 			INSERT INTO autogrid_candidates (
 				scan_id, symbol, decision, current_price, lower_price, upper_price,
-				grid_num, recommended_trend, model_assumptions
+				grid_num, recommended_trend, target_price, model_assumptions
 			) VALUES (
 				-- 98..102: a realistic 4% trend span at atrPct 1.0 — the
 				-- v2.0.139 stress gate prices the SHORT's full traverse to the
 				-- anti-hunt stop (~$11.4 re-anchored at the live price) under
 				-- the $12.5 tranche-2 ceiling; the old 90..110 fixture was a
 				-- $46 traverse the gate correctly refuses.
+				-- target_price 92 is the scanner's structural obstacle: the
+				-- v2.0.195 ROI gate measures a directional harvest as the room
+				-- to it, and without a target the room is 0 → «собирать нечего»
+				-- → the candidate dies at ROI instead of at the cascade gate.
+				-- 92, not 96: the live price re-anchors the entry to 98, so a
+				-- 96 obstacle leaves 2.0% of room — $1.76 of harvest against an
+				-- $11.36 stress traverse, which the ROI gate (v2.0.197: net
+				-- harvest minus the calibrated 7.6% tail) honestly refuses. At
+				-- 6.1% of room the same candidate is deployable, which is what
+				-- this test needs: its subject is the freshness exemption.
 				$1, $2, 'ACCEPTED', 100, 98, 102,
-				10, 'short', '{"atrPct": 1.0, "regime": "TREND_DOWN", "rangePositionPct": 60.0}'::jsonb
+				10, 'short', 92, '{"atrPct": 1.0, "regime": "TREND_DOWN", "rangePositionPct": 60.0, "llmAuditId": "itest-audit"}'::jsonb
 			)
 		`, scanID, symbol); err != nil {
 			t.Fatalf("insert candidate: %v", err)
@@ -1121,7 +1156,7 @@ func TestDeployPaperSkipVisibility(t *testing.T) {
 		settings = *reloaded
 	}
 
-	tickers := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	tickers := httptest.NewServer(itestPublicMux(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
 			"result":    true,
@@ -1154,10 +1189,12 @@ func TestDeployPaperSkipVisibility(t *testing.T) {
 		if _, err := pool.Exec(ctx, `
 			INSERT INTO autogrid_candidates (
 				scan_id, symbol, decision, current_price, lower_price, upper_price,
-				grid_num, recommended_trend, model_assumptions
+				grid_num, recommended_trend, volatility, model_assumptions
 			) VALUES (
+				-- σ_day 10% = половина спана 20% (доктрина span = 2σ): v2.0.197
+				-- модель циклов ROI без σ отказывает fail-closed.
 				$1, $2, 'ACCEPTED', 100, 90, 110,
-				10, 'no_trend', '{"atrPct": 1.0, "regime": "RANGE"}'::jsonb
+				10, 'no_trend', 10, '{"atrPct": 1.0, "regime": "RANGE", "llmAuditId": "itest-audit", "ouHalfLifeHours": 8}'::jsonb
 			)
 		`, scanID, symbol); err != nil {
 			t.Fatalf("insert candidate %s: %v", symbol, err)

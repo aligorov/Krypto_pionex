@@ -58,6 +58,12 @@ func newAdoptionExchangeMock(t *testing.T, helperSymbol, price string) *adoption
 			},
 		})
 	})
+	mux.HandleFunc("POST /api/v1/bot/orders/futuresGrid/cancel", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"result": true, "timestamp": time.Now().UnixMilli(),
+		})
+	})
 	mux.HandleFunc("GET /api/v1/bot/orders", func(w http.ResponseWriter, r *http.Request) {
 		mock.mu.Lock()
 		orders := mock.orders
@@ -127,13 +133,15 @@ func seedUnknownSubmission(t *testing.T, pool *pgxpool.Pool, accountID, settings
 	return botID
 }
 
-// TestStopPathsNeverTouchNullSubmissionRows is the CRIT-3(a) invariant: fleet
-// stop must not stop-request rows whose exchange id is still unknown — that
-// made unsupervisable STOP_REQUESTED zombies blocking the symbol. The rows
-// stay with adoption, which then adopts them (PENDING_SUBMISSION → RUNNING;
-// a pre-existing STOP_REQUESTED zombie keeps its stop intent for the manage
-// loop to cancel) or clears provably-never-created rows to FAILED.
-func TestStopPathsNeverTouchNullSubmissionRows(t *testing.T) {
+// TestStopMarksInFlightSubmissionsForAdoption is the CRIT-3(a) invariant in its
+// v2.0.196 form: a fleet stop marks in-flight submissions (no buOrderId yet)
+// STOP_REQUESTED so a create that lands afterwards cannot stay a managed live
+// grid while the fleet reports STOPPED, and it never terminalizes them — no
+// remote id means nothing can be proven closed. Adoption then owns the rows:
+// it adopts them while KEEPING the stop intent (the manage loop cancels them
+// once the remote id is known), adopts a row that appeared after the stop pass
+// as RUNNING, and clears provably-never-created rows to FAILED.
+func TestStopMarksInFlightSubmissionsForAdoption(t *testing.T) {
 	dbURL := integrationDatabaseURL(t)
 	ctx := context.Background()
 	pool, err := pgxpool.New(ctx, dbURL)
@@ -230,29 +238,48 @@ func TestStopPathsNeverTouchNullSubmissionRows(t *testing.T) {
 		llm.NewService(pool, slog.New(slog.DiscardHandler)), slog.New(slog.DiscardHandler))
 	worker.publicClient = pionex.NewClient(mock.server.URL, "", "")
 
-	// The fleet stop must leave every NULL-bu row exactly as it is.
+	// The fleet stop marks every NULL-bu submission row with the stop intent
+	// and leaves it non-terminal.
 	if err := worker.stop(ctx); err != nil {
 		t.Fatalf("fleet stop: %v", err)
 	}
-	for _, row := range []struct{ id, want string }{
-		{pendingID, "PENDING_SUBMISSION"},
-		{zombieID, "STOP_REQUESTED"},
-		{staleID, "STOP_REQUESTED"},
+	for _, row := range []struct{ id, wantReason string }{
+		// The pass marks the in-flight row itself; the two rows that already
+		// carried the intent are outside its status set and keep their seed.
+		{pendingID, "AUTOGRID_STOP"},
+		{zombieID, ""},
+		{staleID, ""},
 	} {
 		var status string
-		var closed *string
+		var closedReason *string
+		var closedAt *time.Time
 		if err := pool.QueryRow(ctx, `
-			SELECT status, closed_reason FROM grid_bots WHERE id = $1
-		`, row.id).Scan(&status, &closed); err != nil {
+			SELECT status, closed_reason, closed_at FROM grid_bots WHERE id = $1
+		`, row.id).Scan(&status, &closedReason, &closedAt); err != nil {
 			t.Fatalf("load row after stop: %v", err)
 		}
-		if status != row.want || closed != nil {
-			t.Fatalf("stop must not touch NULL-bu rows: want %s/NULL, got %s/%v", row.want, status, closed)
+		if status != "STOP_REQUESTED" {
+			t.Fatalf("fleet stop must leave the in-flight row STOP_REQUESTED, got %s", status)
+		}
+		got := ""
+		if closedReason != nil {
+			got = *closedReason
+		}
+		if got != row.wantReason {
+			t.Fatalf("closed_reason = %q, want %q", got, row.wantReason)
+		}
+		if closedAt != nil {
+			t.Fatalf("a NULL-bu row can never be proven closed, got closed_at %v", closedAt)
 		}
 	}
 
-	// The exchange holds grids for the pending row and the zombie; the stale
-	// row (40 min, complete lists, no match) must be cleared as never created.
+	// A submission that starts AFTER the stop pass is not marked; adoption must
+	// still bring it up as RUNNING.
+	lateID := seedUnknownSubmission(t, pool, account.ID, settings.ID, "ADOPTL_USDT_PERP", "PENDING_SUBMISSION", 5)
+
+	// The exchange holds grids for the pending row, the zombie and the late
+	// row; the stale row (40 min, complete lists, no match) must be cleared as
+	// never created.
 	createdMS := func(ageMinutes int) int64 {
 		return time.Now().Add(-time.Duration(ageMinutes) * time.Minute).UnixMilli()
 	}
@@ -265,6 +292,11 @@ func TestStopPathsNeverTouchNullSubmissionRows(t *testing.T) {
 		{
 			"buOrderId": "ADOPT-Z", "buOrderType": "futures_grid", "status": "running",
 			"base": "ADOPTZ", "quote": "USDT", "createTime": createdMS(5),
+			"buOrderData": map[string]any{"quoteInvestment": "100"},
+		},
+		{
+			"buOrderId": "ADOPT-L", "buOrderType": "futures_grid", "status": "running",
+			"base": "ADOPTL", "quote": "USDT", "createTime": createdMS(5),
 			"buOrderData": map[string]any{"quoteInvestment": "100"},
 		},
 	})
@@ -287,8 +319,8 @@ func TestStopPathsNeverTouchNullSubmissionRows(t *testing.T) {
 	`, pendingID).Scan(&pendingStatus, &pendingBU); err != nil {
 		t.Fatalf("load pending row: %v", err)
 	}
-	if pendingStatus != "RUNNING" || pendingBU == nil || *pendingBU != "ADOPT-P" {
-		t.Fatalf("pending submission must be adopted as RUNNING with its buOrderId, got %s/%v", pendingStatus, pendingBU)
+	if pendingStatus != "STOP_REQUESTED" || pendingBU == nil || *pendingBU != "ADOPT-P" {
+		t.Fatalf("stop-marked submission must adopt its buOrderId while KEEPING the stop intent, got %s/%v", pendingStatus, pendingBU)
 	}
 
 	var zombieStatus string
@@ -300,6 +332,17 @@ func TestStopPathsNeverTouchNullSubmissionRows(t *testing.T) {
 	}
 	if zombieStatus != "STOP_REQUESTED" || zombieBU == nil || *zombieBU != "ADOPT-Z" {
 		t.Fatalf("STOP_REQUESTED zombie must adopt its buOrderId while KEEPING the stop intent, got %s/%v", zombieStatus, zombieBU)
+	}
+
+	var lateStatus string
+	var lateBU *string
+	if err := pool.QueryRow(ctx, `
+		SELECT status, bu_order_id FROM grid_bots WHERE id = $1
+	`, lateID).Scan(&lateStatus, &lateBU); err != nil {
+		t.Fatalf("load late row: %v", err)
+	}
+	if lateStatus != "RUNNING" || lateBU == nil || *lateBU != "ADOPT-L" {
+		t.Fatalf("an unmarked pending submission must be adopted as RUNNING with its buOrderId, got %s/%v", lateStatus, lateBU)
 	}
 
 	var staleStatus, staleReason string

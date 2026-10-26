@@ -1935,31 +1935,39 @@ func (worker *Worker) deployPaper(
 				roiRoomPaper = candidate.CurrentPrice.Sub(*candidate.TargetPrice).Div(candidate.CurrentPrice).Mul(decimal.NewFromInt(100)).InexactFloat64()
 			}
 		}
-		roiOuHLPaper := 0.0
-		if v, ok := candidate.ModelAssumptions["ouHalfLifeHours"].(float64); ok {
-			roiOuHLPaper = v
-		}
 		roiPaper := AssessROI(ROIAssessmentInput{
-			Direction: roiDirPaper, Investment: investAmount, SpanPct: roiSpanPctPaper,
+			// v2.0.196: full-slot budget, mirroring the REAL lane (and this lane's
+			// own stress geometry above). investAmount is tranche-halved, so the
+			// assessment mixed a HALF-slot harvest against a FULL-slot stress loss
+			// — RequiredWinRate = L/(G+L) came out systematically worse than the
+			// REAL twin's for the identical candidate, which is exactly the
+			// divergence the paper fleet exists to rule out.
+			Direction: roiDirPaper, Investment: settings.BudgetUSDT, SpanPct: roiSpanPctPaper,
 			GridNum: mesh.GridNum, GridStepPct: roiStepPaper, Leverage: botLev,
 			FeeBps: decimalFloat(settings.FeeBps), SlippageBps: decimalFloat(settings.SlippageBps),
-			StressLossUSDT: stress.loss, AvgWinUSDT: decimal.NewFromFloat(0.48),
-			FundingBps8h: roiFundingPaper, HoldHours: 48.0,
-			DayVolPct: candidate.VolatilityPct.InexactFloat64(), OUHalfLifeHours: roiOuHLPaper,
+			StressLossUSDT: stress.loss,
+			FundingBps8h:   roiFundingPaper, HoldHours: 48.0,
+			// v2.0.197: σ_day — единственный вход модели циклов (OU-fallback
+			// удалён как невалидированный). Сканер гарантирует пол
+			// MinVolatilityPct, поэтому ноль здесь — мёртвый фид, и гейт
+			// откажет fail-closed, а не угадает сбор.
+			DayVolPct:  candidate.VolatilityPct.InexactFloat64(),
 			RoomPctPct: roiRoomPaper,
 		}, ROIProfileCalm2Pct)
 		candidate.ModelAssumptions["roiAssessment"] = map[string]any{
 			"feasible": roiPaper.Feasible, "reason": roiPaper.Reason,
-			"est_net_usdt":      roiPaper.EstNetUSDT.StringFixed(2),
-			"required_win_rate": roiPaper.RequiredWinRate.StringFixed(2),
-			"profile":           "calm_2pct",
+			"est_net_usdt":       roiPaper.EstNetUSDT.StringFixed(2),
+			"risk_adjusted_usdt": roiPaper.RiskAdjustedUSDT.StringFixed(2),
+			"required_win_rate":  roiPaper.RequiredWinRate.StringFixed(2),
+			"profile":            "calm_2pct",
 		}
 		if !roiPaper.Feasible {
 			worker.rejectCandidateDI(ctx, candidate,
 				"ROI-допуск: "+roiPaper.Reason, nil,
 				"SCANNER_PAPER", "PAPER", "ROI_GATE", map[string]any{
-					"est_net_usdt":      roiPaper.EstNetUSDT.StringFixed(2),
-					"required_win_rate": roiPaper.RequiredWinRate.StringFixed(2)})
+					"est_net_usdt":       roiPaper.EstNetUSDT.StringFixed(2),
+					"risk_adjusted_usdt": roiPaper.RiskAdjustedUSDT.StringFixed(2),
+					"required_win_rate":  roiPaper.RequiredWinRate.StringFixed(2)})
 			continue
 		}
 
@@ -2148,7 +2156,26 @@ func (worker *Worker) deployPaper(
 		// fees_paid_usdt (the fee ledger) and model_state (breakdown).
 		paperEntryFeePaid := paperEntryFee(databaseTrend(trend), mesh.LowerPrice, mesh.UpperPrice,
 			mesh.GridNum, investAmount, botLev, candidate.CurrentPrice)
-		err = worker.db.QueryRow(ctx, `
+		// v2.0.196: the caps are re-read inside the transaction that writes the
+		// row, under an advisory lock. ValidateNewPaperGrid above ran before the
+		// parity checkParams call (seconds of exchange round-trips), so two
+		// overlapping deploys — or a manual PUT landing in that window — both
+		// counted the same fleet and both wrote.
+		var capReject string
+		insertErr := func() error {
+			tx, txErr := worker.db.Begin(ctx)
+			if txErr != nil {
+				return fmt.Errorf("begin paper create transaction: %w", txErr)
+			}
+			defer tx.Rollback(ctx)
+			if lockErr := risk.LockEntryGate(ctx, tx, "paper_entry", settings.ID); lockErr != nil {
+				return lockErr
+			}
+			if capErr := risk.RecheckPaperEntryCaps(ctx, tx, candidate.Symbol, botLev, settings.BudgetUSDT); capErr != nil {
+				capReject = capErr.Error()
+				return capErr
+			}
+			if scanErr := tx.QueryRow(ctx, `
 			INSERT INTO paper_grid_bots (
 				settings_id, candidate_id, symbol, status, direction, grid_type,
 				lower_price, upper_price, grid_num, leverage, quote_investment,
@@ -2184,21 +2211,31 @@ func (worker *Worker) deployPaper(
 			DO NOTHING
 			RETURNING id, bot_number
 	`, settings.ID, candidate.ID, candidate.Symbol,
-			databaseTrend(trend), gridType,
-			mesh.LowerPrice, mesh.UpperPrice, mesh.GridNum,
-			botLev, investAmount,
-			candidate.CurrentPrice, settings.PnLTargetMode, target, maxLoss,
-			confluence.Status, mesh.GridStepPct, confluence.Score, antiHuntStop,
-			levReason, levMode, settings.Leverage,
-			trancheFlag(trancheOn), settings.BudgetUSDT.String(), atrPct, entryFeaturesJSON(candidate),
-			paperEntryFeePaid.Round(8).String(),
-			targetPriceDec, stopLossPriceDec, stopLossHighDec, stopLossPriceDec,
-			adaptiveStrat, riskRewardDec).Scan(&botID, &botNumber)
-		if err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
+				databaseTrend(trend), gridType,
+				mesh.LowerPrice, mesh.UpperPrice, mesh.GridNum,
+				botLev, investAmount,
+				candidate.CurrentPrice, settings.PnLTargetMode, target, maxLoss,
+				confluence.Status, mesh.GridStepPct, confluence.Score, antiHuntStop,
+				levReason, levMode, settings.Leverage,
+				trancheFlag(trancheOn), settings.BudgetUSDT.String(), atrPct, entryFeaturesJSON(candidate),
+				paperEntryFeePaid.Round(8).String(),
+				targetPriceDec, stopLossPriceDec, stopLossHighDec, stopLossPriceDec,
+				adaptiveStrat, riskRewardDec).Scan(&botID, &botNumber); scanErr != nil {
+				return scanErr
+			}
+			return tx.Commit(ctx)
+		}()
+		if capReject != "" {
+			worker.rejectCandidate(ctx, candidate, "risk engine (re-check at insert): "+capReject, nil)
+			worker.logger.Info("paper deploy blocked by risk engine re-check",
+				"component", "autogrid_worker", "symbol", candidate.Symbol, "error", capReject)
+			continue
+		}
+		if insertErr != nil {
+			if errors.Is(insertErr, pgx.ErrNoRows) {
 				continue
 			}
-			return fmt.Errorf("deploy paper grid %s: %w", candidate.Symbol, err)
+			return fmt.Errorf("deploy paper grid %s: %w", candidate.Symbol, insertErr)
 		}
 		activeCount++
 
@@ -3287,31 +3324,31 @@ func (worker *Worker) deployReal(
 				roiRoom = candidate.CurrentPrice.Sub(*candidate.TargetPrice).Div(candidate.CurrentPrice).Mul(decimal.NewFromInt(100)).InexactFloat64()
 			}
 		}
-		roiOuHL := 0.0
-		if v, ok := candidate.ModelAssumptions["ouHalfLifeHours"].(float64); ok {
-			roiOuHL = v
-		}
 		roiAssessment := AssessROI(ROIAssessmentInput{
 			Direction: roiDir, Investment: slotBudget, SpanPct: roiSpanPct,
 			GridNum: mesh.GridNum, GridStepPct: roiStep, Leverage: botLev,
 			FeeBps: decimalFloat(settings.FeeBps), SlippageBps: decimalFloat(settings.SlippageBps),
-			StressLossUSDT: stress.loss, AvgWinUSDT: decimal.NewFromFloat(0.48),
-			FundingBps8h: roiFundingBps, HoldHours: 48.0,
-			DayVolPct: candidate.VolatilityPct.InexactFloat64(), OUHalfLifeHours: roiOuHL,
+			StressLossUSDT: stress.loss,
+			FundingBps8h:   roiFundingBps, HoldHours: 48.0,
+			// v2.0.197: σ_day — единственный вход модели циклов (OU-fallback
+			// удалён как невалидированный). Ноль = мёртвый фид → fail-closed.
+			DayVolPct:  candidate.VolatilityPct.InexactFloat64(),
 			RoomPctPct: roiRoom,
 		}, ROIProfileCalm2Pct)
 		candidate.ModelAssumptions["roiAssessment"] = map[string]any{
 			"feasible": roiAssessment.Feasible, "reason": roiAssessment.Reason,
-			"est_net_usdt":      roiAssessment.EstNetUSDT.StringFixed(2),
-			"required_win_rate": roiAssessment.RequiredWinRate.StringFixed(2),
-			"profile":           "calm_2pct",
+			"est_net_usdt":       roiAssessment.EstNetUSDT.StringFixed(2),
+			"risk_adjusted_usdt": roiAssessment.RiskAdjustedUSDT.StringFixed(2),
+			"required_win_rate":  roiAssessment.RequiredWinRate.StringFixed(2),
+			"profile":            "calm_2pct",
 		}
 		if !roiAssessment.Feasible {
 			worker.rejectCandidateDI(ctx, candidate,
 				"ROI-допуск: "+roiAssessment.Reason, nil,
 				"SCANNER_REAL", "REAL", "ROI_GATE", map[string]any{
-					"est_net_usdt":      roiAssessment.EstNetUSDT.StringFixed(2),
-					"required_win_rate": roiAssessment.RequiredWinRate.StringFixed(2)})
+					"est_net_usdt":       roiAssessment.EstNetUSDT.StringFixed(2),
+					"risk_adjusted_usdt": roiAssessment.RiskAdjustedUSDT.StringFixed(2),
+					"required_win_rate":  roiAssessment.RequiredWinRate.StringFixed(2)})
 			continue
 		}
 
@@ -3816,10 +3853,31 @@ func (worker *Worker) deployReal(
 		// at deploy is booked durably — the epoch formula subtracts Σ fees.
 		// Basis matches pionex.EntryFeeUSDT (taker 0.05% × investment ×
 		// leverage), the same model the invest_in pours book.
-		if feeErr := recordRealEntryFee(ctx, worker.db, botID,
-			pionex.EntryFeeUSDT(investAmount, botLev), "entryFeeUsdt"); feeErr != nil {
-			worker.logger.Error("entry fee booking failed — ledger fee leg incomplete for this deploy",
-				"component", "autogrid_worker", "bot_id", botID, "error", feeErr)
+		entryFee := pionex.EntryFeeUSDT(investAmount, botLev)
+		if feeErr := recordRealEntryFee(ctx, worker.db, botID, entryFee, "entryFeeUsdt"); feeErr != nil {
+			// v2.0.196: a failed write no longer loses the fee. The amount is
+			// stamped on the row and healUnbookedEntryFees books it on a later
+			// pass; only a failed STAMP is a lost leg, and that is alarmed
+			// because Σ fees feeds every net figure the epoch reports.
+			worker.logger.Error("entry fee booking failed — stamped for the heal sweep",
+				"component", "autogrid_worker", "bot_id", botID,
+				"fee_usdt", entryFee.String(), "error", feeErr)
+			if _, stampErr := worker.db.Exec(ctx, `
+				UPDATE grid_bots
+				SET model_state = jsonb_set(COALESCE(model_state, '{}'::jsonb), '{entryFeeUnbookedUsdt}',
+				        to_jsonb($2::TEXT)),
+				    updated_at = NOW()
+				WHERE id = $1
+				  AND NOT COALESCE(model_state, '{}'::jsonb) ? 'entryFeeUnbookedUsdt'
+			`, botID, entryFee.Round(8).String()); stampErr != nil {
+				worker.logger.Error("entry fee stamp failed — fee leg lost for this deploy, manual ledger repair required",
+					"component", "autogrid_worker", "bot_id", botID,
+					"fee_usdt", entryFee.String(), "error", stampErr)
+				_ = QueueTelegramEvent(ctx, worker.db, "EMERGENCY", map[string]any{
+					"message": fmt.Sprintf("Bot %s: комиссия входа %s USDT не записана в ledger (ошибка БД) — требуется ручная корректировка fees_paid_usdt",
+						botID, entryFee.StringFixed(8)),
+				})
+			}
 		}
 
 		var botNum int
@@ -3876,15 +3934,15 @@ func (worker *Worker) stop(ctx context.Context) error {
 	}
 	// Real grids get a durable stop intent; reconcileAndManage submits the
 	// native Pionex cancel and verifies the terminal state remotely.
-	// v2.0.78 CRIT-3: rows without a buOrderId are never touched — a stop
-	// request on an unadopted submission makes the row a STOP_REQUESTED zombie
-	// (the manage loop only supervises rows WITH a remote id) that blocks the
-	// symbol and the slot forever. Adoption owns NULL-bu rows instead.
+	// v2.0.196: in-flight submissions (no buOrderId yet) are marked too — the
+	// v2.0.78 CRIT-3 zombie concern is obsolete now that adoption owns
+	// STOP_REQUESTED rows, and the lifecycle's RUNNING write preserves a raced
+	// stop. Leaving them unmarked let a create that lands after this point stay
+	// a managed live grid while the fleet reports STOPPED.
 	if _, err := worker.db.Exec(ctx, `
 		UPDATE grid_bots
 		SET status = 'STOP_REQUESTED', closed_reason = COALESCE(closed_reason, 'AUTOGRID_STOP'), updated_at = NOW()
 		WHERE autogrid_settings_id = $1
-		  AND bu_order_id IS NOT NULL
 		  AND status IN ('RUNNING', 'PENDING_SUBMISSION', 'SUBMISSION_UNKNOWN')
 	`, settings.ID); err != nil {
 		return fmt.Errorf("request real AutoGrid stop: %w", err)
@@ -3917,6 +3975,20 @@ func (worker *Worker) emergencyStop(ctx context.Context) error {
 }
 
 func (worker *Worker) cancelRealBots(ctx context.Context, settings *Settings) error {
+	// In-flight submissions carry no remote id to cancel. Record the stop
+	// intent first: the lifecycle's RUNNING write preserves a raced
+	// STOP_REQUESTED, and adoption covers that status, so a create that lands
+	// after this point is cancelled instead of becoming a managed live grid.
+	if _, err := worker.db.Exec(ctx, `
+		UPDATE grid_bots
+		SET status = 'STOP_REQUESTED',
+		    closed_reason = COALESCE(closed_reason, 'EMERGENCY_STOP'),
+		    updated_at = NOW()
+		WHERE autogrid_settings_id = $1 AND bu_order_id IS NULL
+		  AND status IN ('PENDING_SUBMISSION', 'SUBMISSION_UNKNOWN')
+	`, settings.ID); err != nil {
+		return fmt.Errorf("mark in-flight submissions for emergency stop: %w", err)
+	}
 	rows, err := worker.db.Query(ctx, `
 		SELECT id, bu_order_id, account_id
 		FROM grid_bots
@@ -3977,6 +4049,17 @@ func (worker *Worker) cancelRealBots(ctx context.Context, settings *Settings) er
 func (worker *Worker) cancelRealBot(
 	ctx context.Context, client *pionex.Client, botID, remoteID, note string,
 ) error {
+	return worker.cancelRealBotImmediate(ctx, client, botID, remoteID, note, false)
+}
+
+// cancelRealBotImmediate sends POST /api/v1/bot/orders/futuresGrid/cancel.
+// `immediate` is the documented force-cancel reserved for STUCK orders: the
+// ordinary stop path must not set it, so it is used only as a single
+// escalation after the exchange refused the graceful cancel because of the
+// bot's current state.
+func (worker *Worker) cancelRealBotImmediate(
+	ctx context.Context, client *pionex.Client, botID, remoteID, note string, immediate bool,
+) error {
 	_, _ = worker.db.Exec(ctx, `
 		UPDATE grid_bots
 		SET status = 'STOPPING', reconciliation_state = 'CANCEL_SUBMITTING',
@@ -3985,14 +4068,29 @@ func (worker *Worker) cancelRealBot(
 	`, botID)
 	cancelErr := client.CancelFuturesGridBot(ctx, pionex.CancelFuturesGridParams{
 		BUOrderID: remoteID, CloseNote: note,
-		CloseSellMode: "TO_USDT", Immediate: true,
+		CloseSellMode: "TO_USDT", Immediate: immediate,
 	})
 	if cancelErr != nil {
 		errStr := strings.ToLower(cancelErr.Error())
-		if strings.Contains(errStr, "already_closed") || strings.Contains(errStr, "already closed") ||
-			strings.Contains(errStr, "not_found") || strings.Contains(errStr, "not found") ||
-			strings.Contains(errStr, "not_exist") || strings.Contains(errStr, "invalid_order") ||
-			strings.Contains(errStr, "forbidden current state") || strings.Contains(errStr, "can not cancel") {
+		// A state refusal ("can not cancel", "forbidden current state") proves
+		// the order EXISTS and is alive — it is not a terminal signal. Writing
+		// STOPPED here dropped the bot out of supervision with margin still
+		// locked and no remote/flat proof.
+		if cancelStateRefused(errStr) {
+			if !immediate {
+				worker.logger.Warn("graceful cancel refused by remote state, escalating to documented force-cancel",
+					"component", "autogrid_worker", "bot_id", botID, "remote_id", remoteID,
+					"error", cancelErr)
+				return worker.cancelRealBotImmediate(ctx, client, botID, remoteID, note, true)
+			}
+			_, _ = worker.db.Exec(ctx, `
+				UPDATE grid_bots
+				SET reconciliation_state = 'CANCEL_REFUSED_STATE', last_error = $2, updated_at = NOW()
+				WHERE id = $1
+			`, botID, cancelErr.Error())
+			return fmt.Errorf("cancel Pionex grid %s refused by remote state: %w", remoteID, cancelErr)
+		}
+		if remoteSaysGone(cancelErr) {
 			_, _ = worker.db.Exec(ctx, `
 				UPDATE grid_bots
 				SET status = 'STOPPED', closed_reason = 'ALREADY_CLOSED',
@@ -4264,12 +4362,13 @@ type terminalSettleResult struct {
 // settleTerminalFinal resolves the terminal final for one REAL bot from the
 // exchange chain result:
 //
-//   - profitExited / total-alias: the exchange's netted total — accepted for
-//     every close class (the position-close leg is inside by construction)
-//     except the guarded anomaly of a POSITIVE total on a loss-class close
-//     (decided from BOTH the stored closed_reason and the exchange reasonBy —
-//     our manage stop comes back as "user cancel", so the stored reason is
-//     the only loss witness); a gated figure falls through to the estimate;
+//   - profitExited / total-alias: the exchange's own carrier — accepted for
+//     every close class except the guarded anomaly of a POSITIVE total on a
+//     loss-class close (decided from BOTH the stored closed_reason and the
+//     exchange reasonBy — our manage stop comes back as "user cancel", so the
+//     stored reason is the only loss witness). The docs publish no netting
+//     formula for profitExited, so a gated figure falls through to the
+//     estimate and the row stays re-probeable for the unlock identity;
 //   - otherwise: estimate b — telemetry_last_total − (taker 0.05% + slippage
 //     0.05%) × last inventory notional, floored at −max_loss − close cost for
 //     EXECUTED stops (manage STOP_LOSS and native STOP_LOSS_NATIVE alike:
@@ -4393,6 +4492,8 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 	// v2.0.58: data-feed health — a silently dead collector must announce
 	// itself instead of fail-opening every gate that leans on it.
 	worker.dataHealthCheck(ctx)
+	// v2.0.196: complete deploy entry fees whose booking write failed.
+	worker.healUnbookedEntryFees(ctx)
 	worker.maybeQueueCascadeShortScan(ctx, *settings)
 	// Pin the implicitly resolved account into settings when possible so
 	// deploys and supervision stay on the same account. Supervision itself
@@ -4500,6 +4601,23 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 	// v2.0.104: adopt exchange-side running grids our DB doesn't actively
 	// track (throttled internally).
 	worker.reconcileOrphanExchangeBots(ctx, *settings)
+	clients := make(map[string]*pionex.Client)
+	clientFor := func(accountID string) (*pionex.Client, error) {
+		if cached, ok := clients[accountID]; ok {
+			return cached, nil
+		}
+		client, err := worker.service.PrivateClient(ctx, worker.accounts, accountID)
+		if err != nil {
+			return nil, err
+		}
+		clients[accountID] = client
+		return client, nil
+	}
+	// Unknown-submission adoption runs BEFORE the empty-fleet early return:
+	// a create whose outcome is unknown is exactly the case where NO row
+	// carries a bu_order_id, so the old placement after the return left a
+	// live exchange grid unmanaged and its local row stranded forever.
+	worker.adoptUnknownSubmissions(ctx, clientFor)
 	var count int
 	if err := worker.db.QueryRow(ctx, `
 		SELECT COUNT(*) FROM grid_bots
@@ -4590,19 +4708,6 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 		bots = append(bots, item)
 	}
 	rows.Close()
-
-	clients := make(map[string]*pionex.Client)
-	clientFor := func(accountID string) (*pionex.Client, error) {
-		if cached, ok := clients[accountID]; ok {
-			return cached, nil
-		}
-		client, err := worker.service.PrivateClient(ctx, worker.accounts, accountID)
-		if err != nil {
-			return nil, err
-		}
-		clients[accountID] = client
-		return client, nil
-	}
 
 	for _, bot := range bots {
 		client, clientErr := clientFor(bot.accountID)
@@ -5457,6 +5562,24 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 						worker.logger.Info("successfully repaired neutral bot take-profit on Pionex card",
 							"component", "autogrid_worker", "bot_id", bot.id, "symbol", bot.symbol,
 							"remote_id", bot.remoteID, "target_amount", profitValStr, "reason", repairReason)
+						// v2.0.196: unlike the stop-loss advance, an unconfirmed
+						// take-profit repair still keeps the local ceiling — it
+						// is a harvest cap, not protection, and dropping it
+						// would leave the exit ladder waiting on the abandoned
+						// pre-repair amount. The missing witness is stamped and
+						// logged instead of swallowed.
+						if confirmErr := confirmNativeTrigger(ctx, client, bot.remoteID, "profitStop", effective); confirmErr != nil {
+							worker.logger.Error("take-profit repair UNCONFIRMED by bot detail — local ceiling kept, witness stamped",
+								"component", "autogrid_worker", "bot_id", bot.id, "symbol", bot.symbol,
+								"remote_id", bot.remoteID, "target_amount", profitValStr, "error", confirmErr)
+							_, _ = worker.db.Exec(ctx, `
+								UPDATE grid_bots
+								SET model_state = jsonb_set(COALESCE(model_state, '{}'::jsonb), '{profitStopUnconfirmedAt}',
+									to_jsonb(to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'))),
+								    updated_at = NOW()
+								WHERE id = $1
+							`, bot.id)
+						}
 						remote.BUOrderData.ProfitStopType = "profit_amount"
 						remote.BUOrderData.ProfitStop = effective
 						_, _ = worker.db.Exec(ctx, `
@@ -6282,6 +6405,22 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 				},
 			}
 			_, updateErr := client.UpdateFuturesGridTriggerProfitLoss(ctx, req)
+			if updateErr == nil {
+				// v2.0.196: a success response is not proof the card moved. The
+				// local stop_loss_price/trailing_sl_price write feeds the
+				// supervision circuit and the exit-slippage telemetry, so
+				// persisting an unconfirmed advance told the engine the
+				// protection had tightened while the exchange could still hold
+				// the looser stop. Confirmation rides the documented bot-detail
+				// field; a failure takes the existing 1h backoff branch, so it
+				// cannot machine-gun the endpoint.
+				if confirmErr := confirmNativeTrigger(ctx, client, bot.remoteID, "lossStop", *decision.TrailingSLPrice); confirmErr != nil {
+					worker.logger.Error("native trailing stop-loss update UNCONFIRMED by bot detail — local stop not advanced",
+						"component", "autogrid_worker", "bot_id", bot.id, "symbol", bot.symbol,
+						"remote_id", bot.remoteID, "requested_sl", newSLStr, "error", confirmErr)
+					updateErr = confirmErr
+				}
+			}
 			if updateErr != nil {
 				worker.logger.Error("failed to update native trailing stop-loss on Pionex",
 					"component", "autogrid_worker", "bot_id", bot.id, "remote_id", bot.remoteID,
@@ -6423,28 +6562,8 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 		}
 	}
 
-	// Unknown submissions are adopted per account: each pending row carries
-	// the account its client must authenticate as. v2.0.78 CRIT-3: STOP_REQUESTED
-	// rows with a NULL bu_order_id (stop requests that raced a create, or the
-	// pre-fix zombies) join the adoption pool — the stop intent itself is
-	// preserved on adopt, the manage loop then submits the native cancel.
-	unknownAccountRows, err := worker.db.Query(ctx, `
-		SELECT DISTINCT account_id FROM grid_bots
-		WHERE bu_order_id IS NULL
-		  AND status IN ('SUBMISSION_UNKNOWN', 'PENDING_SUBMISSION', 'STOP_REQUESTED')
-		  AND created_at > NOW() - INTERVAL '48 hours'
-	`)
-	if err == nil {
-		for unknownAccountRows.Next() {
-			var accountID string
-			if scanErr := unknownAccountRows.Scan(&accountID); scanErr == nil {
-				if unknownClient, clientErr := clientFor(accountID); clientErr == nil {
-					worker.reconcileUnknownSubmissions(ctx, unknownClient)
-				}
-			}
-		}
-		unknownAccountRows.Close()
-	}
+	// Unknown-submission adoption moved to the top of the pass (before the
+	// empty-fleet early return) — see adoptUnknownSubmissions.
 
 	// v2.0.83 bot-aggregate equity: capture runs AFTER the bot loop — the
 	// realized/unrealized columns it sums were just refreshed from remote
@@ -6477,6 +6596,81 @@ func (worker *Worker) reconcileAndManage(ctx context.Context) (int, error) {
 	}
 
 	return clampInterval(settings.ManageIntervalSeconds), nil
+}
+
+// adoptUnknownSubmissions runs the unknown-submission adoption for every
+// account that still has a NULL-bu_order_id row. v2.0.78 CRIT-3: STOP_REQUESTED
+// rows (stop requests that raced a create, or the pre-fix zombies) join the
+// pool — the stop intent itself is preserved on adopt, and the manage loop
+// then submits the native cancel.
+func (worker *Worker) adoptUnknownSubmissions(ctx context.Context, clientFor func(string) (*pionex.Client, error)) {
+	rows, err := worker.db.Query(ctx, `
+		SELECT DISTINCT account_id FROM grid_bots
+		WHERE bu_order_id IS NULL
+		  AND status IN ('SUBMISSION_UNKNOWN', 'PENDING_SUBMISSION', 'STOP_REQUESTED')
+		  AND created_at > NOW() - INTERVAL '48 hours'
+	`)
+	if err != nil {
+		return
+	}
+	accountIDs := make([]string, 0, 4)
+	for rows.Next() {
+		var accountID string
+		if rows.Scan(&accountID) == nil {
+			accountIDs = append(accountIDs, accountID)
+		}
+	}
+	rows.Close()
+	for _, accountID := range accountIDs {
+		client, clientErr := clientFor(accountID)
+		if clientErr != nil {
+			worker.logger.Error("resolve Pionex client for unknown-submission adoption",
+				"component", "autogrid_worker", "account_id", accountID, "error", clientErr)
+			continue
+		}
+		worker.reconcileUnknownSubmissions(ctx, client)
+	}
+	worker.flagExpiredUnknownSubmissions(ctx)
+}
+
+// flagExpiredUnknownSubmissions escalates the rows the 48h adoption window can
+// no longer reach. Silent expiry stranded a create whose outcome was unknown:
+// no remote id, no supervision, symbol and slot blocked forever, while a live
+// exchange grid may still be running. Absence cannot be proven once the remote
+// lists are out of reach, so the row is flagged and alarmed for manual review
+// instead of being finalized.
+func (worker *Worker) flagExpiredUnknownSubmissions(ctx context.Context) {
+	rows, err := worker.db.Query(ctx, `
+		UPDATE grid_bots
+		SET reconciliation_state = 'ADOPTION_WINDOW_EXPIRED',
+		    last_error = 'create outcome unknown: 48h adoption window expired, the remote order can no longer be matched — manual review required',
+		    updated_at = NOW()
+		WHERE bu_order_id IS NULL
+		  AND status IN ('SUBMISSION_UNKNOWN', 'PENDING_SUBMISSION', 'STOP_REQUESTED')
+		  AND created_at <= NOW() - INTERVAL '48 hours'
+		  AND COALESCE(reconciliation_state, '') <> 'ADOPTION_WINDOW_EXPIRED'
+		RETURNING id, symbol
+	`)
+	if err != nil {
+		return
+	}
+	type expiredRow struct{ id, symbol string }
+	found := make([]expiredRow, 0, 4)
+	for rows.Next() {
+		var item expiredRow
+		if rows.Scan(&item.id, &item.symbol) == nil {
+			found = append(found, item)
+		}
+	}
+	rows.Close()
+	for _, item := range found {
+		worker.logger.Error("unknown submission left the adoption window unresolved",
+			"component", "autogrid_worker", "bot_id", item.id, "symbol", item.symbol)
+		_ = QueueTelegramEvent(ctx, worker.db, "EMERGENCY", map[string]any{
+			"message": fmt.Sprintf("Bot %s (%s): create outcome unknown for over 48h — an exchange grid may be live and unmanaged, manual review required",
+				item.symbol, item.id),
+		})
+	}
 }
 
 // reconcileUnknownSubmissions resolves grid bots whose create outcome is
@@ -6524,10 +6718,10 @@ func (worker *Worker) reconcileUnknownSubmissions(ctx context.Context, client *p
 	listsComplete := true
 	for _, listStatus := range []string{"running", "finished"} {
 		token := ""
+		// Both lists get the same budget: a 3-page finished budget truncated
+		// the history while still reporting "complete", so a bot that finished
+		// right after create could be cleared as NOT_CREATED_ON_EXCHANGE.
 		maxPages := 10
-		if listStatus == "finished" {
-			maxPages = 3 // Recent finished grids are on the first pages; older history is irrelevant for adoption
-		}
 		for page := 0; page < maxPages; page++ {
 			orders, next, listErr := client.ListBotOrders(ctx, listStatus, token)
 			if listErr != nil {
@@ -6541,8 +6735,11 @@ func (worker *Worker) reconcileUnknownSubmissions(ctx context.Context, client *p
 				break
 			}
 			token = next
-			if page == maxPages-1 && listStatus == "running" {
-				// Page budget exhausted on RUNNING: the listing is NOT complete — a live bot may sit on the next page.
+			if page == maxPages-1 {
+				// Budget exhausted with a continuation token in hand: absence
+				// is NOT proven for this list, so no row may be cleared.
+				worker.logger.Warn("bot order listing truncated by page budget — adoption cannot prove absence",
+					"component", "autogrid_worker", "status", listStatus, "max_pages", maxPages)
 				listsComplete = false
 			}
 		}
@@ -6631,6 +6828,46 @@ func (worker *Worker) reconcileUnknownSubmissions(ctx context.Context, client *p
 func findFinishedGridRecord(ctx context.Context, client *pionex.Client, buOrderID string) *pionex.BUOrderDataResponse {
 	data, _ := findFinishedGridRaw(ctx, client, buOrderID)
 	return data
+}
+
+// confirmNativeTrigger re-reads the bot detail and requires its documented
+// trigger field («lossStop» / «profitStop» on GET
+// /api/v1/bot/orders/futuresGrid/order) to carry the value just sent to
+// updateTriggerProfitLoss. A success response from that call is not proof the
+// card moved, and the detail read is read-after-write eventually consistent
+// (v2.0.188: 8/8 prod invest_in pours landed yet read back stale), so the read
+// retries before judging. The comparison carries a 5 bp slack because the
+// exchange stores the trigger at the symbol's price precision — a rounding
+// difference is not a failed update.
+func confirmNativeTrigger(
+	ctx context.Context, client *pionex.Client, remoteID, field string, want decimal.Decimal,
+) error {
+	slack := want.Abs().Mul(decimal.NewFromFloat(0.0005))
+	lastSeen := "no read"
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(2 * time.Second):
+			}
+		}
+		remote, err := client.GetFuturesGridBot(ctx, remoteID)
+		if err != nil || remote == nil {
+			lastSeen = "read failed"
+			continue
+		}
+		got := remote.BUOrderData.LossStop
+		if field == "profitStop" {
+			got = remote.BUOrderData.ProfitStop
+		}
+		lastSeen = got.String()
+		if got.Sub(want).Abs().LessThanOrEqual(slack) {
+			return nil
+		}
+	}
+	return fmt.Errorf("bot detail %s = %s при запрошенном %s — обновление не подтверждено",
+		field, lastSeen, want.String())
 }
 
 // findFinishedGridRaw also returns the record's raw buOrderData payload so
@@ -6783,6 +7020,35 @@ func (worker *Worker) tranche2RiskGate(
 	if envelope.GreaterThan(envelopeLimit) {
 		return fmt.Sprintf("конверт стопов флота %s > 0.8× дневного брейкера %s",
 			envelope.StringFixed(2), envelopeLimit.StringFixed(2))
+	}
+	return ""
+}
+
+// paperPourRiskSkip (v2.0.196) is the PAPER tranche-2 analogue of the durable
+// gates AdjustBot runs for a REAL invest_in. Returns the human-readable skip
+// reason, or "" when the pour may proceed.
+func (worker *Worker) paperPourRiskSkip(
+	ctx context.Context,
+	symbol string,
+	botLeverage int,
+	additional decimal.Decimal,
+) string {
+	if !additional.IsPositive() {
+		return ""
+	}
+	if err := worker.risk.ValidatePaperGridTopUp(ctx, symbol, botLeverage, additional); err != nil {
+		return fmt.Sprintf("риск-движок отказал второй доле: %v", err)
+	}
+	return ""
+}
+
+// firstSkipReason returns the first non-empty gate reason, so several gates can
+// share one skip/backoff/journal path.
+func firstSkipReason(reasons ...string) string {
+	for _, reason := range reasons {
+		if reason != "" {
+			return reason
+		}
 	}
 	return ""
 }
@@ -7167,15 +7433,21 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 				realized = realized.Add(*fundingDelta)
 				fundingPaid = fundingPaid.Sub(*fundingDelta)
 			}
-			// Persist the accrual anchor separately: realized itself flows to
-			// the mark/close/adjust UPDATE below, and a crash in between can
-			// lose at most one 8h accrual — never double-count.
+			// v2.0.196: the anchor, the funding column and the realized leg commit
+			// in ONE statement. Splitting them lost money silently — a crash (or an
+			// adjust/close path that never reaches the mark UPDATE below) after the
+			// anchor advanced dropped that accrual from realized_pnl_usdt for good,
+			// since the next cycle re-anchors on the new last_funding_at. The later
+			// mark writes realized absolutely from the in-memory value, which
+			// already carries this delta, so the increment is not double-counted.
 			_, _ = worker.db.Exec(ctx, `
 				UPDATE paper_grid_bots SET last_funding_at = $2,
 				    funding_paid_usdt = funding_paid_usdt + $3,
+				    realized_pnl_usdt = realized_pnl_usdt + $4,
 				    updated_at = NOW()
 				WHERE id = $1
-			`, bot.id, *nextFundingAt, fundingDeltaSigned(fundingPays, *fundingDelta))
+			`, bot.id, *nextFundingAt, fundingDeltaSigned(fundingPays, *fundingDelta),
+				fundingDeltaSigned(fundingPays, *fundingDelta).Neg())
 			_ = LogBotEvent(ctx, worker.db, bot.id, bot.botNumber, "PAPER", bot.symbol, "FUNDING", &price, fundingDelta, map[string]any{
 				"pays": fundingPays, "funding_usdt": fundingDelta.StringFixed(6),
 			})
@@ -7693,7 +7965,14 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 							}, entryOutcomeReject, "TRANCHE_STRESS",
 								"мораторий стресса: шторм-режим или радар-полоса ≥2 — вторая доля не вливается в спасаемую позицию", nil)
 						}
-					} else if skip := worker.tranche2RiskGate(ctx, settings, bot.id, bot.leverage, effMaxLoss, botGridSpanPct(bot.lower, bot.upper, bot.entry)); skip != "" {
+					} else if skip := firstSkipReason(
+						worker.tranche2RiskGate(ctx, settings, bot.id, bot.leverage, effMaxLoss, botGridSpanPct(bot.lower, bot.upper, bot.entry)),
+						// v2.0.196: the paper pour has no exchange call that could refuse
+						// it, so the durable capital gates (kill switch, leverage cap,
+						// paper account/symbol notional) must run here — the REAL twin
+						// clears them inside AdjustBot's invest_in branch.
+						worker.paperPourRiskSkip(ctx, bot.symbol, bot.leverage, base.Sub(bot.investment)),
+					); skip != "" {
 						// Backoff marker: the 24h time-box keeps the trigger
 						// armed forever, so a gated skip must not re-log on
 						// every manage pass — one event per hour max.
@@ -7715,21 +7994,38 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 								"component", "autogrid_worker", "symbol", bot.symbol, "reason", skip)
 						}
 					} else {
-						// v2.0.89 tranche friction: the pour is a taker entry
-						// too — taker 0.05% on the inventory notional the pour
-						// adds (a neutral pour doubles the ladder, so the
-						// added inventory IS the current inventory; a
-						// directional pour adds pending × leverage).
+						// v2.0.89 tranche friction: the pour is an entry
+						// too — the fee rate follows the direction
+						// (paperEntryRateBps): taker for a market-entered
+						// directional grid, MAKER for the neutral ladder's
+						// passive limits. v2.0.196: the neutral pour used to pay
+						// taker on its live inventory, contradicting both
+						// paperEntryFee and the manual pour path.
 						pourAddedNotional := base.Sub(bot.investment).
 							Mul(decimal.NewFromInt(int64(bot.leverage)))
 						if bot.direction == "NEUTRAL" {
 							pourAddedNotional = fundingExposure
 						}
-						pourFee := pourAddedNotional.Mul(paperStopTakerBps).
+						pourFee := pourAddedNotional.Mul(paperEntryRateBps(bot.direction)).
 							Div(decimal.NewFromInt(10000))
+						// v2.0.196: the added directional notional enters at the
+						// current mark — see the harmonic-blend note in
+						// Service.AdjustBot's paper pour. Without it the doubled
+						// investment marked against the original entry invented
+						// a profit (or a loss) at the pour instant.
 						tag, tErr := worker.db.Exec(ctx, `
 						UPDATE paper_grid_bots
-						SET quote_investment = $2,
+						SET entry_price = CASE
+						        WHEN UPPER(direction) <> 'NEUTRAL'
+						             AND COALESCE(entry_price, 0) > 0
+						             AND quote_investment > 0
+						             AND $2 > quote_investment
+						             AND $4::NUMERIC > 0
+						        THEN $2 / (quote_investment / entry_price
+						                   + ($2 - quote_investment) / $4::NUMERIC)
+						        ELSE entry_price
+						    END,
+						    quote_investment = $2,
 						    pnl_target_usdt = pnl_target_usdt * 2,
 						    max_loss_usdt = max_loss_usdt * 2,
 						    realized_pnl_usdt = realized_pnl_usdt - $3::NUMERIC,
@@ -7738,7 +8034,7 @@ func (worker *Worker) managePaperBots(ctx context.Context, settings Settings) er
 						    updated_at = NOW()
 						WHERE id = $1 AND status = 'RUNNING'
 						  AND COALESCE(NULLIF(model_state->>'trancheDeployed','')::INT, 0) = 1
-					`, bot.id, base, pourFee.Round(8).String())
+					`, bot.id, base, pourFee.Round(8).String(), price.String())
 						if tErr == nil && tag.RowsAffected() == 1 {
 							worker.logger.Info("tranche 2 deployed",
 								"component", "autogrid_worker", "symbol", bot.symbol, "reason", trancheReason)
@@ -8242,6 +8538,38 @@ func databaseTrend(trend string) string {
 	default:
 		return "NEUTRAL"
 	}
+}
+
+// cancelStateRefused reports whether a cancel rejection means "the order
+// exists but its current state forbids this cancel". That is evidence the bot
+// is ALIVE, so it must never finalize a row: the documented escalation is the
+// force-cancel (`immediate`), and after that the bot stays under supervision
+// until a remote read proves a terminal status.
+func cancelStateRefused(msg string) bool {
+	return strings.Contains(msg, "forbidden current state") ||
+		strings.Contains(msg, "can not cancel") ||
+		strings.Contains(msg, "cannot cancel")
+}
+
+// remoteSaysGone reports whether the EXCHANGE ITSELF answered "this grid does
+// not exist / is already closed" — the only evidence that may finalize a row
+// from a cancel call.
+//
+// v2.0.196: the classification must come from a Pionex API error payload
+// (result=false + code), never from a substring of a transport failure. An
+// unrouted path or a gateway error page answers HTTP 404 with the body
+// "404 page not found", which contains "not found" — the old substring ladder
+// read that as a closed grid and wrote STOPPED/ALREADY_CLOSED with realized
+// NULL over a bot that was still alive and still holding margin.
+func remoteSaysGone(err error) bool {
+	var apiErr *pionex.APIError
+	if !errors.As(err, &apiErr) || strings.TrimSpace(apiErr.Code) == "" {
+		return false
+	}
+	msg := strings.ToLower(apiErr.Code + " " + apiErr.Message)
+	return strings.Contains(msg, "already_closed") || strings.Contains(msg, "already closed") ||
+		strings.Contains(msg, "not_found") || strings.Contains(msg, "not found") ||
+		strings.Contains(msg, "not_exist") || strings.Contains(msg, "invalid_order")
 }
 
 // terminalRemoteGridStatus reports whether the remote status is FINAL.

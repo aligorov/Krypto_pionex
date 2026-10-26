@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/aligorov/pionex-bot/backend/internal/pionex"
+	"github.com/aligorov/pionex-bot/backend/internal/risk"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/shopspring/decimal"
@@ -103,9 +104,14 @@ func (manager *LifecycleManager) CreateGridBot(
 	// be discovered only after the create already landed. Re-read the
 	// durable switch immediately before the intent is persisted — an
 	// enabled switch (or an unreadable one: fail-closed) refuses here.
+	// The column is kill_switch_enabled (migrations/0001): v2.0.191 shipped
+	// this re-read against a non-existent `enabled` column, so EVERY REAL
+	// create failed fail-closed before the intent row was written. Row id=1
+	// is the single durable settings row the risk engine reads; a missing row
+	// is an error and therefore also a refusal.
 	var killEnabled bool
 	if err := manager.db.QueryRow(ctx,
-		`SELECT COALESCE((SELECT enabled FROM risk_settings ORDER BY updated_at DESC LIMIT 1), false)`).
+		`SELECT kill_switch_enabled FROM risk_settings WHERE id = 1`).
 		Scan(&killEnabled); err != nil {
 		return "", fmt.Errorf("kill-switch re-read failed — create refused (fail-closed): %w", err)
 	}
@@ -138,6 +144,21 @@ func (manager *LifecycleManager) CreateGridBot(
 		if _, lockErr := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))`,
 			input.AccountID, symbol); lockErr != nil {
 			return fmt.Errorf("acquire grid create lock: %w", lockErr)
+		}
+		// v2.0.196: the account-level admission gate. The portfolio caps
+		// (kill switch, leverage, active-grid count, open positions, account
+		// and symbol notional) were checked minutes earlier, outside any
+		// transaction, and re-checked nowhere — two overlapping deploys both
+		// counted N active bots and both wrote. The symbol lock above cannot
+		// serialize them (different symbols, same account caps), so the caps
+		// are re-read here under an account-scoped lock, in the transaction
+		// that writes the intent row.
+		if lockErr := risk.LockEntryGate(ctx, tx, "grid_entry_account", input.AccountID); lockErr != nil {
+			return lockErr
+		}
+		if capErr := risk.RecheckGridEntryCaps(ctx, tx, input.AccountID, symbol,
+			input.Params.BUOrderData.Leverage, input.Params.BUOrderData.QuoteInvestment); capErr != nil {
+			return capErr
 		}
 		var activeID string
 		scanErr := tx.QueryRow(ctx, `

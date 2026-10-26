@@ -13,7 +13,7 @@ import "testing"
 func TestTelegramRoutingDirectionFlipAlwaysSends(t *testing.T) {
 	allOff := telegramChannels{} // every toggle false, every template empty
 	for name, ch := range map[string]telegramChannels{
-		"all toggles off": allOff,
+		"all toggles off":              allOff,
 		"adjust off (the old carrier)": {notifyAdjust: false},
 		"everything on": {notifyCreated: true, notifyTake: true, notifyStop: true,
 			notifyAdjust: true, notifyDigest: true, notifyEmergency: true},

@@ -832,16 +832,33 @@ func (s *Server) autoGridAction(w http.ResponseWriter, r *http.Request) {
 		return
 
 	case "emergency-stop":
-		if current, err := s.control.RiskSettings(r.Context()); err == nil && current != nil {
-			current.KillSwitchEnabled = true
-			_, _ = s.control.UpdateRiskSettings(r.Context(), principal, *current)
+		// Every leg is load-bearing and its failure is reported: the old code
+		// discarded all three errors and always answered "все боты закрыты" —
+		// including for an OPERATOR, whom the ADMIN-only settings update
+		// silently refused, leaving the kill switch disarmed.
+		failures := make([]string, 0, 3)
+		if err := s.control.ArmKillSwitch(r.Context(), principal); err != nil {
+			failures = append(failures, fmt.Sprintf("kill switch: %v", err))
 		}
-		_ = s.autogrid.SetStatus(r.Context(), "EMERGENCY_STOPPED", errors.New("emergency stop engaged"))
+		if err := s.autogrid.SetStatus(r.Context(), "EMERGENCY_STOPPED", errors.New("emergency stop engaged")); err != nil {
+			failures = append(failures, fmt.Sprintf("autogrid status: %v", err))
+		}
 		if err := s.autogrid.CloseAllActiveBots(r.Context(), "EMERGENCY_STOP"); err != nil {
-			s.logger.Warn("Failed to close active bots on emergency stop", "error", err)
+			failures = append(failures, fmt.Sprintf("close bots: %v", err))
+		}
+		s.logger.Error("emergency stop engaged",
+			"actor", principal.Username, "role", principal.Role, "failures", failures)
+		if len(failures) > 0 {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{
+				"success": false, "status": "EMERGENCY_STOP_INCOMPLETE",
+				"message":   "Emergency Stop НЕ завершён — требуется немедленное ручное вмешательство",
+				"failures":  failures,
+			})
+			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{
-			"success": true, "status": "EMERGENCY_STOPPED", "message": "Emergency Stop активирован, все боты закрыты",
+			"success": true, "status": "EMERGENCY_STOPPED",
+			"message": "Emergency Stop активирован: kill-switch взведён, новые входы запрещены, запросы на закрытие ботов поставлены (терминальное состояние подтверждает reconcile)",
 		})
 		return
 

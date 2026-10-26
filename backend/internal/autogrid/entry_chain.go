@@ -60,6 +60,11 @@ const (
 	entryBlockedCascade        = "CASCADE"
 	entryBlockedFeedHealth     = "FEED_HEALTH"
 	entryBlockedMacro          = "MACRO"
+	// entryBlockedRiskEngine (v2.0.196): the durable capital gates in
+	// internal/risk (kill switch, leverage cap, account/symbol exposure) refused
+	// the action. Capital-class, so fail-closed and journalled — the paper pour
+	// path had no code to write its rejection under.
+	entryBlockedRiskEngine = "RISK_ENGINE"
 )
 
 // EntryChainInput is everything the composer needs about one admission

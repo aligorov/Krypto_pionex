@@ -46,12 +46,30 @@ func unknownClassClose(reason string) bool {
 // (profitExited / total-alias). The residual grid+funding legs it used to
 // police are no longer accepted as finals anywhere (client.SettledProfit
 // v2.0.89 returns only exchange totals), so the gate's only job is the
-// unlikely total-alias anomaly: a POSITIVE full total on a loss-class close,
-// decided from BOTH reason sources (stored closed_reason + exchange reasonBy
-// — our manage stop comes back as "user cancel" at the exchange, so the
-// stored reason is the only loss witness). Non-positive totals pass. Anything
-// that is not an exchange total returns nil — the caller falls to the
-// telemetry estimate ladder, it never treats the figure as a final.
+// total-alias anomaly: a NON-NEGATIVE full total on a loss-class close, decided
+// from BOTH reason sources (stored closed_reason + exchange reasonBy — our
+// manage stop comes back as "user cancel" at the exchange, so the stored
+// reason is the only loss witness). Anything that is not an exchange total
+// returns nil — the caller falls to the telemetry estimate ladder, it never
+// treats the figure as a final.
+//
+// v2.0.196: on a loss-class close the carrier must be strictly NEGATIVE. The
+// old `!IsPositive()` pass let a settled 0 through, and SettledProfit's switch
+// to presence-based parsing (client.go v2.0.196) turned the XMR-class record —
+// `profitExited:"0"` next to a live `profitReduce` leg on a loss stop — into a
+// booked final of exactly 0. A loss exit cost money by definition, so a flat
+// carrier there is as unverifiable as a positive one, and booking it would
+// erase the loss from realized_pnl_usdt and from the 24h daily-loss breaker.
+//
+// v2.0.196: nil means UNVERIFIABLE, not "proved wrong". The API docs define
+// profitExited only as «Exited profit» and publish no netting formula (no
+// field is documented as the bot's total/net profit), so a positive figure on a
+// stop-class close may be a genuine grid-over-stop win (CRWVX #1440) or a
+// partial leg that omits the position close — the payload cannot tell them
+// apart. A caller that gets nil must therefore prefer the unlock identity
+// (unlockIdentityFinal: cash back − cash in, true by construction) and
+// otherwise keep the row re-probeable; freezing it at the floored telemetry
+// estimate would overwrite a figure the wallet may still contradict.
 func gateSettledProfit(
 	total decimal.Decimal,
 	source pionex.FinalProfitSource,
@@ -66,10 +84,10 @@ func gateSettledProfit(
 		return &total
 
 	case pionex.FinalProfitExited, pionex.FinalProfitTotalAlias:
-		if !total.IsPositive() {
-			return &total
-		}
 		if lossClassClose(storedReason) || lossClassClose(exchangeReason) {
+			if total.IsNegative() {
+				return &total
+			}
 			return nil
 		}
 		return &total

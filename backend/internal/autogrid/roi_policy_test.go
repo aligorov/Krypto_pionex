@@ -9,35 +9,39 @@ import (
 )
 
 // roiCalmNeutralInput — спокойная нейтральная сетка базового кейса (а):
-// DayVolPct НЕ передан → OU-fallback оценка циклов (σ_day-калибровку гоняет
-// TestAssessROIFivePercentPerDaySystematicallyNotFeasible). Спан 8%
-// (v2.0.163 floor), 16 уровней → шаг 0.5%, OU-полужизнь 4 ч, горизонт 48 ч,
-// капитал $100×4, RT-издержки 20 bps (fee 5 + slip 5 ×2 ноги), фандинг
-// 1 bp/8ч, стресс-проход −$7 против медианной победы класса $25.
+// σ_day 4% при спане 8% (16 уровней × шаг 0.5%) — геометрия самосогласована
+// с доктриной спана v2.0.183 (span = max(8%, 2σ)), горизонт 48 ч, капитал
+// $100×4, RT-издержки 20 bps (fee 5 + slip 5 ×2 ноги), фандинг 1 bp/8ч,
+// стресс-проход −$7 (7% капитала — внутри 10%-го барьера).
 //
-// Ручная арифметика (проверка (а)):
-//   проходов   = 48/4 × 0.5                 = 6
-//   циклов     = 6 × 16 × 0.5               = 48 уровневых round-trip
-//   сбор       = 48 × (0.5%−0.2%) × $25     = $3.60
-//   фандинг    = 0.5×$400 × 1bp × 3×2       = $0.12
-//   винрейт    = 7/(25+7)                   = 0.21875
-//   хвост      = 0.21875 × $7               = $1.53125
-//   чистыми    = 3.60 − 0.12 − 1.53125      = $1.94875 ≥ 0.8×$2 → Feasible
+// Ручная арифметика (проверка (а)), local-time модель ½(σ/шаг)²×утилизация:
+//
+//	циклов/сут = 1.0 × ½ × (4/0.5)²          = 32
+//	циклов     = 32 × 2 суток                = 64 уровневых round-trip
+//	сбор       = 64 × (0.5%−0.2%) × $25      = $4.80
+//	фандинг    = 0.5×$400 × 1bp × 3×2        = $0.12
+//	чистыми    = 4.80 − 0.12                 = $4.68
+//	хвост      = 0.076 × $7                  = $0.532
+//	риск-скор. = 4.68 − 0.532                = $4.148 ≥ 0.8×$2 → Feasible
+//	винрейт    = 7/(7+4.68)                  = 0.599315 (контекст, не барьер)
+//	полоса     = p25 0.45 → $2.04−0.53 = $1.51; p75 1.75 → $8.28−0.53 = $7.75
+//
+// Стресс-проход входит в вердикт вероятностно (p×L), а не барьером L ≤ 3G:
+// медиана отношения стопа к прибыли у наших 96 прибыльных закрытий 19.8.
 func roiCalmNeutralInput() ROIAssessmentInput {
 	return ROIAssessmentInput{
-		Direction:       "NEUTRAL",
-		Investment:      usdt(100),
-		SpanPct:         8,
-		GridNum:         16,
-		GridStepPct:     0.5,
-		Leverage:        4,
-		FeeBps:          5,
-		SlippageBps:     5,
-		StressLossUSDT:  usdt(7),
-		AvgWinUSDT:      usdt(25),
-		FundingBps8h:    1,
-		HoldHours:       48,
-		OUHalfLifeHours: 4,
+		Direction:      "NEUTRAL",
+		Investment:     usdt(100),
+		SpanPct:        8,
+		GridNum:        16,
+		GridStepPct:    0.5,
+		Leverage:       4,
+		FeeBps:         5,
+		SlippageBps:    5,
+		StressLossUSDT: usdt(7),
+		FundingBps8h:   1,
+		HoldHours:      48,
+		DayVolPct:      4,
 	}
 }
 
@@ -62,7 +66,6 @@ func TestRequiredWinRateBinaryBound(t *testing.T) {
 	}
 	for _, c := range cases {
 		got := RequiredWinRate(ROIEconomics{
-			TargetNetUSDT:  usdt(2),
 			StressLossUSDT: usdt(c.stress),
 			AvgWinUSDT:     usdt(c.win),
 		})
@@ -79,23 +82,25 @@ func TestAssessROICalmNeutralGridFeasible(t *testing.T) {
 	if !got.Feasible {
 		t.Fatalf("спокойная сетка должна быть достижима, причина: %s", got.Reason)
 	}
-	if got.EstCycles != 48 {
-		t.Errorf("EstCycles = %v, хочу 48 (48/4×0.5×16×0.5)", got.EstCycles)
+	if got.EstCycles != 64 {
+		t.Errorf("EstCycles = %v, хочу 64 (½×(4/0.5)²×2 суток)", got.EstCycles)
 	}
-	roiWantDecimal(t, got.EstNetUSDT, 1.94875)
-	roiWantDecimal(t, got.RequiredWinRate, 0.21875)
+	roiWantDecimal(t, got.EstNetUSDT, 4.68)
+	roiWantDecimal(t, got.RiskAdjustedUSDT, 4.68-0.532)
+	roiWantDecimal(t, got.RequiredWinRate, 7.0/(7.0+4.68))
 	if got.Profile.Name != ROIProfileCalm2Pct.Name || got.Profile.Pct != 2.0 {
 		t.Errorf("профиль не вернулся: %+v", got.Profile)
 	}
-	for _, want := range []string{"1.95", "2.00", "достижима", "48.0"} {
+	for _, want := range []string{"4.68", "0.53", "4.15", "2.00", "достижима", "64.0", "0.599", "1.51…7.75"} {
 		if !strings.Contains(got.Reason, want) {
 			t.Errorf("причина без числа %q: %s", want, got.Reason)
 		}
 	}
 }
 
-// (б) SUI-кейс: цель ~4.6% при стресс-проходе −33.5 — RequiredWinRate ~0.87
-// выше потолка 0.75 → НЕ достижимо, с числами в причине.
+// (б) SUI-кейс: стресс-проход −33.5 на капитал $100 при цели 5% — хвост
+// 0.076×33.5 = $2.55 съедает $4.86 сбора до $2.31, то есть ниже 0.8×$5.00 =
+// $4.00 → НЕ достижимо, с числами в причине.
 func TestAssessROISUIStressCaseNotFeasible(t *testing.T) {
 	in := ROIAssessmentInput{
 		Direction:      "LONG",
@@ -107,7 +112,6 @@ func TestAssessROISUIStressCaseNotFeasible(t *testing.T) {
 		FeeBps:         5,
 		SlippageBps:    5,
 		StressLossUSDT: usdt(33.5),
-		AvgWinUSDT:     usdt(5),
 		FundingBps8h:   3,
 		HoldHours:      48,
 		RoomPctPct:     4,
@@ -117,23 +121,29 @@ func TestAssessROISUIStressCaseNotFeasible(t *testing.T) {
 	if got.Feasible {
 		t.Fatalf("SUI-кейс не должен быть достижим: %+v", got)
 	}
-	if rwr := got.RequiredWinRate.InexactFloat64(); math.Abs(rwr-0.8701298701) > 1e-6 {
-		t.Errorf("RequiredWinRate = %s, хочу ~0.87 (33.5/38.5)", got.RequiredWinRate)
-	}
-	// Хвост = 0.8701×33.5 ≈ 29.15 сжирает сбор 5.4−0.54 → чистыми ≈ −24.29.
-	roiWantDecimal(t, got.EstNetUSDT, 5.4-0.54-33.5*33.5/38.5)
+	// Сбор 4%×0.5×$300 − RT 0.2%×$300 = $5.40, фандинг $300×3bp×6 = $0.54 →
+	// чистыми $4.86; хвост 0.076×$33.5 = $2.546 → $2.314 против порога $4.00.
+	roiWantDecimal(t, got.EstNetUSDT, 5.4-0.54)
+	roiWantDecimal(t, got.RiskAdjustedUSDT, 5.4-0.54-0.076*33.5)
+	// Контекст журнала: граница безубыточности 33.5/(33.5+4.86) = 0.873.
+	roiWantDecimal(t, got.RequiredWinRate, 33.5/(33.5+5.4-0.54))
 	if got.EstCycles != 4 { // 4% хода / 0.5% шаг × 0.5 лестницы
 		t.Errorf("EstCycles = %v, хочу 4", got.EstCycles)
 	}
-	for _, want := range []string{"винрейт", "0.870", "0.75", "33.50", "5.00"} {
+	for _, want := range []string{"33.50", "2.55", "2.31", "4.00", "7.6%"} {
 		if !strings.Contains(got.Reason, want) {
 			t.Errorf("причина без %q: %s", want, got.Reason)
 		}
 	}
+	// У LONG/SHORT утилизация на лестницу не действует: полосы в причине нет.
+	if strings.Contains(got.Reason, "полоса p25") {
+		t.Errorf("направленная сетка не должна цитировать полосу дисперсии: %s", got.Reason)
+	}
 }
 
-// (в) фандинг 10 bps/8ч съедает цель: тот же спокойный кейс (а) падает ниже
-// 80%-порога исключительно из-за стоимости удержания.
+// (в) фандинг съедает цель: тот же спокойный кейс (а) при ставке 50 bps/8ч
+// (0.5%/8ч — реальный уровень сквиза) уходит в минус исключительно из-за
+// стоимости удержания.
 func TestAssessROIFundingEatsTheHarvest(t *testing.T) {
 	calm := AssessROI(roiCalmNeutralInput(), ROIProfileCalm2Pct)
 	if !calm.Feasible {
@@ -141,19 +151,48 @@ func TestAssessROIFundingEatsTheHarvest(t *testing.T) {
 	}
 
 	hotInput := roiCalmNeutralInput()
-	hotInput.FundingBps8h = 10
+	hotInput.FundingBps8h = 50
 	hot := AssessROI(hotInput, ROIProfileCalm2Pct)
 
 	if hot.Feasible {
-		t.Fatalf("фандинг 10 bps/8ч не съел цель: %s", hot.Reason)
+		t.Fatalf("фандинг 50 bps/8ч не съел цель: %s", hot.Reason)
 	}
-	// Разница чистых ровно как дополнительный фандинг: 0.5×400×9bp×6 ≈ 1.08.
-	roiWantDecimal(t, calm.EstNetUSDT.Sub(hot.EstNetUSDT), 1.08)
-	roiWantDecimal(t, hot.EstNetUSDT, 0.86875)
-	// Винрейт не при чём — причина обязана указать на фандинг числом.
-	roiWantDecimal(t, hot.RequiredWinRate, 0.21875)
-	if !strings.Contains(hot.Reason, "фандинг") || !strings.Contains(hot.Reason, "1.20") {
+	// Разница чистых ровно как дополнительный фандинг: 0.5×400×49bp×6 = 5.88.
+	roiWantDecimal(t, calm.EstNetUSDT.Sub(hot.EstNetUSDT), 5.88)
+	// Фандинг 0.5×$400×50bp×6 = $6.00 против сбора $4.80 → −$1.20.
+	roiWantDecimal(t, hot.EstNetUSDT, -1.20)
+	// Отрицательный чистый сбор не покрывает стресс-проход вовсе: граница
+	// безубыточности вырождается в 1, а причина обязана назвать фандинг числом.
+	if hot.RequiredWinRate.InexactFloat64() != 1.0 {
+		t.Errorf("RequiredWinRate = %s, хочу 1 (сбор ≤ 0 не покрывает стоп)", hot.RequiredWinRate)
+	}
+	if !strings.Contains(hot.Reason, "фандинг") || !strings.Contains(hot.Reason, "6.00") {
 		t.Errorf("причина должна называть фандинг с числом: %s", hot.Reason)
+	}
+	// Вердикт даёт именно фандинг: хвост тот же ($0.532), риск-скорректированный
+	// сбор −1.73 против порога 1.60.
+	roiWantDecimal(t, hot.RiskAdjustedUSDT, -1.20-0.532)
+}
+
+// Знак фандинга: ставка SIGNED — положительная означает «лонги платят
+// шортам», поэтому SHORT её получает, LONG платит, NEUTRAL тарифицируется
+// как плательщик (его инвентарь ниже середины диапазона длинный).
+func TestAssessROIFundingSignFollowsDirection(t *testing.T) {
+	base := roiCalmNeutralInput()
+	base.Direction = "LONG"
+	base.RoomPctPct = 4
+	base.FundingBps8h = 10
+
+	longSide := AssessROI(base, ROIProfileCalm2Pct)
+	shortInput := base
+	shortInput.Direction = "SHORT"
+	shortSide := AssessROI(shortInput, ROIProfileCalm2Pct)
+
+	// Нотционал $400, инвентарь полный: 400×10bp×6 = $2.40 — шорт получает,
+	// лонг платит, разница ровно 2×$2.40.
+	roiWantDecimal(t, shortSide.EstNetUSDT.Sub(longSide.EstNetUSDT), 4.80)
+	if !strings.Contains(shortSide.Reason, "доход шорта") {
+		t.Errorf("причина шорта должна называть фандинг доходом: %s", shortSide.Reason)
 	}
 }
 
@@ -178,18 +217,23 @@ func TestROITargetIndependentOfLeverage(t *testing.T) {
 
 	// Через публичную оценку: цель в причине — 2.00 USDT при любом плече
 	// (сам сбор и вердикт с плечом меняются, определение цели — нет).
+	// Плечо 2: notional $200, per-level $12.5, сбор 64×0.3%×12.5 = $2.40,
+	// фандинг $0.06 → $2.34, минус хвост $0.532 → $1.808 ≥ $1.60;
+	// плечо 8: $9.60 − $0.24 − $0.532 = $8.828.
 	loInput := roiCalmNeutralInput()
 	loInput.Leverage = 2
 	lo := AssessROI(loInput, ROIProfileCalm2Pct)
 	hiInput := roiCalmNeutralInput()
 	hiInput.Leverage = 8
 	hi := AssessROI(hiInput, ROIProfileCalm2Pct)
-	if lo.Feasible {
-		t.Fatalf("при плече 2 сбор 0.21 не должен покрывать порог 1.60: %s", lo.Reason)
+	if !lo.Feasible {
+		t.Fatalf("при плече 2 риск-скорректированный сбор 1.81 покрывает порог 1.60: %s", lo.Reason)
 	}
 	if !hi.Feasible {
-		t.Fatalf("при плече 8 сбор ~5.43 должен покрывать порог: %s", hi.Reason)
+		t.Fatalf("при плече 8 чистый сбор 9.36 должен покрывать порог: %s", hi.Reason)
 	}
+	roiWantDecimal(t, lo.EstNetUSDT, 2.40-0.06)
+	roiWantDecimal(t, hi.EstNetUSDT, 9.60-0.24)
 	for name, reason := range map[string]string{"плечо 2": lo.Reason, "плечо 8": hi.Reason} {
 		if !strings.Contains(reason, "2.00") {
 			t.Errorf("%s: цель должна остаться 2.00 USDT, причина: %s", name, reason)
@@ -199,15 +243,16 @@ func TestROITargetIndependentOfLeverage(t *testing.T) {
 
 // Вырожденные входы: циклы/цель не оцениваются → всегда НЕ достижимо, с причиной.
 func TestAssessROIDegenerateInputs(t *testing.T) {
-	// Нет OU-оценки: циклов 0, сбор 0.
-	noOU := roiCalmNeutralInput()
-	noOU.OUHalfLifeHours = 0
-	got := AssessROI(noOU, ROIProfileCalm2Pct)
+	// Нет дневной σ: модель циклов квадратична по σ, fallback удалён (v2.0.197)
+	// — циклов 0, сбор 0, fail-closed.
+	noVol := roiCalmNeutralInput()
+	noVol.DayVolPct = 0
+	got := AssessROI(noVol, ROIProfileCalm2Pct)
 	if got.Feasible || got.EstCycles != 0 {
-		t.Fatalf("без OU-полужизни не может быть достижимо: %+v", got)
+		t.Fatalf("без дневной σ не может быть достижимо: %+v", got)
 	}
-	if !strings.Contains(got.Reason, "OU-полужизни") {
-		t.Errorf("причина должна называть отсутствие OU-оценки: %s", got.Reason)
+	if !strings.Contains(got.Reason, "дневная σ") {
+		t.Errorf("причина должна называть отсутствие σ: %s", got.Reason)
 	}
 
 	for _, tc := range []struct {
@@ -243,60 +288,93 @@ func TestAssessROIDegenerateInputs(t *testing.T) {
 
 // Фандинг без данных: FundingBps8h==0 — маркер «нет данных», а не «бесплатно»:
 // тарифицируется консервативными 5 bps/8ч (0.15%/сутки на нотационал; типичная
-// ставка 0.03-0.05%/сутки). Мёртвый телеметрический фид дорожает оценку.
+// ставка 0.03-0.05%/сутки). Мёртвый телеметрический фид дорожает оценку и
+// обязан быть назван в причине числом.
 func TestAssessROIFundingZeroMeansConservativeNotFree(t *testing.T) {
 	noData := roiCalmNeutralInput()
 	noData.FundingBps8h = 0
 	explicit := roiCalmNeutralInput()
 	explicit.FundingBps8h = 5
+	live := roiCalmNeutralInput() // 1 bp/8ч — базовый кейс (а)
 
-	got, ref := AssessROI(noData, ROIProfileCalm2Pct), AssessROI(explicit, ROIProfileCalm2Pct)
+	got := AssessROI(noData, ROIProfileCalm2Pct)
+	ref := AssessROI(explicit, ROIProfileCalm2Pct)
+	base := AssessROI(live, ROIProfileCalm2Pct)
 	if !got.EstNetUSDT.Equal(ref.EstNetUSDT) {
 		t.Fatalf("0 на входе должен тарифицироваться как явные 5 bps/8ч: %s против %s",
 			got.EstNetUSDT, ref.EstNetUSDT)
 	}
-	// 0.5×$400 × 0.05% × 3×2 суток = $0.60 — даже спокойная сетка честно
-	// падает ниже порога 1.60: живая ставка фандинга обязана быть на входе.
-	roiWantDecimal(t, got.EstNetUSDT, 3.6-0.6-1.53125)
-	if got.Feasible {
-		t.Fatalf("при консервативном фандинге спокойная сетка не должна проходить: %s", got.Reason)
-	}
+	// 0.5×$400 × 0.05% × 3×2 суток = $0.60 → чистыми 4.80−0.60 = $4.20, то
+	// есть на $0.48 хуже живой ставки 1 bp ($4.68).
+	roiWantDecimal(t, got.EstNetUSDT, 4.8-0.6)
+	roiWantDecimal(t, base.EstNetUSDT.Sub(got.EstNetUSDT), 0.48)
+	// Контекст журнала: граница безубыточности 7/(7+4.20) = 0.625.
+	roiWantDecimal(t, got.RequiredWinRate, 0.625)
 	if !strings.Contains(got.Reason, "0.60") {
 		t.Errorf("причина должна называть фандинг числом 0.60: %s", got.Reason)
 	}
 }
 
-// (3) Честность модуля: «2-5% за 24 ч» систематически недостижимо. Потолок
-// практики живых сеток — 0.15-0.6%/день (r/Pionex); теория пересечений даёт
-// k≈7.8 (arXiv 2506.11921: пересечения ∝ local time/шаг, n²/4 циклов
-// диапазона), планировочные ярусы 2.0/2.5. Профили 3.5% и 5% за HoldHours=24
-// отклоняются на разумной геометрии при любой дневной σ из разумного коридора.
+// (3) Честность модуля: «2-5% за 24 ч» — не планировочная норма. На
+// самосогласованной геометрии (шаг 0.5%, спан 8%, капитал $100×4) local-time
+// модель даёт сбор $0.54/сутки при σ_day 2% и $1.78/сутки при σ_day 3.5% —
+// профили 3.5% и 5% за 24 ч недостижимы. Профиль 5% недостижим и на верхней
+// границе волатильного коридора: σ_day 5% → $3.69 − хвост $0.53 = $3.16 <
+// порога $4.00.
+//
+// σ_day 5% с профилем 3.5% — единственный достижимый агрессивный случай, и он
+// держится ровно на медиане: нижняя квартиль полосы ($1.10) ниже порога
+// ($2.80). То есть «3.5% за сутки» возможно только как медианный исход
+// волатильной пары, не как обещание — поэтому воркер деплоит исключительно
+// профиль calm_2pct на горизонте 48 ч.
 func TestAssessROIFivePercentPerDaySystematicallyNotFeasible(t *testing.T) {
-	for _, dayVol := range []float64{2, 3.5, 5} {
-		for _, prof := range []ROIProfile{ROIProfileBase3_5Pct, ROIProfileAggressive5Pct} {
-			in := roiCalmNeutralInput()
-			in.DayVolPct = dayVol
-			in.HoldHours = 24
-			got := AssessROI(in, prof)
-			if got.Feasible {
-				t.Fatalf("σ_day=%.1f%%: профиль %.1f%% за 24ч не должен быть достижим: %s",
-					dayVol, prof.Pct, got.Reason)
-			}
+	for _, tc := range []struct {
+		dayVol float64
+		prof   ROIProfile
+	}{
+		{2, ROIProfileBase3_5Pct}, {2, ROIProfileAggressive5Pct},
+		{3.5, ROIProfileBase3_5Pct}, {3.5, ROIProfileAggressive5Pct},
+		{5, ROIProfileAggressive5Pct},
+	} {
+		in := roiCalmNeutralInput()
+		in.DayVolPct = tc.dayVol
+		in.HoldHours = 24
+		got := AssessROI(in, tc.prof)
+		if got.Feasible {
+			t.Fatalf("σ_day=%.1f%%: профиль %.1f%% за 24ч не должен быть достижим: %s",
+				tc.dayVol, tc.prof.Pct, got.Reason)
 		}
 	}
 
-	// Протокол чисел для σ_day=3.5%, профиль 3.5%/24ч: консервативный ярус
-	// k=2.0 → 2.0×3.5/0.5×1 = 14 циклов, сбор $1.05, чистыми −$0.54 против
-	// порога $2.80; оптимистичный ярус k=2.5 (17.5 циклов → −$0.28) назван.
+	// Протокол чисел для σ_day=3.5%, профиль 3.5%/24ч: циклов = ½×(3.5/0.5)² =
+	// 24.5, сбор 24.5×0.3%×$25 = $1.8375, фандинг 0.5×$400×1bp×3 = $0.06 →
+	// чистыми $1.7775, минус хвост $0.532 → $1.2455 против порога $2.80;
+	// полоса p25–p75 = $0.23…$2.62.
 	in := roiCalmNeutralInput()
 	in.DayVolPct = 3.5
 	in.HoldHours = 24
 	got := AssessROI(in, ROIProfileBase3_5Pct)
-	if got.EstCycles != 14 {
-		t.Errorf("EstCycles = %v, хочу 14 (2.0×3.5/0.5×1 сутки, консервативный ярус)", got.EstCycles)
+	if got.EstCycles != 24.5 {
+		t.Errorf("EstCycles = %v, хочу 24.5 (½×(3.5/0.5)²×1 сутки)", got.EstCycles)
 	}
-	roiWantDecimal(t, got.EstNetUSDT, 1.05-0.06-1.53125)
-	if !strings.Contains(got.Reason, "оптимистичный ярус k=2.5: -0.28") {
-		t.Errorf("причина должна цитировать оптимистичный ярус k=2.5 числом: %s", got.Reason)
+	roiWantDecimal(t, got.EstNetUSDT, 1.8375-0.06)
+	if !strings.Contains(got.Reason, "полоса p25–p75: 0.23…2.62 USDT") {
+		t.Errorf("причина должна цитировать полосу дисперсии числами: %s", got.Reason)
+	}
+
+	// Верхняя граница коридора: σ_day 5%, профиль 3.5%/24ч — достижимо на
+	// медиане ($3.69 − $0.53 = $3.16 ≥ $2.80), но p25 полосы ($1.10) порога не
+	// покрывает: запас держится ровно на медиане модели.
+	edge := roiCalmNeutralInput()
+	edge.DayVolPct = 5
+	edge.HoldHours = 24
+	gotEdge := AssessROI(edge, ROIProfileBase3_5Pct)
+	if !gotEdge.Feasible {
+		t.Fatalf("σ_day=5%%/24ч на профиле 3.5%% модель считает достижимым: %s", gotEdge.Reason)
+	}
+	roiWantDecimal(t, gotEdge.EstNetUSDT, 3.75-0.06)
+	roiWantDecimal(t, gotEdge.RiskAdjustedUSDT, 3.75-0.06-0.532)
+	if !strings.Contains(gotEdge.Reason, "полоса p25–p75: 1.10…5.97 USDT") {
+		t.Errorf("причина должна показывать, что запас держится на медиане: %s", gotEdge.Reason)
 	}
 }

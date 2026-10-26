@@ -420,6 +420,27 @@ func newInvestInMock(t *testing.T) *investInMock {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{"result": true, "timestamp": time.Now().UnixMilli()})
 	})
+	// v2.0.188: every adjust re-reads the bot to confirm the mutation landed
+	// (a missing endpoint reads as unverified). The seeded bot carries $100 and
+	// the pour adds $50, so the confirmed remote figure is $150.
+	mux.HandleFunc("GET /api/v1/bot/orders/futuresGrid/order", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"result": true, "timestamp": time.Now().UnixMilli(),
+			"data": map[string]any{
+				"buOrderId": r.URL.Query().Get("buOrderId"),
+				"status":    "running",
+				"buOrderData": map[string]any{
+					"status": "running", "top": "110", "bottom": "90", "row": 20,
+					"gridType": "arithmetic", "trend": "no_trend", "leverage": 4,
+					"quoteInvestment": "150", "investment": "150",
+					"position": "0", "positionOpenPrice": "0",
+					"profitReduce": "0", "profitWithdrawn": "0", "totalProfit": "0",
+					"riskStatus": "NORMAL",
+				},
+			},
+		})
+	})
 	mock.server = httptest.NewServer(mux)
 	t.Cleanup(mock.server.Close)
 	return mock

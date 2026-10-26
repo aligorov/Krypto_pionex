@@ -88,6 +88,11 @@ export interface RiskSettings {
   maxLeverage: number;
   maxActiveGridBots: number;
   maxOpenPositions: number;
+  breakerMode?: 'AUTO' | 'MANUAL';
+  /** Optimistic-concurrency token. Echo it back on PUT: a save built from a
+   *  stale copy is refused (ErrStaleSettings) instead of silently reverting a
+   *  kill switch the autopilot armed mid-edit. */
+  updatedAt?: string;
 }
 
 export interface Account {

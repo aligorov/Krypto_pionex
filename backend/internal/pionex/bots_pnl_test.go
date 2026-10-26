@@ -195,6 +195,105 @@ func TestBotOrderFuturesGridData(t *testing.T) {
 	}
 }
 
+// v2.0.196: the adjustParams schema declares `openPrice`/`quoteInvestment` as
+// **number** and `bottom`/`top` as **string**. Sending the wrong JSON type is a
+// contract violation the exchange is free to reject with BOT_INVALID_ARGUMENT.
+func TestAdjustFuturesGridParamsWireTypes(t *testing.T) {
+	open := mustDecimal(t, "1.234567")
+	invest := mustDecimal(t, "250.5")
+	bottom := mustDecimal(t, "1.1")
+	top := mustDecimal(t, "1.4")
+	body, err := json.Marshal(AdjustFuturesGridParams{
+		BUOrderID: "BU-1", Type: "invest_in", ExtraMargin: false,
+		OpenPrice: &open, QuoteInvestment: &invest,
+		Bottom: &bottom, Top: &top, Row: 20,
+	})
+	if err != nil {
+		t.Fatalf("marshal adjust params: %v", err)
+	}
+	var wire map[string]json.RawMessage
+	if err := json.Unmarshal(body, &wire); err != nil {
+		t.Fatalf("re-read marshalled body: %v", err)
+	}
+	for _, field := range []struct {
+		key  string
+		want string
+	}{
+		{"openPrice", "1.234567"},    // number, unquoted, full precision
+		{"quoteInvestment", "250.5"}, // number, unquoted
+		{"bottom", `"1.1"`},          // string per the schema
+		{"top", `"1.4"`},             // string per the schema
+		{"row", "20"},                // number
+		{"extraMargin", "false"},     // boolean, always present (required)
+	} {
+		got, ok := wire[field.key]
+		if !ok {
+			t.Fatalf("%s missing from the request body: %s", field.key, body)
+		}
+		if string(got) != field.want {
+			t.Fatalf("%s marshalled as %s, want %s (body %s)", field.key, got, field.want, body)
+		}
+	}
+}
+
+// v2.0.196: `canceling` is documented as integer/int64. Typed as bool it made
+// the whole bot-orders envelope fail to decode the moment one bot answered 1 —
+// and that list is how the terminal-final ladder finds finished bots.
+func TestBotOrderCancelingIsInteger(t *testing.T) {
+	raw := `{"buOrderId": "BU-9", "status": "running", "canceling": 1, "base": "WDCX", "quote": "USDT"}`
+	var order BotOrder
+	if err := json.Unmarshal([]byte(raw), &order); err != nil {
+		t.Fatalf("a documented integer canceling flag must decode: %v", err)
+	}
+	if order.Canceling != 1 {
+		t.Fatalf("canceling = %d, want 1", order.Canceling)
+	}
+	var idle BotOrder
+	if err := json.Unmarshal([]byte(`{"buOrderId": "BU-8", "canceling": 0}`), &idle); err != nil {
+		t.Fatalf("canceling 0 must decode: %v", err)
+	}
+	if idle.Canceling != 0 {
+		t.Fatalf("canceling = %d, want 0", idle.Canceling)
+	}
+}
+
+// v2.0.196: a settled ZERO is a carrier, not an absence. The old IsZero()
+// ladder read `profitExited:"0"` as "nothing here" and returned FinalProfitNone,
+// so a bot that closed exactly flat was settled from a telemetry ESTIMATE
+// instead of the exchange's own figure.
+func TestSettledProfitZeroIsSettled(t *testing.T) {
+	decode := func(t *testing.T, payload string) *BUOrderDataResponse {
+		t.Helper()
+		var data BUOrderDataResponse
+		if err := json.Unmarshal([]byte(payload), &data); err != nil {
+			t.Fatalf("decode %s: %v", payload, err)
+		}
+		return &data
+	}
+
+	flat := decode(t, `{"status":"canceled","profitExited":"0"}`)
+	if total, source := flat.SettledProfit(); source != FinalProfitExited || !total.IsZero() {
+		t.Fatalf("settled zero = %s / %s, want 0 / exited", total, source)
+	}
+
+	for name, payload := range map[string]string{
+		"absent":  `{"status":"canceled"}`,
+		"null":    `{"status":"canceled","profitExited":null}`,
+		"garbage": `{"status":"canceled","profitExited":"n/a"}`,
+	} {
+		if _, source := decode(t, payload).SettledProfit(); source != FinalProfitNone {
+			t.Fatalf("%s must stay FinalProfitNone, got %s", name, source)
+		}
+	}
+
+	// A zero total alias is a carrier too — and must not be overwritten by a
+	// non-zero figure from a different leg.
+	alias := decode(t, `{"status":"canceled","totalProfit":"0","realizedProfit":"4.5"}`)
+	if total, source := alias.SettledProfit(); source != FinalProfitTotalAlias || !total.IsZero() {
+		t.Fatalf("zero total alias = %s / %s, want 0 / total_alias", total, source)
+	}
+}
+
 // v2.0.105: the client NEVER settles from the unlock fields. The record's
 // own usdtInvestment goes stale across invest_in/adjust_params (ARB #1286
 // returned 101.67 at our final 100 while the field still read 50 — the

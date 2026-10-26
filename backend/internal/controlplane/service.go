@@ -353,6 +353,28 @@ func (s *Service) UpdateRiskSettings(
 	return updated, nil
 }
 
+// ArmKillSwitch engages the durable kill switch as a SAFETY-ONLY mutation.
+// UpdateRiskSettings stays ADMIN-only because it carries exposure limits, but
+// an OPERATOR must be able to stop the fleet: the emergency-stop route called
+// it, got ErrForbidden, discarded the error and answered "все боты закрыты"
+// with the switch still disarmed. Disarming remains ADMIN-only.
+func (s *Service) ArmKillSwitch(ctx context.Context, principal auth.Principal) error {
+	if !principal.HasRole(auth.RoleOperator) {
+		return auth.ErrForbidden
+	}
+	if err := s.risk.SetKillSwitch(ctx, true); err != nil {
+		_ = s.audit.Record(ctx, audit.EventFromPrincipal(
+			principal, "risk.kill_switch.arm", "risk_settings", "1", "FAILED",
+			map[string]any{"error": err.Error()},
+		))
+		return fmt.Errorf("arm kill switch: %w", err)
+	}
+	_ = s.audit.Record(ctx, audit.EventFromPrincipal(
+		principal, "risk.kill_switch.arm", "risk_settings", "1", "SUCCESS", nil,
+	))
+	return nil
+}
+
 func (s *Service) ListAccounts(ctx context.Context) ([]Account, error) {
 	rows, err := s.db.Query(ctx, `
 		SELECT id, name, is_enabled, is_paper, has_read_permission,

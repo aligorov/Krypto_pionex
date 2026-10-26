@@ -166,12 +166,12 @@ type BUOrderDataResponse struct {
 	// marks the epoch-2 reconciliation proved unreliable.
 	UnlockUsdtAmountRaw json.RawMessage `json:"unlockUsdtAmount"`
 	UsdtInvestmentRaw   json.RawMessage `json:"usdtInvestment"`
-	RiskStatus           string          `json:"riskStatus"`
-	LiquidationPriceRaw  json.RawMessage `json:"liquidationPrice"`
-	LossStopRaw          json.RawMessage `json:"lossStop"`
-	ProfitStopRaw        json.RawMessage `json:"profitStop"`
-	LossStopType         string          `json:"lossStopType"`
-	ProfitStopType       string          `json:"profitStopType"`
+	RiskStatus          string          `json:"riskStatus"`
+	LiquidationPriceRaw json.RawMessage `json:"liquidationPrice"`
+	LossStopRaw         json.RawMessage `json:"lossStop"`
+	ProfitStopRaw       json.RawMessage `json:"profitStop"`
+	LossStopType        string          `json:"lossStopType"`
+	ProfitStopType      string          `json:"profitStopType"`
 
 	Top               decimal.Decimal `json:"-"`
 	Bottom            decimal.Decimal `json:"-"`
@@ -183,25 +183,40 @@ type BUOrderDataResponse struct {
 	PositionOpenPrice decimal.Decimal `json:"-"`
 	ProfitWithdrawn   decimal.Decimal `json:"-"`
 	TotalProfit       decimal.Decimal `json:"-"`
-	ClosedBaseAmount  decimal.Decimal `json:"-"`
-	LiquidationPrice  decimal.Decimal `json:"-"`
-	LossStop          decimal.Decimal `json:"-"`
-	ProfitStop        decimal.Decimal `json:"-"`
+	// TotalProfitPresent (v2.0.196) records that one of the total aliases actually
+	// carried a parseable number, so a settled 0 stays distinguishable from "no
+	// carrier at all" — SettledProfit must not trade the exchange's own flat close
+	// for a telemetry estimate.
+	TotalProfitPresent bool            `json:"-"`
+	ClosedBaseAmount   decimal.Decimal `json:"-"`
+	LiquidationPrice   decimal.Decimal `json:"-"`
+	LossStop           decimal.Decimal `json:"-"`
+	ProfitStop         decimal.Decimal `json:"-"`
 }
 
 func parseDecimalRaw(raw json.RawMessage) decimal.Decimal {
+	d, _ := parseDecimalRawOK(raw)
+	return d
+}
+
+// parseDecimalRawOK (v2.0.196) separates "the field carried a number" from
+// "the field was absent, null, or garbage". parseDecimalRaw collapses all four
+// into 0, so a genuine settled zero — a bot that closed exactly flat — was
+// indistinguishable from a missing carrier and got thrown away in favour of an
+// estimate. ok is false unless the payload parsed.
+func parseDecimalRawOK(raw json.RawMessage) (decimal.Decimal, bool) {
 	if len(raw) == 0 {
-		return decimal.Zero
+		return decimal.Zero, false
 	}
 	s := strings.Trim(string(raw), "\" \t\n\r")
 	if s == "" || s == "null" {
-		return decimal.Zero
+		return decimal.Zero, false
 	}
 	d, err := decimal.NewFromString(s)
 	if err != nil {
-		return decimal.Zero
+		return decimal.Zero, false
 	}
-	return d
+	return d, true
 }
 
 func parseIntRaw(raw json.RawMessage) int {
@@ -240,17 +255,17 @@ func (b *BUOrderDataResponse) UnmarshalJSON(data []byte) error {
 	b.Position = parseDecimalRaw(b.PositionRaw)
 	b.PositionOpenPrice = parseDecimalRaw(b.PositionOpenPriceRaw)
 	b.ProfitWithdrawn = parseDecimalRaw(b.ProfitWithdrawnRaw)
-	b.TotalProfit = parseDecimalRaw(b.TotalProfitRaw)
-	if b.TotalProfit.IsZero() {
-		b.TotalProfit = parseDecimalRaw(b.ProfitRaw)
+	// v2.0.196: presence-based fallthrough. The old `IsZero()` chain kept looking
+	// for another alias after a real 0, so a record saying totalProfit=0 could be
+	// overwritten by a non-zero realizedProfit from a different leg.
+	for _, alias := range []json.RawMessage{b.TotalProfitRaw, b.ProfitRaw, b.PnlRaw, b.RealizedProfitRaw} {
+		if total, ok := parseDecimalRawOK(alias); ok {
+			b.TotalProfit = total
+			b.TotalProfitPresent = true
+			break
+		}
 	}
-	if b.TotalProfit.IsZero() {
-		b.TotalProfit = parseDecimalRaw(b.PnlRaw)
-	}
-	if b.TotalProfit.IsZero() {
-		b.TotalProfit = parseDecimalRaw(b.RealizedProfitRaw)
-	}
-	if b.ProfitWithdrawn.IsZero() && !b.TotalProfit.IsZero() {
+	if b.ProfitWithdrawn.IsZero() && b.TotalProfitPresent {
 		b.ProfitWithdrawn = b.TotalProfit
 	}
 	b.ClosedBaseAmount = parseDecimalRaw(b.ClosedBaseAmountRaw)
@@ -315,11 +330,15 @@ func (b *BUOrderDataResponse) Investment() (decimal.Decimal, bool) {
 type FinalProfitSource string
 
 const (
-	// FinalProfitExited is the documented settled figure ("Exited profit") —
-	// the only field the exchange itself nets grid + position-close + fees in.
+	// FinalProfitExited is the documented «Exited profit» carrier. v2.0.196:
+	// the docs publish NO netting formula for it (and no field at all is
+	// documented as the bot's total/net profit), so the figure is the best
+	// available exchange carrier, not a proven net — autogrid's sanity gate
+	// treats a positive one on a loss-class close as unverifiable.
 	FinalProfitExited FinalProfitSource = "profit_exited"
 	// FinalProfitTotalAlias covers totalProfit/profit/pnl/realizedProfit —
-	// observed variants of the full-total carrier on finished records.
+	// undocumented variants observed on finished records; same caveat as
+	// FinalProfitExited.
 	FinalProfitTotalAlias FinalProfitSource = "total_profit_alias"
 	// FinalProfitUnlockIdentity (v2.0.100) is the settlement identity
 	// unlockUsdtAmount − usdtInvestment: what the wallet received back minus
@@ -367,11 +386,15 @@ func (b *BUOrderDataResponse) SettledProfit() (decimal.Decimal, FinalProfitSourc
 	if b == nil {
 		return decimal.Zero, FinalProfitNone
 	}
-	if exited := parseDecimalRaw(b.ProfitExitedRaw); !exited.IsZero() {
+	// v2.0.196: presence, not zero-ness. A finished bot that closed exactly flat
+	// carries `profitExited: "0"`; the old IsZero() ladder read that as "no
+	// carrier" and handed the caller FinalProfitNone, which then settled from a
+	// telemetry ESTIMATE instead of the exchange's own settled zero.
+	if exited, ok := parseDecimalRawOK(b.ProfitExitedRaw); ok {
 		return exited, FinalProfitExited
 	}
-	if total := b.TotalProfit; !total.IsZero() {
-		return total, FinalProfitTotalAlias
+	if b.TotalProfitPresent {
+		return b.TotalProfit, FinalProfitTotalAlias
 	}
 	// v2.0.105: the unlock identity is NOT computed here. The client cannot
 	// know the bot's FINAL invested amount — the exchange's usdtInvestment

@@ -2,7 +2,7 @@ import math
 from typing import Dict, List, Any, Optional
 import numpy as np
 
-BACKTEST_ENGINE_VERSION = "v173"
+BACKTEST_ENGINE_VERSION = "v196"
 
 def t_critical_95(df: int) -> float:
     """Two-sided Student's t critical value at alpha=0.05 for degrees of freedom df."""
@@ -646,6 +646,24 @@ def walk_forward(engine: QuantBacktestEngine, candles: List[Dict[str, Any]],
                 "n_eff": round(c_neff, 2),
                 "is_proxy": True,
                 "evaluation_status": "indicative_proxy",
+                # v2.0.196 (audit F05): the verdict must name the window and the
+                # cost model it was computed on. The candidate slice starts after
+                # eff_train_bars + eff_purge_bars, and eff_train_bars SHRINKS when
+                # fewer candles are available — so identical deploy params could
+                # be certified over 440 bars in one job and 40 in another, with
+                # nothing in the result to tell them apart.
+                "as_of": candles[-1].get("time"),
+                "eval_window": {
+                    "train_bars": eff_train_bars,
+                    "purge_bars": eff_purge_bars,
+                    "start_idx": cand_start,
+                    "bars": len(cand_slice),
+                    "start_time": cand_slice[0].get("time") if cand_slice else None,
+                    "end_time": cand_slice[-1].get("time") if cand_slice else None,
+                    "total_bars": total_bars,
+                },
+                "fee_bps": round(engine.maker_fee * 1e4, 4),
+                "slippage_bps": round(engine.slippage * 1e4, 4),
             }
 
     if not folds:
@@ -818,6 +836,13 @@ def walk_forward(engine: QuantBacktestEngine, candles: List[Dict[str, Any]],
         "autocorr_rho1": round(rho_1, 4),
         "n_eff": round(n_eff, 2),
         "historical_folds": folds,
+        # v2.0.196 (audit F05): the report states the data cut it was computed on
+        # and the cost model it used, so the Go gate can refuse a cached verdict
+        # whose cost model no longer matches the deploy instead of trusting the
+        # job's own params echo.
+        "as_of": candles[-1].get("time") if candles else None,
+        "fee_bps": round(engine.maker_fee * 1e4, 4),
+        "slippage_bps": round(engine.slippage * 1e4, 4),
     }
     if candidate_evaluation is not None:
         report["exact_candidate_evaluation"] = candidate_evaluation

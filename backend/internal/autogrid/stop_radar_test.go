@@ -420,5 +420,3 @@ func TestRadarMicrostructureEmergencyExit_NeutralDecoupledGate(t *testing.T) {
 		t.Fatalf("expected NEUTRAL bot with -$0.50 to proceed to execution and arm retry debounce")
 	}
 }
-
-

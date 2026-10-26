@@ -314,10 +314,14 @@ func TestMatchesDeployParamsDriftTolerance(t *testing.T) {
 		LowerPrice: decimal.NewFromFloat(1030.83),
 		UpperPrice: decimal.NewFromFloat(1067.55),
 		GridNum:    15, Leverage: 4,
+		Investment: decimal.NewFromInt(100), Direction: "LONG",
+		StopLossPct: 8.0, FeeBps: 2.0, SlippageBps: 5.0,
 	}
 	mk := func(lo, up float64, grid int) []byte {
 		b, _ := json.Marshal(map[string]any{
 			"lower_price": lo, "upper_price": up, "grid_num": grid, "leverage": 4,
+			"investment": 100, "direction": "LONG", "stop_loss_pct": 8.0,
+			"fee_bps": 2.0, "slippage_bps": 5.0,
 		})
 		return b
 	}
@@ -394,8 +398,8 @@ func TestNeutralPreBreakRegimeExit(t *testing.T) {
 			Direction: "NEUTRAL", Regime: regime,
 			Lower: decimal.NewFromFloat(100), Upper: decimal.NewFromFloat(110),
 			CurrentPrice: decimal.NewFromFloat(price),
-			RealizedPNL: decimal.Zero, UnrealizedPNL: totalD, PeakPNL: totalD,
-			Budget: decimal.NewFromInt(75),
+			RealizedPNL:  decimal.Zero, UnrealizedPNL: totalD, PeakPNL: totalD,
+			Budget:    decimal.NewFromInt(75),
 			PnLTarget: decVal(1.5), MaxLoss: decVal(30),
 			RangeBreakBuffer: decimal.NewFromInt(2),
 		}
@@ -441,8 +445,8 @@ func TestDirectionalPreBreakRegimeExit(t *testing.T) {
 			Direction: direction, Regime: regime,
 			Lower: decimal.NewFromFloat(100), Upper: decimal.NewFromFloat(110),
 			CurrentPrice: decimal.NewFromFloat(price),
-			RealizedPNL: decimal.Zero, UnrealizedPNL: totalD, PeakPNL: totalD,
-			Budget: decimal.NewFromInt(75),
+			RealizedPNL:  decimal.Zero, UnrealizedPNL: totalD, PeakPNL: totalD,
+			Budget:    decimal.NewFromInt(75),
 			PnLTarget: decVal(1.5), MaxLoss: decVal(16),
 			RangeBreakBuffer: decimal.NewFromInt(2),
 		}

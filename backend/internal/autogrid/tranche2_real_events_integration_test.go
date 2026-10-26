@@ -26,13 +26,19 @@ type tranche2ExchangeMock struct {
 	server      *httptest.Server
 	investCalls atomic.Int64
 	lastBody    map[string]any
+	// remoteInvestment mirrors the exchange-side investment: the detail read
+	// after adjustParams must report the poured figure or v2.0.188 classifies
+	// the top-up as UNVERIFIED and the tranche state never advances.
+	remoteInvestment atomic.Value
 }
 
 func newTranche2ExchangeMock(t *testing.T, symbol, price string) *tranche2ExchangeMock {
 	t.Helper()
 	mock := &tranche2ExchangeMock{}
+	mock.remoteInvestment.Store("100")
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/v1/bot/orders/futuresGrid/order", func(w http.ResponseWriter, r *http.Request) {
+		investment, _ := mock.remoteInvestment.Load().(string)
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
 			"result": true, "timestamp": time.Now().UnixMilli(),
@@ -43,6 +49,7 @@ func newTranche2ExchangeMock(t *testing.T, symbol, price string) *tranche2Exchan
 					"status": "running", "reasonBy": "",
 					"top": "110", "bottom": "90", "row": 20,
 					"gridType": "arithmetic", "trend": "no_trend", "leverage": 2,
+					"quoteInvestment": investment, "investment": investment,
 					"position": "0", "positionOpenPrice": "100",
 					"profitReduce": "0.1", "profitWithdrawn": "0",
 					"riskStatus": "NORMAL",
@@ -93,6 +100,7 @@ func newTranche2ExchangeMock(t *testing.T, symbol, price string) *tranche2Exchan
 		var body map[string]any
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		mock.lastBody = body
+		mock.remoteInvestment.Store("200")
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{"result": true, "timestamp": time.Now().UnixMilli()})
 	})

@@ -1,6 +1,7 @@
 package autogrid
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"testing"
@@ -200,12 +201,19 @@ func TestBacktestGatePending(t *testing.T) {
 
 func TestMatchesDeployParams_EmptyParamsFailClosed(t *testing.T) {
 	dp := &BacktestDeployParams{
-		Symbol:     "BTC_USDT",
-		LowerPrice: decimal.NewFromInt(60000),
-		UpperPrice: decimal.NewFromInt(70000),
-		GridNum:    50,
-		Leverage:   2,
+		Symbol:      "BTC_USDT",
+		LowerPrice:  decimal.NewFromInt(60000),
+		UpperPrice:  decimal.NewFromInt(70000),
+		GridNum:     50,
+		Leverage:    2,
+		Investment:  decimal.NewFromInt(100),
+		Direction:   "LONG",
+		StopLossPct: 8.0,
+		FeeBps:      2.0,
+		SlippageBps: 5.0,
 	}
+	full := `{"lower_price":60000,"upper_price":70000,"grid_num":50,"leverage":2,` +
+		`"investment":100,"direction":"LONG","stop_loss_pct":8,"fee_bps":2,"slippage_bps":5}`
 
 	// When deploy params are expected, empty job params must NEVER match (fail-closed)
 	if matchesDeployParams([]byte{}, dp) {
@@ -216,20 +224,124 @@ func TestMatchesDeployParams_EmptyParamsFailClosed(t *testing.T) {
 	}
 
 	// Valid matching params
-	matchingJSON := []byte(`{"lower_price":60000,"upper_price":70000,"grid_num":50,"leverage":2}`)
-	if !matchesDeployParams(matchingJSON, dp) {
+	if !matchesDeployParams([]byte(full), dp) {
 		t.Fatalf("matching job params must match")
 	}
 
 	// Mismatched params
-	mismatchedJSON := []byte(`{"lower_price":55000,"upper_price":70000,"grid_num":50,"leverage":2}`)
+	mismatchedJSON := []byte(`{"lower_price":55000,"upper_price":70000,"grid_num":50,"leverage":2,` +
+		`"investment":100,"direction":"LONG","stop_loss_pct":8,"fee_bps":2,"slippage_bps":5}`)
 	if matchesDeployParams(mismatchedJSON, dp) {
 		t.Fatalf("mismatched job params must not match")
 	}
 
 	// When deploy params is nil, any params match (unconstrained query)
-	if !matchesDeployParams(matchingJSON, nil) {
+	if !matchesDeployParams([]byte(full), nil) {
 		t.Fatalf("nil deploy params should allow any job params")
+	}
+}
+
+// v2.0.196 (audit F05): a missing identity field is a MISS, not a pass, and the
+// cost model is part of the identity — a verdict simulated under cheaper fees
+// must not certify a deploy that pays more.
+func TestMatchesDeployParams_MissingFieldAndCostModelFailClosed(t *testing.T) {
+	dp := &BacktestDeployParams{
+		LowerPrice:  decimal.NewFromInt(60000),
+		UpperPrice:  decimal.NewFromInt(70000),
+		GridNum:     50,
+		Leverage:    2,
+		Investment:  decimal.NewFromInt(100),
+		Direction:   "LONG",
+		FeeBps:      2.0,
+		SlippageBps: 5.0,
+	}
+	// Every field except the one under test.
+	without := func(drop string) []byte {
+		fields := map[string]any{
+			"lower_price": 60000, "upper_price": 70000, "grid_num": 50, "leverage": 2,
+			"investment": 100, "direction": "LONG", "stop_loss_pct": 8,
+			"fee_bps": 2, "slippage_bps": 5,
+		}
+		delete(fields, drop)
+		b, _ := json.Marshal(fields)
+		return b
+	}
+	for _, field := range []string{
+		"lower_price", "upper_price", "grid_num", "leverage",
+		"investment", "direction", "fee_bps", "slippage_bps",
+	} {
+		if matchesDeployParams(without(field), dp) {
+			t.Fatalf("job params without %q must NOT match (missing field = miss)", field)
+		}
+	}
+
+	base := []byte(`{"lower_price":60000,"upper_price":70000,"grid_num":50,"leverage":2,` +
+		`"investment":100,"direction":"LONG","stop_loss_pct":8,"fee_bps":2,"slippage_bps":5}`)
+	if !matchesDeployParams(base, dp) {
+		t.Fatalf("full identity must match")
+	}
+	// Direction is case-insensitive but never optional.
+	cased := []byte(`{"lower_price":60000,"upper_price":70000,"grid_num":50,"leverage":2,` +
+		`"investment":100,"direction":"long","stop_loss_pct":8,"fee_bps":2,"slippage_bps":5}`)
+	if !matchesDeployParams(cased, dp) {
+		t.Fatalf("direction case must not break the match")
+	}
+	opposite := []byte(`{"lower_price":60000,"upper_price":70000,"grid_num":50,"leverage":2,` +
+		`"investment":100,"direction":"SHORT","stop_loss_pct":8,"fee_bps":2,"slippage_bps":5}`)
+	if matchesDeployParams(opposite, dp) {
+		t.Fatalf("opposite direction must NOT match")
+	}
+	// A richer cost model invalidates the cached verdict.
+	pricier := []byte(`{"lower_price":60000,"upper_price":70000,"grid_num":50,"leverage":2,` +
+		`"investment":100,"direction":"LONG","stop_loss_pct":8,"fee_bps":5,"slippage_bps":5}`)
+	if matchesDeployParams(pricier, dp) {
+		t.Fatalf("a job simulated at 2bps fee must NOT certify a 5bps deploy")
+	}
+	slipperier := []byte(`{"lower_price":60000,"upper_price":70000,"grid_num":50,"leverage":2,` +
+		`"investment":100,"direction":"LONG","stop_loss_pct":8,"fee_bps":2,"slippage_bps":9}`)
+	if matchesDeployParams(slipperier, dp) {
+		t.Fatalf("a job simulated at 5bps slippage must NOT certify a 9bps deploy")
+	}
+}
+
+// v2.0.196: the stop pct is only part of the identity when no absolute stop is
+// sent — with stop_loss_price present the engine ignores the pct entirely
+// (backtest.py:270-276), so comparing it would re-enqueue forever on a field
+// that cannot change the result.
+func TestMatchesDeployParams_StopLossPctOnlyWithoutAbsoluteStop(t *testing.T) {
+	geometry := `"lower_price":60000,"upper_price":70000,"grid_num":50,"leverage":2,` +
+		`"investment":100,"direction":"LONG","fee_bps":2,"slippage_bps":5`
+	// No absolute stop on the deploy: the pct drives the engine, so it must match.
+	pctDeploy := &BacktestDeployParams{
+		LowerPrice: decimal.NewFromInt(60000), UpperPrice: decimal.NewFromInt(70000),
+		GridNum: 50, Leverage: 2, Investment: decimal.NewFromInt(100),
+		Direction: "LONG", StopLossPct: 8.0, FeeBps: 2.0, SlippageBps: 5.0,
+	}
+	if !matchesDeployParams([]byte(`{`+geometry+`,"stop_loss_pct":8}`), pctDeploy) {
+		t.Fatalf("identical stop pct must match")
+	}
+	if matchesDeployParams([]byte(`{`+geometry+`,"stop_loss_pct":14}`), pctDeploy) {
+		t.Fatalf("a materially different stop pct must NOT match")
+	}
+	// A deploy that carries no pct at all is enqueued as the 8.0 legacy default —
+	// the comparator must resolve the same value.
+	noPct := *pctDeploy
+	noPct.StopLossPct = 0
+	if !matchesDeployParams([]byte(`{`+geometry+`,"stop_loss_pct":8}`), &noPct) {
+		t.Fatalf("an unset deploy pct must match the enqueued 8.0 default")
+	}
+	// With an absolute stop the pct is inert: a drifting pct must not churn jobs.
+	absStop := decimal.NewFromInt(57000)
+	absDeploy := *pctDeploy
+	absDeploy.StopLossPrice = &absStop
+	if !matchesDeployParams([]byte(`{`+geometry+`,"stop_loss_pct":3,"stop_loss_price":57000}`), &absDeploy) {
+		t.Fatalf("with an absolute stop the inert pct must not break the match")
+	}
+	if matchesDeployParams([]byte(`{`+geometry+`,"stop_loss_pct":3}`), &absDeploy) {
+		t.Fatalf("a job without the absolute stop is a different bot")
+	}
+	if matchesDeployParams([]byte(`{`+geometry+`,"stop_loss_pct":3,"stop_loss_price":50000}`), &absDeploy) {
+		t.Fatalf("a different absolute stop must NOT match")
 	}
 }
 
