@@ -91,7 +91,7 @@ func TestScoreCandidateKaufmanERGate(t *testing.T) {
 	// extremes) instead of falling through to the neutral ER veto.
 	trendTicker := pionex.TickerInfo{
 		Symbol: "TST_USDT", Open: decimal.NewFromInt(100),
-		Close: decimal.NewFromFloat(100 * math.Pow(1.02, 79)),
+		Close:  decimal.NewFromFloat(100 * math.Pow(1.02, 79)),
 		Amount: volume,
 	}
 	trendCandles := synthCandles(func(i int) float64 { return 100 * math.Pow(1.02, float64(i)) }, 80)
@@ -118,7 +118,7 @@ func TestScoreCandidateKaufmanERGate(t *testing.T) {
 	// the channel midline so no Anti-FOMO band fires.
 	rangeTicker := pionex.TickerInfo{
 		Symbol: "TST_USDT", Open: decimal.NewFromInt(100),
-		Close: decimal.NewFromInt(100),
+		Close:  decimal.NewFromInt(100),
 		Amount: volume,
 	}
 	rangeCandles := synthCandles(func(i int) float64 {

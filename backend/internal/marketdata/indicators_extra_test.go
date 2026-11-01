@@ -89,3 +89,42 @@ func TestIndicatorsShortSeries(t *testing.T) {
 		t.Fatalf("expected empty RSIDiv for short series")
 	}
 }
+
+func TestComputeMACD_BarsAgo(t *testing.T) {
+	// Construct series with a clear turning point:
+	// 44 flat/falling candles, then 6 sharp rising candles.
+	closes := make([]float64, 50)
+	for i := 0; i < 44; i++ {
+		closes[i] = 100.0 - float64(i)*0.5
+	}
+	for i := 44; i < 50; i++ {
+		closes[i] = closes[43] + float64(i-43)*6.0
+	}
+
+	macd := ComputeMACD(closes)
+	if macd.CrossDir != 1 {
+		t.Errorf("expected bullish CrossDir=1, got %d", macd.CrossDir)
+	}
+	if macd.BarsAgo < 0 || macd.BarsAgo > 8 {
+		t.Errorf("expected fresh crossover within 8 bars, got barsAgo=%d", macd.BarsAgo)
+	}
+}
+
+func TestComputeEMACross(t *testing.T) {
+	// 30 downtrend candles, then 5 sharp rising candles
+	closes := make([]float64, 40)
+	for i := 0; i < 30; i++ {
+		closes[i] = 100.0 - float64(i)*1.0
+	}
+	for i := 30; i < 40; i++ {
+		closes[i] = closes[29] + float64(i-29)*5.0
+	}
+
+	res := ComputeEMACross(closes, 9, 21)
+	if res.CrossDir != 1 {
+		t.Errorf("expected bullish EMA crossDir=1, got %d", res.CrossDir)
+	}
+	if res.BarsAgo < 0 || res.BarsAgo > 8 {
+		t.Errorf("expected BarsAgo within [0, 8], got %d", res.BarsAgo)
+	}
+}

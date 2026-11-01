@@ -851,8 +851,8 @@ func (s *Server) autoGridAction(w http.ResponseWriter, r *http.Request) {
 		if len(failures) > 0 {
 			writeJSON(w, http.StatusInternalServerError, map[string]any{
 				"success": false, "status": "EMERGENCY_STOP_INCOMPLETE",
-				"message":   "Emergency Stop НЕ завершён — требуется немедленное ручное вмешательство",
-				"failures":  failures,
+				"message":  "Emergency Stop НЕ завершён — требуется немедленное ручное вмешательство",
+				"failures": failures,
 			})
 			return
 		}

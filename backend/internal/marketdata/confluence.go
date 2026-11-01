@@ -1,5 +1,10 @@
 package marketdata
 
+import (
+	"fmt"
+	"math"
+)
+
 // Confluence verdicts: the engine aggregates INDEPENDENT information classes
 // (regime memory, volume flow, one momentum voice, fair-price stretch,
 // volatility phase) into a bounded verdict. Release 1 uses it as a score
@@ -154,13 +159,23 @@ func EvaluateConfluence(regime RegimeResult, bundle IndicatorBundle) ConfluenceR
 		}
 	}
 
-	// --- MACD Momentum & Crossover (0.15): trend confirmation and inflection detector.
-	if bundle.MACD.CrossedUp {
-		vote("macd_bullish_cross", 1, 0.15, true, "MACD line crossed above signal line")
-		result.LongScore += 0.15
-	} else if bundle.MACD.CrossedDown {
-		vote("macd_bearish_cross", -1, 0.15, true, "MACD line crossed below signal line")
-		result.ShortScore += 0.15
+	// --- MACD Momentum & Crossover (0.15): trend confirmation, crossover age freshness and inflection.
+	if bundle.MACD.CrossedUp || (bundle.MACD.CrossDir == 1 && bundle.MACD.BarsAgo >= 0 && bundle.MACD.BarsAgo <= 8) {
+		barsAgo := bundle.MACD.BarsAgo
+		if barsAgo < 0 {
+			barsAgo = 0
+		}
+		freshWeight := 0.15 * math.Max(0.5, 1.0-float64(barsAgo)*0.06)
+		vote("macd_bullish_cross", 1, freshWeight, true, fmt.Sprintf("MACD crossed above signal (%d bars ago)", barsAgo))
+		result.LongScore += freshWeight
+	} else if bundle.MACD.CrossedDown || (bundle.MACD.CrossDir == -1 && bundle.MACD.BarsAgo >= 0 && bundle.MACD.BarsAgo <= 8) {
+		barsAgo := bundle.MACD.BarsAgo
+		if barsAgo < 0 {
+			barsAgo = 0
+		}
+		freshWeight := 0.15 * math.Max(0.5, 1.0-float64(barsAgo)*0.06)
+		vote("macd_bearish_cross", -1, freshWeight, true, fmt.Sprintf("MACD crossed below signal (%d bars ago)", barsAgo))
+		result.ShortScore += freshWeight
 	} else if bundle.MACD.HistTurning {
 		if bundle.MACD.Histogram < 0 && bundle.MACD.Histogram > bundle.MACD.PrevHist {
 			vote("macd_hist_bullish_turn", 1, 0.08, true, "MACD histogram contracting upward")
@@ -169,6 +184,27 @@ func EvaluateConfluence(regime RegimeResult, bundle IndicatorBundle) ConfluenceR
 			vote("macd_hist_bearish_turn", -1, 0.08, true, "MACD histogram contracting downward")
 			result.ShortScore += 0.08
 		}
+	}
+
+	// --- Dual Crossover Confirmation (0.08): synchronized EMA9/21 and MACD crossovers.
+	if bundle.EMACross.CrossDir == 1 && bundle.MACD.CrossDir == 1 &&
+		bundle.EMACross.BarsAgo >= 0 && bundle.EMACross.BarsAgo <= 8 &&
+		bundle.MACD.BarsAgo >= 0 && bundle.MACD.BarsAgo <= 8 {
+		vote("dual_bullish_cross", 1, 0.08, true, "synchronized fresh EMA9/21 and MACD bullish crossovers")
+		result.LongScore += 0.08
+	} else if bundle.EMACross.CrossDir == -1 && bundle.MACD.CrossDir == -1 &&
+		bundle.EMACross.BarsAgo >= 0 && bundle.EMACross.BarsAgo <= 8 &&
+		bundle.MACD.BarsAgo >= 0 && bundle.MACD.BarsAgo <= 8 {
+		vote("dual_bearish_cross", -1, 0.08, true, "synchronized fresh EMA9/21 and MACD bearish crossovers")
+		result.ShortScore += 0.08
+	} else if bundle.EMACross.CrossDir != 0 && bundle.MACD.CrossDir != 0 &&
+		bundle.EMACross.CrossDir != bundle.MACD.CrossDir &&
+		bundle.EMACross.BarsAgo >= 0 && bundle.EMACross.BarsAgo <= 5 &&
+		bundle.MACD.BarsAgo >= 0 && bundle.MACD.BarsAgo <= 5 {
+		// Opposite crossover signals within 5 bars indicate choppy whipsaw
+		vote("crossover_conflict_whipsaw", 0, 0.08, true, "EMA and MACD crossed in opposing directions")
+		result.LongScore = math.Max(0, result.LongScore-0.08)
+		result.ShortScore = math.Max(0, result.ShortScore-0.08)
 	}
 
 	// --- Stochastic RSI Extreme Reversal (0.10): early oversold/overbought hook.

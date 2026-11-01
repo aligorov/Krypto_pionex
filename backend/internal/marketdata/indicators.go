@@ -19,6 +19,7 @@ type IndicatorBundle struct {
 	Fib       FibonacciRetracement // Fibonacci retracement levels & golden pocket detection
 	SR        SRAnalysisResult     // Multi-swing support & resistance shelves
 	MACD      MACDResult           // MACD (12, 26, 9) line, signal, histogram & crossovers
+	EMACross  EMACrossResult       // EMA (9, 21) crossover, age and direction
 	StochRSI  StochRSIResult       // Stochastic RSI (14, 14, 3, 3) %K/%D and overbought/oversold crosses
 	RSIDiv    RSIDivergence        // RSI regular divergence versus price swings
 }
@@ -59,9 +60,18 @@ type MACDResult struct {
 	Signal      float64 `json:"signal"`
 	Histogram   float64 `json:"histogram"`
 	PrevHist    float64 `json:"prevHist"`
-	CrossedUp   bool    `json:"crossedUp"`   // Bullish crossover (MACD crossed above Signal)
-	CrossedDown bool    `json:"crossedDown"` // Bearish crossover (MACD crossed below Signal)
+	CrossedUp   bool    `json:"crossedUp"`   // Bullish crossover (MACD crossed above Signal on latest bar)
+	CrossedDown bool    `json:"crossedDown"` // Bearish crossover (MACD crossed below Signal on latest bar)
 	HistTurning bool    `json:"histTurning"` // Histogram turning towards zero/opposite direction
+	BarsAgo     int     `json:"barsAgo"`     // Bars since the last crossover (0 = latest bar, -1 = none)
+	CrossDir    int     `json:"crossDir"`    // Direction of the last crossover: +1 bullish, -1 bearish, 0 none
+}
+
+type EMACrossResult struct {
+	CrossedUp   bool `json:"crossedUp"`   // Fast EMA crossed above Slow EMA on latest bar
+	CrossedDown bool `json:"crossedDown"` // Fast EMA crossed below Slow EMA on latest bar
+	BarsAgo     int  `json:"barsAgo"`     // Bars since the last EMA crossover (0 = latest bar, -1 = none)
+	CrossDir    int  `json:"crossDir"`    // Direction of the last crossover: +1 bullish, -1 bearish, 0 none
 }
 
 type StochRSIResult struct {
@@ -105,6 +115,7 @@ func ComputeIndicatorBundle(s *Series) IndicatorBundle {
 	atr := atrFromSeries(s, s.Len(), 14)
 	bundle.SR = DetectSRLevels(s, 60, atr)
 	bundle.MACD = ComputeMACD(s.Close)
+	bundle.EMACross = ComputeEMACross(s.Close, 9, 21)
 	bundle.StochRSI = ComputeStochRSI(s.Close)
 	bundle.RSIDiv = DetectRSIDivergence(s.Close, 40)
 	return bundle
@@ -556,9 +567,9 @@ func atrFromSeries(s *Series, end, period int) float64 {
 }
 
 // ComputeMACD computes the classic MACD (12, 26, 9) on closes, identifying line crossover
-// and histogram acceleration/reversal patterns.
+// age (BarsAgo), crossover direction, and histogram acceleration/reversal patterns.
 func ComputeMACD(closes []float64) MACDResult {
-	res := MACDResult{}
+	res := MACDResult{BarsAgo: -1}
 	n := len(closes)
 	if n < 35 {
 		return res
@@ -590,16 +601,66 @@ func ComputeMACD(closes []float64) MACDResult {
 	res.Histogram = currHist
 	res.PrevHist = prevHist
 
-	// Bullish crossover: MACD crossed above Signal line
-	res.CrossedUp = prevMACD <= prevSignal && currMACD > currSignal
-	// Bearish crossover: MACD crossed below Signal line
-	res.CrossedDown = prevMACD >= prevSignal && currMACD < currSignal
+	// Look backwards from newest bar to detect the most recent crossover
+	for i := n - 1; i >= 1; i-- {
+		pM, cM := macdLine[i-1], macdLine[i]
+		pS, cS := signalLine[i-1], signalLine[i]
+		if pM <= pS && cM > cS {
+			res.BarsAgo = n - 1 - i
+			res.CrossDir = 1
+			break
+		} else if pM >= pS && cM < cS {
+			res.BarsAgo = n - 1 - i
+			res.CrossDir = -1
+			break
+		}
+	}
+
+	// Bullish crossover: MACD crossed above Signal line on latest bar
+	res.CrossedUp = (res.CrossDir == 1 && res.BarsAgo == 0)
+	// Bearish crossover: MACD crossed below Signal line on latest bar
+	res.CrossedDown = (res.CrossDir == -1 && res.BarsAgo == 0)
 
 	// Histogram turning: negative histogram shrinking upwards or positive histogram shrinking downwards
 	if (prevHist < 0 && currHist > prevHist) || (prevHist > 0 && currHist < prevHist) {
 		res.HistTurning = true
 	}
 
+	return res
+}
+
+// ComputeEMACross calculates fast/slow EMA crossover age and direction.
+func ComputeEMACross(closes []float64, fastPeriod, slowPeriod int) EMACrossResult {
+	res := EMACrossResult{BarsAgo: -1}
+	n := len(closes)
+	if n < slowPeriod+2 {
+		return res
+	}
+	fastEMA := emaFloat(closes, fastPeriod)
+	slowEMA := emaFloat(closes, slowPeriod)
+	if len(fastEMA) < n || len(slowEMA) < n {
+		return res
+	}
+
+	for i := n - 1; i >= 1; i-- {
+		pF, cF := fastEMA[i-1], fastEMA[i]
+		pS, cS := slowEMA[i-1], slowEMA[i]
+		if pF <= pS && cF > cS {
+			res.BarsAgo = n - 1 - i
+			res.CrossDir = 1
+			if i == n-1 {
+				res.CrossedUp = true
+			}
+			break
+		} else if pF >= pS && cF < cS {
+			res.BarsAgo = n - 1 - i
+			res.CrossDir = -1
+			if i == n-1 {
+				res.CrossedDown = true
+			}
+			break
+		}
+	}
 	return res
 }
 
@@ -741,4 +802,3 @@ func DetectRSIDivergence(closes []float64, lookback int) RSIDivergence {
 	}
 	return result
 }
-

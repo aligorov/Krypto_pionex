@@ -305,4 +305,3 @@ func TestUpdateFuturesGridTriggerProfitLossContract(t *testing.T) {
 		t.Fatalf("unexpected item0 extras: %+v", item0)
 	}
 }
-

@@ -383,4 +383,3 @@ func TestComputeIndividualTargetPrices(t *testing.T) {
 		t.Fatalf("no_trend target price %s must NOT overshoot UpperPrice 0.0980", resNoTrend.TargetPrice)
 	}
 }
-

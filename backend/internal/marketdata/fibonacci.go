@@ -6,9 +6,9 @@ import "math"
 type FibonacciRetracement struct {
 	SwingHigh       float64    `json:"swingHigh"`
 	SwingLow        float64    `json:"swingLow"`
-	TrendDir        int        `json:"trendDir"`        // +1 upswing (pullback down), -1 downswing (relief rally up), 0 undefined
-	Levels          [5]float64 `json:"levels"`          // Price levels at ratios [0.236, 0.382, 0.500, 0.618, 0.786]
-	Ratios          [5]float64 `json:"ratios"`          // [0.236, 0.382, 0.500, 0.618, 0.786]
+	TrendDir        int        `json:"trendDir"` // +1 upswing (pullback down), -1 downswing (relief rally up), 0 undefined
+	Levels          [5]float64 `json:"levels"`   // Price levels at ratios [0.236, 0.382, 0.500, 0.618, 0.786]
+	Ratios          [5]float64 `json:"ratios"`   // [0.236, 0.382, 0.500, 0.618, 0.786]
 	CurrentPrice    float64    `json:"currentPrice"`
 	InGoldenPocket  bool       `json:"inGoldenPocket"`  // true if price is in 0.618-0.786 retracement zone
 	NearLevel       float64    `json:"nearLevel"`       // closest Fibonacci price level

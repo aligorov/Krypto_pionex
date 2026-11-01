@@ -16,39 +16,40 @@ import (
 )
 
 type ScannerCandidate struct {
-	Symbol              string
-	BaseCurrency        string
-	QuoteCurrency       string
-	Price               decimal.Decimal
-	VolatilityPct       float64
-	Volume24h           decimal.Decimal
-	FundingRate         *decimal.Decimal
-	ExpectedValuePct    float64
-	Sharpe              float64
-	Sortino             float64
-	MaxDrawdownPct      float64
-	WinRatePct          float64
-	ProfitFactor        float64
-	TurnoverProxy       float64
-	Score               float64
-	Regime              string  `json:"regime"`
-	ADXPct              float64 `json:"adxPct"`
-	RangePositionPct    float64 `json:"rangePositionPct"`
-	ATRPct              float64 `json:"atrPct"`
-	Choppiness          float64 `json:"choppiness"`
-	BBWPercentile       float64 `json:"bbwPercentile"`
-	Hurst               float64 `json:"hurst"`
-	ConfluenceVerdict   string  `json:"confluenceVerdict"`
-	ConfluenceStrength  float64 `json:"confluenceStrength"`
-	IsSqueeze           bool    `json:"isSqueeze"`
-	Decision            string
-	RejectionReason     string
-	LowerPrice          decimal.Decimal
-	UpperPrice          decimal.Decimal
-	GridNum             int
-	RecommendedLeverage int
-	RecommendedTrend    string
-	ModelAssumptions    map[string]any
+	Symbol                string
+	BaseCurrency          string
+	QuoteCurrency         string
+	Price                 decimal.Decimal
+	VolatilityPct         float64
+	Volume24h             decimal.Decimal
+	FundingRate           *decimal.Decimal
+	ExpectedValuePct      float64
+	Sharpe                float64
+	Sortino               float64
+	MaxDrawdownPct        float64
+	WinRatePct            float64
+	ProfitFactor          float64
+	TurnoverProxy         float64
+	Score                 float64
+	Regime                string  `json:"regime"`
+	ADXPct                float64 `json:"adxPct"`
+	RangePositionPct      float64 `json:"rangePositionPct"`
+	ATRPct                float64 `json:"atrPct"`
+	CornishFisherVaR99Pct float64 `json:"cornishFisherVaR99Pct"`
+	Choppiness            float64 `json:"choppiness"`
+	BBWPercentile         float64 `json:"bbwPercentile"`
+	Hurst                 float64 `json:"hurst"`
+	ConfluenceVerdict     string  `json:"confluenceVerdict"`
+	ConfluenceStrength    float64 `json:"confluenceStrength"`
+	IsSqueeze             bool    `json:"isSqueeze"`
+	Decision              string
+	RejectionReason       string
+	LowerPrice            decimal.Decimal
+	UpperPrice            decimal.Decimal
+	GridNum               int
+	RecommendedLeverage   int
+	RecommendedTrend      string
+	ModelAssumptions      map[string]any
 }
 
 type ScanConfig struct {
@@ -514,6 +515,12 @@ func scoreCandidate(
 		leverage = 2
 	}
 
+	cfVaR99, skewness, excessKurtosis := CornishFisherVaR(CandleCloses(sorted), periodsPerDay)
+	// Tail risk leverage cap (Doctrine C6): cap leverage to 2x when 99% CF-VaR > 15%
+	if cfVaR99 > 15.0 && leverage > 2 {
+		leverage = 2
+	}
+
 	var change24hPct float64
 	if ticker.Open.GreaterThan(decimal.Zero) {
 		change24hPct, _ = ticker.Close.Sub(ticker.Open).Div(ticker.Open).Mul(decimal.NewFromInt(100)).Float64()
@@ -575,6 +582,14 @@ func scoreCandidate(
 	}
 	if volatilityPct > config.MaxVolatilityPct {
 		reasons = append(reasons, "volatility above risk threshold")
+	}
+	// Extreme tail-risk gate (Doctrine C6): reject candidates with extreme fat tails (high kurtosis + high VaR)
+	// or catastrophic daily VaR99 > 45%.
+	tailRiskThreshold := math.Max(45.0, config.MaxVolatilityPct*2.0)
+	if (excessKurtosis > 2.5 && cfVaR99 > 25.0) || cfVaR99 > tailRiskThreshold {
+		reasons = append(reasons, fmt.Sprintf(
+			"хвостовой риск экстрим: Cornish-Fisher VaR99 (%.1f%%) с толстым хвостом (Kurtosis: %.1f, Skew: %.2f) — риск мгновенной ликвидации",
+			cfVaR99, excessKurtosis, skewness))
 	}
 	minEV := config.MinExpectedValuePct
 	if evPct < minEV {
@@ -873,7 +888,8 @@ func scoreCandidate(
 		ProfitFactor: profitFactor, TurnoverProxy: turnover, Score: score,
 		Regime: regime.Regime, ADXPct: regime.ADX,
 		RangePositionPct: regime.RangePositionPct, ATRPct: regime.ATRPct,
-		Choppiness: regime.Choppiness, BBWPercentile: regime.BBWPercentile,
+		CornishFisherVaR99Pct: cfVaR99,
+		Choppiness:            regime.Choppiness, BBWPercentile: regime.BBWPercentile,
 		Hurst: bundle.Hurst, ConfluenceVerdict: confluence.Verdict,
 		ConfluenceStrength: confluence.Strength,
 		IsSqueeze:          regime.IsSqueeze,
@@ -908,6 +924,9 @@ func scoreCandidate(
 			"emaSlopePct":           regime.EMASlopePct,
 			"rangePositionPct":      regime.RangePositionPct,
 			"atrPct":                regime.ATRPct,
+			"cornishFisherVaR99Pct": cfVaR99,
+			"skewness":              skewness,
+			"excessKurtosis":        excessKurtosis,
 			"volatilityParkinson":   volParkinson,
 			"hurst":                 bundle.Hurst,
 			"kaufmanER":             bundle.KaufmanER,

@@ -1398,6 +1398,13 @@ func (worker *Worker) deployPaper(
 				fmt.Sprintf("sector cap: в секторе %s уже %d ботов — коррелированный кластер, вход отложен", sector, maxBotsPerSector), nil)
 			continue
 		}
+		// Portfolio correlation gate (closing Master-Plan P0 §4):
+		// Prevents stacking same-direction bots that share empirical return correlation >= 0.75
+		if blocked, corrReason := worker.checkPortfolioCorrelation(ctx, candidate.Symbol, candidate.RecommendedTrend,
+			worker.getRunningPaperDirectionalBots(ctx, settings.ID)); blocked {
+			worker.rejectCandidate(ctx, candidate, corrReason, nil)
+			continue
+		}
 		// Entry gate (v2.0.12): anchor to the LIVE price. The scan price is
 		// captured at scan start and ages through AI Kit calls, LLM audits
 		// and backtest waits; deploying a grid centered minutes in the past
@@ -2796,6 +2803,13 @@ func (worker *Worker) deployReal(
 			worker.sectorRealBotCount(ctx, *settings.AccountID, sector) >= maxBotsPerSector {
 			worker.rejectCandidate(ctx, candidate,
 				fmt.Sprintf("sector cap: в секторе %s уже %d ботов — коррелированный кластер, вход отложен", sector, maxBotsPerSector), nil)
+			continue
+		}
+		// Portfolio correlation gate (closing Master-Plan P0 §4):
+		// Prevents stacking same-direction REAL bots that share empirical return correlation >= 0.75
+		if blocked, corrReason := worker.checkPortfolioCorrelation(ctx, candidate.Symbol, candidate.RecommendedTrend,
+			worker.getRunningRealDirectionalBots(ctx, *settings.AccountID)); blocked {
+			worker.rejectCandidate(ctx, candidate, corrReason, nil)
 			continue
 		}
 		atrPct := 2.0

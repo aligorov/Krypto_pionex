@@ -40,3 +40,60 @@ func TestAnalyzeTakerFlow_Balanced(t *testing.T) {
 		t.Errorf("expected BuyRatio=0.5, got %.2f", metrics.BuyRatio)
 	}
 }
+
+func TestAnalyzeTakerFlow_WhaleMAD(t *testing.T) {
+	// Simulated altcoin tape: 15 normal trades ~$30 (total ~$450),
+	// followed by a sudden $2,500 sell print (whale dumping).
+	// Under the old static thresholds ($5,000 and $15,000), this would be MISSED.
+	// Under the MAD Modified Z-score, M_z > 3.5 flags WhaleSellCount=1, SellRatio > 80%,
+	// triggering IsAggressiveDumping.
+	trades := make([]pionex.Trade, 0, 16)
+	for i := 0; i < 15; i++ {
+		side := "BUY"
+		if i%2 == 0 {
+			side = "SELL"
+		}
+		trades = append(trades, pionex.Trade{
+			Price: decimal.NewFromFloat(1.0),
+			Size:  decimal.NewFromFloat(30.0),
+			Side:  side,
+		})
+	}
+	// Add whale sell
+	trades = append(trades, pionex.Trade{
+		Price: decimal.NewFromFloat(1.0),
+		Size:  decimal.NewFromFloat(2500.0),
+		Side:  "SELL",
+	})
+
+	metrics := AnalyzeTakerFlow(trades)
+	if !metrics.IsAggressiveDumping {
+		t.Fatalf("expected IsAggressiveDumping=true via Whale MAD, got false")
+	}
+	if metrics.WhaleSellCount != 1 {
+		t.Errorf("expected WhaleSellCount=1, got %d", metrics.WhaleSellCount)
+	}
+	if metrics.MaxModifiedZScore < 3.5 {
+		t.Errorf("expected MaxModifiedZScore >= 3.5, got %.2f", metrics.MaxModifiedZScore)
+	}
+}
+
+func TestAnalyzeTakerFlow_ZeroMADProtection(t *testing.T) {
+	// Tape where all trades are identical $20: MAD would mathematically be 0.
+	// Safety floor must prevent division by zero or panic.
+	trades := make([]pionex.Trade, 0, 10)
+	for i := 0; i < 10; i++ {
+		trades = append(trades, pionex.Trade{
+			Price: decimal.NewFromFloat(2.0),
+			Size:  decimal.NewFromFloat(10.0),
+			Side:  "BUY",
+		})
+	}
+	metrics := AnalyzeTakerFlow(trades)
+	if metrics.MADNotionalUSDT <= 0 {
+		t.Errorf("expected MADNotionalUSDT > 0 with floor, got %.4f", metrics.MADNotionalUSDT)
+	}
+	if metrics.MaxModifiedZScore != 0 {
+		t.Errorf("expected MaxModifiedZScore = 0 for identical trades, got %.2f", metrics.MaxModifiedZScore)
+	}
+}

@@ -55,8 +55,8 @@ func TestStackedEMAPreservation(t *testing.T) {
 		p := decimal.NewFromFloat(100 + 3*math.Sin(float64(i)/1.5))
 		sine = append(sine, pionex.KlineCandle{
 			Time: int64(i) * 900_000, Open: p,
-			High: p.Mul(decimal.NewFromFloat(1.010)),
-			Low:  p.Mul(decimal.NewFromFloat(0.990)),
+			High:  p.Mul(decimal.NewFromFloat(1.010)),
+			Low:   p.Mul(decimal.NewFromFloat(0.990)),
 			Close: p,
 		})
 	}

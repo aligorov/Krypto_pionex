@@ -13,6 +13,8 @@ import (
 type RegimeResult struct {
 	Regime              string  `json:"regime"`              // RANGE, TREND_UP, TREND_DOWN
 	ADX                 float64 `json:"adx"`                 // Wilder ADX(14), trend strength
+	PlusDI              float64 `json:"plusDI"`              // Wilder +DI(14), positive directional index
+	MinusDI             float64 `json:"minusDI"`             // Wilder -DI(14), negative directional index
 	RSI                 float64 `json:"rsi"`                 // Wilder RSI(14), momentum oscillator 0..100
 	Choppiness          float64 `json:"choppiness"`          // Dreiss Choppiness Index (14), 0..100 (>61.8 range, <38.2 trend)
 	BBWPct              float64 `json:"bbwPct"`              // Bollinger Band Width %
@@ -62,7 +64,7 @@ func DetectRegime(candles []pionex.KlineCandle) RegimeResult {
 	}
 	result.EMAFast = ema(closes, emaFastPeriod)
 	result.EMASlow = ema(closes, emaSlowPeriod)
-	result.ADX = adx(candles, adxPeriod)
+	result.ADX, result.PlusDI, result.MinusDI = adx(candles, adxPeriod)
 	result.RSI = CalculateRSI(candles, 14)
 	result.Choppiness = ChoppinessIndex(candles, adxPeriod)
 	result.BBWPct, result.IsSqueeze = BollingerBandWidth(candles, bbPeriod, 2.0)
@@ -275,14 +277,13 @@ func ema(values []float64, period int) float64 {
 
 // adx implements Wilder's Average Directional Index over OHLC candles:
 // +DI/-DI are Wilder-smoothed, DX is derived per candle, and ADX is the
-// Wilder-smoothed average of the DX series. Returning raw DX (as this
-// function did before) made the trend thresholds classify noise as trend
-// and trend as noise.
-func adx(candles []pionex.KlineCandle, period int) float64 {
+// Wilder-smoothed average of the DX series. Returns ADX, latest +DI, and latest -DI.
+func adx(candles []pionex.KlineCandle, period int) (float64, float64, float64) {
 	if len(candles) < period*2+1 {
-		return 0
+		return 0, 0, 0
 	}
 	var trSmooth, plusSmooth, minusSmooth float64
+	var lastPlusDI, lastMinusDI float64
 	dxs := make([]float64, 0, len(candles))
 	first := true
 	for index := 1; index < len(candles); index++ {
@@ -315,6 +316,8 @@ func adx(candles []pionex.KlineCandle, period int) float64 {
 		if trSmooth > 0 {
 			plusDI := 100 * plusSmooth / trSmooth
 			minusDI := 100 * minusSmooth / trSmooth
+			lastPlusDI = plusDI
+			lastMinusDI = minusDI
 			sum := plusDI + minusDI
 			if sum > 0 {
 				dxs = append(dxs, clamp(100*math.Abs(plusDI-minusDI)/sum, 0, 100))
@@ -322,10 +325,10 @@ func adx(candles []pionex.KlineCandle, period int) float64 {
 		}
 	}
 	if len(dxs) == 0 {
-		return 0
+		return 0, lastPlusDI, lastMinusDI
 	}
 	if len(dxs) < period {
-		return mean(dxs)
+		return mean(dxs), lastPlusDI, lastMinusDI
 	}
 	// Wilder ADX: seed with the mean of the first `period` DX values, then
 	// smooth each subsequent DX with the (period-1)/period recursion.
@@ -333,7 +336,7 @@ func adx(candles []pionex.KlineCandle, period int) float64 {
 	for _, dx := range dxs[period:] {
 		result = (result*float64(period-1) + dx) / float64(period)
 	}
-	return clamp(result, 0, 100)
+	return clamp(result, 0, 100), lastPlusDI, lastMinusDI
 }
 
 func atrPercent(candles []pionex.KlineCandle, period int) float64 {

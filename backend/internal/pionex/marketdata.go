@@ -266,4 +266,3 @@ func (c *Client) GetTrades(ctx context.Context, symbol string, limit int) ([]Tra
 	}
 	return data.Trades, nil
 }
-
