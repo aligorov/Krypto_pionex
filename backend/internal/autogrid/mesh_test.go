@@ -88,25 +88,22 @@ func TestComputeAdaptiveMeshFloorFollowsFees(t *testing.T) {
 	}
 }
 
-// v2.0.94 quality upgrade: a wide span (≥14%) on a quiet tape (ATR ≤2.5%)
-// takes ONE notch above base (cap 6) — the weekly mining put ZERO stop-outs
-// in the ≥14% span cohort while every stop of the week lived in ≤9% spans.
-// The narrow-span de-gir must keep priority, and a noisy tape must NOT
-// upgrade even on a wide span.
-func TestComputeDynamicLeverageQualityUpgrade(t *testing.T) {
+// v2.0.199: dynamic leverage never exceeds baseLev (quiet tape upgrades eliminated
+// because volatility shocks explode upgraded leverage). It can only de-gear down.
+func TestComputeDynamicLeverageNeverExceedsBase(t *testing.T) {
 	up := ComputeDynamicLeverage(2.0, 4, 16.0)
-	if up.Leverage != 5 || up.IsScaleDown {
-		t.Fatalf("wide quiet span must upgrade 4x→5x, got %dx (%s)", up.Leverage, up.Reason)
+	if up.Leverage > 4 {
+		t.Fatalf("wide quiet span must NOT upgrade above base (4x), got %dx (%s)", up.Leverage, up.Reason)
 	}
 	// Hard cap at 6x even with a higher base.
 	capped := ComputeDynamicLeverage(1.0, 6, 20.0)
-	if capped.Leverage != 6 {
-		t.Fatalf("upgrade must cap at 6x, got %d", capped.Leverage)
+	if capped.Leverage > 6 {
+		t.Fatalf("leverage must cap at 6x, got %d", capped.Leverage)
 	}
 	// Noisy tape on a wide span: stays at base.
 	noisy := ComputeDynamicLeverage(3.5, 4, 16.0)
-	if noisy.Leverage != 4 {
-		t.Fatalf("ATR 3.5%% must not upgrade, got %d", noisy.Leverage)
+	if noisy.Leverage > 4 {
+		t.Fatalf("ATR 3.5%% must not exceed base, got %d", noisy.Leverage)
 	}
 	// Narrow span still de-gears — the de-gir branch runs first.
 	degear := ComputeDynamicLeverage(2.0, 4, 5.0)

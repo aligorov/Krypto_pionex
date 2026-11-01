@@ -93,6 +93,9 @@ type Settings struct {
 	OURotationEnabled        bool            `json:"ouRotationEnabled"`
 	MinRiskReward            decimal.Decimal `json:"minRiskReward"`
 	MarginReservePct         decimal.Decimal `json:"marginReservePct"`
+	DirectionalEnabled       bool            `json:"directionalEnabled"`
+	MaxLeverageCap           int             `json:"maxLeverageCap"`
+	MaxLossTargetMultiplier  decimal.Decimal `json:"maxLossTargetMultiplier"`
 	CreatedAt                time.Time       `json:"createdAt"`
 	UpdatedAt                time.Time       `json:"updatedAt"`
 }
@@ -154,6 +157,9 @@ type UpdateSettingsInput struct {
 	OURotationEnabled        *bool            `json:"ouRotationEnabled"`
 	MinRiskReward            *decimal.Decimal `json:"minRiskReward"`
 	MarginReservePct         *decimal.Decimal `json:"marginReservePct"`
+	DirectionalEnabled       *bool            `json:"directionalEnabled"`
+	MaxLeverageCap           *int             `json:"maxLeverageCap"`
+	MaxLossTargetMultiplier  *decimal.Decimal `json:"maxLossTargetMultiplier"`
 }
 
 type ScanRun struct {
@@ -445,7 +451,10 @@ func (s *Service) GetSettings(ctx context.Context) (*Settings, error) {
 		       COALESCE(ofi_harvest_enabled, true),
 		       COALESCE(ou_rotation_enabled, true),
 		       COALESCE(min_risk_reward, 1.8),
-		       COALESCE(margin_reserve_pct, 0.00)
+		       COALESCE(margin_reserve_pct, 0.00),
+		       COALESCE(directional_enabled, false),
+		       COALESCE(max_leverage_cap, 2),
+		       COALESCE(max_loss_target_multiplier, 2.80)
 		FROM autogrid_settings WHERE scope_key = $1
 	`, DefaultScope).Scan(settingsScanTargets(&item)...)
 	if err != nil {
@@ -593,6 +602,24 @@ func (s *Service) UpdateSettings(
 	if input.MarginReservePct != nil {
 		marginReserve = *input.MarginReservePct
 	}
+	directionalEnabled := current.DirectionalEnabled
+	if input.DirectionalEnabled != nil {
+		directionalEnabled = *input.DirectionalEnabled
+	}
+	maxLevCap := current.MaxLeverageCap
+	if input.MaxLeverageCap != nil && *input.MaxLeverageCap > 0 {
+		maxLevCap = *input.MaxLeverageCap
+	}
+	if maxLevCap <= 0 {
+		maxLevCap = 2
+	}
+	maxLossMultiplier := current.MaxLossTargetMultiplier
+	if input.MaxLossTargetMultiplier != nil && input.MaxLossTargetMultiplier.IsPositive() {
+		maxLossMultiplier = *input.MaxLossTargetMultiplier
+	}
+	if !maxLossMultiplier.IsPositive() {
+		maxLossMultiplier = decimal.NewFromFloat(2.80)
+	}
 	accountID := input.AccountID
 	if accountID != nil && strings.TrimSpace(*accountID) == "" {
 		accountID = nil
@@ -622,6 +649,8 @@ func (s *Service) UpdateSettings(
 		    smart_exit_enabled = $47, ofi_harvest_enabled = $48,
 		    ou_rotation_enabled = $49, min_risk_reward = $50,
 		    margin_reserve_pct = $51,
+		    directional_enabled = $52, max_leverage_cap = $53,
+		    max_loss_target_multiplier = $54,
 		    last_error = NULL, updated_at = NOW()
 		WHERE scope_key = $1
 	`, DefaultScope, accountID, input.ExecutionMode, input.BudgetUSDT,
@@ -638,7 +667,8 @@ func (s *Service) UpdateSettings(
 		trancheDeploy, input.StopForecastMode, input.RadarAutoCloseMode,
 		dgtRedeploy, wickShield, wickGrace, fleetMaxDelta, universeCap,
 		maxSpread, gaussDensity, obProfiler, knifePause, minDepthCushion,
-		smartExit, ofiHarvest, ouRotation, minRR, marginReserve)
+		smartExit, ofiHarvest, ouRotation, minRR, marginReserve,
+		directionalEnabled, maxLevCap, maxLossMultiplier)
 	if err != nil {
 		return nil, fmt.Errorf("update AutoGrid settings: %w", err)
 	}
@@ -1479,9 +1509,10 @@ func (s *Service) scannerConfig(settings Settings) marketdata.ScanConfig {
 		// v2.0.75 margin-density doctrine: the scanner sizes the level count
 		// against the notional a slot actually commits.
 		NotionalPerBot:  settings.BudgetUSDT.Mul(decimal.NewFromInt(int64(settings.Leverage))).InexactFloat64(),
-		UniverseScanCap: settings.UniverseScanCap,
-		MaxSpreadPct:    decimalFloat(settings.MaxSpreadPct),
-		GaussianDensity: settings.GaussianDensityEnabled,
+		UniverseScanCap:    settings.UniverseScanCap,
+		MaxSpreadPct:       decimalFloat(settings.MaxSpreadPct),
+		GaussianDensity:    settings.GaussianDensityEnabled,
+		DirectionalEnabled: settings.DirectionalEnabled,
 	}
 }
 
@@ -1855,6 +1886,7 @@ func settingsScanTargets(item *Settings) []any {
 		&item.OrderbookProfilerEnabled, &item.KnifePauseEnabled, &item.MinDepthCushionRatio,
 		&item.SmartExitEnabled, &item.OFIHarvestEnabled, &item.OURotationEnabled, &item.MinRiskReward,
 		&item.MarginReservePct,
+		&item.DirectionalEnabled, &item.MaxLeverageCap, &item.MaxLossTargetMultiplier,
 	}
 }
 

@@ -337,6 +337,9 @@ export interface AutoGridSettings {
   ouRotationEnabled?: boolean;
   minRiskReward?: string;
   marginReservePct?: string;
+  directionalEnabled?: boolean;
+  maxLeverageCap?: number;
+  maxLossTargetMultiplier?: string;
   lastError: string | null;
   lastStartedAt: string | null;
   lastStoppedAt: string | null;

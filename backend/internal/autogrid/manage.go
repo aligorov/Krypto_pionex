@@ -105,6 +105,9 @@ func decideBotAction(input botActionInput) manageDecision {
 			slBreached = input.CurrentPrice.LessThanOrEqual(*input.StopLossPrice)
 		}
 		if slBreached {
+			if total.IsPositive() {
+				return manageDecision{Action: ActionCloseTakeProfit, Reason: "TRAILING_SL_PROFIT_LOCK"}
+			}
 			return manageDecision{Action: ActionCloseStopLoss, Reason: "STOP_LOSS_PRICE_BREACH"}
 		}
 	}
@@ -112,6 +115,9 @@ func decideBotAction(input botActionInput) manageDecision {
 	// Neutral Grid Upper Stop-Loss Breach
 	if input.StopLossHigh != nil && input.StopLossHigh.GreaterThan(decimal.Zero) && input.CurrentPrice.GreaterThan(decimal.Zero) {
 		if input.CurrentPrice.GreaterThanOrEqual(*input.StopLossHigh) {
+			if total.IsPositive() {
+				return manageDecision{Action: ActionCloseTakeProfit, Reason: "TRAILING_SL_PROFIT_LOCK"}
+			}
 			return manageDecision{Action: ActionCloseStopLoss, Reason: "STOP_LOSS_HIGH_BREACH"}
 		}
 	}

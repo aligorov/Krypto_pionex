@@ -299,6 +299,9 @@ func slotCapital(trancheBase *string, investment decimal.Decimal) decimal.Decima
 // the shared entry-chain composer, the same single implementation every
 // entry path clears.
 func (worker *Worker) dgtSharedGateBlockers(ctx context.Context, settings Settings, spec dgtRedeploySpec) (string, string) {
+	if !settings.DirectionalEnabled && (strings.ToLower(spec.direction) == "long" || strings.ToLower(spec.direction) == "short") {
+		return "направленные боты отключены (directional_enabled=false) — DGT переоткрытие отменено", "DIRECTIONAL_DISABLED"
+	}
 	// v2.0.136: re-entry microstructure gate. A protective exit fired on a
 	// CONFIRMED dump/pump seconds ago; re-opening a grid into the SAME still
 	// confirmed flow would reload the inventory the exit just shed (audit
@@ -798,6 +801,9 @@ func (worker *Worker) dgtRedeployPaper(ctx context.Context, settings Settings, s
 		botLev = harGeo.geo.Leverage
 		levMode = "HAR"
 	}
+	if settings.MaxLeverageCap > 0 && botLev > settings.MaxLeverageCap {
+		botLev = settings.MaxLeverageCap
+	}
 
 	investAmount := spec.slotBudget
 	trancheOn := settings.TrancheDeployEnabled
@@ -872,6 +878,19 @@ func (worker *Worker) dgtRedeployPaper(ctx context.Context, settings Settings, s
 			botMaxLossVal = stress.loss.Round(2)
 			maxLoss = &botMaxLossVal
 		}
+		if isNeutralPaper && target != nil && target.IsPositive() {
+			mult := decimal.NewFromFloat(2.80)
+			if settings.MaxLossTargetMultiplier.IsPositive() {
+				mult = settings.MaxLossTargetMultiplier
+			}
+			lossCap := target.Mul(mult).Round(2)
+			if maxLoss != nil && maxLoss.GreaterThan(lossCap) {
+				*maxLoss = lossCap
+			}
+		}
+	}
+	if target != nil && maxLoss != nil && maxLoss.IsPositive() {
+		riskRewardDec = target.Div(*maxLoss).Round(4)
 	}
 	// v2.0.142 (audit P2b): ...and the SAME ceiling. The floor keeps the
 	// stored stop honest, but a replacement geometry whose full-traverse
@@ -1069,6 +1088,9 @@ func (worker *Worker) dgtRedeployReal(ctx context.Context, settings Settings, sp
 	} else if harGeo != nil && harGeo.geo.Leverage < botLev {
 		botLev = harGeo.geo.Leverage
 	}
+	if settings.MaxLeverageCap > 0 && botLev > settings.MaxLeverageCap {
+		botLev = settings.MaxLeverageCap
+	}
 
 	// Price precision from the break price itself (the deploy path's
 	// exponent fallback — a re-center has no candidate assumption to read).
@@ -1162,6 +1184,19 @@ func (worker *Worker) dgtRedeployReal(ctx context.Context, settings Settings, sp
 			botMaxLossVal = stress.loss.Round(2)
 			botMaxLoss = &botMaxLossVal
 		}
+		if isNeutral && botTarget != nil && botTarget.IsPositive() {
+			mult := decimal.NewFromFloat(2.80)
+			if settings.MaxLossTargetMultiplier.IsPositive() {
+				mult = settings.MaxLossTargetMultiplier
+			}
+			lossCap := botTarget.Mul(mult).Round(2)
+			if botMaxLoss != nil && botMaxLoss.GreaterThan(lossCap) {
+				*botMaxLoss = lossCap
+			}
+		}
+	}
+	if botTarget != nil && botMaxLoss != nil && botMaxLoss.IsPositive() {
+		riskRewardDec = botTarget.Div(*botMaxLoss).Round(4)
 	}
 	// v2.0.142 (audit P2b): ...and the same CEILING (paper twin's comment):
 	// a replacement geometry whose full-traverse loss overflows the

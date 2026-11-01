@@ -487,7 +487,8 @@ func TestScoreCandidateSwapsRangeShareForTrendShare(t *testing.T) {
 		MinExpectedValuePct: 0, MinSharpe: -10,
 		MaxDrawdownPct: 100, MinProfitFactor: 0,
 		FeeBps: 0, SlippageBps: 0, BaseLeverage: 2,
-		NotionalPerBot: 200,
+		NotionalPerBot:     200,
+		DirectionalEnabled: true,
 	}
 
 	mk := func(symbol string, pattern func(i int) float64) (pionex.SymbolInfo, pionex.TickerInfo, []pionex.KlineCandle) {
@@ -564,5 +565,46 @@ func TestScoreCandidateSwapsRangeShareForTrendShare(t *testing.T) {
 	newGap := rangey.Score - trendy.Score
 	if newGap >= oldGap {
 		t.Fatalf("separate ranking must narrow the range-vs-trend gap inside LONG: old %.4f, new %.4f", oldGap, newGap)
+	}
+}
+
+func TestScoreCandidateDirectionalDisabledDemotesToNoTrend(t *testing.T) {
+	config := ScanConfig{
+		Interval: "60M", LookbackCandles: 60,
+		MinVolume24h:        decimal.NewFromInt(100_000),
+		MinVolatilityPct:    0.1,
+		MaxVolatilityPct:    40,
+		MinExpectedValuePct: 0,
+		MinSharpe:           -10,
+		MaxDrawdownPct:      100,
+		MinProfitFactor:     0,
+		FeeBps:              0,
+		SlippageBps:         0,
+		BaseLeverage:        2,
+		NotionalPerBot:      200,
+		DirectionalEnabled:  false, // default killswitch
+	}
+
+	info := pionex.SymbolInfo{
+		Symbol: "TRENDY_USDT_PERP", BaseCurrency: "TRENDY", QuoteCurrency: "USDT",
+		Type: "PERP", Status: "TRADING", Enabled: true,
+	}
+	ticker := pionex.TickerInfo{
+		Symbol: "TRENDY_USDT_PERP",
+		Open:   decimal.NewFromFloat(100), Close: decimal.NewFromFloat(102),
+		Amount: decimal.NewFromInt(2_000_000),
+	}
+	candles := synthCandles(func(i int) float64 {
+		return 100 * math.Pow(1.02, float64(i)) * (1 + 0.012*math.Sin(float64(i)/1.5))
+	}, 80)
+
+	turnover := decimal.NewFromInt(2_000_000)
+	c, err := scoreCandidate(info, ticker, turnover, candles, config)
+	if err != nil {
+		t.Fatalf("score candidate: %v", err)
+	}
+
+	if c.RecommendedTrend != "no_trend" {
+		t.Fatalf("expected RecommendedTrend to be demoted to 'no_trend' when DirectionalEnabled=false, got %q", c.RecommendedTrend)
 	}
 }

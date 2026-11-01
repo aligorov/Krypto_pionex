@@ -734,11 +734,18 @@ func TestDecideBotActionPriceHit(t *testing.T) {
 		t.Fatalf("expected TAKE_PROFIT_PRICE_HIT, got %+v", decision)
 	}
 
-	// Price breaches stop loss price
+	// Price breaches stop loss price with positive PnL (trailing SL lock)
 	input.CurrentPrice = mustDecimal("87.9")
 	decision = decideBotAction(input)
+	if decision.Action != ActionCloseTakeProfit || decision.Reason != "TRAILING_SL_PROFIT_LOCK" {
+		t.Fatalf("expected TRAILING_SL_PROFIT_LOCK on positive PnL, got %+v", decision)
+	}
+
+	// Price breaches stop loss price with negative PnL (real stop loss breach)
+	input.RealizedPNL = mustDecimal("-5.0")
+	decision = decideBotAction(input)
 	if decision.Action != ActionCloseStopLoss || decision.Reason != "STOP_LOSS_PRICE_BREACH" {
-		t.Fatalf("expected STOP_LOSS_PRICE_BREACH, got %+v", decision)
+		t.Fatalf("expected STOP_LOSS_PRICE_BREACH on negative PnL, got %+v", decision)
 	}
 }
 

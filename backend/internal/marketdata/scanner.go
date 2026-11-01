@@ -105,6 +105,9 @@ type ScanConfig struct {
 	// DefaultVolQuota (the autogrid Settings path leaves it unset, so the
 	// default rides the zero value).
 	VolQuota int
+	// DirectionalEnabled (v2.0.199): when false, disables directional (LONG/SHORT)
+	// recommendations; pairs are evaluated as NEUTRAL (no_trend) range grids.
+	DirectionalEnabled bool
 }
 
 const (
@@ -542,6 +545,10 @@ func scoreCandidate(
 	if change24hPct >= 3.0 && recommendedTrend == "short" {
 		recommendedTrend = "no_trend"
 	} else if change24hPct <= -3.0 && recommendedTrend == "long" {
+		recommendedTrend = "no_trend"
+	}
+	// v2.0.199: when directional trading is disabled by settings, evaluate as neutral range
+	if !config.DirectionalEnabled && (recommendedTrend == "long" || recommendedTrend == "short") {
 		recommendedTrend = "no_trend"
 	}
 	// v2.0.162 (unlock plan): the mature-trend LONG demotion (v2.0.39,

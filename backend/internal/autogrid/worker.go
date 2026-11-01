@@ -1571,6 +1571,11 @@ func (worker *Worker) deployPaper(
 			}
 			trend = smartTrend
 		}
+		if !settings.DirectionalEnabled && (trend == "long" || trend == "short") {
+			worker.rejectCandidate(ctx, candidate,
+				"направленные боты отключены (directional_enabled=false) — деплой отклонён", nil)
+			continue
+		}
 		// v2.0.138 entry chain: the shared market-blocker composer now owns
 		// the per-candidate fleet gates — liquidation cascade + feed health
 		// (direction-aware against the FINAL trend: SHORT stays live, the
@@ -1693,6 +1698,10 @@ func (worker *Worker) deployPaper(
 			levReason = fmt.Sprintf("HAR σ=%.0f%%/год R²=%.2f (%dx)",
 				harGeo.forecastPct, harGeo.geo.Confidence, botLev)
 			levMode = "HAR"
+		}
+		if settings.MaxLeverageCap > 0 && botLev > settings.MaxLeverageCap {
+			botLev = settings.MaxLeverageCap
+			levReason = fmt.Sprintf("Ограничение риска max_leverage_cap=%dx", settings.MaxLeverageCap)
 		}
 
 		// v2.0.56 (F9): block directional flip-entries on a symbol that ran
@@ -1914,6 +1923,28 @@ func (worker *Worker) deployPaper(
 			srRes = sr
 		}
 
+		minRR := 1.8
+		if settings.MinRiskReward.IsPositive() {
+			minRR = settings.MinRiskReward.InexactFloat64()
+		}
+
+		adaptiveRes := marketdata.ComputeIndividualTargetPrices(marketdata.AdaptiveBotTargetInput{
+			Symbol:         candidate.Symbol,
+			Direction:      trend,
+			CurrentPrice:   candidate.CurrentPrice,
+			LowerPrice:     mesh.LowerPrice,
+			UpperPrice:     mesh.UpperPrice,
+			GridNum:        mesh.GridNum,
+			Budget:         settings.BudgetUSDT.InexactFloat64(),
+			Leverage:       botLev,
+			ATR:            atrVal,
+			OrderBookDepth: obProfile,
+			SRAnalysis:     srRes,
+			MinRiskReward:  minRR,
+			TakerFeeBps:    settings.FeeBps.InexactFloat64(),
+			SlippageBps:    settings.SlippageBps.InexactFloat64(),
+		})
+
 		// v2.0.195: ROI-допуск для PAPER-деплоя — зеркало REAL-пути (v2.0.194
 		// врезал гейт ТОЛЬКО в REAL, а флот работает в PAPER: ANTHROPIC LONG
 		// #1638 открыт ПОСЛЕ выката 194 и закрыт STOP_LOSS -$31.12 в обход
@@ -1935,11 +1966,11 @@ func (worker *Worker) deployPaper(
 			roiDirPaper = "NEUTRAL"
 		}
 		roiRoomPaper := 0.0
-		if (roiDirPaper == "LONG" || roiDirPaper == "SHORT") && candidate.TargetPrice != nil && candidate.TargetPrice.GreaterThan(decimal.Zero) && candidate.CurrentPrice.IsPositive() {
+		if (roiDirPaper == "LONG" || roiDirPaper == "SHORT") && adaptiveRes.TargetPrice.GreaterThan(decimal.Zero) && candidate.CurrentPrice.IsPositive() {
 			if roiDirPaper == "LONG" {
-				roiRoomPaper = candidate.TargetPrice.Sub(candidate.CurrentPrice).Div(candidate.CurrentPrice).Mul(decimal.NewFromInt(100)).InexactFloat64()
+				roiRoomPaper = adaptiveRes.TargetPrice.Sub(candidate.CurrentPrice).Div(candidate.CurrentPrice).Mul(decimal.NewFromInt(100)).InexactFloat64()
 			} else {
-				roiRoomPaper = candidate.CurrentPrice.Sub(*candidate.TargetPrice).Div(candidate.CurrentPrice).Mul(decimal.NewFromInt(100)).InexactFloat64()
+				roiRoomPaper = candidate.CurrentPrice.Sub(adaptiveRes.TargetPrice).Div(candidate.CurrentPrice).Mul(decimal.NewFromInt(100)).InexactFloat64()
 			}
 		}
 		roiPaper := AssessROI(ROIAssessmentInput{
@@ -1978,28 +2009,6 @@ func (worker *Worker) deployPaper(
 			continue
 		}
 
-		minRR := 1.8
-		if settings.MinRiskReward.IsPositive() {
-			minRR = settings.MinRiskReward.InexactFloat64()
-		}
-
-		adaptiveRes := marketdata.ComputeIndividualTargetPrices(marketdata.AdaptiveBotTargetInput{
-			Symbol:         candidate.Symbol,
-			Direction:      trend,
-			CurrentPrice:   candidate.CurrentPrice,
-			LowerPrice:     mesh.LowerPrice,
-			UpperPrice:     mesh.UpperPrice,
-			GridNum:        mesh.GridNum,
-			Budget:         settings.BudgetUSDT.InexactFloat64(),
-			Leverage:       botLev,
-			ATR:            atrVal,
-			OrderBookDepth: obProfile,
-			SRAnalysis:     srRes,
-			MinRiskReward:  minRR,
-			TakerFeeBps:    settings.FeeBps.InexactFloat64(),
-			SlippageBps:    settings.SlippageBps.InexactFloat64(),
-		})
-
 		normTrend := strings.ToLower(strings.TrimSpace(trend))
 		isNeutralPaper := normTrend == "no_trend" || normTrend == "neutral" || normTrend == ""
 		var targetPriceDec *decimal.Decimal
@@ -2013,7 +2022,6 @@ func (worker *Worker) deployPaper(
 			stopLossPriceDec = adaptiveRes.StopLossPrice
 			stopLossHighDec = adaptiveRes.StopLossHigh
 		}
-		riskRewardDec := decimal.NewFromFloat(adaptiveRes.RiskRewardRatio)
 		adaptiveStrat := adaptiveRes.AdaptiveStrategy
 
 		if settings.PnLTargetMode == "DYNAMIC" {
@@ -2033,6 +2041,21 @@ func (worker *Worker) deployPaper(
 				botMaxLossVal = stress.loss.Round(2)
 				maxLoss = &botMaxLossVal
 			}
+			// v2.0.199: Cap max loss for neutral bots as a multiple of target (prevent 1:10 ruin asymmetry)
+			if isNeutralPaper && target != nil && target.IsPositive() {
+				mult := decimal.NewFromFloat(2.80)
+				if settings.MaxLossTargetMultiplier.IsPositive() {
+					mult = settings.MaxLossTargetMultiplier
+				}
+				lossCap := target.Mul(mult).Round(2)
+				if maxLoss != nil && maxLoss.GreaterThan(lossCap) {
+					*maxLoss = lossCap
+				}
+			}
+		}
+		riskRewardDec := decimal.NewFromFloat(adaptiveRes.RiskRewardRatio)
+		if target != nil && maxLoss != nil && maxLoss.IsPositive() {
+			riskRewardDec = target.Div(*maxLoss).Round(4)
 		}
 		// The envelope gate below reserves the candidate's FULL
 		// (post-tranche-2) stop — the exact amount tranche2RiskGate later
@@ -2993,6 +3016,11 @@ func (worker *Worker) deployReal(
 			}
 			trend = smartParam
 		}
+		if !settings.DirectionalEnabled && (trend == "long" || trend == "short") {
+			worker.rejectCandidate(ctx, candidate,
+				"направленные боты отключены (directional_enabled=false) — деплой отклонён", nil)
+			continue
+		}
 		// v2.0.138 entry chain: the shared market-blocker composer now owns
 		// the per-candidate fleet gates — liquidation cascade + feed health
 		// (direction-aware against the FINAL trend: SHORT stays live, smart
@@ -3149,6 +3177,9 @@ func (worker *Worker) deployReal(
 		} else if harGeo != nil && harGeo.geo.Leverage < botLev {
 			botLev = harGeo.geo.Leverage
 		}
+		if settings.MaxLeverageCap > 0 && botLev > settings.MaxLeverageCap {
+			botLev = settings.MaxLeverageCap
+		}
 
 		// Fleet Net Delta Cap (Quant & Vision v3.0). v2.0.142 (audit P2a):
 		// the charge and the park projection moved into the shared
@@ -3291,6 +3322,42 @@ func (worker *Worker) deployReal(
 		// AI Kit/scanner readings, or the operator's fixed amount) is enforced
 		// by Pionex itself (profit_amount), so it survives even if this
 		// process is down. The management loop double-checks it locally.
+		atrVal := 0.0
+		if aVal, ok := candidate.ModelAssumptions["atrPct"].(float64); ok && aVal > 0 {
+			atrVal = aVal * candidate.CurrentPrice.InexactFloat64() / 100.0
+		}
+		var obProfile *marketdata.DepthProfile
+		if dp, ok := candidate.ModelAssumptions["orderBookDepth"].(*marketdata.DepthProfile); ok {
+			obProfile = dp
+		}
+		var srRes *marketdata.SRAnalysisResult
+		if sr, ok := candidate.ModelAssumptions["srAnalysis"].(*marketdata.SRAnalysisResult); ok {
+			srRes = sr
+		}
+
+		minRR := 1.8
+		if settings.MinRiskReward.IsPositive() {
+			minRR = settings.MinRiskReward.InexactFloat64()
+		}
+
+		adaptiveRes := marketdata.ComputeIndividualTargetPrices(marketdata.AdaptiveBotTargetInput{
+			Symbol:         candidate.Symbol,
+			Direction:      trend,
+			CurrentPrice:   candidate.CurrentPrice,
+			LowerPrice:     lowerPrice,
+			UpperPrice:     upperPrice,
+			GridNum:        mesh.GridNum,
+			Budget:         slotBudget.InexactFloat64(),
+			Leverage:       botLev,
+			ATR:            atrVal,
+			OrderBookDepth: obProfile,
+			SRAnalysis:     srRes,
+			MinRiskReward:  minRR,
+			TakerFeeBps:    settings.FeeBps.InexactFloat64(),
+			SlippageBps:    settings.SlippageBps.InexactFloat64(),
+			PricePrecision: pricePrecision,
+		})
+
 		botTargetSpan := 0.0
 		if mesh.UpperPrice.GreaterThan(mesh.LowerPrice) && candidate.CurrentPrice.IsPositive() {
 			botTargetSpan, _ = mesh.UpperPrice.Sub(mesh.LowerPrice).Div(candidate.CurrentPrice).Mul(decimal.NewFromInt(100)).Float64()
@@ -3331,11 +3398,17 @@ func (worker *Worker) deployReal(
 			roiDir = "NEUTRAL"
 		}
 		roiRoom := 0.0
-		if (roiDir == "LONG" || roiDir == "SHORT") && candidate.TargetPrice != nil && candidate.CurrentPrice.IsPositive() {
-			if roiDir == "LONG" {
-				roiRoom = candidate.TargetPrice.Sub(candidate.CurrentPrice).Div(candidate.CurrentPrice).Mul(decimal.NewFromInt(100)).InexactFloat64()
-			} else {
-				roiRoom = candidate.CurrentPrice.Sub(*candidate.TargetPrice).Div(candidate.CurrentPrice).Mul(decimal.NewFromInt(100)).InexactFloat64()
+		if (roiDir == "LONG" || roiDir == "SHORT") && candidate.CurrentPrice.IsPositive() {
+			tpDec := candidate.TargetPrice
+			if (tpDec == nil || tpDec.IsZero()) && adaptiveRes.TargetPrice.GreaterThan(decimal.Zero) {
+				tpDec = &adaptiveRes.TargetPrice
+			}
+			if tpDec != nil && tpDec.IsPositive() {
+				if roiDir == "LONG" {
+					roiRoom = tpDec.Sub(candidate.CurrentPrice).Div(candidate.CurrentPrice).Mul(decimal.NewFromInt(100)).InexactFloat64()
+				} else {
+					roiRoom = candidate.CurrentPrice.Sub(*tpDec).Div(candidate.CurrentPrice).Mul(decimal.NewFromInt(100)).InexactFloat64()
+				}
 			}
 		}
 		roiAssessment := AssessROI(ROIAssessmentInput{
@@ -3429,42 +3502,6 @@ func (worker *Worker) deployReal(
 				botMaxLoss = &half
 			}
 		}
-		atrVal := 0.0
-		if aVal, ok := candidate.ModelAssumptions["atrPct"].(float64); ok && aVal > 0 {
-			atrVal = aVal * candidate.CurrentPrice.InexactFloat64() / 100.0
-		}
-		var obProfile *marketdata.DepthProfile
-		if dp, ok := candidate.ModelAssumptions["orderBookDepth"].(*marketdata.DepthProfile); ok {
-			obProfile = dp
-		}
-		var srRes *marketdata.SRAnalysisResult
-		if sr, ok := candidate.ModelAssumptions["srAnalysis"].(*marketdata.SRAnalysisResult); ok {
-			srRes = sr
-		}
-
-		minRR := 1.8
-		if settings.MinRiskReward.IsPositive() {
-			minRR = settings.MinRiskReward.InexactFloat64()
-		}
-
-		adaptiveRes := marketdata.ComputeIndividualTargetPrices(marketdata.AdaptiveBotTargetInput{
-			Symbol:         candidate.Symbol,
-			Direction:      trend,
-			CurrentPrice:   candidate.CurrentPrice,
-			LowerPrice:     lowerPrice,
-			UpperPrice:     upperPrice,
-			GridNum:        mesh.GridNum,
-			Budget:         slotBudget.InexactFloat64(),
-			Leverage:       botLev,
-			ATR:            atrVal,
-			OrderBookDepth: obProfile,
-			SRAnalysis:     srRes,
-			MinRiskReward:  minRR,
-			TakerFeeBps:    settings.FeeBps.InexactFloat64(),
-			SlippageBps:    settings.SlippageBps.InexactFloat64(),
-			PricePrecision: pricePrecision,
-		})
-
 		// Sized net true USDT targets: respect PnLTargetMode (DYNAMIC vs FIXED) and TrancheDeployEnabled
 		if settings.PnLTargetMode == "DYNAMIC" {
 			botTargetVal := decimal.NewFromFloat(adaptiveRes.TargetUSDT).Round(2)
@@ -3490,6 +3527,17 @@ func (worker *Worker) deployReal(
 		// pnl_target_usdt below inherits the same capped value.
 		if isNeutralReal {
 			botTarget = applyNeutralHarvestTP(settings.PnLTargetMode, investAmount, botTarget)
+			// v2.0.199: Cap max loss for neutral bots as a multiple of target (prevent 1:10 ruin asymmetry)
+			if botTarget != nil && botTarget.IsPositive() {
+				mult := decimal.NewFromFloat(2.80)
+				if settings.MaxLossTargetMultiplier.IsPositive() {
+					mult = settings.MaxLossTargetMultiplier
+				}
+				lossCap := botTarget.Mul(mult).Round(2)
+				if botMaxLoss != nil && botMaxLoss.GreaterThan(lossCap) {
+					*botMaxLoss = lossCap
+				}
+			}
 		}
 
 		// Configure native Pionex take-profit directly on the bot card:
@@ -3801,6 +3849,9 @@ func (worker *Worker) deployReal(
 			storedSLHigh = slHighPrice
 		}
 		riskRewardDec := decimal.NewFromFloat(adaptiveRes.RiskRewardRatio)
+		if botTarget != nil && botMaxLoss != nil && botMaxLoss.IsPositive() {
+			riskRewardDec = botTarget.Div(*botMaxLoss).Round(4)
+		}
 		adaptiveStrat := adaptiveRes.AdaptiveStrategy
 
 		botID, createErr := manager.CreateGridBot(ctx, grid.CreateInput{

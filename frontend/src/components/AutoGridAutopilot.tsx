@@ -551,6 +551,9 @@ function SettingsSummary({ settings }: { settings: AutoGridSettings }) {
     ['OFI Harvest (тейк на вершине)', settings.ofiHarvestEnabled !== false ? 'включён (своевременная фиксация)' : 'выключен'],
     ['OU Rotation (ротация застрявших)', settings.ouRotationEnabled !== false ? 'включена (при t > 1.5 × t½)' : 'выключена'],
     ['Мин. Risk/Reward (R:R)', settings.minRiskReward ? `≥ ${settings.minRiskReward}` : '≥ 1.80'],
+    ['Направленные боты (LONG/SHORT)', settings.directionalEnabled ? 'включены ⚠️' : 'отключены 🛡️ (только NEUTRAL)'],
+    ['Потолок плеча (Max Leverage Cap)', `${settings.maxLeverageCap ?? 2}x`],
+    ['Макс. множитель стопа (Max Loss Multiplier)', `${settings.maxLossTargetMultiplier ?? '2.80'}x от цели`],
   ];
   return (
     <div>
@@ -669,6 +672,9 @@ function SettingsForm({
           ouRotationEnabled: !!form.ouRotationEnabled,
           minRiskReward: dec(form.minRiskReward ?? '1.80'),
           marginReservePct: dec(form.marginReservePct ?? '0'),
+          directionalEnabled: !!form.directionalEnabled,
+          maxLeverageCap: numberField(String(form.maxLeverageCap ?? 2), 2),
+          maxLossTargetMultiplier: dec(form.maxLossTargetMultiplier ?? '2.80'),
         }),
       });
       await onSaved();
@@ -1043,6 +1049,45 @@ function SettingsForm({
               value={form.minRiskReward || '1.80'}
               onChange={(event) => setForm((current) => ({ ...current, minRiskReward: event.target.value }))}
               placeholder="1.80"
+            />
+          </label>
+        </div>
+
+        <div className="section-divider" style={{ margin: '16px 0', borderTop: '1px solid var(--border)' }} />
+        <h4 style={{ margin: '0 0 12px 0' }}>💎 Защитные шлюзы «АЛМАЗ» v2.0.199</h4>
+
+        <div className="toggle-row">
+          <div>
+            <strong>Направленные боты (LONG/SHORT)</strong>
+            <span>
+              Отключено по умолчанию: контртрендовые входы в альткоины несут повышенный риск. Когда выключено — разрешены только безопасные NEUTRAL-сетки, захватывающие колебания в обе стороны.
+            </span>
+          </div>
+          <input
+            type="checkbox"
+            checked={Boolean(form.directionalEnabled)}
+            onChange={(event) => setForm((current) => ({ ...current, directionalEnabled: event.target.checked }))}
+          />
+        </div>
+
+        <div className="field-grid">
+          <label>
+            <span>Потолок плеча (Max Leverage Cap)</span>
+            <input
+              type="number"
+              min={1}
+              max={10}
+              value={form.maxLeverageCap ?? 2}
+              onChange={(event) => setForm((current) => ({ ...current, maxLeverageCap: Number(event.target.value) }))}
+            />
+          </label>
+          <label>
+            <span>Макс. множитель стопа (Stop/Target Ratio)</span>
+            <input
+              type="text"
+              value={form.maxLossTargetMultiplier || '2.80'}
+              onChange={(event) => setForm((current) => ({ ...current, maxLossTargetMultiplier: event.target.value }))}
+              placeholder="2.80"
             />
           </label>
         </div>
